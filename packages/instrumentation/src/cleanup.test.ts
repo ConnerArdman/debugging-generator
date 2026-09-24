@@ -37,7 +37,8 @@
  * ## A conflict is a pass, not a failure
  *
  * Half of these cases end with a record in `conflict` and a cleanup status of
- * `conflict` or `partial`, and each of them is asserting success: the
+ * `conflict` — whatever else the same pass restored — and each of them is
+ * asserting success: the
  * developer's bytes survived untouched, the pristine original is still
  * recoverable from the backup directory, and both user interfaces were handed a
  * report to show. The failure this suite is built to catch is the opposite one —
@@ -88,7 +89,7 @@ import {
 } from './cleanup.js';
 import type { CleanupContext, CleanupFileSystem, CleanupStatus, RecordScope } from './cleanup.js';
 import { createBackupStore } from './patch/backup-store.js';
-import type { BackupStore } from './patch/backup-store.js';
+import type { BackupStore, RecordedBackup } from './patch/backup-store.js';
 import { createPatcher } from './patch/patcher.js';
 import type { PatchOutcome } from './patch/patcher.js';
 import { MODIFICATION_STATUSES } from './schema/modification.js';
@@ -1532,7 +1533,9 @@ describe('a chain of plan versions over one file', () => {
     const mark = world.mark();
     const outcome = await cleanupSession(world.sessionId, world.context);
 
-    expect(outcome.status).toBe('partial');
+    // Link 3 came back, but link 2's conflict is outstanding, and that is what
+    // the verdict reports (AAP §0.5.5).
+    expect(outcome.status).toBe('conflict');
     expect(outcome.restored.map((record) => record.id)).toEqual([third.record.id]);
     expect(outcome.skipped.map((record) => record.id)).toEqual([second.record.id, first.record.id]);
     expect(outcome.failures).toEqual([]);
@@ -1644,7 +1647,8 @@ describe('a chain of plan versions over one file', () => {
     const outcome = await cleanupSession(world.sessionId, world.context);
 
     // The tip came back; the earlier version could not, and was not forced.
-    expect(outcome.status).toBe('partial');
+    // Its conflict is outstanding, so the pass reports `conflict`.
+    expect(outcome.status).toBe('conflict');
     expect(outcome.restored.map((record) => record.id)).toEqual([second.record.id]);
     expect(outcome.skipped.map((record) => record.id)).toEqual([first.record.id]);
     expect(outcome.failures).toEqual([]);
@@ -1877,7 +1881,9 @@ describe('a file whose records do not form a single chain', () => {
 
     const outcome = await reconcileModifications(world.context);
 
-    expect(outcome.status).toBe('partial');
+    // The unrelated file came back, and the refused fork is still an
+    // outstanding conflict.
+    expect(outcome.status).toBe('conflict');
     expect(outcome.examined).toBe(4);
     expect(outcome.restored.map((record) => record.id)).toEqual([unrelated.record.id]);
     expect(outcome.closed).toEqual([]);
@@ -2459,7 +2465,10 @@ describe('the reconciliation table', () => {
     // than leaving a file patched.
     const outcome = await reconcileModifications(world.context);
 
-    expect(outcome.status).toBe('conflict');
+    // A record that could not be attempted, and no conflict observed: the
+    // next start, given a resolver, settles it.
+    expect(outcome.status).toBe('partial');
+    expect(outcome.conflicts).toEqual([]);
     expect(outcome.restored).toEqual([]);
     expect(outcome.skipped.map((record) => record.id)).toEqual([patched.record.id]);
     expect(only(outcome.failures, 'failure').error.code).toBe('SESSION_NOT_FOUND');
@@ -2707,6 +2716,113 @@ describe('a backup that cannot be read back', () => {
     expect(conflict.actualHash).toBe(patched.record.instrumentedHash);
 
     expect(world.journal.row(patched.record.id).status).toBe('conflict');
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+  });
+});
+
+describe('a backup that is there but no longer hashes to its digest', () => {
+  it('conflicts as backup-corrupt, writes nothing and keeps the untrusted backup', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const backupPath = world.backupPathOf(patched.record.originalHash);
+    const tampered = Buffer.from('this is not the original content\n', 'utf8');
+
+    writeFileSync(backupPath, tampered);
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.restored).toEqual([]);
+    expectNothingWritten(world.log);
+
+    // Named for what was observed: the file is there and was read, it simply
+    // is not the original — not "missing", and not "could not be read back".
+    const conflict = only(outcome.conflicts, 'conflict report');
+    expect(conflict.reason).toBe('backup-corrupt');
+    expect(conflict.recordId).toBe(patched.record.id);
+    expect(conflict.backupPath).toBe(patched.record.backupPath);
+    expect(conflict.message).toContain('no longer hashes to the digest it was filed under');
+    expect(conflict.message).not.toContain('could not be read back');
+    expect(conflict.message).not.toContain(sha256Hex(tampered));
+
+    // The developer's project file and the untrusted backup are both exactly
+    // as they were: nothing was restored from it, and nothing deleted it.
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    expectFileBytes(backupPath, tampered);
+    expect(world.removals).toEqual([]);
+    expect(world.journal.row(patched.record.id).status).toBe('conflict');
+  });
+
+  /**
+   * The world's store, answering the conflict detector's read (the first) with
+   * the real backup and the restoration's own read (the second) with `second`:
+   * the backup changed between the verdict and the write.
+   */
+  function storeChangingOnSecondRead(
+    world: World,
+    second: (real: RecordedBackup) => Result<RecordedBackup>,
+  ): BackupStore {
+    let reads = 0;
+
+    return {
+      ...world.backups,
+      readRecorded: async (recordedPath: string, digest: string) => {
+        reads += 1;
+
+        const real = await world.backups.readRecorded(recordedPath, digest);
+
+        return reads < 2 || isErr(real) ? real : second(real.value);
+      },
+    };
+  }
+
+  it('refuses a backup whose bytes changed after the verdict, as backup-corrupt', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const backups = storeChangingOnSecondRead(world, (real) =>
+      ok({ ...real, bytes: Buffer.from('swapped after the verdict\n', 'utf8') }),
+    );
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(patched.record, { ...world.context, backups }),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('conflict');
+    expect(outcome.wrote).toBe(false);
+    expect(outcome.conflict?.reason).toBe('backup-corrupt');
+    expect(outcome.conflict?.message).toContain('does not match the digest it was filed under');
+    expect(outcome.conflict?.message).not.toContain('could not be read back');
+    expectNothingWritten(world.log);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+    expectFileBytes(world.backupPathOf(patched.record.originalHash), patched.originalBytes);
+  });
+
+  it('reads a store-reported digest mismatch at restore time as backup-corrupt', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const backups = storeChangingOnSecondRead(world, () =>
+      err(
+        new DebuggenError('STORE_ERROR', 'The stored backup does not match its digest.', {
+          details: { reason: 'stored-digest-mismatch' },
+        }),
+      ),
+    );
+
+    world.resetLog();
+
+    const outcome = expectOk(
+      await restoreModification(patched.record, { ...world.context, backups }),
+      'a restore outcome',
+    );
+
+    expect(outcome.kind).toBe('conflict');
+    expect(outcome.conflict?.reason).toBe('backup-corrupt');
+    expect(outcome.conflict?.message).not.toContain('could not be read back');
+    expectNothingWritten(world.log);
     expectFileBytes(patched.path, patched.instrumentedBytes);
   });
 });
@@ -3300,7 +3416,8 @@ describe('a record whose file is not inside the project', () => {
 
     const outcome = await cleanupSession(world.sessionId, world.context);
 
-    expect(outcome.status).toBe('conflict');
+    // A failure, not a conflict: nothing was found to have diverged.
+    expect(outcome.status).toBe('partial');
     expect(outcome.restored).toEqual([]);
     expect(outcome.conflicts).toEqual([]);
     expect(outcome.skipped.map((record) => record.id)).toEqual([patched.record.id]);
@@ -3313,6 +3430,27 @@ describe('a record whose file is not inside the project', () => {
     expectNothingWritten(world.log);
     expectFileBytes(outsidePath, OUTSIDE_CONTENT);
     expect(existsSync(world.backupPathOf(patched.record.originalHash))).toBe(true);
+  });
+
+  it('still reports conflict when the record it could not re-report is already in conflict', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    // An unresolved conflict from an earlier pass, whose path this pass refuses
+    // before it can compose a fresh report: no report is renewed, and the
+    // conflict is still outstanding.
+    world.journal.arrange({ ...patched.record, status: 'conflict', file: `../${OUTSIDE_FILE}` });
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('conflict');
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.restored).toEqual([]);
+    expect(only(outcome.skipped, 'skipped record').status).toBe('conflict');
+    expect(only(outcome.failures, 'failure').error.code).toBe('PATH_OUTSIDE_PROJECT');
+    expectNothingWritten(world.log);
+    expect(world.journal.row(patched.record.id).status).toBe('conflict');
   });
 });
 
@@ -3360,7 +3498,7 @@ describe('a repeated pass', () => {
 });
 
 describe('a pass over two files, one of which was edited', () => {
-  it('reports partial with both lists populated and the time it finished', async () => {
+  it('reports conflict with both lists populated and the time it finished', async () => {
     const world = makeWorld();
     const untouched = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
     const edited = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
@@ -3370,7 +3508,9 @@ describe('a pass over two files, one of which was edited', () => {
 
     const outcome = await cleanupSession(world.sessionId, world.context);
 
-    expect(outcome.status).toBe('partial');
+    // The restore beside it does not soften the verdict: an edited file was
+    // left alone, so `cleanup.status` is `conflict` (AAP §0.5.5).
+    expect(outcome.status).toBe('conflict');
     expect(outcome.completedAt).toBe(FIXED_NOW);
     expect(outcome.restored.map((record) => record.file)).toEqual([OTHER_FILE]);
     expect(outcome.skipped.map((record) => record.file)).toEqual([TARGET_FILE]);
@@ -3393,6 +3533,120 @@ describe('a pass over two files, one of which was edited', () => {
     expect(existsSync(world.backupPathOf(untouched.record.originalHash))).toBe(false);
     expect(existsSync(world.backupPathOf(edited.record.originalHash))).toBe(true);
     expect(existsSync(world.backups.sessionDirectory)).toBe(true);
+  });
+
+  it('reports conflict on the first pass and on a second pass over the same state', async () => {
+    const world = makeWorld();
+    const untouched = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+    const edited = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+    const developerBytes = developerEdits(edited.path);
+
+    world.resetLog();
+
+    const first = await cleanupSession(world.sessionId, world.context);
+
+    expect(first.status).toBe('conflict');
+    expect(first.restored.map((record) => record.id)).toEqual([untouched.record.id]);
+    expect(only(first.conflicts, 'first-pass conflict').reason).toBe('content-changed');
+    expectFileBytes(untouched.path, untouched.originalBytes);
+    expectFileBytes(edited.path, developerBytes);
+
+    world.resetLog();
+
+    const second = await cleanupSession(world.sessionId, world.context);
+
+    // Identical state, identical verdict: the status describes what is
+    // outstanding, not what the pass happened to restore.
+    expect(second.status).toBe(first.status);
+    expect(second.restored).toEqual([]);
+    expect(only(second.conflicts, 'second-pass conflict').recordId).toBe(edited.record.id);
+    expect(second.skipped.map((record) => record.id)).toEqual([edited.record.id]);
+    expectNothingWritten(world.log);
+    expectFileBytes(untouched.path, untouched.originalBytes);
+    expectFileBytes(edited.path, developerBytes);
+    expect(world.journal.row(edited.record.id).status).toBe('conflict');
+    expect(existsSync(world.backupPathOf(edited.record.originalHash))).toBe(true);
+  });
+});
+
+describe('a pass that restores one file and cannot attempt another', () => {
+  it('reports partial when the outstanding record is a failure and nothing conflicted', async () => {
+    const world = makeWorld();
+    const restorable = await patchSymbol(world, { file: OTHER_FILE, symbol: OTHER_SYMBOL });
+    const escaping = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    writeFileSync(join(world.root, OUTSIDE_FILE), OUTSIDE_CONTENT);
+    world.journal.arrange({ ...escaping.record, file: `../${OUTSIDE_FILE}` });
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, world.context);
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.forks).toEqual([]);
+    expect(outcome.restored.map((record) => record.id)).toEqual([restorable.record.id]);
+    expect(outcome.skipped.map((record) => record.id)).toEqual([escaping.record.id]);
+    expect(only(outcome.failures, 'failure').error.code).toBe('PATH_OUTSIDE_PROJECT');
+
+    // One write, to the restorable file; the refused record is still open with
+    // its backup, for a pass that can place it.
+    expect(world.log.writes.map((write) => write.expectedHash)).toEqual([
+      restorable.record.instrumentedHash,
+    ]);
+    expectFileBytes(restorable.path, restorable.originalBytes);
+    expectFileBytes(join(world.root, OUTSIDE_FILE), OUTSIDE_CONTENT);
+    expect(world.journal.row(escaping.record.id).status).toBe('applied');
+    expect(existsSync(world.backupPathOf(escaping.record.originalHash))).toBe(true);
+  });
+});
+
+describe('a journal that will not answer', () => {
+  /** A copy of the world's journal whose listings fail, as a locked store's would. */
+  function unanswering(world: World): ModificationJournal {
+    const refusal = new DebuggenError('STORE_ERROR', 'The suite journal refuses to list.', {
+      details: { reason: 'suite-listing-refused' },
+    });
+
+    return {
+      ...world.journal,
+      listBySession: () => Promise.resolve(err(refusal)),
+      listOpen: () => Promise.resolve(err(refusal)),
+    };
+  }
+
+  it('makes a session pass partial, not conflict: nothing was attempted and nothing diverged', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    world.resetLog();
+
+    const outcome = await cleanupSession(world.sessionId, {
+      ...world.context,
+      journal: unanswering(world),
+    });
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.conflicts).toEqual([]);
+    expect(outcome.restored).toEqual([]);
+    expect(only(outcome.failures, 'failure').error.code).toBe('STORE_ERROR');
+    expectNoFileSystemAccess(world.log);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
+  });
+
+  it('makes a start-up reconciliation partial, not conflict', async () => {
+    const world = makeWorld();
+    const patched = await patchSymbol(world, { file: TARGET_FILE, symbol: TARGET_SYMBOL });
+
+    world.resetLog();
+
+    const outcome = await reconcileModifications({ ...world.context, journal: unanswering(world) });
+
+    expect(outcome.status).toBe('partial');
+    expect(outcome.examined).toBe(0);
+    expect(outcome.conflicts).toEqual([]);
+    expect(only(outcome.failures, 'failure').error.code).toBe('STORE_ERROR');
+    expectNoFileSystemAccess(world.log);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
   });
 });
 

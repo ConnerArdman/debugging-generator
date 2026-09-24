@@ -114,12 +114,16 @@
  * @see ../host/useQuery for the loading/empty/error machine they drive.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import type { DataQuery, MetricCardsNode } from '@debuggen/panel-schema';
 import { DATA_QUERY_DEFAULT_OFFSET } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { MetricId, MetricUnit, MetricValue } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
@@ -136,6 +140,7 @@ import {
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
+  formatBytesParts,
   formatCount,
   formatDurationParts,
   humanizeLabel,
@@ -174,6 +179,25 @@ const FAILING_QUERY_NAME = 'Failing query';
 const RETRY_NAME = 'Retry';
 
 /**
+ * The shared error-state contract every query-backed node renders a failure
+ * with, spelled out rather than read back from the host's constants, so this
+ * suite pins the words a reader actually sees: the title, the generic lead the
+ * provider's cause follows, and the focus key the host's node frame uses to
+ * restore focus to the retry control after a remount.
+ */
+const QUERY_FAILURE_TITLE = 'Could not load this view';
+const QUERY_FAILURE_LEAD = 'The data for this view could not be loaded.';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** A provider's cause and hint for the shared-contract case. */
+const PROVIDER_CAUSE = 'The channel to the service is closed.';
+const PROVIDER_HINT = 'Start the Debug Generator service, then retry.';
+
+/** What a service behind a proxy answers when it is down, as a plain rejection. */
+const SERVICE_UNAVAILABLE_MESSAGE = 'The service answered 503 Service Unavailable.';
+const SERVICE_UNAVAILABLE_STATUS = 503;
+
+/**
  * A duration in the critical severity bucket, and one in the fast bucket.
  *
  * Expressed as offsets from the product's own thresholds rather than as bare
@@ -185,6 +209,9 @@ const FAST_MS = DURATION_NORMAL_THRESHOLD_MS - 38;
 
 /** A measured byte size, which the byte scale formats as one figure. */
 const TRANSFERRED_BYTES_VALUE = 1_500_000;
+
+/** A transfer below one kilobyte, which the byte scale shows in whole bytes. */
+const SMALL_TRANSFER_BYTES = 512;
 
 /** The default value {@link makeMetric} gives a count. */
 const DEFAULT_COUNT = 1;
@@ -658,9 +685,21 @@ function queryOfCall(stub: StubProvider, call: number): DataQuery {
   return query;
 }
 
-/** The text of a tile's advisory note, read off the tooltip that describes it. */
+/**
+ * The text of a tile's advisory note, read off the tooltip that describes it.
+ *
+ * `Tooltip` mounts its bubble only while it is open, so the note is opened the
+ * way a keyboard reader opens it — focus arriving on its affordance — read, and
+ * closed again, leaving the tile as it was.
+ */
 function noteOf(card: HTMLElement): string {
-  return within(card).getByRole('tooltip').textContent ?? '';
+  const affordance = within(card).getByLabelText(NOTE_AFFORDANCE_NAME);
+
+  fireEvent.focus(affordance);
+  const text = within(card).getByRole('tooltip').textContent ?? '';
+  fireEvent.blur(affordance);
+
+  return text;
 }
 
 /**
@@ -728,6 +767,9 @@ describe('MetricCards states', () => {
     expect(busy.classList.contains('dg-loading-state')).toBe(true);
     expect(busy.parentElement?.classList.contains('dg-metric-cards__loading')).toBe(true);
 
+    // The announced label ends in the single ellipsis every busy region uses.
+    expect(busy.textContent).toBe('Loading the computed values of this capture…');
+
     // Nothing is drawn yet: no group, therefore no tiles, and above all no
     // empty state — an unsettled query is not an answer (AAP 0.5.5).
     expect(screen.queryByRole('list')).toBeNull();
@@ -753,11 +795,18 @@ describe('MetricCards states', () => {
       true,
     );
 
+    // Announced as the settled status, with a short title and a decorative
+    // glyph above the sentence, like every other view's empty capture.
+    const state = screen.getByRole('status');
+    expect(state).toBe(message.parentElement);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('No metrics');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty response is a success, so it is drawn as an absence and not as a
     // failure — and not as a row of `n/a` tiles either, since there is no value
     // whose absence could be reported.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
     expect(message.textContent).not.toContain(NOT_AVAILABLE_LABEL);
   });
@@ -795,6 +844,62 @@ describe('MetricCards states', () => {
 
     // No tiles were invented behind the failure.
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
+  });
+
+  it('renders a provider rejection through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', PROVIDER_CAUSE, { hint: PROVIDER_HINT }),
+    );
+
+    renderCards(makeNode(['total_duration']), { provider: stub.provider });
+
+    // A lone failure is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+
+    // The one title every failed view carries, and a message that opens with the
+    // generic lead and keeps the provider's own cause after it.
+    expect(within(alert).getByText(QUERY_FAILURE_TITLE)).toBeDefined();
+
+    const message = alert.querySelector('.dg-error-state__message');
+
+    expect(message?.textContent?.startsWith(QUERY_FAILURE_LEAD)).toBe(true);
+    expect(message?.textContent).toContain(PROVIDER_CAUSE);
+
+    // The hint stands on its own line, and the code is a chip rather than prose.
+    expect(within(alert).getByText(PROVIDER_HINT).classList).toContain('dg-error-state__message');
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').closest('.dg-badge')).not.toBeNull();
+
+    // The query block holds exactly the query that was asked. `<details>` is a
+    // group too, so the block is always looked up by its name.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the host's node frame restores focus by.
+    expect(
+      within(alert).getByRole('button', { name: RETRY_NAME }).getAttribute('data-dg-focus-key'),
+    ).toBe(RETRY_FOCUS_KEY);
+  });
+
+  it('reports a plain 503 rejection as a lost transport, never as an internal error', async () => {
+    const stub = recordingProvider(() =>
+      Promise.reject(
+        Object.assign(new Error(SERVICE_UNAVAILABLE_MESSAGE), {
+          status: SERVICE_UNAVAILABLE_STATUS,
+        }),
+      ),
+    );
+
+    renderCards(makeNode(['total_duration']), { provider: stub.provider });
+
+    const alert = await screen.findByRole('alert');
+    const message = alert.querySelector('.dg-error-state__message');
+
+    // The status maps to the code it means, and the provider's own sentence is
+    // kept after the generic lead instead of being replaced by it.
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').closest('.dg-badge')).not.toBeNull();
+    expect(within(alert).queryByText('INTERNAL')).toBeNull();
+    expect(message?.textContent).toBe(`${QUERY_FAILURE_LEAD} ${SERVICE_UNAVAILABLE_MESSAGE}`);
   });
 
   it('reports a node whose query names another source, and asks the provider for nothing', async () => {
@@ -1072,6 +1177,13 @@ describe('MetricCards paging', () => {
     expect(message.textContent).not.toMatch(NOTHING_COMPUTED);
     expect(screen.queryAllByRole('listitem')).toHaveLength(0);
     expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+    // Titled as an empty page, in the words every paged view uses, and never
+    // as the empty capture; the same glyph and settled status as that state.
+    const state = screen.getByRole('status');
+    expect(state).toBe(message.parentElement);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('Nothing on this page');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
   });
 
   it('draws a requested id an authored offset did not reach as not on the page', async () => {
@@ -1459,7 +1571,7 @@ describe('MetricCards figures', () => {
     expect(severityStyleOf(card)).toBeNull();
   });
 
-  it('shows a measured byte size as a single figure, since the byte scale has no split', async () => {
+  it('splits a measured byte size into its figure and its unit, as a duration is', async () => {
     const stub = resolvingProvider([
       makeMetric('transferred_bytes', { unit: 'bytes', value: TRANSFERRED_BYTES_VALUE }),
     ]);
@@ -1467,11 +1579,40 @@ describe('MetricCards figures', () => {
     renderCards(makeNode(['transferred_bytes']), { provider: stub.provider });
 
     const card = cardAt(await findCards(1), 0);
+    const parts = formatBytesParts(TRANSFERRED_BYTES_VALUE);
+    if (!parts.available) {
+      throw new Error('the byte size under test is not measurable');
+    }
 
+    // The number in the prominent role and the unit in its own muted element —
+    // never the unit concatenated into the figure — and the pair reads as the
+    // one joined label every other surface shows.
     expect(isUnavailable(card)).toBe(false);
-    expect(textOf(card, 'value')).toBe(formatBytes(TRANSFERRED_BYTES_VALUE));
-    expect(partOf(card, 'unit')).toBeNull();
+    expect(textOf(card, 'value')).toBe(parts.value);
+    expect(textOf(card, 'unit')).toBe(parts.unit);
+    expect(textOf(card, 'value')).not.toContain(parts.unit);
+    expect(`${textOf(card, 'value') ?? ''} ${textOf(card, 'unit') ?? ''}`).toBe(
+      formatBytes(TRANSFERRED_BYTES_VALUE),
+    );
+    expect(card.getAttribute('aria-label')).toBe(
+      `${humanizeLabel('transferred_bytes')}: ${formatBytes(TRANSFERRED_BYTES_VALUE)}`,
+    );
+
+    // A size has no duration threshold to be read against, so no severity.
     expect(severityStyleOf(card)).toBeNull();
+  });
+
+  it('splits every step of the byte scale, whole bytes included', async () => {
+    const stub = resolvingProvider([
+      makeMetric('transferred_bytes', { unit: 'bytes', value: SMALL_TRANSFER_BYTES }),
+    ]);
+
+    renderCards(makeNode(['transferred_bytes']), { provider: stub.provider });
+
+    const card = cardAt(await findCards(1), 0);
+
+    expect(textOf(card, 'value')).toBe(formatCount(SMALL_TRANSFER_BYTES));
+    expect(textOf(card, 'unit')).toBe('B');
   });
 
   it('falls back to the humanized id when a value arrives with a blank heading', async () => {
@@ -1598,8 +1739,8 @@ describe('MetricCards accessibility and interaction', () => {
 
     expect(document.activeElement).toBe(affordance);
 
-    // `Tooltip` always mounts its bubble, so the description is in the
-    // accessibility tree even while the bubble is visually closed.
+    // Focus opened the bubble, which `Tooltip` mounts only while it is open, and
+    // the affordance names it as its description for exactly that long.
     const bubble = within(card).getByRole('tooltip');
 
     expect(bubble.textContent).toBe(COVERAGE_NOTE);
@@ -1642,5 +1783,150 @@ describe('MetricCards accessibility and interaction', () => {
     expect(spies.onOpenSource).not.toHaveBeenCalled();
     expect(spies.onExpand).not.toHaveBeenCalled();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The stylesheet half of the tile contract
+ *
+ * The test environment applies no stylesheet, so the three presentational
+ * guarantees below are pinned in two halves: the markup the component emits,
+ * asserted on the rendered tiles, and the rule `../styles/components.css`
+ * declares for that markup, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents. The path is joined with
+ * `node:path` because under happy-dom the global `URL` is the DOM's, which
+ * Node's `fileURLToPath` rejects.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The component stylesheet, comments removed so a commented rule cannot match. */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+).replace(/\/\*[\s\S]*?\*\//gu, '');
+
+/** One top-level rule of the stylesheet: its selector list and its declarations. */
+interface StyleRule {
+  readonly selectors: readonly string[];
+  readonly declarations: readonly string[];
+}
+
+/**
+ * The stylesheet's top-level rules. A rule nested in an at-rule splits into
+ * more than two parts at its braces and is left out, which is sound here: every
+ * rule this block reads is a top-level one.
+ */
+const STYLE_RULES: readonly StyleRule[] = COMPONENT_STYLESHEET.split('}')
+  .map((chunk) => chunk.split('{'))
+  .filter((parts): parts is [string, string] => parts.length === 2)
+  .map(([selectorText, body]) => ({
+    selectors: selectorText
+      .split(',')
+      .map((selector) => selector.trim())
+      .filter((selector) => selector !== ''),
+    declarations: body
+      .split(';')
+      .map((declaration) => declaration.trim())
+      .filter((declaration) => declaration !== ''),
+  }));
+
+/**
+ * Every declaration the stylesheet gives one selector, across all the rules
+ * whose selector list names it exactly.
+ *
+ * @param selector The selector as written in the stylesheet.
+ * @returns The declarations, in stylesheet order.
+ */
+function declarationsFor(selector: string): readonly string[] {
+  return STYLE_RULES.filter((rule) => rule.selectors.includes(selector)).flatMap(
+    (rule) => rule.declarations,
+  );
+}
+
+describe('MetricCards tile presentation', () => {
+  it('draws an unavailable tile in a shape of its own, not only in the muted colour', async () => {
+    // A measured zero duration is muted too: the fast-duration token is the
+    // muted text colour (AAP 0.6.3). So the unavailable tile must differ in
+    // shape — a dashed edge and an italic figure — and the zero must not.
+    const stub = resolvingProvider([
+      makeDuration('frontend_duration', 0),
+      makeMetric('transferred_bytes', { unit: 'bytes', value: undefined, note: COVERAGE_NOTE }),
+    ]);
+
+    renderCards(makeNode(['frontend_duration', 'transferred_bytes']), {
+      provider: stub.provider,
+    });
+
+    const cards = await findCards(2);
+    const zero = cardAt(cards, 0);
+    const absent = cardAt(cards, 1);
+    const zeroParts = formatDurationParts(0);
+
+    // The zero is a measurement: its figure and unit, the fast severity, and
+    // no unavailable state. The absence carries the state and nothing else.
+    expect(isUnavailable(zero)).toBe(false);
+    expect(textOf(zero, 'value')).toBe(zeroParts.value);
+    expect(severityStyleOf(zero)).toContain(durationColorVar(0));
+    expect(isUnavailable(absent)).toBe(true);
+    expect(textOf(absent, 'value')).toBe(NOT_AVAILABLE_LABEL);
+
+    // And the state's rules change the shape as well as the colour.
+    expect(declarationsFor('.dg-metric-card.dg-is-unavailable')).toContain('border-style: dashed');
+    expect(declarationsFor('.dg-metric-card.dg-is-unavailable .dg-metric-card__value')).toEqual(
+      expect.arrayContaining(['color: var(--dg-text-muted)', 'font-style: italic']),
+    );
+  });
+
+  it('holds each heading at the top of its tile and its figure at the bottom', async () => {
+    // A heading that wraps onto a second line must not lower its own figure
+    // below the figures of the tiles beside it in the same grid row.
+    const stub = resolvingProvider([
+      makeMetric('render_count', { value: RENDER_COUNT, label: RENDER_COUNT_LABEL }),
+      makeMetric('render_trigger_unknown_count', {
+        value: UNKNOWN_TRIGGER_RENDERS,
+        label: UNKNOWN_TRIGGER_LABEL,
+      }),
+    ]);
+
+    renderCards(makeNode(['render_count', 'render_trigger_unknown_count']), {
+      provider: stub.provider,
+    });
+
+    for (const card of await findCards(2)) {
+      // Two children: the heading first, the figure's group last.
+      expect(card.children).toHaveLength(2);
+      expect(card.firstElementChild).toBe(partOf(card, 'label'));
+      expect(card.lastElementChild?.contains(partOf(card, 'value'))).toBe(true);
+    }
+
+    for (const selector of ['.dg-metric-card', '.dg-metric-cards__card']) {
+      expect(declarationsFor(selector)).toEqual(
+        expect.arrayContaining(['flex-direction: column', 'justify-content: space-between']),
+      );
+    }
+  });
+
+  it('spans each state box across every track of the tile grid', async () => {
+    const stub = resolvingProvider([]);
+
+    renderCards(makeNode(['total_duration']), { provider: stub.provider });
+
+    // The empty state sits in its box, which is an item of the tile grid.
+    const message = await screen.findByText(NOTHING_COMPUTED);
+    const box = message.parentElement?.parentElement;
+    expect(box?.classList.contains('dg-metric-cards__empty')).toBe(true);
+    expect(box?.parentElement?.classList.contains('dg-metric-cards')).toBe(true);
+
+    for (const state of ['empty', 'loading', 'error']) {
+      expect(declarationsFor(`.dg-metric-cards__${state}`)).toContain('grid-column: 1 / -1');
+    }
+
+    // A column box whose state grows to fill it, so the copy is centred in the
+    // node rather than shrink-wrapped at its inline start.
+    expect(declarationsFor('.dg-metric-cards__empty')).toContain('flex-direction: column');
+    expect(declarationsFor('.dg-metric-cards__empty > .dg-empty-state')).toContain(
+      'flex: 1 1 auto',
+    );
   });
 });

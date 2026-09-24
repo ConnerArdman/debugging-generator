@@ -46,6 +46,26 @@
  *    contributes a diagnostic rather than a throw, a syntactically broken module
  *    still yields the call sites the parse recovered, two runs agree exactly, and
  *    `extract` writes nothing.
+ * 6. **A handle an instance holds is found by its declaration.** A property
+ *    constructed in its initialiser, a property that is only annotated and a
+ *    constructor parameter property all prove a `this.<member>` receiver, in a
+ *    class declaration or a class expression; a property of a non-driver class,
+ *    a plain constructor parameter and the instance itself prove nothing, and a
+ *    handle assigned in a constructor body without a declaration is reachable
+ *    only through the marked generic-name fallback.
+ * 7. **A dollar-quoted literal is a value.** `$$…$$`, `$tag$…$tag$` (the same
+ *    tag closing it, whatever it contains) and an unterminated quote each become
+ *    one placeholder, while a `$n` placeholder and a `$` that opens no quote are
+ *    kept, and no dollar-quoted body reaches a node.
+ * 8. **Every export form and module kind has the owner the graph holds.** A
+ *    default-exported arrow, a nameless default function, a function exported
+ *    by `export default <name>` or by an aliased clause, a route or page
+ *    module's handler, a component module's function and a class member each
+ *    start their `queries` edge at a node the assembled graph contains; a
+ *    wrapped default export falls back to its module.
+ * 9. **One unreadable call site costs only itself**, as a `warning` diagnostic
+ *    naming a position and an error class, and a module whose path is not a safe
+ *    project-relative path is declined outright.
  *
  * ## How the cases are driven
  *
@@ -531,6 +551,33 @@ const VALUES_SENTINELS = ['sentinel-values-first', 'sentinel-values-second'] as 
 const ARGUMENT_SENTINEL = 'sentinelSelector';
 
 /**
+ * The bodies of the dollar-quoted literals in `src/dollar-quoted.ts`, one per
+ * form. A dollar-quoted body is a value, so none of these may appear anywhere
+ * in a node — which is a substring search over the serialised nodes rather than
+ * an inference from the shape.
+ */
+const DOLLAR_SENTINELS = {
+  empty: 'dollar-sentinel-empty-tag',
+  tagged: 'dollar-sentinel-named-tag',
+  digits: 'dollar-sentinel-digit-tag',
+  nested: 'dollar-sentinel-nested-tag',
+  mismatched: 'dollar-sentinel-mismatched-tag',
+  unterminated: 'dollar-sentinel-unterminated-tag',
+  bare: 'dollar-sentinel-bare-literal',
+} as const;
+
+/**
+ * The bodies of the escaped and unterminated single-quoted literals in
+ * `src/literal-escapes.ts`: a tokeniser that ended one of them early would emit
+ * the rest as statement text, so none may appear anywhere in a node.
+ */
+const ESCAPE_SENTINELS = {
+  doubled: 'escape-sentinel-doubled-quote',
+  backslash: 'escape-sentinel-backslash-quote',
+  unclosed: 'escape-sentinel-unclosed-quote',
+} as const;
+
+/**
  * The scratch project's modules, keyed by project-relative POSIX path.
  *
  * Written as line arrays rather than template literals so that a line holding a
@@ -549,8 +596,10 @@ const SCRATCH_MODULES: Readonly<Record<string, string>> = {
         moduleResolution: 'bundler',
         strict: true,
         noEmit: true,
+        // The component-module cases are `.tsx`; markup is parsed, never built.
+        jsx: 'preserve',
       },
-      include: ['**/*.ts'],
+      include: ['**/*.ts', '**/*.tsx'],
       exclude: ['node_modules'],
     },
     null,
@@ -790,6 +839,354 @@ const SCRATCH_MODULES: Readonly<Record<string, string>> = {
     'const gamma = new Pool();',
     '',
     "void gamma.query('SELECT note FROM widget_log');",
+    '',
+  ].join('\n'),
+
+  // Handles held by an instance: a property constructed in its initialiser, a
+  // property only annotated, a parameter property of each driver, and three
+  // `this` receivers that hold no handle — a property of a non-driver class, a
+  // plain constructor parameter, and the instance itself. The calls sit in a
+  // property arrow, the constructor and a method, so each member kind owns one.
+  'src/class-handles.ts': [
+    "import { Pool, PrismaClient } from './drivers';",
+    "import type { PoolClient } from './drivers';",
+    '',
+    'class QueryHelper {',
+    '  query(text: string): Promise<void> {',
+    '    void text;',
+    '    return Promise.resolve();',
+    '  }',
+    '}',
+    '',
+    'export class WidgetRepository {',
+    '  private readonly pool = new Pool();',
+    '',
+    '  readonly archive: PrismaClient;',
+    '',
+    '  private readonly helper = new QueryHelper();',
+    '',
+    '  readonly refresh = async (): Promise<void> => {',
+    "    await this.pool.query('SELECT note FROM widget_log');",
+    '  };',
+    '',
+    '  constructor(',
+    '    private readonly store: PrismaClient,',
+    '    protected lease: PoolClient,',
+    '    plain: Pool,',
+    '  ) {',
+    '    this.archive = new PrismaClient();',
+    '    void this.store.widget.findFirst({});',
+    '    void plain;',
+    '  }',
+    '',
+    '  async list(kind: string): Promise<void> {',
+    "    await this.pool.query('SELECT id, note FROM widget_log WHERE kind = $1', [kind]);",
+    '    await this.archive.gadget.create({});',
+    "    await this.lease.query('DELETE FROM widget_log WHERE kind = $1', [kind]);",
+    "    await this.helper.query('SELECT kind FROM widget_log');",
+    "    await this.plain.query('SELECT size FROM widget_log');",
+    "    await this.query('SELECT label FROM widget_log');",
+    '  }',
+    '',
+    '  query(text: string): Promise<void> {',
+    '    void text;',
+    '    return Promise.resolve();',
+    '  }',
+    '}',
+    '',
+  ].join('\n'),
+
+  // A class expression holding a constructed handle, and a class that assigns
+  // its handles in the constructor body without declaring them — which binds
+  // nothing structural, so only a generic name can still be matched.
+  'src/class-expression.ts': [
+    "import { Pool } from './drivers';",
+    '',
+    'export const makeRecorder = () =>',
+    '  new (class {',
+    '    private readonly pool = new Pool();',
+    '',
+    '    record(note: string): Promise<unknown> {',
+    "      return this.pool.query('INSERT INTO widget_log (note) VALUES ($1)', [note]);",
+    '    }',
+    '  })();',
+    '',
+    'export class LooseRepository {',
+    '  constructor() {',
+    '    this.db = new Pool();',
+    '    this.archive = new Pool();',
+    '  }',
+    '',
+    '  run(): Promise<unknown> {',
+    "    void this.archive.query('SELECT note FROM widget_log');",
+    "    return this.db.query('UPDATE widget_log SET note = $1', ['x']);",
+    '  }',
+    '}',
+    '',
+  ].join('\n'),
+
+  // Every dollar-quoting form, one call per form, in source order: the
+  // assertions below index this list, so a call added here belongs at the end.
+  'src/dollar-quoted.ts': [
+    "import { beta } from './handles';",
+    '',
+    'export async function dollarQuoted(kind: string): Promise<void> {',
+    `  await beta.query('SELECT $$${DOLLAR_SENTINELS.empty}$$ AS body FROM widget_log WHERE kind = $1', [kind]);`,
+    `  await beta.query("UPDATE widget_log SET note = $body$ it's ${DOLLAR_SENTINELS.tagged} -- not a comment /* nor this */ $body$ WHERE kind = $2", [kind]);`,
+    `  await beta.query('SELECT $q_1$ ${DOLLAR_SENTINELS.digits} $q_1$ AS body, $1 AS kind FROM widget_log');`,
+    `  await beta.query('SELECT $outer$ holds $$ ${DOLLAR_SENTINELS.nested} $$ inside $outer$ AS body FROM widget_log');`,
+    `  await beta.query('SELECT $a$ ${DOLLAR_SENTINELS.mismatched} $b$ still inside $a$ AS body FROM widget_log');`,
+    `  await beta.query('SELECT $open$ ${DOLLAR_SENTINELS.unterminated} FROM widget_log');`,
+    "  await beta.query('SELECT note FROM widget_log WHERE kind = $1 AND size > $12');",
+    "  await beta.query('SELECT note FROM widget_log WHERE note = $ AND label = $tag');",
+    `  await beta.query('$$${DOLLAR_SENTINELS.bare}$$');`,
+    '}',
+    '',
+  ].join('\n'),
+
+  // `export default <arrow>`: the export statement is the only declaration.
+  'src/default-arrow.ts': [
+    "import { beta } from './handles';",
+    '',
+    'export default async (kind: string): Promise<void> => {',
+    "  await beta.query('DELETE FROM widget_log WHERE kind = $1', [kind]);",
+    '};',
+    '',
+  ].join('\n'),
+
+  // `export default function () {}`: a declaration with no name of its own.
+  'src/default-function.ts': [
+    "import { alpha } from './handles';",
+    '',
+    'export default async function (): Promise<unknown[]> {',
+    '  return (await alpha.widget.findMany({})) as unknown[];',
+    '}',
+    '',
+  ].join('\n'),
+
+  // A function that leaves the module only through `export default <name>`,
+  // one that leaves only through an aliased export clause, one that does not
+  // leave at all, and a re-export clause naming another module's binding.
+  'src/default-named.ts': [
+    "import { beta } from './handles';",
+    '',
+    'async function purge(kind: string): Promise<void> {',
+    "  await beta.query('DELETE FROM widget_log WHERE kind = $1', [kind]);",
+    '}',
+    '',
+    "const load = async (): Promise<unknown> => beta.query('SELECT note FROM widget_log');",
+    '',
+    'function helper(): Promise<unknown> {',
+    "  return beta.query('SELECT kind FROM widget_log');",
+    '}',
+    '',
+    'void helper;',
+    '',
+    'export { load as read };',
+    "export { alpha } from './handles';",
+    'export default purge;',
+    '',
+  ].join('\n'),
+
+  // A default export wrapped in an assertion, which the two extractors whose
+  // node ids this one spells anchor differently — so it owns nothing.
+  'src/default-wrapped.ts': [
+    "import { beta } from './handles';",
+    '',
+    'export default ((async (): Promise<void> => {',
+    "  await beta.query('SELECT note FROM widget_log');",
+    '}) as () => Promise<void>);',
+    '',
+  ].join('\n'),
+
+  // Handles that leave their modules only as the default export: one
+  // constructed in the export statement, one re-bound from an import.
+  'src/default-handle.ts': [
+    "import { Pool } from './drivers';",
+    '',
+    'export default new Pool();',
+    '',
+  ].join('\n'),
+
+  'src/default-alias.ts': [
+    "import { beta } from './handles';",
+    '',
+    'export default beta;',
+    '',
+  ].join('\n'),
+
+  'src/default-handle-use.ts': [
+    "import keeper from './default-alias';",
+    "import store from './default-handle';",
+    '',
+    'export async function viaDefaultExports(): Promise<void> {',
+    "  await store.query('SELECT note FROM widget_log');",
+    "  await keeper.query('SELECT kind FROM widget_log');",
+    '}',
+    '',
+  ].join('\n'),
+
+  // An App Router route module, a module beside it that is not one, and a
+  // Pages Router module: only the first and last are framework entry points.
+  'src/app/widgets/route.ts': [
+    "import { beta } from '../../handles';",
+    '',
+    'export async function GET(): Promise<unknown> {',
+    "  return beta.query('SELECT note FROM widget_log');",
+    '}',
+    '',
+  ].join('\n'),
+
+  'src/app/widgets/format.ts': [
+    "import { beta } from '../../handles';",
+    '',
+    'export async function formatWidgets(): Promise<unknown> {',
+    "  return beta.query('SELECT kind FROM widget_log');",
+    '}',
+    '',
+  ].join('\n'),
+
+  'src/pages/api/widgets.ts': [
+    "import { beta } from '../../handles';",
+    '',
+    'export default async function handler(): Promise<unknown> {',
+    "  return beta.query('SELECT label FROM widget_log');",
+    '}',
+    '',
+  ].join('\n'),
+
+  // Markup with a component-shaped function name, markup whose names are all
+  // lower-case, and markup beside a component-shaped variable.
+  'src/components/WidgetPanel.tsx': [
+    "import { beta } from '../handles';",
+    '',
+    'export function WidgetPanel(): unknown {',
+    "  void beta.query('SELECT note FROM widget_log');",
+    '  return <section />;',
+    '}',
+    '',
+  ].join('\n'),
+
+  'src/components/render-rows.tsx': [
+    "import { beta } from '../handles';",
+    '',
+    'export function renderRows(): unknown {',
+    "  void beta.query('SELECT kind FROM widget_log');",
+    '  return <ul />;',
+    '}',
+    '',
+  ].join('\n'),
+
+  'src/components/panel-exports.tsx': [
+    "import { beta } from '../handles';",
+    '',
+    'const Summary = (): unknown => <p />;',
+    '',
+    'export const summarize = async (): Promise<unknown> => {',
+    '  void Summary;',
+    "  return beta.query('SELECT label FROM widget_log');",
+    '};',
+    '',
+  ].join('\n'),
+
+  // Members a class names without an identifier: a computed name, which no
+  // lookup can match, and string-literal names, which read as their value.
+  'src/class-computed.ts': [
+    "import { Pool } from './drivers';",
+    '',
+    'export class ComputedMembers {',
+    "  private readonly 'archive' = new Pool();",
+    '',
+    "  ['refresh' + 'All'](): Promise<unknown> {",
+    "    return this.archive.query('SELECT note FROM widget_log');",
+    '  }',
+    '',
+    "  'quoted-name'(): Promise<unknown> {",
+    "    return this.archive.query('SELECT kind FROM widget_log');",
+    '  }',
+    '}',
+    '',
+  ].join('\n'),
+
+  // The single-quote and number rules the tokeniser applies, one call per rule,
+  // in source order: the assertions below index this list.
+  'src/literal-escapes.ts': [
+    "import { beta } from './handles';",
+    '',
+    'export async function escapes(kind: string): Promise<void> {',
+    `  await beta.query("SELECT note FROM widget_log WHERE note = 'it''s ${ESCAPE_SENTINELS.doubled}' AND kind = $1");`,
+    `  await beta.query("SELECT note FROM widget_log WHERE note = 'a\\\\'${ESCAPE_SENTINELS.backslash}' AND kind = $1");`,
+    "  await beta.query('SELECT note FROM widget_log WHERE size > 1.5 AND ratio < 2e10 AND delta = 3E-4 AND step = 7.25e+2');",
+    '  await beta.query(\'SELECT "Odd ""Quoted"" Name" FROM widget_log\');',
+    `  await beta.query("SELECT note FROM widget_log WHERE note = 'never closed ${ESCAPE_SENTINELS.unclosed}");`,
+    "  await beta.query('-- only a comment');",
+    "  await beta.query('SELECT note FROM widget_log WHERE col1 = t2.c3');",
+    "  await beta.query('SELECT note FROM ' + 'widget_log WHERE kind = $1');",
+    "  await beta.query('SELECT note FROM widget_log WHERE kind = ' + kind);",
+    '}',
+    '',
+  ].join('\n'),
+
+  // Barrels: a renamed re-export clause and a star re-export of the handle
+  // module, each one resolution hop away from the construction.
+  'src/handles-barrel.ts': ["export { beta as ledger } from './handles';", ''].join('\n'),
+
+  'src/handles-star.ts': ["export * from './handles';", ''].join('\n'),
+
+  // Receivers reached through a namespace import and through barrels, a local
+  // that shadows the namespace, and the receiver shapes discovery refuses: an
+  // element access, a call at the root, and delegate chains that are not the
+  // generated client's shape.
+  'src/receivers.ts': [
+    "import * as handles from './handles';",
+    "import { ledger } from './handles-barrel';",
+    "import { beta as starred } from './handles-star';",
+    "import { alpha, beta } from './handles';",
+    '',
+    'function currentPool(): typeof beta {',
+    '  return beta;',
+    '}',
+    '',
+    'export async function receivers(): Promise<void> {',
+    "  await handles.beta.query('SELECT note FROM widget_log');",
+    '  await handles.alpha.widget.findMany({});',
+    "  await ledger.query('SELECT kind FROM widget_log');",
+    "  await starred.query('SELECT size FROM widget_log');",
+    "  await beta['query']('SELECT label FROM widget_log');",
+    "  await currentPool().query('SELECT note, kind FROM widget_log');",
+    '  await alpha.widget.nested.findMany({});',
+    '  await alpha.$extends.widget();',
+    '  await alpha.widget.$call();',
+    '}',
+    '',
+    'export async function shadowed(): Promise<void> {',
+    '  const handles = { beta: { query: (text: string) => text } };',
+    "  await handles.beta.query('SELECT note, size FROM widget_log');",
+    '}',
+    '',
+  ].join('\n'),
+
+  // Alias chains: one inside the documented resolution-hop bound and one far
+  // past it. Neither name is generic, so only resolution can produce a node.
+  'src/alias-chain.ts': [
+    "import { beta } from './handles';",
+    '',
+    'const near1 = beta;',
+    'const near2 = near1;',
+    '',
+    'const far1 = beta;',
+    'const far2 = far1;',
+    'const far3 = far2;',
+    'const far4 = far3;',
+    'const far5 = far4;',
+    'const far6 = far5;',
+    'const far7 = far6;',
+    'const far8 = far7;',
+    '',
+    'export async function viaAliases(): Promise<void> {',
+    "  await near2.query('SELECT note FROM widget_log');",
+    "  await far8.query('SELECT kind FROM widget_log');",
+    '}',
     '',
   ].join('\n'),
 };
@@ -1911,5 +2308,829 @@ describe('dbCallsExtractor: tolerance, purity and determinism', () => {
     // that changed it would leave `git status` dirty for every later suite.
     expect(corpusSnapshot).toBeDefined();
     expect(directorySnapshot(FIXTURE_ROOT)).toStrictEqual(corpusSnapshot);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Scratch helpers for the cases below
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * One scratch module's source text, as written into the project.
+ *
+ * @param file The project-relative POSIX path, a key of {@link SCRATCH_MODULES}.
+ * @returns The text.
+ */
+function scratchText(file: string): string {
+  const text = SCRATCH_MODULES[file];
+
+  if (text === undefined) {
+    throw new Error(`the scratch project declares no module at ${file}`);
+  }
+
+  return text;
+}
+
+/**
+ * One scratch module's whole result and its `db-call` nodes, by path.
+ *
+ * @param file The project-relative POSIX path, `.ts` or `.tsx`.
+ * @param logger An optional recording logger.
+ * @returns The result and its nodes, in emission order.
+ */
+function scratchFile(
+  file: string,
+  logger?: Logger,
+): { readonly result: ExtractorResult; readonly nodes: readonly CodeNodeOf<'db-call'>[] } {
+  const result = resultOf(openedScratch().project, file, logger);
+
+  return {
+    result,
+    nodes: result.nodes.filter((node): node is CodeNodeOf<'db-call'> => node.kind === 'db-call'),
+  };
+}
+
+/**
+ * The fields of a node a case asserts, in one comparable value: the call as
+ * written, where it is, what it records, and whether its handle was matched by
+ * name.
+ *
+ * @param node The node.
+ * @returns Its summary.
+ */
+function summaryOf(node: CodeNodeOf<'db-call'>): {
+  readonly name: string;
+  readonly line: number;
+  readonly column: number;
+  readonly data: DbCallNodeData;
+  readonly heuristic: boolean;
+} {
+  return {
+    name: node.name,
+    line: node.line,
+    column: node.column,
+    data: node.data,
+    heuristic: isHeuristicDbCall(node.data),
+  };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * 7. Handles held by a class instance
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: handles held by a class instance', () => {
+  const CLASS_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/class-handles.ts`;
+  const EXPRESSION_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/class-expression.ts`;
+
+  it('proves a constructed property, an annotated property and both parameter properties', () => {
+    const text = scratchText(CLASS_MODULE);
+    const at = (needle: string): { readonly line: number; readonly column: number } =>
+      soleCodeOccurrence(text, needle);
+
+    // Five instance calls in source order — the property arrow's, the
+    // constructor's and the method's three — each resolved through the member
+    // declaration the class holds, so none is marked as a name match.
+    expect(scratchFile(CLASS_MODULE).nodes.map(summaryOf)).toStrictEqual([
+      {
+        name: 'this.pool.query',
+        ...at("this.pool.query('SELECT note"),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT note FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+      {
+        name: 'this.store.widget.findFirst',
+        ...at('this.store.widget.findFirst('),
+        data: { driver: 'prisma', model: 'widget', operation: 'findFirst', dynamic: false },
+        heuristic: false,
+      },
+      {
+        name: 'this.pool.query',
+        ...at("this.pool.query('SELECT id"),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT id, note FROM widget_log WHERE kind = $1',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+      {
+        // Declared with only a type annotation and assigned in the
+        // constructor: the annotation is the evidence.
+        name: 'this.archive.gadget.create',
+        ...at('this.archive.gadget.create('),
+        data: { driver: 'prisma', model: 'gadget', operation: 'create', dynamic: false },
+        heuristic: false,
+      },
+      {
+        // A `protected` parameter property annotated as a borrowed connection.
+        name: 'this.lease.query',
+        ...at('this.lease.query('),
+        data: {
+          driver: 'pg',
+          operation: 'delete',
+          statementShape: 'DELETE FROM widget_log WHERE kind = $1',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+    ]);
+  });
+
+  it('records nothing for a non-driver property, a plain parameter or the instance itself', () => {
+    const names = scratchFile(CLASS_MODULE).nodes.map((node) => node.name);
+
+    // `helper` is constructed from a class that is not a driver, `plain` is a
+    // constructor parameter without a modifier — local to the constructor, so
+    // no member — and `this.query` has the instance itself as its receiver.
+    // None of the three names is generic, so no fallback applies either.
+    expect(names).not.toContain('this.helper.query');
+    expect(names).not.toContain('this.plain.query');
+    expect(names).not.toContain('this.query');
+    expect(names).toHaveLength(5);
+  });
+
+  it('names each member kind as the owner of the calls written inside it', () => {
+    const { result, nodes } = scratchFile(CLASS_MODULE);
+
+    // A property arrow, the constructor and a method of a module-level class
+    // are symbols in the class's name space, never server functions.
+    expect(nodes.map((node) => node.symbol)).toStrictEqual([
+      'refresh',
+      'constructor',
+      'list',
+      'list',
+      'list',
+    ]);
+    expect(result.edges.map((edge) => edge.from.split('#')[0])).toStrictEqual(
+      Array.from({ length: 5 }, () => `symbol:${CLASS_MODULE}`),
+    );
+  });
+
+  it('resolves a handle a class expression holds, owned by the export that builds it', () => {
+    const text = scratchText(EXPRESSION_MODULE);
+    const node = itemAt(scratchFile(EXPRESSION_MODULE).nodes, 0, 'the class-expression call');
+
+    expect(summaryOf(node)).toStrictEqual({
+      name: 'this.pool.query',
+      ...soleCodeOccurrence(text, 'this.pool.query('),
+      data: {
+        driver: 'pg',
+        operation: 'insert',
+        statementShape: 'INSERT INTO widget_log (note) VALUES ($1)',
+        dynamic: false,
+      },
+      heuristic: false,
+    });
+    // A class expression's members are not addressable, so the walk continues
+    // outward to the exported arrow that constructs the instance.
+    expect(node.symbol).toBe('makeRecorder');
+  });
+
+  it('reaches an undeclared, constructor-assigned handle only by a generic name, and marks it', () => {
+    const text = scratchText(EXPRESSION_MODULE);
+    const nodes = scratchFile(EXPRESSION_MODULE).nodes;
+
+    // `this.db = new Pool()` in a constructor body declares no member, so no
+    // structural step applies: `db` is a generic driver word and is matched —
+    // marked — while `archive`, assigned the same way, is not a generic word
+    // and yields nothing.
+    expect(nodes.map((node) => node.name)).toStrictEqual(['this.pool.query', 'this.db.query']);
+    expect(summaryOf(itemAt(nodes, 1, 'the generic-name call'))).toStrictEqual({
+      name: 'this.db.query',
+      ...soleCodeOccurrence(text, 'this.db.query('),
+      data: {
+        driver: 'pg',
+        operation: 'update',
+        statementShape: 'UPDATE widget_log SET note = $1',
+        dynamic: false,
+        heuristicHandle: true,
+      },
+      heuristic: true,
+    });
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 8. Dollar-quoted statement literals
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: dollar-quoted statement literals', () => {
+  const DOLLAR_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/dollar-quoted.ts`;
+
+  /**
+   * The dollar-quoting module's nodes, count-checked so the indices below name
+   * the calls they mean.
+   *
+   * @returns The nine nodes, in source order.
+   */
+  function dollarNodes(): readonly CodeNodeOf<'db-call'>[] {
+    const { nodes } = scratchFile(DOLLAR_MODULE);
+
+    expect(nodes).toHaveLength(9);
+
+    return nodes;
+  }
+
+  /** The shape at an index of {@link dollarNodes}. */
+  function shapeAt(index: number): string | undefined {
+    return itemAt(dollarNodes(), index, `dollar-quoted call ${String(index)}`).data.statementShape;
+  }
+
+  it('reduces an empty-tag quote and a named-tag quote to one placeholder each', () => {
+    expect(shapeAt(0)).toBe('SELECT ? AS body FROM widget_log WHERE kind = $1');
+    // The body holds an apostrophe, a line-comment marker and a block-comment
+    // opener; inside a dollar quote all three are value text, not syntax.
+    expect(shapeAt(1)).toBe('UPDATE widget_log SET note = ? WHERE kind = $2');
+  });
+
+  it('reads a tag of letters, digits and underscores, closed only by the same tag', () => {
+    expect(shapeAt(2)).toBe('SELECT ? AS body, $1 AS kind FROM widget_log');
+    // `$$` inside `$outer$` does not close it, and neither does `$b$` inside
+    // `$a$`: the quote ends only where its own tag appears again.
+    expect(shapeAt(3)).toBe('SELECT ? AS body FROM widget_log');
+    expect(shapeAt(4)).toBe('SELECT ? AS body FROM widget_log');
+  });
+
+  it('consumes an unterminated dollar quote to the end of the statement', () => {
+    // Everything after an opening tag that never closes is the literal's body,
+    // so nothing of it — not even the table name — survives.
+    expect(shapeAt(5)).toBe('SELECT ?');
+  });
+
+  it('keeps $n placeholders, which are never read as the opening of a quote', () => {
+    expect(shapeAt(6)).toBe('SELECT note FROM widget_log WHERE kind = $1 AND size > $12');
+  });
+
+  it('emits a dollar that opens no quote as written', () => {
+    // A `$` before a space opens nothing, and `$tag` with no closing `$` before
+    // the statement ends is not a tag: both are kept literally.
+    expect(shapeAt(7)).toBe('SELECT note FROM widget_log WHERE note = $ AND label = $tag');
+  });
+
+  it('derives no operation from a statement that is only a literal', () => {
+    const node = itemAt(dollarNodes(), 8, 'the bare literal');
+
+    expect(node.data).toStrictEqual({ driver: 'pg', statementShape: '?', dynamic: false });
+    expect(Object.keys(node.data)).not.toContain('operation');
+  });
+
+  it('records the leading keyword of every other dollar-quoted statement', () => {
+    expect(dollarNodes().map((node) => node.data.operation)).toStrictEqual([
+      'select',
+      'update',
+      'select',
+      'select',
+      'select',
+      'select',
+      'select',
+      'select',
+      undefined,
+    ]);
+  });
+
+  it('never records a dollar-quoted body anywhere in a node', () => {
+    const serialised = JSON.stringify(dollarNodes());
+
+    for (const sentinel of Object.values(DOLLAR_SENTINELS)) {
+      expect(serialised).not.toContain(sentinel);
+    }
+
+    expect(serialised).not.toContain("it's");
+    expect(serialised).not.toContain('not a comment');
+    expect(serialised).not.toContain('nor this');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 9. Owners across export forms and module kinds
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: owners across export forms and module kinds', () => {
+  /** The assembled graph over the whole scratch project, for resolving edge origins. */
+  let scratchGraph: CodeGraph | undefined;
+
+  beforeAll(async () => {
+    const built = await buildIndex(openedScratch().project, { logger: noopLogger });
+
+    if (!isOk(built)) {
+      throw new Error(`indexing the scratch project failed: ${built.error.message}`);
+    }
+
+    scratchGraph = CodeGraph.fromIndex(built.value, { logger: noopLogger });
+  });
+
+  /**
+   * The assembled graph, or a failure naming the missing `beforeAll`.
+   *
+   * @returns The graph.
+   */
+  function graph(): CodeGraph {
+    if (scratchGraph === undefined) {
+      throw new Error('the scratch graph was not built: beforeAll did not run');
+    }
+
+    return scratchGraph;
+  }
+
+  /**
+   * Each call of a module with the node its `queries` edge starts at, as the
+   * assembled graph holds it.
+   *
+   * @param file The project-relative POSIX path.
+   * @returns One entry per node, in emission order.
+   */
+  function ownersIn(file: string): readonly {
+    readonly call: string;
+    readonly symbol: string | undefined;
+    readonly ownerKind: string | undefined;
+    readonly owner: string | undefined;
+  }[] {
+    const { result, nodes } = scratchFile(file);
+
+    expect(result.edges).toHaveLength(nodes.length);
+
+    return nodes.map((node) => {
+      const edge = result.edges.find((candidate) => candidate.to === node.id);
+      const origin = edge === undefined ? undefined : graph().nodeById(edge.from);
+
+      return {
+        call: node.name,
+        symbol: node.symbol,
+        ownerKind: origin?.kind,
+        owner: origin?.name,
+      };
+    });
+  }
+
+  it.each([
+    ['a default-exported arrow', 'default-arrow.ts', 'beta.query', 'server-function', 'default'],
+    [
+      'a nameless default function',
+      'default-function.ts',
+      'alpha.widget.findMany',
+      'server-function',
+      'default',
+    ],
+    [
+      'an App Router module that is not a route',
+      'app/widgets/format.ts',
+      'beta.query',
+      'server-function',
+      'formatWidgets',
+    ],
+    ['an App Router route handler', 'app/widgets/route.ts', 'beta.query', 'symbol', 'GET'],
+    ['a Pages Router default handler', 'pages/api/widgets.ts', 'beta.query', 'symbol', 'handler'],
+    [
+      'a component-named function in a markup module',
+      'components/WidgetPanel.tsx',
+      'beta.query',
+      'symbol',
+      'WidgetPanel',
+    ],
+    [
+      'a lower-case function in a markup module',
+      'components/render-rows.tsx',
+      'beta.query',
+      'server-function',
+      'renderRows',
+    ],
+    [
+      'a function beside a component-named variable',
+      'components/panel-exports.tsx',
+      'beta.query',
+      'symbol',
+      'summarize',
+    ],
+  ])(
+    'starts the edge for %s at the node the graph holds',
+    (_label, stem, call, ownerKind, owner) => {
+      // The node's `symbol` names the owner, and the owner is a node the
+      // assembled graph holds, of the kind the module's shape calls for.
+      expect(ownersIn(`${SCRATCH_SOURCE_DIRECTORY}/${stem}`)).toStrictEqual([
+        { call, symbol: owner, ownerKind, owner },
+      ]);
+    },
+  );
+
+  it('follows export default <name> and an aliased export clause to the declaration they export', () => {
+    // `purge` leaves only as the default export and `load` only as `read`; both
+    // are still the declaration a call inside them belongs to, and both are
+    // service functions. `helper`, which does not leave the module, is a symbol,
+    // and the re-export clause naming another module's binding marks nothing.
+    expect(ownersIn(`${SCRATCH_SOURCE_DIRECTORY}/default-named.ts`)).toStrictEqual([
+      { call: 'beta.query', symbol: 'purge', ownerKind: 'server-function', owner: 'purge' },
+      { call: 'beta.query', symbol: 'load', ownerKind: 'server-function', owner: 'load' },
+      { call: 'beta.query', symbol: 'helper', ownerKind: 'symbol', owner: 'helper' },
+    ]);
+  });
+
+  it('falls back to the module for a call inside a wrapped default export, and says so at debug', () => {
+    const file = `${SCRATCH_SOURCE_DIRECTORY}/default-wrapped.ts`;
+    const { records, logger } = recordingLogger();
+    const { result, nodes } = scratchFile(file, logger);
+    const node = itemAt(nodes, 0, 'the wrapped call');
+
+    expect(ownersIn(file)).toStrictEqual([
+      { call: 'beta.query', symbol: undefined, ownerKind: 'file', owner: file },
+    ]);
+    expect(Object.keys(node)).not.toContain('symbol');
+    expect(result.diagnostics).toBeUndefined();
+    expect(records.map((record) => record.fields)).toStrictEqual([
+      { extractorId: DB_CALLS_EXTRACTOR_ID, file, line: node.line, column: node.column },
+    ]);
+  });
+
+  it('proves a handle that leaves its module only as the default export', () => {
+    const file = `${SCRATCH_SOURCE_DIRECTORY}/default-handle-use.ts`;
+    const text = scratchText(file);
+
+    // `store` is `export default new Pool()` and `keeper` is
+    // `export default beta`, a re-binding of an imported handle. Neither name is
+    // generic, so a node for either proves the default export was followed.
+    expect(scratchFile(file).nodes.map(summaryOf)).toStrictEqual([
+      {
+        name: 'store.query',
+        ...soleCodeOccurrence(text, 'store.query('),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT note FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+      {
+        name: 'keeper.query',
+        ...soleCodeOccurrence(text, 'keeper.query('),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT kind FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+    ]);
+  });
+
+  it('owns a computed-name member’s call by its class, and a string-named member’s by its name', () => {
+    const file = `${SCRATCH_SOURCE_DIRECTORY}/class-computed.ts`;
+    const text = scratchText(file);
+    const nodes = scratchFile(file).nodes;
+
+    // No lookup can match a computed name, so the walk continues to the
+    // module-level class itself; a string-literal name reads as its value, for
+    // the member that owns a call and for the member that holds the handle.
+    expect(ownersIn(file)).toStrictEqual([
+      {
+        call: 'this.archive.query',
+        symbol: 'ComputedMembers',
+        ownerKind: 'symbol',
+        owner: 'ComputedMembers',
+      },
+      {
+        call: 'this.archive.query',
+        symbol: 'quoted-name',
+        ownerKind: 'symbol',
+        owner: 'quoted-name',
+      },
+    ]);
+    expect(nodes.map((node) => ({ line: node.line, column: node.column }))).toStrictEqual([
+      soleCodeOccurrence(text, "this.archive.query('SELECT note"),
+      soleCodeOccurrence(text, "this.archive.query('SELECT kind"),
+    ]);
+    expect(nodes.every((node) => !isHeuristicDbCall(node.data))).toBe(true);
+  });
+
+  it('starts every edge of these modules at a node the graph holds, and drops none', () => {
+    const files = Object.keys(SCRATCH_MODULES).filter(
+      (file) =>
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/class-`) ||
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/default-`) ||
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/dollar-`) ||
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/app/`) ||
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/pages/`) ||
+        file.startsWith(`${SCRATCH_SOURCE_DIRECTORY}/components/`),
+    );
+    const edges = files.flatMap((file) => scratchFile(file).result.edges);
+
+    // Seventeen modules — two of them handle modules with no call site — and
+    // one edge per call site: 5 + 2 + 2 + 9 + 1 + 1 + 3 + 1 + 2 + 1 + 1 + 1 + 3.
+    expect(files).toHaveLength(17);
+    expect(edges).toHaveLength(32);
+
+    for (const edge of edges) {
+      expect(graph().nodeById(edge.from), edge.from).toBeDefined();
+      expect(
+        graph()
+          .incoming(edge.to, 'queries')
+          .map((found) => found.id),
+      ).toStrictEqual([edge.id]);
+    }
+
+    expect(
+      graph().diagnostics.filter(
+        (finding) => finding.code === 'dangling-edge' && files.includes(finding.file ?? ''),
+      ),
+    ).toStrictEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 10. A call site or a module it cannot read
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: a call site or a module path it cannot read', () => {
+  /** A module with one call inside a function and one at module scope. */
+  const TWO_SITES = [
+    'class Pool {',
+    '  query(text: string): string {',
+    '    return text;',
+    '  }',
+    '}',
+    '',
+    'const pool = new Pool();',
+    '',
+    'export function kept(): string {',
+    "  return pool.query('SELECT note FROM widget_log');",
+    '}',
+    '',
+    "void pool.query('SELECT kind FROM widget_log');",
+    '',
+  ].join('\n');
+
+  /**
+   * A logger whose `debug` throws, which is the one call the owner cascade makes
+   * for a module-scope call site — so that site, and only that site, fails.
+   *
+   * @param thrown What `debug` throws.
+   * @returns The logger.
+   */
+  function loggerThrowingOnDebug(thrown: unknown): Logger {
+    const logger: Logger = {
+      ...noopLogger,
+      debug: () => {
+        throw thrown;
+      },
+      child: () => logger,
+    };
+
+    return logger;
+  }
+
+  it('reports one unreadable call site as a warning and still indexes the rest', () => {
+    const context = {
+      ...inMemoryContext('src/two-sites.ts', TWO_SITES),
+      logger: loggerThrowingOnDebug(new TypeError(`refused ${VALUES_SENTINELS[0]}`)),
+    };
+    const result = dbCallsExtractor.extract(context);
+    const failed = soleCodeOccurrence(TWO_SITES, "pool.query('SELECT kind");
+
+    expect(result.nodes.map((node) => node.name)).toStrictEqual(['pool.query']);
+    expect(result.nodes.map((node) => node.symbol)).toStrictEqual(['kept']);
+    expect(result.edges).toHaveLength(1);
+    expect(result.diagnostics).toStrictEqual([
+      {
+        severity: 'warning',
+        code: 'extractor-failed',
+        message:
+          'A database call site could not be read; it contributes no db-call node (TypeError).',
+        file: 'src/two-sites.ts',
+        extractorId: DB_CALLS_EXTRACTOR_ID,
+        detail: `line ${String(failed.line)}, column ${String(failed.column)}`,
+      },
+    ]);
+    // The error's class, never its message: a message can quote source text.
+    expect(JSON.stringify(result.diagnostics)).not.toContain(VALUES_SENTINELS[0]);
+  });
+
+  it('names a thrown value that is not an Error by its type', () => {
+    const context = {
+      ...inMemoryContext('src/two-sites.ts', TWO_SITES),
+      logger: loggerThrowingOnDebug('a bare string'),
+    };
+    const [diagnostic] = dbCallsExtractor.extract(context).diagnostics ?? [];
+
+    expect(diagnostic?.message).toBe(
+      'A database call site could not be read; it contributes no db-call node (string).',
+    );
+    expect(diagnostic?.message).not.toContain('a bare string');
+  });
+
+  it.each([
+    ['a traversal', '../outside.ts'],
+    ['an absolute path', '/elsewhere/module.ts'],
+  ])('declines a module whose path is %s, and says so', (_label, file) => {
+    const { records, logger } = recordingLogger();
+    const result = dbCallsExtractor.extract({
+      ...inMemoryContext('src/two-sites.ts', TWO_SITES),
+      file,
+      logger,
+    });
+
+    expect(result).toStrictEqual({ nodes: [], edges: [] });
+    expect(records.map((record) => [record.level, record.fields])).toStrictEqual([
+      ['warn', { extractorId: DB_CALLS_EXTRACTOR_ID, file }],
+    ]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 11. Escaped literals, numbers and concatenated statements
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: escaped literals, numbers and concatenated statements', () => {
+  const ESCAPES_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/literal-escapes.ts`;
+
+  /**
+   * The escape module's nodes, count-checked so the indices below name the calls
+   * they mean.
+   *
+   * @returns The nine nodes, in source order.
+   */
+  function escapeNodes(): readonly CodeNodeOf<'db-call'>[] {
+    const { nodes } = scratchFile(ESCAPES_MODULE);
+
+    expect(nodes).toHaveLength(9);
+
+    return nodes;
+  }
+
+  /** The payload at an index of {@link escapeNodes}. */
+  function dataAt(index: number): DbCallNodeData {
+    return itemAt(escapeNodes(), index, `escape call ${String(index)}`).data;
+  }
+
+  it('ends a literal only at an unescaped quote, under both escape conventions', () => {
+    // A doubled quote and a backslash-escaped quote both continue the literal;
+    // ending it at either would emit the rest of the value as statement text.
+    expect(dataAt(0).statementShape).toBe(
+      'SELECT note FROM widget_log WHERE note = ? AND kind = $1',
+    );
+    expect(dataAt(1).statementShape).toBe(
+      'SELECT note FROM widget_log WHERE note = ? AND kind = $1',
+    );
+  });
+
+  it('consumes an unterminated literal to the end of the statement', () => {
+    expect(dataAt(4).statementShape).toBe('SELECT note FROM widget_log WHERE note = ?');
+  });
+
+  it('reduces decimals and exponents whole, and leaves digits inside names alone', () => {
+    expect(dataAt(2).statementShape).toBe(
+      'SELECT note FROM widget_log WHERE size > ? AND ratio < ? AND delta = ? AND step = ?',
+    );
+    expect(dataAt(6).statementShape).toBe('SELECT note FROM widget_log WHERE col1 = t2.c3');
+  });
+
+  it('keeps a delimited identifier with doubled quotes inside it as one identifier', () => {
+    expect(dataAt(3).statementShape).toBe('SELECT "Odd ""Quoted"" Name" FROM widget_log');
+  });
+
+  it('records no shape and no operation for a statement that is only a comment', () => {
+    // The pooled handle is proved, so the call is still a node; the source
+    // states no statement, which `dynamic` reports.
+    expect(dataAt(5)).toStrictEqual({ driver: 'pg', dynamic: true });
+  });
+
+  it('joins a concatenation of literals, and marks one with a computed part as dynamic', () => {
+    expect(dataAt(7)).toStrictEqual({
+      driver: 'pg',
+      operation: 'select',
+      statementShape: 'SELECT note FROM widget_log WHERE kind = $1',
+      dynamic: false,
+    });
+    expect(dataAt(8)).toStrictEqual({
+      driver: 'pg',
+      operation: 'select',
+      statementShape: `SELECT note FROM widget_log WHERE kind = ${VALUE_PLACEHOLDER}`,
+      dynamic: true,
+    });
+  });
+
+  it('never records the body of an escaped or unterminated literal anywhere in a node', () => {
+    const serialised = JSON.stringify(escapeNodes());
+
+    for (const sentinel of Object.values(ESCAPE_SENTINELS)) {
+      expect(serialised).not.toContain(sentinel);
+    }
+
+    expect(serialised).not.toContain('only a comment');
+    expect(serialised).not.toContain('never closed');
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 12. Receivers through namespaces, barrels and alias chains
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('dbCallsExtractor: receivers through namespaces, barrels and alias chains', () => {
+  const RECEIVERS_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/receivers.ts`;
+  const ALIAS_MODULE = `${SCRATCH_SOURCE_DIRECTORY}/alias-chain.ts`;
+
+  it('resolves a handle through a namespace import, a renamed re-export and a star re-export', () => {
+    const text = scratchText(RECEIVERS_MODULE);
+
+    // None of `handles`, `ledger` or `starred` is a generic driver word, so a
+    // node — unmarked — proves each route was followed to the construction.
+    expect(scratchFile(RECEIVERS_MODULE).nodes.map(summaryOf)).toStrictEqual([
+      {
+        name: 'handles.beta.query',
+        ...soleCodeOccurrence(text, "handles.beta.query('SELECT note FROM"),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT note FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+      {
+        name: 'handles.alpha.widget.findMany',
+        ...soleCodeOccurrence(text, 'handles.alpha.widget.findMany('),
+        data: { driver: 'prisma', model: 'widget', operation: 'findMany', dynamic: false },
+        heuristic: false,
+      },
+      {
+        name: 'ledger.query',
+        ...soleCodeOccurrence(text, 'ledger.query('),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT kind FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+      {
+        name: 'starred.query',
+        ...soleCodeOccurrence(text, 'starred.query('),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT size FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+    ]);
+  });
+
+  it('refuses receivers whose handle or member is not statically known', () => {
+    const names = scratchFile(RECEIVERS_MODULE).nodes.map((node) => node.name);
+    const serialised = JSON.stringify(scratchFile(RECEIVERS_MODULE).nodes);
+
+    // An element access, a call at the root, a delegate chain one segment too
+    // deep, a `$`-prefixed model and a `$`-prefixed delegate operation: each is
+    // either not statically known or not the generated client's shape, and a
+    // guess is worse than a miss.
+    for (const refusedStatement of ['SELECT label', 'SELECT note, kind']) {
+      expect(serialised).not.toContain(refusedStatement);
+    }
+
+    expect(names).not.toContain('beta.query');
+    expect(names).not.toContain('alpha.widget.nested.findMany');
+    expect(names).not.toContain('alpha.$extends.widget');
+    expect(names).not.toContain('alpha.widget.$call');
+  });
+
+  it('lets a local binding shadow a namespace import of the same name', () => {
+    // `handles` in `shadowed` is a local object literal: the namespace route is
+    // closed, and nothing structural or generic remains.
+    const serialised = JSON.stringify(scratchFile(RECEIVERS_MODULE).nodes);
+
+    expect(serialised).not.toContain('SELECT note, size');
+    expect(scratchFile(RECEIVERS_MODULE).nodes.map((node) => node.symbol)).toStrictEqual([
+      'receivers',
+      'receivers',
+      'receivers',
+      'receivers',
+    ]);
+  });
+
+  it('follows an alias chain inside the resolution bound and gives up on one far past it', () => {
+    const text = scratchText(ALIAS_MODULE);
+
+    // Two re-bindings from the import resolve; eight exceed the bound on
+    // resolution hops, and the call is left out rather than guessed at.
+    expect(scratchFile(ALIAS_MODULE).nodes.map(summaryOf)).toStrictEqual([
+      {
+        name: 'near2.query',
+        ...soleCodeOccurrence(text, 'near2.query('),
+        data: {
+          driver: 'pg',
+          operation: 'select',
+          statementShape: 'SELECT note FROM widget_log',
+          dynamic: false,
+        },
+        heuristic: false,
+      },
+    ]);
   });
 });

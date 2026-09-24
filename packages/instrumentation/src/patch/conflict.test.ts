@@ -1501,14 +1501,82 @@ describe('a recorded original that cannot be read back', () => {
     expect(verdict.backup.available).toBe(false);
     expect(verdict.backup.reason).toBe('digest-mismatch');
     expect(verdict.backup.detail).toBe(sha256Hex(corrupted));
-    expect(verdict.conflict.reason).toBe('backup-missing');
+    expect(verdict.conflict.reason).toBe('backup-corrupt');
     expectSchemaValidConflict(verdict);
+
+    // The message names what was observed — a backup that is there but fails
+    // its digest — never "could not be read back", and never the mismatching
+    // digest, which describes content and gives the developer nothing to do.
+    expect(verdict.conflict.message).toContain('no longer hashes to the digest it was filed under');
+    expect(verdict.conflict.message).toContain('cannot be trusted');
+    expect(verdict.conflict.message).not.toContain('could not be read back');
+    expect(verdict.conflict.message).not.toContain(sha256Hex(corrupted));
 
     // Neither copy was touched: the corrupt backup is still the only copy of
     // whatever it holds, and the project file is still instrumented.
     expectFileBytes(backupPath, corrupted);
     expectFileBytes(patched.path, patched.instrumentedBytes);
     expectDetectionWroteNothing(world);
+  });
+
+  it('says a corrupt backup cannot be trusted when the file was edited too', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const backupPath = world.backupPathOf(patched.record.originalHash);
+    const corrupted = Buffer.from('not the original either\n', 'utf8');
+
+    writeFileSync(backupPath, corrupted);
+    developerEdits(patched.path);
+    world.resetLogs();
+
+    const verdict = contentChangedVerdictOf(
+      verdictOf(await detectConflict(patched.record, contextOf(world))),
+    );
+
+    // The headline is the edit; the backup's fate is worded as the mismatch it
+    // is rather than as an unreadable file.
+    expect(verdict.conflict.reason).toBe('content-changed');
+    expect(verdict.backup.available).toBe(false);
+    expect(verdict.conflict.message).toContain('was changed after it was instrumented');
+    expect(verdict.conflict.message).toContain(
+      'no longer hashes to the digest it was filed under, so it cannot be trusted',
+    );
+    expect(verdict.conflict.message).not.toContain('could not be read back');
+    expect(verdict.conflict.message).not.toContain(sha256Hex(corrupted));
+    expectSchemaValidConflict(verdict);
+    expectFileBytes(backupPath, corrupted);
+    expectDetectionWroteNothing(world);
+  });
+
+  it('reads a store-reported digest mismatch as a corrupt backup, not an unreadable one', async () => {
+    const world = makeWorld();
+    const patched = await world.patch({ file: TARGET_FILE, symbol: FIRST_SYMBOL });
+    const refusing: BackupStore = {
+      ...world.backups.store,
+      // A store that verifies on read, answering in its own documented
+      // vocabulary for a stored file that fails its name.
+      readRecorded: () =>
+        Promise.resolve(
+          err(
+            new DebuggenError('STORE_ERROR', 'The stored backup does not match its digest.', {
+              details: { reason: 'stored-digest-mismatch' },
+            }),
+          ),
+        ),
+    };
+
+    world.resetLogs();
+
+    const verdict = backupUnavailableVerdictOf(
+      verdictOf(await detectConflict(patched.record, contextOf(world, { backups: refusing }))),
+    );
+
+    expect(verdict.backup.reason).toBe('digest-mismatch');
+    expect(verdict.backup.detail).toBe('stored-digest-mismatch');
+    expect(verdict.conflict.reason).toBe('backup-corrupt');
+    expect(verdict.conflict.message).not.toContain('could not be read back');
+    expectSchemaValidConflict(verdict);
+    expectFileBytes(patched.path, patched.instrumentedBytes);
   });
 });
 

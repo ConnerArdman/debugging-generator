@@ -397,6 +397,116 @@ const MANY_OWNER_SOURCES: Readonly<Record<string, string>> = {
   ].join('\n'),
 };
 
+/** The module that constructs the handle in the reachability and tooling corpora. */
+const COBALT_HANDLE_SOURCE = [
+  "import { PrismaClient } from '@prisma/client';",
+  '',
+  'export const cobaltHandle = new PrismaClient();',
+  '',
+].join('\n');
+
+/** A seed module that queries through the shared handle. */
+const COBALT_SEED_SOURCE = [
+  "import { cobaltHandle } from '../src/back/handles';",
+  '',
+  'export async function plantWicketRows(laneId: string): Promise<unknown> {',
+  '  return cobaltHandle.wicketRow.inscribe({ data: { laneId } });',
+  '}',
+  '',
+].join('\n');
+
+/** A top-level operational script that queries through the shared handle. */
+const COBALT_SCRIPT_SOURCE = [
+  "import { cobaltHandle } from '../src/back/handles';",
+  '',
+  'export async function rebuildLaneRows(laneId: string): Promise<unknown[]> {',
+  '  const rows = await cobaltHandle.wicketRow.fetchMany({ where: { laneId } });',
+  '',
+  '  return rows as unknown[];',
+  '}',
+  '',
+].join('\n');
+
+/**
+ * One querying module: a single exported function that reads one model.
+ *
+ * @param symbol The function's name.
+ * @param model The model it reads.
+ * @returns The module source.
+ */
+function cobaltLedgerSource(symbol: string, model: string): string {
+  return [
+    "import { cobaltHandle } from './handles';",
+    '',
+    `export async function ${symbol}(laneId: string): Promise<unknown[]> {`,
+    `  const rows = await cobaltHandle.${model}.fetchMany({ where: { laneId } });`,
+    '',
+    '  return rows as unknown[];',
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * The corpus that separates *reachable* query sites from merely *present* ones,
+ * and application modules from tooling modules.
+ *
+ * - `app/api/wicket/route.ts` answers a request through a desk function that
+ *   calls one querying function directly and a second through a relay, so the
+ *   two sit several hops below the route and neither has a caller in the route
+ *   module itself — a one-hop caller check reaches neither.
+ * - The farther query site's module (`abacus-ledger`) sorts *before* the nearer
+ *   one's (`wicket-ledger`), and an unrelated querying module nothing calls
+ *   (`aardvark-ledger`) sorts before both, so a ranking by path order alone
+ *   would choose wrongly.
+ * - A seed module and a top-level script query too, and both sort before every
+ *   `src/` module. They run in processes of their own, never in the dev server,
+ *   and must never be proposed.
+ */
+const REACHABILITY_SOURCES: Readonly<Record<string, string>> = {
+  'src/back/handles.ts': COBALT_HANDLE_SOURCE,
+  'app/api/wicket/route.ts': [
+    "import { gatherWicketDigest } from '../../../src/back/wicket-desk';",
+    '',
+    'export async function GET(): Promise<unknown> {',
+    "  return gatherWicketDigest('lane-1');",
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-desk.ts': [
+    "import { relayWicketTally } from './wicket-relay';",
+    "import { tallyWicketRows } from './wicket-ledger';",
+    '',
+    'export async function gatherWicketDigest(laneId: string): Promise<unknown[]> {',
+    '  const rows = await tallyWicketRows(laneId);',
+    '  const relayed = await relayWicketTally(laneId);',
+    '',
+    '  return [...rows, relayed];',
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-relay.ts': [
+    "import { tallyAbacusRows } from './abacus-ledger';",
+    '',
+    'export async function relayWicketTally(laneId: string): Promise<unknown[]> {',
+    '  return tallyAbacusRows(laneId);',
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-ledger.ts': cobaltLedgerSource('tallyWicketRows', 'wicketRow'),
+  'src/back/abacus-ledger.ts': cobaltLedgerSource('tallyAbacusRows', 'abacusRow'),
+  'src/back/aardvark-ledger.ts': cobaltLedgerSource('countAardvarkRows', 'aardvarkRow'),
+  'prisma/seed.ts': COBALT_SEED_SOURCE,
+  'scripts/rebuild-lanes.ts': COBALT_SCRIPT_SOURCE,
+};
+
+/** A corpus whose only mapper query sites are in a seed module and a script. */
+const TOOLING_ONLY_SOURCES: Readonly<Record<string, string>> = {
+  'src/back/handles.ts': COBALT_HANDLE_SOURCE,
+  'prisma/seed.ts': COBALT_SEED_SOURCE,
+  'scripts/rebuild-lanes.ts': COBALT_SCRIPT_SOURCE,
+};
+
 /** The committed fixture, indexed once. */
 let fixture: IndexedProject;
 
@@ -412,6 +522,12 @@ let databaseFree: IndexedProject;
 /** The corpus with more query owners than one proposal may hold. */
 let manyOwners: IndexedProject;
 
+/** The corpus with reachable, unreachable and tooling-module query sites. */
+let reachability: IndexedProject;
+
+/** The corpus whose only query sites are in tooling modules. */
+let toolingOnly: IndexedProject;
+
 /** The fixture's file list with each file's size and modification time. */
 let fixtureFootprintBefore: readonly string[];
 
@@ -422,6 +538,8 @@ beforeAll(async () => {
   driverOnly = await scratchProject('driver-only', DRIVER_ONLY_SOURCES);
   databaseFree = await scratchProject('database-free', DATABASE_FREE_SOURCES);
   manyOwners = await scratchProject('many-owners', MANY_OWNER_SOURCES);
+  reachability = await scratchProject('reachability', REACHABILITY_SOURCES);
+  toolingOnly = await scratchProject('tooling-only', TOOLING_ONLY_SOURCES);
 
   assertCorpusInventory();
 }, 180_000);
@@ -1504,6 +1622,161 @@ describe('createPlan', () => {
     await createPrismaAdapter().createPlan(contextFor({ project: fixture }), databaseQuestion);
 
     expect(journalCalls).toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * createPlan — tooling modules and reachability from the question's route
+ *
+ * The mapper's spans come from the preload inside the dev-server process, so a
+ * seed or a script (each run in a process of its own) can never contribute one,
+ * and a question about a route is answered with the query sites that route
+ * actually reaches, however many calls below its handler they sit.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The request path the reachability corpus's route module answers. */
+const WICKET_ROUTE = '/api/wicket';
+
+/** The reachability corpus's modules the adapter must never anchor on. */
+const TOOLING_MODULES: readonly string[] = ['prisma/seed.ts', 'scripts/rebuild-lanes.ts'];
+
+/**
+ * `file#symbol` keys, in order, for comparing a proposal against the graph.
+ *
+ * @param entries Actions or owners.
+ * @returns Their keys, in the order given.
+ */
+function targetKeys(entries: readonly OwnerRef[]): string[] {
+  return entries.map((entry) => `${entry.file}#${entry.symbol}`);
+}
+
+/**
+ * The reachability corpus's owner in one module.
+ *
+ * @param file The module.
+ * @returns The owner.
+ */
+function reachabilityOwner(file: string): OwnerRef {
+  const owner = mapperOwners(reachability).find((candidate) => candidate.file === file);
+
+  if (owner === undefined) {
+    throw new Error(`the reachability corpus must record a mapper query owner in ${file}`);
+  }
+
+  return owner;
+}
+
+describe('createPlan — tooling modules and reachability', () => {
+  it('stands on a corpus whose tooling owners sort first and whose route reaches two owners', () => {
+    const owners = mapperOwners(reachability);
+    const byFile = [...owners].sort((left, right) =>
+      left.file < right.file ? -1 : left.file > right.file ? 1 : 0,
+    );
+
+    // Without the exclusion, a path-ordered proposal would open on the seed
+    // and the script.
+    expect(new Set(byFile.slice(0, 2).map((owner) => owner.file))).toEqual(
+      new Set(TOOLING_MODULES),
+    );
+
+    const route = reachability.queries.routeForUrl(WICKET_ROUTE);
+    const routeNode = route?.node?.nodeId;
+
+    expect(routeNode).toBeDefined();
+
+    const near = reachabilityOwner('src/back/wicket-ledger.ts');
+    const far = reachabilityOwner('src/back/abacus-ledger.ts');
+    const unrelated = reachabilityOwner('src/back/aardvark-ledger.ts');
+
+    // Neither reached owner has a caller in the route module itself, so only a
+    // multi-hop search can connect them to the question.
+    for (const owner of [near, far]) {
+      const callerFiles = reachability.queries
+        .whoCalls({ file: owner.file, symbol: owner.symbol })
+        .map((caller) => caller.caller.file);
+
+      expect(callerFiles).not.toContain(route?.file);
+    }
+
+    const nearPath = reachability.queries.pathBetween(routeNode ?? '', {
+      file: near.file,
+      symbol: near.symbol,
+    });
+    const farPath = reachability.queries.pathBetween(routeNode ?? '', {
+      file: far.file,
+      symbol: far.symbol,
+    });
+
+    expect(nearPath?.depth).toBeGreaterThan(1);
+    expect(farPath?.depth).toBeGreaterThan(nearPath?.depth ?? Number.POSITIVE_INFINITY);
+    expect(far.file < near.file).toBe(true);
+    expect(unrelated.file < far.file).toBe(true);
+    expect(
+      reachability.queries.pathBetween(routeNode ?? '', {
+        file: unrelated.file,
+        symbol: unrelated.symbol,
+      }),
+    ).toBeUndefined();
+  });
+
+  it('never proposes a seed or script query site, even for an unnarrowed question', async () => {
+    const applicationOwners = mapperOwners(reachability).filter(
+      (owner) => !TOOLING_MODULES.includes(owner.file),
+    );
+    const everyAnchor = await createPrismaAdapter({
+      maxTargets: PRISMA_ADAPTER_LIMITS.maxTargetsCeiling,
+    }).createPlan(contextFor({ project: reachability }), databaseQuestion);
+    const shipped = await createPrismaAdapter().createPlan(
+      contextFor({ project: reachability }),
+      databaseQuestion,
+    );
+
+    // The fallback still offers every application owner, and nothing else.
+    expect(new Set(targetKeys(everyAnchor))).toEqual(new Set(targetKeys(applicationOwners)));
+    expect(shipped.length).toBe(
+      Math.min(PRISMA_ADAPTER_LIMITS.maxTargets, applicationOwners.length),
+    );
+
+    for (const action of [...everyAnchor, ...shipped]) {
+      expect(TOOLING_MODULES).not.toContain(action.file);
+    }
+  });
+
+  it('proposes nothing when every query site is in a tooling module', async () => {
+    const lines: LogLine[] = [];
+    const actions = await createPrismaAdapter({ logger: capturingLogger(lines) }).createPlan(
+      contextFor({ project: toolingOnly }),
+      databaseQuestion,
+    );
+
+    expect(mapperOwners(toolingOnly).length).toBe(TOOLING_MODULES.length);
+    expect(actions).toEqual([]);
+    expect(lines.map((line) => line.message)).toContain(
+      'every query owner is a tooling module; proposing nothing',
+    );
+    expect([...new Set(lines.map((line) => line.level))]).toEqual(['debug']);
+  });
+
+  it('anchors on the query sites a named route reaches through several calls, nearest first', async () => {
+    const near = reachabilityOwner('src/back/wicket-ledger.ts');
+    const far = reachabilityOwner('src/back/abacus-ledger.ts');
+    const routeQuestion = understandingFor(['prisma'], [{ kind: 'route', name: WICKET_ROUTE }]);
+
+    const actions = await createPrismaAdapter().createPlan(
+      contextFor({ project: reachability }),
+      routeQuestion,
+    );
+
+    // Exactly the reached owners, the nearer first although its module sorts
+    // later; the unrelated owner and both tooling owners are not proposed.
+    expect(targetKeys(actions)).toEqual(targetKeys([near, far]));
+
+    const single = await createPrismaAdapter({ maxTargets: 1 }).createPlan(
+      contextFor({ project: reachability }),
+      routeQuestion,
+    );
+
+    expect(targetKeys(single)).toEqual(targetKeys([near]));
   });
 });
 

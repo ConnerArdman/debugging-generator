@@ -46,15 +46,31 @@
  *   parent never arrived at all", which is a different statement, and
  *   conflating the two would invent evidence.
  *
- * ## Nothing here is measured
+ * ## The canvas is laid out in CSS pixels
  *
- * The canvas is a FIXED logical `viewBox` scaled by CSS (`width: 100%`), so
- * the drawing is a pure function of the data: no `getBoundingClientRect`, no
- * `ResizeObserver`, no `offsetWidth`, and therefore an environment with no
- * layout — the component suites, and every first paint — renders exactly what
- * a browser renders. `preserveAspectRatio="xMinYMin meet"` is what keeps that
- * honest: the drawing scales uniformly, so a narrow panel shrinks the whole
- * picture rather than stretching the glyphs of its labels sideways.
+ * `../utils/measure`'s `useChartCanvas` reports the inner width of the scroll
+ * viewport the canvas is drawn into, kept current as the panel is resized, and
+ * the canvas is drawn exactly that wide with a `viewBox` of the same size
+ * (`resolveCanvasWidth` in `../utils/scale`): one user unit is one CSS pixel,
+ * so the 11 px label roles render at 11 px at every panel width, the canvas
+ * declares no height it does not draw into, and the time axis spans the whole
+ * section however wide it is. A viewport narrower than `MIN_CANVAS_WIDTH`
+ * scrolls the canvas horizontally instead of squeezing it. This file reads no
+ * layout itself: the hook takes its first measurement while the viewport's ref
+ * attaches, before the first paint, and follows every resize after it.
+ *
+ * A bar's label is measured in the label font before it is placed, so it is
+ * drawn only where it fits — after the bar, before it, inside it, or shortened
+ * to an ellipsis — and never across the lane labels, past the canvas edge or
+ * over another bar or label (see "Bar labels" below).
+ *
+ * Where nothing can be measured — an environment with no layout, which is
+ * every component suite — the canvas lays out at `DEFAULT_CANVAS_WIDTH` user
+ * units, declares `width="100%"` and scales that drawing uniformly to its
+ * container (`preserveAspectRatio="xMinYMin meet"`, so glyphs are never
+ * stretched sideways), and labels are measured by the hook's deterministic
+ * estimate. The drawing is then a pure function of the data, which is what the
+ * layout-free suite asserts against.
  *
  * Every coordinate comes from `../utils/scale` and every colour from
  * `../utils/color`; this file performs no interval arithmetic of its own and
@@ -76,31 +92,63 @@
  * opening a file never also selects a span.
  *
  * A row's full description — the sentence a bar carries as its SVG title — is
- * keyboard-reachable too, because a tooltip opens on focus and an unfocusable
- * trigger would make it hover-only. Two routes lead to it, and neither adds a
- * tab stop to every row. The row that holds focus drives the detail strip above
- * the table, whose name is a focusable tooltip trigger reached by Shift+Tab
- * from the row (past the strip's source chip, when the row has one). And
- * the name in that row's own Operation cell becomes a tab stop — in that row
- * only, one Tab from the row itself — while the name in every other row stays
- * out of the tab order, so the body remains the single roving stop the table
- * primitive makes it plus the one trigger of the row being read.
+ * keyboard-reachable too, and reaching it adds no tab stop: the table body stays
+ * the single roving stop the table primitive makes it. While a row itself holds
+ * KEYBOARD focus — Tab, Shift+Tab or the table's arrow keys, never the focus a
+ * pointer press causes — its Operation cell shows the description by holding
+ * the name's own `Tooltip` open (its controlled `open`): the same bubble a
+ * pointer opens on hover, measured and placed against the name by the
+ * primitive exactly as a hovered one is, and Escape dismisses it until focus
+ * moves to another row (the Waterfall and flame-chart rows reveal theirs the
+ * same way). No row's name is ever a tab stop, and neither is a row's source
+ * chip: like every control a `DataTable` cell renders it is `tabIndex={-1}`,
+ * reached by the table's own arrow keys. The row that holds focus also drives
+ * the detail strip below the canvas; the strip's name is that same
+ * description's trigger for a pointer, and neither it nor the strip's source
+ * chip is a tab stop, so Tab passes through the whole view on the table's one
+ * stop. Escape peels one layer per press: the row's revealed description
+ * first, then the strip's preview of that row.
+ *
+ * ## The selection is the panel's, not this chart's
+ *
+ * Every chart of one panel draws the same captured spans, so a selection kept
+ * here would let this chart mark one span while the flame chart beside it marks
+ * another. The selected bar, the selected table row and the strip's
+ * "Selected" line therefore follow the panel host's one shared selection, read
+ * through `useViewSelection` and matched with `matchesPanelSelection` — by
+ * event id, or by the same trace and span. Activating a bar or a row reports
+ * the span through `onSelectEvent`, which is where the host records it, and
+ * every view of the panel moves its mark together. Outside a host the view
+ * falls back to its own last activation, exactly as it behaved on its own.
  *
  * ## Evidence is rendered as it arrives
  *
  * - An **ambiguous** async continuation — more than one settled request had an
  *   open continuation window when the event landed — is drawn with the dashed
- *   edge the stylesheet implements, and its alternative candidate span ids are
- *   named in the row's description. A guessed relationship must never read as
- *   a measured one (AAP 0.4.2).
+ *   warning edge the stylesheet implements and a dashed warning outline on its
+ *   bar, and its alternative candidates are named in the row's description: by
+ *   the operation each recorded and its span id, where the candidate is a span
+ *   of the same trace among the rows on screen, and by its span id alone
+ *   otherwise. A guessed relationship must never read as a measured one
+ *   (AAP 0.4.2).
+ * - An async continuation attributed with a **single** candidate is inferred
+ *   rather than measured, but not in doubt: its edge is solid, in the info
+ *   tone, and the description names the mechanism. The dependency graph draws
+ *   its relationships' two lineage states the same way.
  * - An **orphan** — a span whose parent never arrived, re-attached to the
  *   trace root — is marked and kept. Dropping it would silently remove real
  *   work from the picture.
  * - A **partial** result says so: a `spans` result reports how much of it is
  *   on screen and, for as long as the service names a next offset, offers the
  *   next page — appended after the rows already drawn, which stay on screen
- *   while it loads and if it fails; a `trace` reports the correlator's own
- *   truncation and the walk's.
+ *   while it loads and if it fails. A `trace` arrives whole, so a walk stopped
+ *   at its row bound (`../utils/scale`'s `DEFAULT_MAX_TRACE_ROWS`) states "N of
+ *   M spans shown", M being the trace's own node count, and offers "Show more
+ *   spans", which raises the bound by one step without asking the provider for
+ *   anything; the bound returns to its default when the node's query changes.
+ *   A trace the correlator itself bounded says so and gives the refine route —
+ *   narrowing the query or capturing a shorter interaction — since nothing more
+ *   of it is in memory.
  * - URLs, statements and attribute values arrive redacted and truncated
  *   (AAP 0.5.2). They are rendered exactly as given: nothing here reconstructs
  *   a URL, expands a statement or dumps an attribute bag.
@@ -119,17 +167,25 @@
  *   dg-timeline__lanes         the lane bands, their accents and their labels
  *   dg-timeline__lane
  *   dg-timeline__lane-label
- *   dg-timeline__row           one span: its bar and the label beside it
- *   dg-timeline__bar
+ *   dg-timeline__row           one span: its bar and its label — beside the
+ *   dg-timeline__bar           bar on a backdrop, or inside it (`--inside`)
  *   dg-timeline__bar-label
+ *   dg-timeline__bar-label--inside
+ *   dg-timeline__bar-label-backdrop
  *   dg-timeline__edge          a parent → child connector
- *   dg-timeline__tooltip       the slot the hovered row's description sits in
+ *   dg-timeline__detail        the reserved, never-wrapping line between the
+ *                              canvas and the table: the selected span, or a
+ *                              hovered or focused one previewed in its place
+ *   dg-timeline__detail-rest   that line's trailing run, clipped rather than
+ *                              wrapped on a narrow panel
+ *   dg-timeline__tooltip       the slot the shown row's description sits in
  *   dg-timeline__equivalent    the keyboard-reachable table of the same rows
  *   dg-timeline__empty         the three states
  *   dg-timeline__loading
  *   dg-timeline__error
  *   dg-is-selected             states, composed onto a bar or an edge
  *   dg-is-ambiguous
+ *   dg-is-inferred             (an edge only)
  *   dg-is-orphan / dg-is-orphaned
  *
  * `dg-is-orphan` is what the stylesheet paints; `dg-is-orphaned` is the name
@@ -153,8 +209,17 @@ import type {
   TraceTree,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { useCallback, useMemo, useState } from 'react';
-import type { CSSProperties, FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type {
+  CSSProperties,
+  FocusEvent as ReactFocusEvent,
+  KeyboardEvent as ReactKeyboardEvent,
+  PointerEvent as ReactPointerEvent,
+  ReactElement,
+  ReactNode,
+  RefObject,
+} from 'react';
+import { ChartGantt } from 'lucide-react';
 
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
@@ -176,9 +241,12 @@ import {
   useDataProvider,
 } from '../host/DataProvider';
 import type { DataProvider } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { kindColorVar, tierColorVar } from '../utils/color';
+import { fitTextToWidth, useChartCanvas } from '../utils/measure';
+import type { TextMeasure } from '../utils/measure';
 import {
   NOT_AVAILABLE_LABEL,
   collapseWhitespace,
@@ -189,18 +257,21 @@ import {
   formatOffset,
   formatStatusLabel,
   formatTierLabel,
-  truncate,
 } from '../utils/format';
 import {
+  DEFAULT_MAX_TRACE_ROWS,
   DEFAULT_ROW_HEIGHT,
   alignHairline,
   clamp,
   createTimeScale,
   flattenTraceRows,
   generateAxisTicks,
+  isMeasuredWidth,
   layoutDepth,
   layoutLaneStack,
   placeSpanDuration,
+  rankLaneDepths,
+  resolveCanvasWidth,
 } from '../utils/scale';
 import type { AxisTick, FlatTraceRow, TimeScale, TraceLayoutOptions } from '../utils/scale';
 import { SourceLink } from './SourceLink';
@@ -242,15 +313,20 @@ const TIER_LANE_ORDER: readonly TelemetryTier[] = Object.freeze([
  *
  * Unitless SVG user units, which is what `../utils/scale` speaks and what the
  * stylesheet deliberately does not: every rule there sets paint and text only,
- * so a coordinate has exactly one owner. None of these is a CSS value — no
- * `px`, no `rem`, no colour — and none of them is measured.
+ * so a coordinate has exactly one owner. A measured canvas draws one user unit
+ * per CSS pixel, so these are pixel sizes there; an unmeasured one scales its
+ * `DEFAULT_CANVAS_WIDTH` units to its container (see this module's header).
+ * None of these is a CSS value — no `px`, no `rem`, no colour. The canvas's
+ * WIDTH is not among them: it is the viewport's, resolved per render.
  * ---------------------------------------------------------------------------
  */
 
-/** The canvas's logical width. CSS scales it; nothing here reads a real size. */
-const VIEW_BOX_WIDTH = 1000;
-
-/** The leading gutter the tier labels occupy, before the time axis begins. */
+/**
+ * The leading gutter the tier labels occupy, before the time axis begins.
+ *
+ * Nothing but a lane label is drawn in it: a bar starts at its right edge at
+ * the earliest, and a bar's label never extends left of it.
+ */
 const LANE_LABEL_WIDTH = 108;
 
 /** The trailing gutter, so a bar that reaches the window's end still has an edge. */
@@ -278,14 +354,21 @@ const BAR_INSET = 3;
 const CANVAS_BOTTOM_PADDING = 6;
 
 /**
- * The longest a bar's own label may be, in characters.
- *
- * A character bound rather than a measured width: nothing here may measure, and
- * a label that overran would be clipped by the viewport with no indication. The
- * full name is one row away in the table below and in the row's description, so
- * the bound costs nothing.
+ * The inset between a bar's edges and a label drawn inside it: the bar's own
+ * vertical inset, so the text sits in an even margin on the kind fill.
  */
-const MAX_BAR_LABEL_CHARS = 32;
+const BAR_LABEL_INSET = BAR_INSET;
+
+/**
+ * The fewest graphemes of a span's name a shortened bar label keeps before its
+ * ellipsis.
+ *
+ * Below this a label names nothing a reader could recognise — "c…" identifies
+ * no span — so the bar is left unlabelled instead. Nothing is lost by that:
+ * the full name is in the bar's description, the detail strip and the table
+ * below the canvas.
+ */
+const MIN_BAR_LABEL_GRAPHEMES = 4;
 
 /**
  * The separator between a bar label's name and its duration.
@@ -370,8 +453,33 @@ interface TimelineModel {
   readonly startTime: number;
   /** The window's end, in epoch milliseconds. */
   readonly endTime: number;
-  /** Whether rows exist that this model does not hold. */
+  /**
+   * Whether rows exist that this model does not hold, for any reason: the
+   * walk's row bound, its depth bound, or the correlator's own truncation. It
+   * is what marks the summary as a partial result.
+   */
   readonly truncated: boolean;
+  /**
+   * Whether the trace walk stopped at its ROW bound with more of the tree in
+   * memory — the one reduction "Show more spans" lifts. Only a trace sets it.
+   */
+  readonly walkBounded: boolean;
+  /**
+   * Whether the correlator itself bounded the trace before this view saw it.
+   * Nothing more of it is in memory, so no control can show more: only a
+   * narrower query or a shorter capture reaches the rest. Only a trace sets it.
+   */
+  readonly correlatorTruncated: boolean;
+  /**
+   * Whether the walk's DEPTH bound left children out. A larger row bound does
+   * not lift it, so the footer states it apart from the row bound.
+   */
+  readonly depthClamped: boolean;
+  /**
+   * The trace's own node count — the `M` of "N of M spans shown" — or
+   * `undefined` for span pages, whose total the service reports instead.
+   */
+  readonly nodeCount: number | undefined;
 }
 
 /**
@@ -857,21 +965,40 @@ function flattenParentFirst(events: readonly TelemetryEvent[]): readonly Unassig
   return bars;
 }
 
-/** The bound the trace walk runs under. */
-function traceWalkOptions(tree: TraceTree): TraceLayoutOptions | undefined {
+/**
+ * The bounds the trace walk runs under.
+ *
+ * The walk visits ONE span past `maxRows` and keeps only the first `maxRows`
+ * rows (its `visibleRows` window): whether it produced that extra span is the
+ * exact answer to "does the trace hold more than this view shows", which the
+ * layout's `truncated` flag cannot give because the depth bound sets it too.
+ *
+ * @param tree The resolved trace.
+ * @param maxRows The most spans this view shows.
+ * @returns The layout options.
+ */
+function traceWalkOptions(tree: TraceTree, maxRows: number): TraceLayoutOptions {
   // The tree's own greatest depth bounds the walk. It is honoured only when it
   // is a usable positive integer: a stored tree reporting `0` while its roots
   // carry children would otherwise have every child left unvisited, and hiding
   // captured work is the one thing this walk may not do. Absent, the walk uses
   // the layout module's own bound.
+  const rows = { maxRows: maxRows + 1, visibleRows: maxRows };
   return Number.isInteger(tree.maxDepth) && tree.maxDepth > 0
-    ? { maxDepth: tree.maxDepth }
-    : undefined;
+    ? { ...rows, maxDepth: tree.maxDepth }
+    : rows;
 }
 
-/** A correlated trace as rows: the children-only walk, in tree order. */
-function modelFromTrace(tree: TraceTree): TimelineModel {
-  const layout = flattenTraceRows(tree, traceWalkOptions(tree));
+/**
+ * A correlated trace as rows: the children-only walk, in tree order.
+ *
+ * @param tree The resolved trace.
+ * @param maxRows The row bound in force — the default, or as raised by "Show
+ * more spans".
+ * @returns The model, with what the walk and the correlator left out.
+ */
+function modelFromTrace(tree: TraceTree, maxRows: number): TimelineModel {
+  const layout = flattenTraceRows(tree, traceWalkOptions(tree, maxRows));
   const bars = layout.rows.map(barFromTraceRow);
   const { rows, tiers } = assignLanes(bars);
 
@@ -896,15 +1023,24 @@ function modelFromTrace(tree: TraceTree): TimelineModel {
         ? Math.max(tree.endTime, derived.end)
         : derived.end;
 
+  // The lookahead span was produced only when more of the tree lies within the
+  // depth bound than the row bound shows.
+  const walkBounded = layout.totalRowCount > maxRows;
+  const depthClamped = layout.rows.some((row) => row.childrenTruncated);
+
   return {
     rows,
     tiers,
     startTime,
     endTime,
-    // Both truncations matter and they are different statements: the correlator
-    // may have dropped nodes before this view saw the tree, and this walk may
-    // have stopped at its own bound.
-    truncated: tree.truncated || layout.truncated,
+    // Every truncation matters and they are different statements: the
+    // correlator may have dropped nodes before this view saw the tree, and this
+    // walk may have stopped at its row bound or its depth bound.
+    truncated: tree.truncated || walkBounded || depthClamped,
+    walkBounded,
+    correlatorTruncated: tree.truncated,
+    depthClamped,
+    nodeCount: tree.nodeCount,
   };
 }
 
@@ -931,6 +1067,10 @@ function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
     // A page is not a truncated result: how much of the result it holds is what
     // `total` reports, and the footer states it exactly rather than as a flag.
     truncated: false,
+    walkBounded: false,
+    correlatorTruncated: false,
+    depthClamped: false,
+    nodeCount: undefined,
   };
 }
 
@@ -938,12 +1078,13 @@ function modelFromSpans(events: readonly TelemetryEvent[]): TimelineModel {
  * ---------------------------------------------------------------------------
  * Geometry
  *
- * One pure function of the model, so the canvas is reproducible and nothing has
- * to be measured. Every number below comes out of `../utils/scale`: the
- * time-to-pixel map, a bar's offset and width with its minimum visible width
- * and its edge clipping, the lane stack, the depth rhythm and the axis ticks.
- * Re-deriving any of that here would give the product two timelines that
- * disagree slightly.
+ * One pure function of the model and the canvas it is drawn on — the canvas's
+ * width and a measure of the label font — so the same three inputs always draw
+ * the same picture, and no layout is read here. Every number below comes out
+ * of `../utils/scale`: the time-to-pixel map, a bar's offset and width with its
+ * minimum visible width and its edge clipping, the lane stack, the depth
+ * rhythm and the axis ticks. Re-deriving any of that here would give the
+ * product two timelines that disagree slightly.
  * ---------------------------------------------------------------------------
  */
 
@@ -962,14 +1103,42 @@ interface LaneGeometry {
   readonly y: number;
   /** The band's height: its depth rows and the gutters between them. */
   readonly height: number;
-  /** How many depth rows the lane holds. */
+  /** How many rows the lane holds: one per distinct depth among its spans. */
   readonly rowCount: number;
+}
+
+/**
+ * Where a bar's label sits: beside the bar on the lane surface (after its end
+ * or before its start), or inside it on the kind fill.
+ */
+type BarLabelPlacement = 'after' | 'before' | 'inside';
+
+/** A bar's label, measured and placed (see "Bar labels" below). */
+interface BarLabelGeometry {
+  /**
+   * The text drawn: the span's name and compact duration, or — where that does
+   * not fit anywhere — a shortened form: the name cut to an ellipsis with the
+   * duration kept, or the name alone.
+   */
+  readonly text: string;
+  /** Where the text starts, or ends when it is anchored at its end. */
+  readonly x: number;
+  /** Which side of {@link x} the text occupies. */
+  readonly anchor: 'start' | 'end';
+  /** Beside the bar or inside it, which decides the label's paint. */
+  readonly placement: BarLabelPlacement;
+  /** The text's left edge, whichever way it is anchored. */
+  readonly start: number;
+  /** The text's measured advance width, in user units. */
+  readonly width: number;
 }
 
 /** One span's bar, its label and the paint it carries. */
 interface BarGeometry {
   /** The row this bar draws. */
   readonly row: TimelineBar;
+  /** The row of its lane the bar sits in, counting from `0`. */
+  readonly laneRow: number;
   /** The bar's left edge. */
   readonly x: number;
   /** The bar's width, never below the scale's minimum visible width. */
@@ -984,12 +1153,12 @@ interface BarGeometry {
   readonly centerY: number;
   /** The kind colour, as a token reference for `--dgc-bar-color`. */
   readonly color: string;
-  /** The text drawn beside the bar: the name, shortened, and the duration. */
-  readonly label: string;
-  /** Where that text starts (or ends, when it is anchored at its end). */
-  readonly labelX: number;
-  /** Which side of {@link labelX} the text occupies. */
-  readonly labelAnchor: 'start' | 'end';
+  /**
+   * The bar's label, or `undefined` where no recognisable form of it fits
+   * anywhere near the bar. The span's name is still in the bar's description,
+   * the detail strip and the table.
+   */
+  readonly label: BarLabelGeometry | undefined;
   /** Whether the bar was widened to stay visible — a sub-millisecond operation. */
   readonly minWidthApplied: boolean;
 }
@@ -1002,6 +1171,11 @@ interface EdgeGeometry {
   readonly path: string;
   /** Whether the attribution had more than one candidate parent. */
   readonly ambiguous: boolean;
+  /**
+   * Whether the child joined its parent through a lineage attribution with a
+   * single candidate: inferred rather than measured, and not ambiguous.
+   */
+  readonly inferred: boolean;
   /** Whether the child was re-attached rather than placed. */
   readonly orphaned: boolean;
 }
@@ -1018,15 +1192,10 @@ interface TimelineGeometry {
   readonly edges: readonly EdgeGeometry[];
   /** The axis ticks, already positioned and labelled. */
   readonly ticks: readonly AxisTick[];
-  /** The canvas's logical height. */
+  /** The canvas's width in user units: the lane bands span it. */
+  readonly width: number;
+  /** The canvas's height in user units. */
   readonly height: number;
-}
-
-/** The text drawn beside a bar: a shortened name and the duration. */
-function barLabelFor(row: TimelineBar): string {
-  const name = truncate(collapseWhitespace(row.name), MAX_BAR_LABEL_CHARS);
-
-  return `${name}${BAR_LABEL_SEPARATOR}${formatDurationCompact(row.durationMs)}`;
 }
 
 /** A depth read defensively: a value that is not a non-negative integer is a root. */
@@ -1034,37 +1203,422 @@ function usableDepth(depth: number): number {
   return Number.isInteger(depth) && depth > 0 ? depth : 0;
 }
 
-/** Turns the model into the canvas, with no measurement and no mutation. */
-function buildGeometry(model: TimelineModel): TimelineGeometry {
+/**
+ * The canvas a model is drawn on: what {@link buildGeometry} needs beyond the
+ * data, and all of what it knows about the page.
+ */
+interface CanvasFrame {
+  /**
+   * The canvas's width in user units, from `resolveCanvasWidth`: the viewport's
+   * measured inner width in CSS pixels, or the unmeasured fallback width.
+   */
+  readonly width: number;
+  /** Measures a string in the bar-label font, in the same user units. */
+  readonly measureText: TextMeasure;
+}
+
+/*
+ * Bar labels
+ *
+ * A bar's label is its span's name and compact duration ("name · 12 ms"),
+ * measured in the label font and drawn in the first place it fits whole:
+ *
+ *   1. after the bar — start-anchored `BAR_LABEL_GAP` past its end;
+ *   2. before the bar — end-anchored `BAR_LABEL_GAP` before its start;
+ *   3. inside the bar — start-anchored `BAR_LABEL_INSET` past its start, in
+ *      the `dg-timeline__bar-label--inside` treatment (the base surface on the
+ *      kind fill, as a flame frame's label is drawn).
+ *
+ * Where it fits in none of them, it is shortened into the WIDEST of the three
+ * rooms (ties go to the order above): the name is cut to an ellipsis and the
+ * " · duration" suffix kept while at least `MIN_BAR_LABEL_GRAPHEMES` of the
+ * name fit beside it — the duration is what the bar's length encodes, and a
+ * reader compares it across bars — otherwise the name alone is drawn, cut if it
+ * must be. The room before a bar is considered too, not only the room after and
+ * inside it: a late, short span (a commit at the window's end) has no room
+ * after it and none inside, and the room before it is where its name still
+ * fits. Where not even that fits, the bar is left unlabelled (`undefined`).
+ *
+ * A room is the free run of the bar's OWN ROW on that side: bounded by the
+ * lane-label column on the left and the canvas's trailing gutter on the right,
+ * and ended by any other bar on the row or any label already placed there,
+ * each kept `BAR_LABEL_GAP` clear so a label cannot be read as belonging to its
+ * neighbour. So no label is drawn over a lane label, past the canvas edge, over
+ * a foreign bar or over another label. The row is the only scope a collision
+ * needs: a label is centred in its row, and the row pitch is taller than the
+ * label's glyphs, so it cannot reach a neighbouring row's bars.
+ *
+ * Bars are labelled in the model's row order, so a parent, drawn first, claims
+ * its room before the siblings that follow it. The result is a pure function of
+ * the bar geometry and the measure: identical on every render, and in the
+ * unmeasured mode (with the measure's deterministic estimate) identical in an
+ * environment with no layout.
+ */
+
+/** A horizontal run of one row, in user units, from `start` to `end`. */
+interface RowExtent {
+  readonly start: number;
+  readonly end: number;
+}
+
+/** A bar before it is labelled: everything {@link BarGeometry} holds but the label. */
+type UnlabelledBar = Omit<BarGeometry, 'label'>;
+
+/** The key of the row a bar sits in: its lane and its row within that lane. */
+function rowKeyOfBar(bar: UnlabelledBar): string {
+  return `${String(bar.row.laneIndex)}:${String(bar.laneRow)}`;
+}
+
+/** Appends `value` to the list `key` names, creating the list on first use. */
+function appendToRow<T>(rows: Map<string, T[]>, key: string, value: T): void {
+  const values = rows.get(key);
+  if (values === undefined) {
+    rows.set(key, [value]);
+  } else {
+    values.push(value);
+  }
+}
+
+/**
+ * The run from `start` to `end` widened by `BAR_LABEL_GAP` on both sides: an
+ * obstacle as a label must keep clear of it, the gap it keeps from its own bar.
+ */
+function paddedExtent(start: number, end: number): RowExtent {
+  return { start: start - BAR_LABEL_GAP, end: end + BAR_LABEL_GAP };
+}
+
+/**
+ * How many of the ascending `values` are at most `value` — or, when `strict`,
+ * less than it. A binary search, so a room query costs a logarithm of the
+ * row's size rather than a scan of it.
+ */
+function countUpTo(values: readonly number[], value: number, strict: boolean): number {
+  let low = 0;
+  let high = values.length;
+  while (low < high) {
+    const middle = Math.floor((low + high) / 2);
+    // In range by the loop bound; the fallback only satisfies the index type.
+    const probe = values[middle] ?? Number.POSITIVE_INFINITY;
+    if (strict ? probe < value : probe <= value) {
+      low = middle + 1;
+    } else {
+      high = middle;
+    }
+  }
+
+  return low;
+}
+
+/**
+ * One row's obstacles, indexed for the room queries of {@link placeBarLabel}:
+ * its bars, fixed once every bar is placed, and the labels placed on it so far.
+ * Every extent is padded ({@link paddedExtent}).
+ *
+ * Indexed rather than scanned because a row can be long — a render-heavy
+ * capture puts hundreds or thousands of spans at one depth of one lane — and
+ * a scan per query would make labelling quadratic in the row. The bars are
+ * ordered by start with running maxima of their ends, so "does a bar other
+ * than this one cover this point, and where does the nearest one begin or
+ * end" is one binary search. The labels never overlap one another — each is
+ * placed in a room that excludes every label before it — so, ordered by start,
+ * they are ordered by end too, and the same questions are one search each.
+ */
+interface RowIndex {
+  /** The padded start of each bar, ordered by start. */
+  readonly starts: readonly number[];
+  /** Where each bar sits in that order. */
+  readonly positionOf: ReadonlyMap<UnlabelledBar, number>;
+  /**
+   * For the prefix of that order ending at each position: the position of
+   * the bar with the greatest padded end, that end, and the greatest end
+   * among the prefix's other bars — so the greatest end with any one bar left
+   * out is known without a rescan.
+   */
+  readonly leaderAt: readonly number[];
+  readonly leaderEnd: readonly number[];
+  readonly runnerUpEnd: readonly number[];
+  /** The padded starts and ends of the labels placed on the row, ordered by start. */
+  readonly labelStarts: number[];
+  readonly labelEnds: number[];
+}
+
+/** Indexes one row's bars; the row starts with no labels. */
+function indexRow(rowBars: readonly UnlabelledBar[]): RowIndex {
+  // `sort` is stable, so bars that start together keep the model's order.
+  const bars = [...rowBars].sort((left, right) => left.x - right.x);
+  const starts: number[] = [];
+  const positionOf = new Map<UnlabelledBar, number>();
+  const leaderAt: number[] = [];
+  const leaderEnd: number[] = [];
+  const runnerUpEnd: number[] = [];
+
+  let leader = -1;
+  let best = Number.NEGATIVE_INFINITY;
+  let second = Number.NEGATIVE_INFINITY;
+  for (const [position, bar] of bars.entries()) {
+    const extent = paddedExtent(bar.x, bar.end);
+    starts.push(extent.start);
+    positionOf.set(bar, position);
+    if (extent.end > best) {
+      second = best;
+      best = extent.end;
+      leader = position;
+    } else if (extent.end > second) {
+      second = extent.end;
+    }
+    leaderAt.push(leader);
+    leaderEnd.push(best);
+    runnerUpEnd.push(second);
+  }
+
+  return {
+    starts,
+    positionOf,
+    leaderAt,
+    leaderEnd,
+    runnerUpEnd,
+    labelStarts: [],
+    labelEnds: [],
+  };
+}
+
+/**
+ * The greatest padded end among the first `count` bars of the row with `self`
+ * left out, or `-Infinity` when there is no such bar.
+ */
+function greatestBarEnd(index: RowIndex, count: number, self: UnlabelledBar): number {
+  const last = count - 1;
+  if (last < 0) {
+    return Number.NEGATIVE_INFINITY;
+  }
+  const leadsPrefix = index.leaderAt[last] === index.positionOf.get(self);
+
+  return (
+    (leadsPrefix ? index.runnerUpEnd[last] : index.leaderEnd[last]) ?? Number.NEGATIVE_INFINITY
+  );
+}
+
+/**
+ * The free run rightward of `from`, up to `limit` or the nearest obstacle
+ * other than `self`'s own bar, whichever comes first; `0` when an obstacle
+ * covers `from` itself.
+ */
+function roomRightOf(index: RowIndex, from: number, limit: number, self: UnlabelledBar): number {
+  // The bars that start at or before `from`: one of them covers it when the
+  // greatest of their ends lies past it. The first bar after them is the
+  // nearest that starts past it — skipping `self`, should that be the one.
+  const count = countUpTo(index.starts, from, false);
+  if (greatestBarEnd(index, count, self) > from) {
+    return 0;
+  }
+  const next = count === index.positionOf.get(self) ? count + 1 : count;
+  let end = Math.min(limit, index.starts[next] ?? Number.POSITIVE_INFINITY);
+
+  const labelCount = countUpTo(index.labelStarts, from, false);
+  if ((index.labelEnds[labelCount - 1] ?? Number.NEGATIVE_INFINITY) > from) {
+    return 0;
+  }
+  end = Math.min(end, index.labelStarts[labelCount] ?? Number.POSITIVE_INFINITY);
+
+  return Math.max(end - from, 0);
+}
+
+/**
+ * The free run leftward of `from`, down to `limit` or the nearest obstacle
+ * other than `self`'s own bar, whichever comes first; `0` when an obstacle
+ * covers `from` itself.
+ */
+function roomLeftOf(index: RowIndex, from: number, limit: number, self: UnlabelledBar): number {
+  // The bars and labels that start before `from`: one of them covers it when
+  // the greatest of their ends reaches it, and otherwise that end is where the
+  // room begins.
+  const barEnd = greatestBarEnd(index, countUpTo(index.starts, from, true), self);
+  const labelCount = countUpTo(index.labelStarts, from, true);
+  const labelEnd = index.labelEnds[labelCount - 1] ?? Number.NEGATIVE_INFINITY;
+  if (barEnd >= from || labelEnd >= from) {
+    return 0;
+  }
+
+  return Math.max(from - Math.max(limit, barEnd, labelEnd), 0);
+}
+
+/** Records a label placed from `start` to `end` on the row, as an obstacle to later labels. */
+function recordLabel(index: RowIndex, start: number, end: number): void {
+  const extent = paddedExtent(start, end);
+  const at = countUpTo(index.labelStarts, extent.start, false);
+  index.labelStarts.splice(at, 0, extent.start);
+  index.labelEnds.splice(at, 0, extent.end);
+}
+
+/** One side of a bar a label could occupy, and how much room it has there. */
+interface LabelSlot {
+  readonly placement: BarLabelPlacement;
+  /** The label's anchor point: where it starts, or ends when end-anchored. */
+  readonly x: number;
+  readonly anchor: 'start' | 'end';
+  /** The free width at that anchor, in user units. */
+  readonly room: number;
+}
+
+/**
+ * The shortened forms of a label that fit `room`, best first: the name cut to
+ * an ellipsis with the duration suffix kept, then the name alone (whole where
+ * it fits, cut where it must be). `undefined` when neither keeps at least
+ * {@link MIN_BAR_LABEL_GRAPHEMES} of the name.
+ */
+function shortenBarLabel(
+  name: string,
+  suffix: string,
+  room: number,
+  measure: TextMeasure,
+): { readonly text: string; readonly width: number } | undefined {
+  const options = { minGraphemes: MIN_BAR_LABEL_GRAPHEMES };
+
+  const beside = fitTextToWidth(name, room - measure(suffix), measure, options);
+  if (beside !== undefined) {
+    // Measured as drawn rather than summed, so no kerning across the join can
+    // carry the label past its room.
+    const text = `${beside.text}${suffix}`;
+    const width = measure(text);
+    if (width <= room) {
+      return { text, width };
+    }
+  }
+
+  const alone = fitTextToWidth(name, room, measure, options);
+
+  return alone === undefined ? undefined : { text: alone.text, width: alone.width };
+}
+
+/** A label of `text`, measured `width` wide, drawn in `slot`. */
+function labelInSlot(slot: LabelSlot, text: string, width: number): BarLabelGeometry {
+  return {
+    text,
+    x: slot.x,
+    anchor: slot.anchor,
+    placement: slot.placement,
+    start: slot.anchor === 'start' ? slot.x : slot.x - width,
+    width,
+  };
+}
+
+/**
+ * Places one bar's label on its row (see "Bar labels" above), or returns
+ * `undefined` when no recognisable form of it fits.
+ *
+ * @param bar The bar to label.
+ * @param row The bar's row: every bar on it and every label already placed.
+ * @param frame The canvas width and the label measure.
+ */
+function placeBarLabel(
+  bar: UnlabelledBar,
+  row: RowIndex,
+  frame: CanvasFrame,
+): BarLabelGeometry | undefined {
+  const { measureText } = frame;
+  const name = collapseWhitespace(bar.row.name);
+  const suffix = `${BAR_LABEL_SEPARATOR}${formatDurationCompact(bar.row.durationMs)}`;
+  const whole = `${name}${suffix}`;
+  const wholeWidth = measureText(whole);
+
+  const plotEnd = frame.width - CANVAS_RIGHT_GUTTER;
+  const afterX = bar.end + BAR_LABEL_GAP;
+  const beforeX = bar.x - BAR_LABEL_GAP;
+  const insideX = bar.x + BAR_LABEL_INSET;
+  const insideEnd = bar.end - BAR_LABEL_INSET;
+
+  // In the order a whole label is tried in, which is also the tie-break order
+  // for a shortened one.
+  const slots: readonly LabelSlot[] = [
+    {
+      placement: 'after',
+      x: afterX,
+      anchor: 'start',
+      room: roomRightOf(row, afterX, plotEnd, bar),
+    },
+    {
+      placement: 'before',
+      x: beforeX,
+      anchor: 'end',
+      room: roomLeftOf(row, beforeX, LANE_LABEL_WIDTH, bar),
+    },
+    {
+      placement: 'inside',
+      x: insideX,
+      anchor: 'start',
+      room: insideEnd > insideX ? roomRightOf(row, insideX, insideEnd, bar) : 0,
+    },
+  ];
+
+  const fitting = slots.find((slot) => wholeWidth <= slot.room);
+  if (fitting !== undefined) {
+    return labelInSlot(fitting, whole, wholeWidth);
+  }
+
+  let widest: LabelSlot | undefined;
+  for (const slot of slots) {
+    if (slot.room > 0 && (widest === undefined || slot.room > widest.room)) {
+      widest = slot;
+    }
+  }
+  if (widest === undefined) {
+    return undefined;
+  }
+
+  const shortened = shortenBarLabel(name, suffix, widest.room, measureText);
+
+  return shortened === undefined ? undefined : labelInSlot(widest, shortened.text, shortened.width);
+}
+
+/**
+ * Labels every bar, in order, each against the bars of its row and the labels
+ * placed on that row before it.
+ */
+function labelBars(bars: readonly UnlabelledBar[], frame: CanvasFrame): BarGeometry[] {
+  const barsByRow = new Map<string, UnlabelledBar[]>();
+  for (const bar of bars) {
+    appendToRow(barsByRow, rowKeyOfBar(bar), bar);
+  }
+  const rows = new Map<string, RowIndex>();
+  for (const [key, rowBars] of barsByRow) {
+    rows.set(key, indexRow(rowBars));
+  }
+
+  return bars.map((bar) => {
+    const row = rows.get(rowKeyOfBar(bar));
+    // Every bar was indexed into its row above; the guard satisfies the map type.
+    const label = row === undefined ? undefined : placeBarLabel(bar, row, frame);
+    if (row !== undefined && label !== undefined) {
+      recordLabel(row, label.start, label.start + label.width);
+    }
+
+    return { ...bar, label };
+  });
+}
+
+/** Turns the model into the canvas it is drawn on, reading no layout and mutating nothing. */
+function buildGeometry(model: TimelineModel, frame: CanvasFrame): TimelineGeometry {
+  const { width } = frame;
   const scale = createTimeScale(
     [model.startTime, model.endTime],
-    [LANE_LABEL_WIDTH, VIEW_BOX_WIDTH - CANVAS_RIGHT_GUTTER],
+    [LANE_LABEL_WIDTH, width - CANVAS_RIGHT_GUTTER],
   );
 
-  // Depth is what places a row inside its lane: a lane holds a contiguous slice
-  // of the tree's depth range, so the slice is normalised to its own first depth
-  // and a lane that begins six levels down still starts at its own first row
-  // instead of reserving six empty ones.
-  const laneFirstDepth: number[] = [];
-  const laneRowCounts: number[] = [];
-
-  for (const [index] of model.tiers.entries()) {
-    laneFirstDepth[index] = Number.POSITIVE_INFINITY;
-    laneRowCounts[index] = 0;
-  }
+  // Depth is what places a row inside its lane, and a lane's depths are sparse:
+  // a tier holds the spans of one process, nested under spans drawn in other
+  // lanes, so a database lane can hold an orphan re-attached at depth 1 and a
+  // query nested at depth 5. Each lane's depths are ranked (`rankLaneDepths`):
+  // every distinct depth occupies one row, a deeper span still sits below a
+  // shallower one, and no row is reserved for a depth nothing in the lane
+  // occupies — so a lane that begins six levels down starts at its own first
+  // row, and a gap in its depths opens no empty band.
+  const laneDepths: number[][] = model.tiers.map(() => []);
   for (const row of model.rows) {
-    const depth = usableDepth(row.depth);
-    const first = laneFirstDepth[row.laneIndex];
-    laneFirstDepth[row.laneIndex] = Math.min(first ?? depth, depth);
+    laneDepths[row.laneIndex]?.push(usableDepth(row.depth));
   }
-  for (const row of model.rows) {
-    const depth = usableDepth(row.depth);
-    const first = laneFirstDepth[row.laneIndex] ?? depth;
-    const rows = laneRowCounts[row.laneIndex] ?? 0;
-    laneRowCounts[row.laneIndex] = Math.max(rows, depth - first + 1);
-  }
+  const laneRanks = laneDepths.map((depths) => rankLaneDepths(depths));
 
-  const laneStack = layoutLaneStack(laneRowCounts);
+  const laneStack = layoutLaneStack(laneRanks.map((rank) => rank.rowCount));
 
   const lanes: LaneGeometry[] = model.tiers.map((tier, index) => {
     const box = laneStack.lanes[index];
@@ -1079,28 +1633,19 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
     };
   });
 
-  const midpoint = (scale.rangeStart + scale.rangeEnd) / 2;
-
-  const bars: BarGeometry[] = model.rows.map((row) => {
+  const unlabelled: UnlabelledBar[] = model.rows.map((row) => {
     const lane = lanes[row.laneIndex];
-    const depth = usableDepth(row.depth);
-    const first = laneFirstDepth[row.laneIndex] ?? depth;
-    const depthRow = layoutDepth(depth - first);
+    // Every depth was ranked above; the fallback is the compiler's reassurance.
+    const laneRow = laneRanks[row.laneIndex]?.rowOf.get(usableDepth(row.depth)) ?? 0;
+    const depthRow = layoutDepth(laneRow);
     const placement = placeSpanDuration(row.startTime, row.durationMs, scale);
 
     const height = clamp(depthRow.height - BAR_INSET * 2, MIN_BAR_HEIGHT, depthRow.height);
     const y = (lane?.y ?? AXIS_BAND_HEIGHT) + depthRow.y + BAR_INSET;
 
-    // A label sits after the bar while there is room for it and before the bar
-    // once the bar has passed the middle of the window. That is a decision made
-    // from the bar's own position rather than from a measured text width, which
-    // is what keeps it identical in a browser and in an environment with no
-    // layout — and the bound below keeps the text inside the viewport, since an
-    // SVG clips to its viewBox and a label outside it would simply vanish.
-    const labelAfter = placement.end <= midpoint;
-
     return {
       row,
+      laneRow,
       x: placement.x,
       width: placement.width,
       end: placement.end,
@@ -1108,16 +1653,13 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
       height,
       centerY: y + height / 2,
       color: kindColorVar(row.kind),
-      label: barLabelFor(row),
-      labelX: clamp(
-        labelAfter ? placement.end + BAR_LABEL_GAP : placement.x - BAR_LABEL_GAP,
-        0,
-        VIEW_BOX_WIDTH,
-      ),
-      labelAnchor: labelAfter ? 'start' : 'end',
       minWidthApplied: placement.minWidthApplied,
     };
   });
+
+  // Every bar is placed before any is labelled, because a label must keep clear
+  // of the bars that come after it on its row as well as those before it.
+  const bars = labelBars(unlabelled, frame);
 
   // The first bar carrying a span — a span id inside its own trace, the key
   // `traceSpanKey` builds — answers a parent lookup, so a colliding span id in
@@ -1159,6 +1701,7 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
         alignHairline(bar.centerY),
       )} H ${String(alignHairline(bar.x))}`,
       ambiguous: bar.row.lineageAmbiguous,
+      inferred: bar.row.lineage !== undefined && !bar.row.lineageAmbiguous,
       orphaned: bar.row.orphaned,
     });
   }
@@ -1169,7 +1712,7 @@ function buildGeometry(model: TimelineModel): TimelineGeometry {
     AXIS_BAND_HEIGHT + DEFAULT_ROW_HEIGHT + CANVAS_BOTTOM_PADDING,
   );
 
-  return { scale, lanes, bars, edges, ticks, height };
+  return { scale, lanes, bars, edges, ticks, width, height };
 }
 
 /*
@@ -1200,15 +1743,72 @@ function statusToneFor(status: TelemetryStatus): BadgeTone {
 }
 
 /**
+ * The operation name of every span on screen, keyed by {@link traceSpanKey} —
+ * a span id inside its own trace — so a candidate parent recorded as a bare
+ * span id can be named in words.
+ */
+type SpanNames = ReadonlyMap<string, string>;
+
+/** No names: the lookup of a view with no rows, shared so it never changes identity. */
+const NO_SPAN_NAMES: SpanNames = new Map<string, string>();
+
+/**
+ * The span-name lookup for a model's rows.
+ *
+ * The first row carrying a span answers for it — the same first-claim rule the
+ * connectors are resolved by (see `buildGeometry`) — so a capture holding two
+ * records of one span names a candidate after the record its children are
+ * drawn under.
+ *
+ * @param rows The rows on screen, in the model's order.
+ * @returns The lookup; empty for no rows.
+ */
+function spanNamesOf(rows: readonly TimelineBar[]): SpanNames {
+  if (rows.length === 0) {
+    return NO_SPAN_NAMES;
+  }
+
+  const names = new Map<string, string>();
+  for (const row of rows) {
+    const key = traceSpanKey(row.traceId, row.spanId);
+    if (!names.has(key)) {
+      names.set(key, row.name);
+    }
+  }
+
+  return names;
+}
+
+/**
+ * One candidate parent, as the description states it: the operation that span
+ * recorded, with its id kept beside it — `name (0000000000000a01)` — when a span
+ * of the row's own trace with that id is on screen, and the bare id otherwise.
+ * A candidate from another trace, or on a page not loaded, is stated exactly as
+ * it was recorded rather than guessed at; the id is kept in both forms, so the
+ * reader can always look the span up.
+ *
+ * @param row The row whose attribution was ambiguous.
+ * @param candidateSpanId One of the candidate span ids it recorded.
+ * @param spanNames The names of the spans on screen.
+ */
+function candidateText(row: TimelineBar, candidateSpanId: string, spanNames: SpanNames): string {
+  const name = spanNames.get(traceSpanKey(row.traceId, candidateSpanId));
+
+  return name === undefined ? candidateSpanId : `${name} (${candidateSpanId})`;
+}
+
+/**
  * What the pipeline recorded about how this row joined its trace, and where
  * this view could not place it under its parent, as a sentence — or nothing,
  * when it joined the ordinary way and is drawn under its parent.
  *
  * The dashed edge, the orphan mark and the "Parent not loaded" flag are visual
  * signals, and a visual signal is never the only signal: everything they mean
- * is also stated here, in the row's description and its detail strip.
+ * is also stated here, in the row's description and its detail strip. The
+ * other candidates of an ambiguous attribution are named through `spanNames`
+ * (see {@link candidateText}).
  */
-function lineageNoteFor(row: TimelineBar): string | undefined {
+function lineageNoteFor(row: TimelineBar, spanNames: SpanNames): string | undefined {
   const notes: string[] = [];
 
   if (row.orphaned) {
@@ -1230,7 +1830,9 @@ function lineageNoteFor(row: TimelineBar): string | undefined {
     notes.push(
       row.lineageCandidates.length === 0
         ? 'More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty.'
-        : `More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty; the others were ${row.lineageCandidates.join(', ')}.`,
+        : `More than one parent was possible, so this attribution is the most recently settled candidate rather than a certainty; the others were ${row.lineageCandidates
+            .map((candidate) => candidateText(row, candidate, spanNames))
+            .join(', ')}.`,
     );
   }
 
@@ -1242,18 +1844,22 @@ function lineageNoteFor(row: TimelineBar): string | undefined {
  * when it started relative to the window, how it reported and what the
  * pipeline had to infer about its position.
  *
- * Used for the bar's own description and for the tooltip on the row's name, so
- * the two cannot drift apart. Values arrive redacted and truncated and are
- * rendered exactly as given (AAP 0.5.2).
+ * Used for the bar's own description, for the detail strip and for the tooltip
+ * on the row's name, so the three cannot drift apart. Values arrive redacted
+ * and truncated and are rendered exactly as given (AAP 0.5.2).
+ *
+ * @param row The row to describe.
+ * @param origin The window start its offset is measured from.
+ * @param spanNames The names of the spans on screen, for naming candidates.
  */
-function describeBar(row: TimelineBar, origin: number): string {
+function describeBar(row: TimelineBar, origin: number, spanNames: SpanNames): string {
   const sentence = `${row.name} — ${formatKindLabel(row.kind)}, ${formatTierLabel(
     row.tier,
   )} tier, ${formatDuration(row.durationMs)} at ${formatOffset(
     row.startTime,
     origin,
   )}. Reported: ${formatStatusLabel(row.status)}.`;
-  const note = lineageNoteFor(row);
+  const note = lineageNoteFor(row, spanNames);
 
   return note === undefined ? sentence : `${sentence} ${note}`;
 }
@@ -1280,14 +1886,26 @@ type CssVariableStyle = CSSProperties & Record<`--${string}`, string>;
 interface TimelineCanvasProps {
   /** The positioned lanes, bars, edges and ticks. */
   readonly geometry: TimelineGeometry;
+  /**
+   * Whether the geometry was laid out at the viewport's measured width, in
+   * which case the canvas is drawn at that size in CSS pixels; otherwise it is
+   * the unmeasured fallback, scaled to its container.
+   */
+  readonly measured: boolean;
   /** The window the offsets in the bars' descriptions are measured from. */
   readonly origin: number;
+  /** The names of the spans on screen, so a description can name its candidates. */
+  readonly spanNames: SpanNames;
   /** The row currently selected, so its bar carries the selected state. */
   readonly selectedEventId: string | undefined;
   /** Raised when a bar is activated with a pointer. */
   readonly onSelect: (row: TimelineBar) => void;
-  /** Raised with the row under the pointer, or `undefined` when it leaves. */
-  readonly onHover: (eventId: string | undefined) => void;
+  /**
+   * Raised with a bar's row when the pointer enters it. Leaving a bar raises
+   * nothing: the preview it started stays while the pointer travels on to the
+   * detail strip, and the parent ends it (see `TimelineView`).
+   */
+  readonly onHover: (eventId: string) => void;
   /** The canvas's text alternative. */
   readonly label: string;
 }
@@ -1299,6 +1917,13 @@ interface TimelineCanvasProps {
  * and `z-index` does not apply — so the groups are written in the order they
  * must be painted: the bands behind everything, the gridlines over the bands,
  * the connectors under the bars they join, and the bars and their labels last.
+ * A label beside its bar is laid on a backdrop in the lane's own surface
+ * colour, the bar's height and the label's width plus its inset: a connector
+ * or gridline running under the label stops at the backdrop's edges instead of
+ * showing through the spaces between its words, which the label's halo cannot
+ * cover — a halo outlines glyphs, and a space has none. Its inset is narrower
+ * than the `BAR_LABEL_GAP` every label keeps from every bar, so it never
+ * covers one.
  *
  * The canvas is `role="img"` with a text alternative, so its bars are not in
  * the accessibility tree and deliberately not focusable: a tab stop with no
@@ -1306,19 +1931,25 @@ interface TimelineCanvasProps {
  * exactly these rows is the table the parent renders below it.
  */
 function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
-  const { geometry, origin, selectedEventId, onSelect, onHover, label } = props;
+  const { geometry, measured, origin, spanNames, selectedEventId, onSelect, onHover, label } =
+    props;
   const gridlineEnd = geometry.height - CANVAS_BOTTOM_PADDING;
   const tickCount = geometry.ticks.length;
 
   return (
+    // Measured, the canvas is `geometry.width` CSS pixels wide with a viewBox
+    // of the same size: one user unit per pixel, nothing scaled, and the
+    // default `preserveAspectRatio` has no ratio to reconcile. Unmeasured (no
+    // layout), the fallback width is scaled uniformly to the container — see
+    // this module's header.
     <svg
       className="dg-timeline__canvas"
       role="img"
       aria-label={label}
-      width="100%"
+      width={measured ? geometry.width : '100%'}
       height={geometry.height}
-      viewBox={`0 0 ${String(VIEW_BOX_WIDTH)} ${String(geometry.height)}`}
-      preserveAspectRatio="xMinYMin meet"
+      viewBox={`0 0 ${String(geometry.width)} ${String(geometry.height)}`}
+      preserveAspectRatio={measured ? undefined : 'xMinYMin meet'}
     >
       <g className="dg-timeline__lanes">
         {geometry.lanes.map((lane) => {
@@ -1330,7 +1961,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
                 className="dg-timeline__lane"
                 x={0}
                 y={lane.y}
-                width={VIEW_BOX_WIDTH}
+                width={geometry.width}
                 height={lane.height}
               />
               <rect
@@ -1375,7 +2006,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
               />
               <text
                 className="dg-timeline__axis-label"
-                x={clamp(tick.offset, 0, VIEW_BOX_WIDTH)}
+                x={clamp(tick.offset, 0, geometry.width)}
                 y={AXIS_LABEL_BASELINE}
                 textAnchor={axisLabelAnchor(index, tickCount)}
               >
@@ -1393,6 +2024,7 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
             className={clsx(
               'dg-timeline__edge',
               edge.ambiguous && ['dg-timeline__edge--dashed', 'dg-is-ambiguous'],
+              edge.inferred && 'dg-is-inferred',
               // `dg-is-orphan` is the painted state and `dg-is-orphaned` the
               // contract's name for it; both are written, so neither the
               // stylesheet nor a consumer has to guess which spelling won.
@@ -1426,20 +2058,35 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
               onPointerEnter={() => {
                 onHover(bar.row.eventId);
               }}
-              onPointerLeave={() => {
-                onHover(undefined);
-              }}
             >
-              <title>{describeBar(bar.row, origin)}</title>
+              {/* The user agent's own tooltip, kept for the pointer. The same
+                  sentence is author-rendered in the detail strip, which the
+                  pointer can reach and Escape dismisses, and in the table row's
+                  description, which keyboard focus opens. */}
+              <title>{describeBar(bar.row, origin, spanNames)}</title>
             </rect>
-            <text
-              className="dg-timeline__bar-label"
-              x={bar.labelX}
-              y={bar.centerY}
-              textAnchor={bar.labelAnchor}
-            >
-              {bar.label}
-            </text>
+            {bar.label === undefined || bar.label.placement === 'inside' ? null : (
+              <rect
+                className="dg-timeline__bar-label-backdrop"
+                x={bar.label.start - BAR_LABEL_INSET}
+                y={bar.y}
+                width={bar.label.width + BAR_LABEL_INSET * 2}
+                height={bar.height}
+              />
+            )}
+            {bar.label === undefined ? null : (
+              <text
+                className={clsx(
+                  'dg-timeline__bar-label',
+                  bar.label.placement === 'inside' && 'dg-timeline__bar-label--inside',
+                )}
+                x={bar.label.x}
+                y={bar.centerY}
+                textAnchor={bar.label.anchor}
+              >
+                {bar.label.text}
+              </text>
+            )}
           </g>
         );
       })}
@@ -1456,16 +2103,79 @@ function TimelineCanvas(props: TimelineCanvasProps): ReactElement {
 /** What {@link TimelineDetail} shows. */
 interface TimelineDetailProps {
   /**
-   * The row under the pointer; when the pointer is away, the row in the table
-   * that holds keyboard focus; and otherwise the selected one.
+   * The row to spell out: the row under the pointer; when the pointer is away,
+   * the row in the table that holds keyboard focus; and otherwise the selected
+   * one. `undefined` when there is none of the three, which draws the strip's
+   * resting line instead — the strip itself never leaves the layout.
    */
-  readonly row: TimelineBar;
+  readonly row: TimelineBar | undefined;
+  /**
+   * Whether `row` is a preview — the hovered or focused row, shown in place of
+   * the selection only while the pointer or focus rests on it — rather than
+   * the selected row itself. Stated in words at the head of the strip, so the
+   * reader can tell a passing preview from what they selected.
+   */
+  readonly previewing: boolean;
   /** The window start every offset is measured from. */
   readonly origin: number;
+  /** The names of the spans on screen, so the lineage notes can name candidates. */
+  readonly spanNames: SpanNames;
 }
 
+/** What {@link TimelineDetail} needs beyond the line it draws. */
+interface TimelineDetailStripProps extends TimelineDetailProps {
+  /**
+   * Receives the strip's element, so the parent can tell a pointer resting on
+   * the strip — which keeps a hover preview — from one that moved elsewhere.
+   */
+  readonly stripRef: RefObject<HTMLDivElement | null>;
+  /**
+   * Raised with the shown row's event id when focus arrives inside the strip,
+   * so the row the reader is reading holds the strip for as long as focus stays
+   * in it, whatever the pointer does meanwhile.
+   */
+  readonly onFocusWithin: (eventId: string) => void;
+}
+
+/** The strip's accessible name: what the region beside the canvas is for. */
+const DETAIL_LABEL = 'Span detail';
+
+/** The strip's resting line, while no span is hovered, focused or selected. */
+const DETAIL_RESTING_TEXT = 'Select a span, or point at a bar, to see its detail here.';
+
+/** The lead word of the strip while it shows the selected span. */
+const DETAIL_SELECTED_LEAD = 'Selected';
+
+/** The lead word of the strip while it previews a hovered or focused span. */
+const DETAIL_PREVIEW_LEAD = 'Preview';
+
 /**
- * The hovered, focused or selected row, spelled out beside the canvas.
+ * The selected row, spelled out between the canvas and the table — or, while
+ * the pointer or keyboard focus rests on another row, a preview of that row.
+ *
+ * **The strip is always in the layout.** It occupies one reserved line
+ * (`dg-timeline__detail` in `../styles/components.css`) whether or not a row
+ * is shown, and it never wraps: a strip that appeared on hover and grew with
+ * its content would push the table down under the pointer that was reading it.
+ * A line longer than the panel is wide scrolls inside the strip instead of
+ * adding a second one, and every value in it is also in the row's own cells
+ * below. While nothing is hovered, focused or selected it shows a resting line
+ * that says how to fill it.
+ *
+ * **It follows the selection; a hover or a focus is a preview.** What it shows
+ * by default is the selected span, and a row under the pointer or holding
+ * keyboard focus replaces it only for as long as the pointer or focus stays —
+ * the lead word says which of the two the reader is looking at.
+ *
+ * **A preview is hoverable and dismissible (WCAG 1.4.13).** A bar's preview
+ * does not end when the pointer leaves the bar: it stays while the pointer
+ * crosses the canvas and the gap below it and rests on this strip, so the
+ * source chip in it can be reached and used, and it ends when the pointer
+ * moves on to the table, the toolbar or out of the view. Escape dismisses a
+ * preview without moving the pointer or focus — see `TimelineView` for the two
+ * listeners. Focus inside the strip — on the source chip a pointer clicked —
+ * holds the row it shows, so neither the pointer moving away nor a dismissal
+ * can pull the focused chip out from under the reader.
  *
  * This is where a bar's description is readable: the `Tooltip` primitive wraps
  * an HTML element and cannot wrap an SVG shape, so the stylesheet gives this
@@ -1474,44 +2184,123 @@ interface TimelineDetailProps {
  * here — the name, the kind, the tier, the duration, the offset, the status and
  * the lineage notes — and the chip, where the row resolved to a location.
  *
- * The name is the tooltip's trigger, and it is focusable on purpose: the
- * primitive opens on focus, so an unfocusable trigger would leave the full
- * description to pointer users alone. It is named by its own text, and the
- * global `:focus-visible` rule in `../styles/base.css` draws its ring.
+ * The name is the tooltip's trigger for a POINTER, and it is deliberately not a
+ * tab stop: the strip mirrors the table row that holds focus, and that row —
+ * while it holds keyboard focus — reveals the same description in its own
+ * Operation cell (see {@link TimelineOperationName} and this module's header).
+ * A focusable copy here would be a stray stop outside the table's roving tab
+ * order. The strip's source chip is out of the tab order too, so nothing in the
+ * strip is a stop: focus reaches it only when a pointer clicks that chip. The
+ * trigger still carries the description as `aria-describedby`, so the full
+ * sentence stays attached to the name for assistive technology.
  */
-function TimelineDetail(props: TimelineDetailProps): ReactElement {
-  const { row, origin } = props;
-  const note = lineageNoteFor(row);
+function TimelineDetail(props: TimelineDetailStripProps): ReactElement {
+  const { row, previewing, origin, spanNames, stripRef, onFocusWithin } = props;
+  const shownEventId = row?.eventId;
+
+  // React's `onFocus` bubbles, so focus landing on the source chip — the one
+  // focusable part of the strip, reached by a pointer — reaches this handler.
+  // The resting line holds nothing focusable, so there is no row to report
+  // while it shows.
+  const handleFocus = useCallback((): void => {
+    if (shownEventId !== undefined) {
+      onFocusWithin(shownEventId);
+    }
+  }, [onFocusWithin, shownEventId]);
 
   return (
-    <Stack direction="horizontal" gap={2} align="center" wrap>
-      <Badge variant="soft" color={kindColorVar(row.kind)}>
-        {formatKindLabel(row.kind)}
-      </Badge>
-      <Badge variant="outline" color={tierColorVar(row.tier)}>
-        {formatTierLabel(row.tier)}
-      </Badge>
-      <div className="dg-timeline__tooltip">
-        <Tooltip content={describeBar(row, origin)}>
-          <Text size="sm" truncate tabIndex={0}>
-            {row.name}
-          </Text>
-        </Tooltip>
-      </div>
-      <DurationCell ms={row.durationMs} severity="auto" size="sm" />
-      <Text size="sm" tone="secondary" numeric>
-        {formatOffset(row.startTime, origin)}
-      </Text>
-      <Badge variant="soft" tone={statusToneFor(row.status)}>
-        {formatStatusLabel(row.status)}
-      </Badge>
-      {row.source === undefined ? null : <SourceLink location={row.source} compact />}
-      {note === undefined ? null : (
-        <Text size="xs" tone="warning">
-          {note}
+    <div
+      ref={stripRef}
+      className="dg-timeline__detail"
+      role="group"
+      aria-label={DETAIL_LABEL}
+      onFocus={handleFocus}
+    >
+      {row === undefined ? (
+        <Text size="sm" tone="muted">
+          {DETAIL_RESTING_TEXT}
         </Text>
+      ) : (
+        <TimelineDetailLine
+          row={row}
+          previewing={previewing}
+          origin={origin}
+          spanNames={spanNames}
+        />
       )}
-    </Stack>
+    </div>
+  );
+}
+
+/**
+ * The one line {@link TimelineDetail} draws for a row, in two runs.
+ *
+ * The **lead run** — the lead word, the kind and tier badges, and the name with
+ * its description — is what identifies the span, so it is laid out first and
+ * keeps its width; on a narrow panel only the name gives way, truncating. The
+ * **trailing run** — the duration, the offset, the status, the source chip and
+ * the lineage note — takes what width is left and is clipped at the strip's
+ * inline end rather than wrapped (`dg-timeline__detail-rest`). The name's
+ * description bubble opens from the lead run, which clips nothing, so it is
+ * never cut off by the strip however narrow the panel is.
+ *
+ * @param props The row, whether it is a preview, the window start, and the
+ *   names of the spans on screen, which the lineage note and the description
+ *   name an ambiguous attribution's other candidates by.
+ * @returns The line, laid out without wrapping.
+ */
+function TimelineDetailLine(
+  props: TimelineDetailProps & { readonly row: TimelineBar },
+): ReactElement {
+  const { row, previewing, origin, spanNames } = props;
+  const note = lineageNoteFor(row, spanNames);
+
+  return (
+    <>
+      <Stack direction="horizontal" gap={2} align="center">
+        <Text size="xs" tone="muted">
+          {previewing ? DETAIL_PREVIEW_LEAD : DETAIL_SELECTED_LEAD}
+        </Text>
+        <Badge variant="soft" color={kindColorVar(row.kind)}>
+          {formatKindLabel(row.kind)}
+        </Badge>
+        <Badge variant="outline" color={tierColorVar(row.tier)}>
+          {formatTierLabel(row.tier)}
+        </Badge>
+        <div className="dg-timeline__tooltip">
+          {/* The pointer's trigger and no tab stop: the row holding keyboard
+              focus reveals the same description in its own Operation cell. */}
+          <Tooltip content={describeBar(row, origin, spanNames)}>
+            <Text size="sm" truncate>
+              {row.name}
+            </Text>
+          </Tooltip>
+        </div>
+      </Stack>
+      <div className="dg-timeline__detail-rest">
+        <Stack direction="horizontal" gap={2} align="center">
+          <DurationCell ms={row.durationMs} severity="auto" size="sm" />
+          <Text size="sm" tone="secondary" numeric>
+            {formatOffset(row.startTime, origin)}
+          </Text>
+          <Badge variant="soft" tone={statusToneFor(row.status)}>
+            {formatStatusLabel(row.status)}
+          </Badge>
+          {/* Out of the tab order: the same chip is one arrow key into the
+              row's own Source cell, and this one may sit in the clipped part of
+              the run on a narrow panel, where focus would land on a control the
+              reader cannot see. It stays a real control for the pointer. */}
+          {row.source === undefined ? null : (
+            <SourceLink location={row.source} compact tabIndex={-1} />
+          )}
+          {note === undefined ? null : (
+            <Text size="xs" tone="warning">
+              {note}
+            </Text>
+          )}
+        </Stack>
+      </div>
+    </>
   );
 }
 
@@ -1521,6 +2310,57 @@ function TimelineDetail(props: TimelineDetailProps): ReactElement {
  * ---------------------------------------------------------------------------
  */
 
+/** Props of {@link TimelineOperationName}. */
+interface TimelineOperationNameProps {
+  /** The row whose name and description are shown. */
+  readonly row: TimelineBar;
+  /** The window start every offset is measured from. */
+  readonly origin: number;
+  /** The names of the spans on screen, so the description can name candidates. */
+  readonly spanNames: SpanNames;
+  /** Whether the row itself holds keyboard focus and has not dismissed it. */
+  readonly revealed: boolean;
+}
+
+/**
+ * The name in a row's Operation cell and the description it announces.
+ *
+ * One `Tooltip`, two ways open. Normally a pointer opens it on hover. While the
+ * row itself holds keyboard focus the row holds the same `Tooltip` open
+ * instead (`open`), because the name is not focusable and must not become a
+ * second stop in the row; the row's own handler answers Escape. Either way the
+ * primitive measures the bubble against the name and re-places it on every
+ * scroll and resize — an open bubble is fixed to the viewport, so one it did
+ * not place would paint at the viewport's corner. It is one element in both
+ * forms, so exactly one `role="tooltip"` belongs to the name at all times and
+ * the name is never remounted by the switch, and the name stays described by
+ * it through `aria-describedby`, so assistive technology hears the description
+ * once. It opens below the name, so a row's description covers the rows after
+ * it and never the table's header above the first row.
+ *
+ * The name carries no `tabIndex` at all — not `-1`, which would make a click on
+ * the name focus the text instead of its row and strand the arrow keys the
+ * table answers only on a row.
+ */
+function TimelineOperationName({
+  row,
+  origin,
+  spanNames,
+  revealed,
+}: TimelineOperationNameProps): ReactElement {
+  return (
+    <Tooltip
+      content={describeBar(row, origin, spanNames)}
+      placement="bottom"
+      open={revealed ? true : undefined}
+    >
+      <Text size="sm" truncate>
+        {row.name}
+      </Text>
+    </Tooltip>
+  );
+}
+
 /**
  * The columns of the tabular equivalent: the fields AAP 0.6.2 says this node
  * reads, in the order a reader scans them.
@@ -1529,36 +2369,49 @@ function TimelineDetail(props: TimelineDetailProps): ReactElement {
  * not copied, not normalised, not rounded — because the object the chip raises
  * is the object the editor opens (see that module). The chip is a real control,
  * and the table primitive does not treat a click inside one as a row
- * activation, so opening a file never also selects the span.
+ * activation, so opening a file never also selects the span. It is
+ * `tabIndex={-1}`, as `../primitives/DataTable` requires of every control a
+ * cell renders: the table's own arrow keys (ArrowRight or F2 on the row) move
+ * focus onto it, and a chip left in the Tab order would add one stop per
+ * rendered row to the single roving stop the table body is.
  *
- * The name in the Operation cell is the trigger of the row's description, and
- * it is a tab stop in exactly one row: the one that holds keyboard focus, one
- * Tab from the row itself. Every other row's name carries no `tabIndex` at all
- * — not `-1`, which would make a click on the name focus the text instead of
- * its row and strand the arrow keys the table answers only on a row — so the
- * table body gains one tab stop, not one per rendered row (see this module's
- * header).
+ * The name in the Operation cell is the trigger of the row's description (see
+ * {@link TimelineOperationName}). It is never a tab stop: the table body is one
+ * roving stop, and the keyboard reads the description while the row itself
+ * holds focus instead (see this module's header).
+ *
+ * Every column has a readable MINIMUM in `ch` of the table's type - the widest
+ * kind chip ("Outgoing request"), tier, status, offset and duration figure plus
+ * the cell's padding - and a share of the spare width. The table primitive sums
+ * those minimums into its floor, so in a narrow panel the equivalent scrolls
+ * horizontally instead of squeezing a column to its padding (see
+ * `../primitives/DataTable`, `DataTableColumn.width`).
  *
  * @param origin The window start every offset in the table is measured from.
- * @param focusedEventId The row that holds keyboard focus, if any.
+ * @param revealedEventId The row whose description is revealed for keyboard
+ *   focus, if any.
+ * @param spanNames The names of the spans on screen, for naming candidates in
+ *   each row's description.
  */
 function timelineColumns(
   origin: number,
-  focusedEventId: string | undefined,
+  revealedEventId: string | undefined,
+  spanNames: SpanNames,
 ): readonly DataTableColumn<TimelineBar>[] {
   return [
     {
       key: 'name',
       header: 'Operation',
       rowHeader: true,
-      width: 'minmax(0, 3fr)',
+      width: 'minmax(28ch, 3fr)',
       cell: (row) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
-          <Tooltip content={describeBar(row, origin)}>
-            <Text size="sm" truncate tabIndex={row.eventId === focusedEventId ? 0 : undefined}>
-              {row.name}
-            </Text>
-          </Tooltip>
+          <TimelineOperationName
+            row={row}
+            origin={origin}
+            spanNames={spanNames}
+            revealed={row.eventId === revealedEventId}
+          />
           {row.orphaned ? (
             <Badge variant="outline" tone="warning">
               Re-attached
@@ -1582,7 +2435,7 @@ function timelineColumns(
     {
       key: 'kind',
       header: 'Kind',
-      width: 'minmax(0, 1fr)',
+      width: 'minmax(18ch, 1fr)',
       cell: (row) => (
         <Badge variant="soft" color={kindColorVar(row.kind)}>
           {formatKindLabel(row.kind)}
@@ -1592,7 +2445,7 @@ function timelineColumns(
     {
       key: 'tier',
       header: 'Tier',
-      width: 'minmax(0, 1fr)',
+      width: 'minmax(11ch, 1fr)',
       cell: (row) => (
         <Badge variant="outline" color={tierColorVar(row.tier)}>
           {formatTierLabel(row.tier)}
@@ -1602,7 +2455,7 @@ function timelineColumns(
     {
       key: 'status',
       header: 'Reported',
-      width: 'minmax(0, 1fr)',
+      width: 'minmax(12ch, 1fr)',
       cell: (row) => (
         <Badge variant="soft" tone={statusToneFor(row.status)}>
           {formatStatusLabel(row.status)}
@@ -1613,7 +2466,7 @@ function timelineColumns(
       key: 'offset',
       header: 'Offset',
       align: 'end',
-      width: 'minmax(0, 1fr)',
+      width: 'minmax(12ch, 1fr)',
       cell: (row) => (
         <Text size="sm" tone="secondary" numeric>
           {formatOffset(row.startTime, origin)}
@@ -1624,20 +2477,22 @@ function timelineColumns(
       key: 'duration',
       header: 'Duration',
       align: 'end',
-      width: 'minmax(0, 1fr)',
+      width: 'minmax(13ch, 1fr)',
       cell: (row) => <DurationCell ms={row.durationMs} severity="auto" size="sm" />,
     },
     {
       key: 'source',
       header: 'Source',
-      width: 'minmax(0, 2fr)',
+      width: 'minmax(24ch, 2fr)',
       cell: (row) =>
         row.source === undefined ? (
           <Text size="sm" tone="muted">
             {NOT_AVAILABLE_LABEL}
           </Text>
         ) : (
-          <SourceLink location={row.source} compact />
+          // Out of the Tab order and reached by the table's arrow keys (see
+          // above); still a real, pointer-activatable control.
+          <SourceLink location={row.source} compact tabIndex={-1} />
         ),
     },
   ];
@@ -1690,12 +2545,45 @@ function rowHoldingFocus(
   return Number.isInteger(index) ? rows[index] : undefined;
 }
 
+/** Whether `target` is a data row element of the equivalent table itself. */
+function isDataRowElement(target: EventTarget): boolean {
+  return target instanceof Element && target.matches(DATA_ROW_SELECTOR);
+}
+
 /** The row carrying `eventId`, or `undefined` for none or an id not on screen. */
 function rowWithId(
   rows: readonly TimelineBar[],
   eventId: string | undefined,
 ): TimelineBar | undefined {
   return eventId === undefined ? undefined : rows.find((row) => row.eventId === eventId);
+}
+
+/**
+ * The row the panel's selection stands for, or `undefined` when nothing is
+ * selected or the selected event is not among the rows on screen.
+ *
+ * The row carrying the selected event id wins. Failing that, the first row that
+ * names the same trace **and** the same span — the other pairing
+ * `matchesPanelSelection` accepts — so a selection reported by a view that drew
+ * the span under another record's id still lands on it here. At most one row is
+ * returned: the table marks a single selected row and the canvas marks that
+ * same one, so the two representations can never disagree.
+ *
+ * @param rows The rows on screen, in the model's order.
+ * @param selection The panel's selection, as `useViewSelection` returns it.
+ * @returns The selected row, if it is on screen.
+ */
+function rowForSelection(
+  rows: readonly TimelineBar[],
+  selection: PanelSelection | undefined,
+): TimelineBar | undefined {
+  if (selection === undefined) {
+    return undefined;
+  }
+
+  return (
+    rowWithId(rows, selection.eventId) ?? rows.find((row) => matchesPanelSelection(selection, row))
+  );
 }
 
 /*
@@ -1775,6 +2663,74 @@ const LOAD_MORE_LABEL = 'Load more spans';
 const LOADING_MORE_LABEL = 'Loading more spans…';
 
 /**
+ * The footer control that raises a trace walk's row bound by one step. A trace
+ * arrives whole, so this shows more of what is already in memory rather than
+ * asking the provider for another page.
+ */
+const SHOW_MORE_SPANS_LABEL = 'Show more spans';
+
+/**
+ * The refine route for a trace the correlator bounded, in the words the flame
+ * chart uses: nothing more of it is in memory, so no control could show more.
+ */
+const REFINE_TRUNCATED_TRACE = 'Narrow the query or capture a shorter interaction to see the rest.';
+
+/**
+ * The row bound after one "Show more spans": one default step higher, capped
+ * at the trace's own node count when that count is larger than the bound in
+ * force. A trace whose count cannot be believed still moves by one step, so
+ * the control always reveals something the walk left out.
+ *
+ * @param maxRows The row bound in force.
+ * @param nodeCount The trace's own node count.
+ * @returns The next row bound.
+ */
+function nextTraceRowBound(maxRows: number, nodeCount: number): number {
+  const stepped = maxRows + DEFAULT_MAX_TRACE_ROWS;
+  return nodeCount > maxRows ? Math.min(stepped, nodeCount) : stepped;
+}
+
+/**
+ * The footer's statement about a trace — or about span pages the service
+ * reported no total for, which read as a bare count — the counterpart of a
+ * span page's "Showing N of M spans.".
+ *
+ * A walk stopped at its row bound states N of M, where M is the trace's own
+ * node count — or, for a trace whose count cannot be believed, only that these
+ * are the first N. A trace the correlator bounded, or whose depth the walk
+ * clamped, says that more was captured than this view holds, and the
+ * correlator's case adds the refine route.
+ *
+ * @param model The payload's model.
+ * @returns The footer text.
+ */
+function traceFooterText(model: TimelineModel): string {
+  const loaded = model.rows.length;
+  const total = model.nodeCount ?? 0;
+  const sentences: string[] = [];
+
+  if (!model.walkBounded) {
+    sentences.push(`${formatCount(loaded)} spans shown.`);
+  } else if (total > loaded) {
+    sentences.push(`${formatCount(loaded)} of ${formatCount(total)} spans shown.`);
+  } else {
+    sentences.push(`The first ${formatCount(loaded)} spans of this trace are shown.`);
+  }
+
+  // Neither the correlator's bound nor the depth bound is lifted by a larger
+  // row bound, so each is stated on its own, and the correlator's with the one
+  // route that does reach the rest.
+  if (model.correlatorTruncated || model.depthClamped) {
+    sentences.push('More were captured than this view holds.');
+  }
+  if (model.correlatorTruncated) {
+    sentences.push(REFINE_TRUNCATED_TRACE);
+  }
+
+  return sentences.join(' ');
+}
+
+/**
  * The title shown for a resolved span page that held nothing while the result
  * may not: one that named a next page, one short of or past the end of a
  * positive total, and one past the first row of a result with no total.
@@ -1787,13 +2743,6 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
  */
 const EMPTY_PAGE_MESSAGE =
   'This page of spans held nothing to place on the axis. More of the result remains to be loaded.';
-
-/** The title of the footer's failure, when the rows above it are still good. */
-const PAGE_ERROR_TITLE = 'The next page of spans could not be loaded';
-
-/** The footer failure's message when the provider's error carried none. */
-const PAGE_ERROR_MESSAGE =
-  'The spans already shown are unaffected; retry to request the page again.';
 
 /** What one empty state says: its short label and the sentence beneath it. */
 interface EmptyCopy {
@@ -2001,9 +2950,11 @@ export interface TimelineProps {
  * host that rebinds a mounted panel to another session swaps the provider
  * without remounting the node, and the same node id and query can recur in
  * that session's panel; the accumulated pages, the next offset and the
- * selected, hovered and focused rows of the previous provider must not
- * survive into it, so a new provider is a new instance that paints none of
- * them and starts from the authored first page.
+ * hovered and focused rows of the previous provider must not survive into it,
+ * so a new provider is a new instance that paints none of them and starts from
+ * the authored first page. The selection is the panel host's, which drops it
+ * with the panel it was made in; outside a host it is this instance's own
+ * fallback and goes with it.
  *
  * @example The node a panel carries, rendered inside a host that provides a
  * data provider and the panel actions.
@@ -2051,8 +3002,8 @@ function useProviderGeneration(): number {
 }
 
 /**
- * The stateful body of {@link Timeline}: one provider's pages, selection and
- * focus for one node.
+ * The stateful body of {@link Timeline}: one provider's pages, hover and focus
+ * for one node, marking the panel's shared selection.
  *
  * @param props The props, as documented on {@link TimelineProps}.
  * @returns The chart and its tabular equivalent, or one of the three states.
@@ -2064,13 +3015,47 @@ function TimelineView(props: TimelineProps): ReactElement {
   // that module's documented contract: a surface with no actions still renders.
   const actions = usePanelActions();
 
+  // The panel's one shared selection under a host — so this chart marks the
+  // span a flame cell, a table row or an evidence chip selected, and they mark
+  // the one selected here — and this view's own last activation outside one
+  // (see `useViewSelection` in ../host/PanelActions).
+  const { selection, markSelected } = useViewSelection();
+
   const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
-  const [selectedEventId, setSelectedEventId] = useState<string | undefined>(undefined);
+  // A trace walk's row bound as raised by "Show more spans", tagged with the
+  // query it was raised for, like the page accumulator: a changed query reads
+  // the default bound again on the render that shows it.
+  const [raisedTraceBound, setRaisedTraceBound] = useState<
+    { readonly identity: string; readonly maxRows: number } | undefined
+  >(undefined);
+  // The bar the pointer last entered, previewed in the detail strip until the
+  // pointer leaves the canvas-and-strip region or Escape dismisses it.
   const [hoveredEventId, setHoveredEventId] = useState<string | undefined>(undefined);
   // The row of the equivalent table that holds keyboard focus, while focus is
-  // anywhere inside this view: it drives the detail strip and makes that row's
-  // name a tab stop (see this module's header).
+  // anywhere inside this view: it drives the detail strip (see this module's
+  // header).
   const [focusedEventId, setFocusedEventId] = useState<string | undefined>(undefined);
+  // The focused row whose preview Escape dismissed. The preview stays away for
+  // as long as focus stays on that row, and returns when focus moves to another
+  // one; the row stays the table's tab stop.
+  const [dismissedFocusEventId, setDismissedFocusEventId] = useState<string | undefined>(undefined);
+  // The row whose description is revealed in its Operation cell: set when the
+  // row element itself receives focus that no pointer press caused, cleared
+  // when that row loses focus and by Escape.
+  const [revealedEventId, setRevealedEventId] = useState<string | undefined>(undefined);
+  // Set by a pointer press inside the table and consumed by the focus it
+  // causes, so a click — which focuses the row too — does not pop a bubble the
+  // hover tooltip already offers. A ref, not state: it changes nothing on screen.
+  const pointerFocusRef = useRef(false);
+
+  // The block, the canvas's scroll container and the detail strip: the one
+  // region a hover preview survives the pointer crossing, and the document the
+  // view is mounted in, which is where an Escape pressed while the pointer
+  // rests on a bar arrives. The block is also where a focus handoff after
+  // "Show more spans" finds the table's tab stop.
+  const blockRef = useRef<HTMLDivElement | null>(null);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
+  const stripRef = useRef<HTMLDivElement | null>(null);
 
   const source = node.query.source;
 
@@ -2093,6 +3078,10 @@ function TimelineView(props: TimelineProps): ReactElement {
   // not even for one frame, and it returns to its first page by derivation.
   const activePages = pages !== undefined && pages.identity === queryIdentity ? pages : undefined;
   const carriedRows = activePages?.rows ?? NO_EVENTS;
+  const maxTraceRows =
+    raisedTraceBound !== undefined && raisedTraceBound.identity === queryIdentity
+      ? raisedTraceBound.maxRows
+      : DEFAULT_MAX_TRACE_ROWS;
 
   // One page size for every request, held inside the contract's bounds and
   // never grown; the walk advances by offset instead (see "Paging"). The floor
@@ -2134,7 +3123,7 @@ function TimelineView(props: TimelineProps): ReactElement {
     // state below, never an error.
     const tree = traceResult.data;
     if (tree !== undefined && tree !== null) {
-      return modelFromTrace(tree);
+      return modelFromTrace(tree, maxTraceRows);
     }
 
     // Every row loaded so far. While a further page is in flight, or after it
@@ -2145,46 +3134,274 @@ function TimelineView(props: TimelineProps): ReactElement {
     }
 
     return undefined;
-  }, [traceResult.data, spansPage, spanRows]);
+  }, [traceResult.data, spansPage, spanRows, maxTraceRows]);
+
+  // The canvas's viewport, observed: its inner width in CSS pixels once it has
+  // been laid out (`undefined` before that and wherever there is no layout),
+  // and a measure of the bar-label font — `.dg-timeline__bar-label` is set in
+  // `--dg-mono-sm`. Called unconditionally, as a hook must be; its ref attaches
+  // only when the viewport renders, which is the settled state below.
+  const {
+    ref: measureViewportRef,
+    width: viewportWidth,
+    measureText,
+  } = useChartCanvas<HTMLDivElement>({ font: 'monoSm' });
+  const measured = isMeasuredWidth(viewportWidth);
+  const canvasWidth = resolveCanvasWidth(viewportWidth);
+
+  // One element, two readers: the measure above observes the viewport's width,
+  // and `viewportRef` is how the hover handlers below ask whether the pointer
+  // is still inside it. The callback ref attaches both and detaches both.
+  const attachViewport = useCallback(
+    (element: HTMLDivElement | null) => {
+      viewportRef.current = element;
+      const release = measureViewportRef(element);
+
+      return () => {
+        viewportRef.current = null;
+        release?.();
+      };
+    },
+    [measureViewportRef],
+  );
 
   const geometry = useMemo<TimelineGeometry | undefined>(
-    () => (model === undefined ? undefined : buildGeometry(model)),
+    () =>
+      model === undefined ? undefined : buildGeometry(model, { width: canvasWidth, measureText }),
+    [model, canvasWidth, measureText],
+  );
+
+  // The names every description draws candidate parents from: one lookup per
+  // model, shared by the bar titles, the detail strip and the table.
+  const spanNames = useMemo<SpanNames>(
+    () => (model === undefined ? NO_SPAN_NAMES : spanNamesOf(model.rows)),
     [model],
   );
 
+  // Records the activation (a no-op under a host, which records the report
+  // itself) and reports it, so every view of the panel follows. All three
+  // coordinates are supplied because this view holds all three.
   const handleSelect = useCallback(
     (row: TimelineBar): void => {
-      setSelectedEventId(row.eventId);
-      actions?.onSelectEvent({
+      const ref: PanelEventRef = {
         eventId: row.eventId,
         spanId: row.spanId,
         traceId: row.traceId,
-      });
+      };
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
+    [actions, markSelected],
   );
 
-  const handleHover = useCallback((eventId: string | undefined): void => {
+  // The selected row, and the two previews that may stand in for it in the
+  // strip. Each preview is resolved against the rows on screen on its own, so an
+  // id that no longer names a row falls through to the next rather than
+  // blanking the strip. A focused row is a preview only while it differs from
+  // the selection and Escape has not dismissed it.
+  const modelRows = model?.rows;
+  const selectedRow = modelRows === undefined ? undefined : rowForSelection(modelRows, selection);
+  const hoveredRow = modelRows === undefined ? undefined : rowWithId(modelRows, hoveredEventId);
+  const focusedRow =
+    modelRows === undefined || focusedEventId === dismissedFocusEventId
+      ? undefined
+      : rowWithId(modelRows, focusedEventId);
+  const hoverPreviewing = hoveredRow !== undefined;
+  const focusPreviewing = focusedRow !== undefined && focusedRow !== selectedRow;
+
+  const handleHover = useCallback((eventId: string): void => {
     setHoveredEventId(eventId);
   }, []);
+
+  // Ends the hover preview once the pointer is over anything outside the
+  // canvas-and-strip region: the toolbar, the table, the footer. The block's
+  // own box is the gap between the canvas and the strip, which the pointer
+  // crosses on its way down, so it keeps the preview. Leaving a bar does not
+  // end it, which is what lets the pointer reach the strip at all (WCAG 1.4.13
+  // "hoverable").
+  const handleBlockPointerOver = useCallback((event: ReactPointerEvent<HTMLDivElement>): void => {
+    const { target, currentTarget } = event;
+    if (!(target instanceof Node) || target === currentTarget) {
+      return;
+    }
+
+    if (
+      viewportRef.current?.contains(target) === true ||
+      stripRef.current?.contains(target) === true
+    ) {
+      return;
+    }
+
+    setHoveredEventId(undefined);
+  }, []);
+
+  // The pointer left the view altogether. Listened for as the native,
+  // non-bubbling `pointerleave` of the block itself rather than through React's
+  // synthetic leave, which React derives from `pointerout` and its
+  // `relatedTarget`: a pointer event that reports no related target reads to
+  // React as leaving the window, and would end a preview the pointer is still
+  // carrying from a bar to the strip. The native event is dispatched only when
+  // the pointer really leaves the block.
+  useEffect(() => {
+    const block = blockRef.current;
+    if (block === null) {
+      return undefined;
+    }
+
+    const end = (): void => {
+      setHoveredEventId(undefined);
+    };
+
+    block.addEventListener('pointerleave', end);
+    return () => {
+      block.removeEventListener('pointerleave', end);
+    };
+  }, []);
+
+  // The first Escape layer, for a preview that keyboard focus drives: the key
+  // reaches the element holding focus, and every focusable part of this view
+  // is inside the block. It dismisses both previews — the strip then shows the
+  // selection, or its resting line — and consumes the key only when it
+  // dismissed something, so a dialog or a shortcut above the panel still sees
+  // an Escape this view had no use for. Anything open nearer the focus closes
+  // first and consumes that press itself — the description a keyboard-focused
+  // row reveals (see `handleEquivalentKeyDown`), or a `Tooltip` bubble open on
+  // a control inside a row — so each press dismisses one layer. Focus inside
+  // the strip — on the source chip a pointer clicked — is reading the preview
+  // itself, and dismissing the strip would unmount the focused chip.
+  const handleBlockKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+      if (event.key !== 'Escape' || event.defaultPrevented) {
+        return;
+      }
+
+      const { target } = event;
+      if (target instanceof Node && stripRef.current?.contains(target) === true) {
+        return;
+      }
+
+      if (!hoverPreviewing && !focusPreviewing) {
+        return;
+      }
+
+      setHoveredEventId(undefined);
+      if (focusPreviewing) {
+        setDismissedFocusEventId(focusedEventId);
+      }
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    [focusPreviewing, focusedEventId, hoverPreviewing],
+  );
+
+  // The second Escape layer, for a preview the pointer drives: the pointer does
+  // not move focus, so while the pointer rests on a bar or on the strip the key
+  // goes to whatever holds focus — most often the page body. The listener lives
+  // on the view's own document for exactly as long as a hover preview is shown,
+  // and consumes nothing. An Escape something else already handled is left
+  // alone, and one the handler above consumed never arrives.
+  useEffect(() => {
+    if (!hoverPreviewing) {
+      return undefined;
+    }
+
+    const ownerDocument = blockRef.current?.ownerDocument ?? document;
+    const dismiss = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape' || event.defaultPrevented) {
+        return;
+      }
+
+      // Focus inside the strip holds the row it shows (see
+      // `handleStripFocus`), so ending the hover preview never unmounts the
+      // focused chip.
+      setHoveredEventId(undefined);
+    };
+
+    ownerDocument.addEventListener('keydown', dismiss);
+    return () => {
+      ownerDocument.removeEventListener('keydown', dismiss);
+    };
+  }, [hoverPreviewing]);
 
   // Follows focus into the equivalent table, wherever in a row it lands. React's
   // `onFocus` bubbles, so one handler on the table's wrapper sees the roving row
   // and every control inside it; focus that lands outside a data row changes
-  // nothing.
-  const modelRows = model?.rows;
+  // nothing. Focus reaching another row ends a dismissal, so that row previews.
+  // The row's description is revealed only for focus of the row element itself
+  // that no pointer press caused: Tab, Shift+Tab and the table's arrow keys.
+  // Focus on a control inside the row — its source chip, which the arrow keys
+  // also reach — is not the row's and reveals nothing. The reveal is decided on
+  // every focus a row receives, not only when the focused row changes, so
+  // returning from the chip to its own row reveals that row's description
+  // again.
   const handleEquivalentFocus = useCallback(
     (event: ReactFocusEvent<HTMLDivElement>): void => {
+      const fromPointer = pointerFocusRef.current;
+      pointerFocusRef.current = false;
+
       if (modelRows === undefined) {
         return;
       }
 
       const row = rowHoldingFocus(event.target, event.currentTarget, modelRows);
-      if (row !== undefined) {
+      if (row === undefined) {
+        return;
+      }
+
+      if (row.eventId !== focusedEventId) {
         setFocusedEventId(row.eventId);
+        setDismissedFocusEventId(undefined);
+      }
+      setRevealedEventId(isDataRowElement(event.target) && !fromPointer ? row.eventId : undefined);
+    },
+    [focusedEventId, modelRows],
+  );
+
+  // Focus arriving inside the strip makes the row it shows the focused one, so
+  // the strip keeps showing it while the reader is in it. Nothing in the strip
+  // is a tab stop, so that focus is a pointer's: a click on the strip's source
+  // chip, most often while the pointer is previewing a bar.
+  const handleStripFocus = useCallback(
+    (eventId: string): void => {
+      if (eventId !== focusedEventId) {
+        setFocusedEventId(eventId);
+        setDismissedFocusEventId(undefined);
       }
     },
-    [modelRows],
+    [focusedEventId],
+  );
+
+  // A row element losing focus — to another row, to a control inside it, or out
+  // of the table — ends its reveal; the focus that follows, if it lands on a
+  // row, reveals that row's instead.
+  const handleEquivalentBlur = useCallback((event: ReactFocusEvent<HTMLDivElement>): void => {
+    if (isDataRowElement(event.target)) {
+      setRevealedEventId(undefined);
+    }
+  }, []);
+
+  const handleEquivalentPointerDown = useCallback((): void => {
+    pointerFocusRef.current = true;
+  }, []);
+
+  // Escape dismisses the revealed description until focus moves to another
+  // row, and is consumed only when there was one to dismiss: a dialog or a
+  // picking mode above the panel needs Escape too. It is the innermost of the
+  // view's Escape layers, so the press stops here and the strip's preview of
+  // the same row is the next press's to dismiss (see `handleBlockKeyDown`). An
+  // Escape something inside the table already handled is left alone. Any key
+  // press is keyboard use, so it also forgets a pointer press that caused no
+  // focus.
+  const handleEquivalentKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+      pointerFocusRef.current = false;
+      if (event.key === 'Escape' && !event.defaultPrevented && revealedEventId !== undefined) {
+        event.preventDefault();
+        event.stopPropagation();
+        setRevealedEventId(undefined);
+      }
+    },
+    [revealedEventId],
   );
 
   // Forgets the focused row only when focus leaves this view altogether. Moving
@@ -2197,6 +3414,7 @@ function TimelineView(props: TimelineProps): ReactElement {
     }
 
     setFocusedEventId(undefined);
+    setDismissedFocusEventId(undefined);
   }, []);
 
   // Where the next page starts, read off the page that settled; `undefined`
@@ -2227,8 +3445,52 @@ function TimelineView(props: TimelineProps): ReactElement {
     });
   }, [nextPageOffset, queryIdentity, spanRows, knownTotal]);
 
+  /**
+   * Set when "Show more spans" was activated, and read once the rows it asked
+   * for have rendered: when the bound now covers the whole trace, the control
+   * that held focus has gone, and focus moves to the table's tab stop rather
+   * than falling back to the document.
+   */
+  const focusAfterShowMore = useRef(false);
+
+  const traceNodeCount = model?.nodeCount;
+  const handleShowMoreSpans = useCallback((): void => {
+    if (traceNodeCount === undefined) {
+      return;
+    }
+    focusAfterShowMore.current = true;
+    setRaisedTraceBound({
+      identity: queryIdentity,
+      maxRows: nextTraceRowBound(maxTraceRows, traceNodeCount),
+    });
+  }, [maxTraceRows, queryIdentity, traceNodeCount]);
+
+  useEffect(() => {
+    if (!focusAfterShowMore.current) {
+      return;
+    }
+    focusAfterShowMore.current = false;
+    const block = blockRef.current;
+    const active = block?.ownerDocument.activeElement;
+    // Only a focus that was lost is handed on: while the control remains, it
+    // keeps focus, and a reader who has moved elsewhere is left where they are.
+    if (
+      block === null ||
+      (active !== null && active !== undefined && active !== block.ownerDocument.body)
+    ) {
+      return;
+    }
+    block.querySelector<HTMLElement>('.dg-timeline__equivalent [tabindex="0"]')?.focus();
+  }, [model]);
+
   const activeResult = source === 'trace' ? traceResult : spansResult;
-  const serializedQuery = JSON.stringify(node.query, null, 2);
+
+  // The query the active hook was handed: exactly what a failure reports as the
+  // failing query and what its retry asks again — for a span result, the page
+  // size and offset this render requested included. The authored query stands
+  // in only when neither hook was handed one, which is the unsupported source,
+  // and that branch reports the authored query itself.
+  const activeQuery: DataQuery = (source === 'trace' ? traceQuery : spansQuery) ?? node.query;
 
   // A further span page in flight behind rows already on screen, and one that
   // failed behind them. Both are reported in the footer; neither replaces the
@@ -2240,15 +3502,13 @@ function TimelineView(props: TimelineProps): ReactElement {
   let content: ReactNode;
 
   if (!supported) {
+    // A panel defect rather than a failed request: nothing was asked, so the
+    // authored query is what is shown and no retry is offered — asking again
+    // cannot change the answer. The wording is the shared contract's, composed
+    // from this node type's catalog entry.
     content = (
       <div className="dg-timeline__error">
-        <ErrorState
-          title="This view cannot draw the requested data"
-          message={`A correlated timeline places each record on a shared axis, so it can read only ${CATALOG_ENTRY.sources.join(
-            ' or ',
-          )}. The panel asked for “${source}”.`}
-          query={serializedQuery}
-        />
+        <ErrorState {...unsupportedQueryProps(node.type, node.query)} />
       </div>
     );
   } else if (activeResult.status === 'loading' && !appending) {
@@ -2258,14 +3518,13 @@ function TimelineView(props: TimelineProps): ReactElement {
       </div>
     );
   } else if (activeResult.status === 'error' && !pageFailed) {
+    // Nothing is on screen yet, so the failure is the view's: the shared
+    // contract supplies the title, the generic lead with the provider's cause,
+    // the hint, the code, the failing query in the one format every node
+    // prints, the technical details, the announcement and the retry.
     content = (
       <div className="dg-timeline__error">
-        <ErrorState
-          message={activeResult.error?.message ?? 'The correlated timeline could not be loaded.'}
-          code={activeResult.error?.code}
-          query={serializedQuery}
-          onRetry={activeResult.retry}
-        />
+        <ErrorState {...queryFailureProps(activeResult, activeQuery)} />
       </div>
     );
   } else if (
@@ -2308,9 +3567,16 @@ function TimelineView(props: TimelineProps): ReactElement {
         ? emptySpanPageCopy(pageLimit, pageOffset, knownTotal)
         : NOTHING_CAPTURED_COPY;
 
+    // Only the empty capture carries the view's glyph, as every other view's
+    // empty capture does: a count-only answer or an empty page is a statement
+    // about paging, and its title already names which one it is.
     content = (
       <div className="dg-timeline__empty">
-        <EmptyState title={empty.title} message={empty.message} />
+        <EmptyState
+          title={empty.title}
+          message={empty.message}
+          icon={empty === NOTHING_CAPTURED_COPY ? <ChartGantt className="dg-icon" /> : undefined}
+        />
       </div>
     );
   } else {
@@ -2329,25 +3595,28 @@ function TimelineView(props: TimelineProps): ReactElement {
       pageFailed ||
       (total !== undefined && loaded < total);
 
-    // The pointer first, then keyboard focus, then the selection: each is
-    // resolved against the rows on screen on its own, so an id that no longer
-    // names a row falls through to the next rather than blanking the strip.
-    const detailRow =
-      rowWithId(model.rows, hoveredEventId) ??
-      rowWithId(model.rows, focusedEventId) ??
-      rowWithId(model.rows, selectedEventId);
+    // The selection is what the strip shows; the pointer, then keyboard focus,
+    // preview another row in its place while they rest on it and until Escape
+    // dismisses them (see the three rows resolved above the handlers).
+    const detailRow = hoveredRow ?? focusedRow ?? selectedRow;
+    const previewing = detailRow !== undefined && detailRow !== selectedRow;
 
-    const canvasLabel = `${CATALOG_ENTRY.label}: ${formatCount(
-      loaded,
-    )} spans in ${formatCount(model.tiers.length)} tier lanes over ${formatDuration(
+    // A walk stopped at its row bound says so in the picture's own words, as the
+    // flame chart's does: the subset and the trace it was drawn from.
+    const traceTotal = model.walkBounded ? model.nodeCount : undefined;
+    const drawnCount =
+      traceTotal !== undefined && traceTotal > loaded
+        ? `${formatCount(loaded)} of ${formatCount(traceTotal)}`
+        : formatCount(loaded);
+    const canvasLabel = `${CATALOG_ENTRY.label}: ${drawnCount} spans in ${formatCount(
+      model.tiers.length,
+    )} tier lanes over ${formatDuration(
       windowMs,
     )}. The table below lists every span with its kind, tier, offset and duration.`;
 
     const footerText =
       total === undefined
-        ? model.truncated
-          ? `${formatCount(loaded)} spans shown. More were captured than this view holds.`
-          : `${formatCount(loaded)} spans shown.`
+        ? traceFooterText(model)
         : `Showing ${formatCount(loaded)} of ${formatCount(total)} spans.`;
 
     content = (
@@ -2367,38 +3636,63 @@ function TimelineView(props: TimelineProps): ReactElement {
           ]}
         />
 
-        <div className="dg-timeline__viewport">
+        <div ref={attachViewport} className="dg-timeline__viewport">
           <TimelineCanvas
             geometry={geometry}
+            measured={measured}
             origin={model.startTime}
-            selectedEventId={selectedEventId}
+            spanNames={spanNames}
+            selectedEventId={selectedRow?.eventId}
             onSelect={handleSelect}
             onHover={handleHover}
             label={canvasLabel}
           />
         </div>
 
-        {detailRow === undefined ? null : (
-          <TimelineDetail row={detailRow} origin={model.startTime} />
-        )}
+        {/* Always drawn, in a reserved line, so neither a hover nor a
+            selection moves the table below it (see `TimelineDetail`). */}
+        <TimelineDetail
+          row={detailRow}
+          previewing={previewing}
+          origin={model.startTime}
+          spanNames={spanNames}
+          stripRef={stripRef}
+          onFocusWithin={handleStripFocus}
+        />
 
-        <div className="dg-timeline__equivalent" onFocus={handleEquivalentFocus}>
+        <div
+          className="dg-timeline__equivalent"
+          onFocus={handleEquivalentFocus}
+          onBlur={handleEquivalentBlur}
+          onPointerDown={handleEquivalentPointerDown}
+          onKeyDown={handleEquivalentKeyDown}
+        >
           <DataTable<TimelineBar>
             id={`${node.id}-rows`}
             caption={`${node.title ?? CATALOG_ENTRY.label}: every captured span of this interaction, with its kind, tier, offset and duration.`}
             rows={model.rows}
-            columns={timelineColumns(model.startTime, focusedEventId)}
+            columns={timelineColumns(model.startTime, revealedEventId, spanNames)}
             rowKey={rowKeyOf}
-            selectedRowKey={selectedEventId ?? null}
+            selectedRowKey={selectedRow === undefined ? null : rowKeyOf(selectedRow)}
             onRowActivate={handleSelect}
             compact
           />
         </div>
 
         <Stack direction="horizontal" gap={2} align="center" justify="between" wrap>
-          <Text size="xs" tone="muted">
+          {/* Polite and live, so the count a further page or a larger bound
+              reveals is announced; never `role="status"`, which is the
+              loading placeholder's. */}
+          <Text size="xs" tone="muted" aria-live="polite">
             {footerText}
           </Text>
+          {model.walkBounded ? (
+            // A trace is in memory whole, so this raises the walk's row bound
+            // by one step instead of asking the provider for a page.
+            <Button variant="secondary" size="sm" onClick={handleShowMoreSpans}>
+              {SHOW_MORE_SPANS_LABEL}
+            </Button>
+          ) : null}
           {canLoadMore || appending ? (
             // Kept in place while the page it asked for is in flight — disabled
             // and busy, its label the appending indicator — so the control
@@ -2418,13 +3712,11 @@ function TimelineView(props: TimelineProps): ReactElement {
         {pageFailed ? (
           // The next page failed, the rows above it did not: the failure and
           // its retry sit below them, and the retry re-requests that same page.
+          // The page scope says so in its title and lead, and the query shown
+          // is the page that failed, at the offset it was requested at.
           <div className="dg-timeline__error">
             <ErrorState
-              title={PAGE_ERROR_TITLE}
-              message={spansResult.error?.message ?? PAGE_ERROR_MESSAGE}
-              code={spansResult.error?.code}
-              query={JSON.stringify(spansQuery ?? node.query, null, 2)}
-              onRetry={spansResult.retry}
+              {...queryFailureProps(spansResult, spansQuery ?? node.query, { scope: 'page' })}
             />
           </div>
         ) : null}
@@ -2432,8 +3724,17 @@ function TimelineView(props: TimelineProps): ReactElement {
     );
   }
 
+  // The block listens for the two ends of a preview: the pointer moving out of
+  // the canvas-and-strip region or out of the view, and Escape from whatever
+  // holds focus inside it. None of these makes the block itself interactive.
   return (
-    <div className={clsx('dg-timeline', className)} onBlur={handleBlockBlur}>
+    <div
+      ref={blockRef}
+      className={clsx('dg-timeline', className)}
+      onBlur={handleBlockBlur}
+      onKeyDown={handleBlockKeyDown}
+      onPointerOver={handleBlockPointerOver}
+    >
       {content}
     </div>
   );

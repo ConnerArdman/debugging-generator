@@ -98,6 +98,10 @@
  * @see ../host/useQuery for the loading/error/success machine they drive.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
@@ -107,7 +111,7 @@ import type { DataQuery, EventLogNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -115,8 +119,9 @@ import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { Button } from '../primitives/Button';
 import { kindColorVar } from '../utils/color';
 import {
   MAX_PREVIEW_LENGTH,
@@ -199,14 +204,38 @@ const ALL_KINDS_LABEL = 'All kinds';
 const LOAD_MORE_NAME = 'Load more';
 const RETRY_NAME = 'Retry';
 
+/**
+ * The control the keyboard cases place after the log, so a Tab can be seen to
+ * leave the grid. The toolbar's kind picker is the control just before it.
+ */
+const AFTER_LOG = 'After the log';
+
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
+
+/**
+ * The shared error-state contract every query-backed node renders a failure
+ * with, spelled out rather than read back from the host's constants, so this
+ * suite pins the words a reader actually sees: the title, the generic lead the
+ * provider's cause follows, and the focus key the host's node frame uses to
+ * restore focus to the retry control after a remount.
+ */
+const QUERY_FAILURE_TITLE = 'Could not load this view';
+const QUERY_FAILURE_LEAD = 'The data for this view could not be loaded.';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** A provider's cause and hint for the shared-contract case. */
+const PROVIDER_CAUSE = 'The channel to the service is closed.';
+const PROVIDER_HINT = 'Start the Debug Generator service, then retry.';
 
 /** The five column headers, left to right. */
 const COLUMN_HEADERS: readonly string[] = ['Seq', 'Offset', 'Kind', 'Name', 'Attributes'];
 
 /** The note that keeps the text filter honest, as the toolbar states it. */
 const PARTIAL_SEARCH_NOTE = 'Text filter applies to loaded records only';
+
+/** The control the no-match state offers to undo the text filter. */
+const CLEAR_SEARCH_NAME = 'Clear text filter';
 
 /** The heading of the state a count-only (`limit: 0`) query resolves to. */
 const COUNT_ONLY_TITLE = 'Count only';
@@ -549,6 +578,95 @@ function renderComponent(
 }
 
 /**
+ * Renders the component followed by an ordinary control, for the keyboard
+ * cases: a Tab leaving the grid is only observable against something after it.
+ *
+ * @param node The node to draw.
+ * @param context The provider to resolve its query and the actions to report to.
+ */
+function renderBeforeControl(
+  node: EventLogNode,
+  context: { readonly provider: DataProvider; readonly actions: PanelActions },
+): void {
+  render(
+    <>
+      <DataProviderContext.Provider value={context.provider}>
+        <PanelSessionContext.Provider value={SESSION_ID}>
+          <PanelActionsContext.Provider value={context.actions}>
+            <EventLog node={node} />
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+      <Button>{AFTER_LOG}</Button>
+    </>,
+  );
+}
+
+/**
+ * Moves focus to an element directly, as a reader's previous Tab would have.
+ *
+ * @param element The element to focus.
+ */
+function focusDirectly(element: HTMLElement): void {
+  act(() => {
+    element.focus();
+  });
+}
+
+/**
+ * Every element inside the grid that is in the page's Tab order.
+ *
+ * Read off the DOM property rather than the attribute, so a button that
+ * carries no `tabindex` attribute — and is therefore a Tab stop by default —
+ * counts, exactly as a browser would count it.
+ *
+ * @param grid The grid.
+ * @returns Its Tab stops, in document order.
+ */
+function tabStopsIn(grid: HTMLElement): HTMLElement[] {
+  return Array.from(
+    grid.querySelectorAll<HTMLElement>('a[href], button, input, select, textarea, [tabindex]'),
+  ).filter((element) => element.tabIndex >= 0);
+}
+
+/**
+ * The tooltip bubble a trigger names among its `aria-describedby` tokens.
+ *
+ * @param trigger The trigger.
+ * @returns The bubble.
+ */
+function bubbleOf(trigger: HTMLElement): HTMLElement {
+  const tokens = (trigger.getAttribute('aria-describedby') ?? '').split(/\s+/);
+  const bubble = tokens
+    .map((token) => document.getElementById(token))
+    .find((element) => element?.getAttribute('role') === 'tooltip');
+
+  if (bubble === undefined || bubble === null) {
+    throw new Error('the trigger names no tooltip bubble');
+  }
+
+  return bubble;
+}
+
+/**
+ * The data row at a 0-based position of the whole result, found by the index
+ * the primitive writes on it rather than by document order — under
+ * virtualization only a window of the rows is mounted.
+ *
+ * @param index The row's position in the result.
+ * @returns That row.
+ */
+function rowAtIndex(index: number): HTMLElement {
+  const row = dataRows().find((candidate) => candidate.dataset.rowIndex === String(index));
+
+  if (row === undefined) {
+    throw new Error(`no data row at index ${String(index)} is mounted`);
+  }
+
+  return row;
+}
+
+/**
  * The grid's data rows, in document order.
  *
  * Obtained by role and then narrowed by the attribute the primitive writes on a
@@ -597,6 +715,39 @@ function rowNamed(name: string): HTMLElement {
 /** The text field that filters the loaded records. */
 function searchField(): HTMLElement {
   return screen.getByRole('textbox', { name: SEARCH_NAME });
+}
+
+/**
+ * The block's live region: the one element that announces the text filter's
+ * match count.
+ *
+ * It carries no role — the busy state owns the view's one `status` — so it is
+ * reached from the filter row, which is obtained by role and name, and then by
+ * the attributes that make it an atomic live region. Exactly one must exist
+ * inside the block once the first page has settled, or an announcement would be
+ * doubled. The paging footer is a live region of its own, announcing coverage
+ * rather than the filter, and is not atomic, so it is not counted here.
+ *
+ * @returns That region.
+ */
+function liveRegion(): HTMLElement {
+  const block = screen.getByRole('group', { name: TOOLBAR_NAME }).closest('.dg-event-log');
+
+  if (block === null) {
+    throw new Error('the filter row is not inside the event log block');
+  }
+
+  const regions = Array.from(
+    block.querySelectorAll<HTMLElement>('[aria-live][aria-atomic="true"]'),
+  );
+  expect(regions).toHaveLength(1);
+
+  const [region] = regions;
+  if (region === undefined) {
+    throw new Error('the event log block holds no live region');
+  }
+
+  return region;
 }
 
 /** The kind picker, which the component offers only when there is a kind to pick. */
@@ -801,16 +952,30 @@ describe('EventLog states', () => {
     }
     expect(message.textContent).not.toContain(SOURCE_FILE);
 
+    // Announced as the settled status, with a short title and a decorative
+    // glyph above the sentence, like every other view's empty capture.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.parentElement?.classList.contains('dg-event-log__empty')).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('No records');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty page is a success, so it is drawn as an absence and not as a
     // failure, and there is no grid to hold rows.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
 
     // Nothing loaded, so nothing is claimed about coverage and no page can be
     // asked for.
     expect(screen.queryByText(/records loaded/)).toBeNull();
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // A settled empty capture reached with no narrowing of the reader's leaves
+    // no record for the text filter to search and nothing for a kind to
+    // narrow, so the filter bar is not drawn over it.
+    expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+    expect(screen.queryByRole('textbox', { name: SEARCH_NAME })).toBeNull();
   });
 
   it('renders an alert carrying the failed query, and retries it on request', async () => {
@@ -851,6 +1016,42 @@ describe('EventLog states', () => {
 
     // No rows were invented behind the failure.
     expect(screen.queryAllByRole('row')).toHaveLength(0);
+  });
+
+  it('renders a provider rejection through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', PROVIDER_CAUSE, { hint: PROVIDER_HINT }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // A lone failure is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+
+    // The one title every failed view carries, and a message that opens with the
+    // generic lead and keeps the provider's own cause after it — the hint is
+    // not folded into it.
+    expect(within(alert).getByText(QUERY_FAILURE_TITLE)).toBeDefined();
+
+    const message = alert.querySelector('.dg-error-state__message');
+    expect(message?.textContent).toBe(`${QUERY_FAILURE_LEAD} ${PROVIDER_CAUSE}`);
+
+    // The hint stands on its own line, and the code is a chip rather than prose.
+    expect(within(alert).getByText(PROVIDER_HINT).classList).toContain('dg-error-state__message');
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').closest('.dg-badge')).not.toBeNull();
+
+    // The query block holds exactly the query that was asked. `<details>` is a
+    // group too, so the block is always looked up by its name.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the host's node frame restores focus by.
+    expect(
+      within(alert).getByRole('button', { name: RETRY_NAME }).getAttribute('data-dg-focus-key'),
+    ).toBe(RETRY_FOCUS_KEY);
+
+    // Exactly one glyph: the primitive's own default, as on every other node.
+    expect(alert.querySelectorAll('.dg-error-state__icon svg')).toHaveLength(1);
   });
 });
 
@@ -1050,6 +1251,27 @@ describe('EventLog kind filter', () => {
       'render',
     ]);
   });
+
+  it('keeps its toolbar when a chosen kind narrows the result to nothing', async () => {
+    // The capture holds records; the reader's kind narrows the query to none.
+    const stub = pagingProvider('events', [{ data: PROVIDER_ORDER }, { data: [], total: 0 }]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.selectOptions(kindPicker(), 'fetch');
+
+    // The narrowed result is empty, and it is the reader's own narrowing that
+    // emptied it, so the bar that made the choice stays, still showing it, and
+    // the choice can be undone where it was made.
+    await screen.findByText(/no records were captured/i);
+    expect(screen.getByRole('group', { name: TOOLBAR_NAME })).toBeDefined();
+    const picker = kindPicker();
+    expect(picker instanceof HTMLSelectElement ? picker.value : '').toBe('fetch');
+    expect(searchField()).toBeDefined();
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+  });
 });
 
 describe('EventLog text filter', () => {
@@ -1118,7 +1340,315 @@ describe('EventLog text filter', () => {
     ).toBeDefined();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
+
+  it('clears an unmatched filter from its own empty state and returns focus to the field', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER, { total: 40, nextOffset: 3 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Before any filtering there is nothing to clear, so nothing offers to.
+    expect(screen.queryByRole('button', { name: CLEAR_SEARCH_NAME })).toBeNull();
+
+    await user.type(searchField(), 'unmatched');
+
+    // The control sits in the no-match state itself, beside a sentence that
+    // names it in its own words, so the reader need not hunt for the field.
+    const clear = await screen.findByRole('button', { name: CLEAR_SEARCH_NAME });
+    expect(clear.closest('.dg-empty-state__action')).not.toBeNull();
+    const message = screen.getByText(/no loaded records match this text filter/i);
+    expect(message.textContent).toContain('Clear the text filter');
+
+    await user.click(clear);
+
+    // The filter is gone: the field is empty, every loaded row is back in the
+    // provider's order, and no match statement remains to be shown or heard.
+    const field = searchField();
+    expect(field instanceof HTMLInputElement ? field.value : undefined).toBe('');
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(PROVIDER_ORDER_NAMES);
+    });
+    expect(screen.queryByText(/loaded records match/)).toBeNull();
+    expect(screen.queryByText(PARTIAL_SEARCH_NOTE)).toBeNull();
+    expect(screen.queryByRole('button', { name: CLEAR_SEARCH_NAME })).toBeNull();
+
+    // The button unmounted with the state it belonged to, and focus did not
+    // fall to the document body with it: the reader is back in the field.
+    expect(document.activeElement).toBe(field);
+
+    // Clearing is local, like the filter it undoes: nothing was re-requested.
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('announces the match count through one polite live region, silent while unfiltered', async () => {
+    // A total equal to the loaded page, so the filter reached every record and
+    // the announcement is the match statement alone.
+    const stub = resolvingProvider('events', PROVIDER_ORDER, { total: 3 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Mounted before anything is filtered, and empty: a region that appeared
+    // with its text already in it would not be announced at all.
+    const region = liveRegion();
+    expect(region.getAttribute('aria-live')).toBe('polite');
+    expect(region.getAttribute('aria-atomic')).toBe('true');
+    expect(region.getAttribute('role')).toBeNull();
+    expect(region.classList.contains('dg-visually-hidden')).toBe(true);
+    expect(region.textContent).toBe('');
+
+    await user.type(searchField(), 'click');
+
+    // Exactly the statement the toolbar draws, so what is heard is what is shown.
+    const statement = `${formatCount(1)} of ${formatCount(3)} loaded records match`;
+    await waitFor(() => {
+      expect(liveRegion().textContent).toBe(statement);
+    });
+    expect(screen.getAllByText(statement)).toHaveLength(2);
+    expect(screen.queryByText(PARTIAL_SEARCH_NOTE)).toBeNull();
+
+    // Emptied with the filter, and the same element throughout: a replaced
+    // region would lose the announcement that follows the replacement.
+    await user.clear(searchField());
+    await waitFor(() => {
+      expect(liveRegion().textContent).toBe('');
+    });
+    expect(liveRegion()).toBe(region);
+  });
+
+  it('announces the partial-search note in the same sentence as the match count', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER, { total: 40, nextOffset: 3 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    await user.type(searchField(), 'unmatched');
+
+    // One atomic sentence: both statements the toolbar draws, in its order, so
+    // the limitation is heard with the count it qualifies.
+    await waitFor(() => {
+      expect(liveRegion().textContent).toBe(
+        `${formatCount(0)} of ${formatCount(3)} loaded records match. ${PARTIAL_SEARCH_NOTE}`,
+      );
+    });
+
+    // Each pill remains the only element whose own text is its statement.
+    expect(
+      screen.getAllByText(`${formatCount(0)} of ${formatCount(3)} loaded records match`),
+    ).toHaveLength(1);
+    expect(screen.getAllByText(PARTIAL_SEARCH_NOTE)).toHaveLength(1);
+  });
 });
+
+describe('EventLog announcements (B2-F10)', () => {
+  /**
+   * The region that announces the text filter's match count.
+   *
+   * It has no role — the busy state owns this view's one `status` — so it is
+   * found by the two attributes that make it an atomic polite region, and the
+   * case fails unless exactly one such region exists.
+   *
+   * @returns That region.
+   */
+  function matchCountRegion(): HTMLElement {
+    const regions = Array.from(
+      document.querySelectorAll<HTMLElement>('[aria-live="polite"][aria-atomic="true"]'),
+    ).filter((region) => region.getAttribute('role') === null);
+
+    expect(regions).toHaveLength(1);
+
+    const [region] = regions;
+
+    if (region === undefined) {
+      throw new Error('no match-count live region is mounted');
+    }
+
+    return region;
+  }
+
+  /**
+   * Every live region whose text mentions the match count, so a case can prove
+   * that one statement is announced once rather than by two regions at once.
+   *
+   * @returns The live regions carrying the count.
+   */
+  function liveCopiesOfMatchCount(): HTMLElement[] {
+    return Array.from(document.querySelectorAll<HTMLElement>('[aria-live]')).filter(
+      (region) =>
+        region.getAttribute('aria-live') !== 'off' &&
+        (region.textContent ?? '').includes('loaded records match'),
+    );
+  }
+
+  it('announces the match count politely as the text filter changes, and only then', async () => {
+    // The whole source is loaded, so the count is the only statement.
+    const stub = resolvingProvider('events', PROVIDER_ORDER, { total: PROVIDER_ORDER.length });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // Mounted before the reader types, and silent: a region inserted with its
+    // text already in it would not be announced.
+    const region = matchCountRegion();
+    expect(region.getAttribute('aria-live')).toBe('polite');
+    expect(region.classList.contains('dg-visually-hidden')).toBe(true);
+    expect(region.textContent).toBe('');
+
+    // Two of the three records carry a dotted name.
+    await user.type(searchField(), 'example.');
+
+    const twoMatch = `${formatCount(2)} of ${formatCount(3)} loaded records match`;
+    await waitFor(() => {
+      expect(region.textContent).toBe(twoMatch);
+    });
+
+    // What is heard is what the toolbar shows, and the toolbar's pill is not a
+    // second announcement of it: exactly one live copy exists.
+    const shown = screen.getAllByText(twoMatch).filter((element) => element !== region);
+    expect(shown).toHaveLength(1);
+    expect(shown[0]?.classList.contains('dg-badge')).toBe(true);
+    expect(shown[0]?.closest('[aria-live]')).toBeNull();
+    expect(liveCopiesOfMatchCount()).toEqual([region]);
+
+    // Narrowing further updates the same, still-mounted region.
+    await user.type(searchField(), 'c');
+    await waitFor(() => {
+      expect(region.textContent).toBe(
+        `${formatCount(1)} of ${formatCount(3)} loaded records match`,
+      );
+    });
+    expect(matchCountRegion()).toBe(region);
+
+    // Clearing the filter silences it again rather than unmounting it.
+    await user.clear(searchField());
+    await waitFor(() => {
+      expect(region.textContent).toBe('');
+    });
+    expect(region.isConnected).toBe(true);
+  });
+
+  it('adds the loaded-only note to the announcement when the page is shorter than the source', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER, { total: 40, nextOffset: 3 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.type(searchField(), 'click');
+
+    // One atomic sentence, the two toolbar statements in their toolbar order.
+    await waitFor(() => {
+      expect(matchCountRegion().textContent).toBe(
+        `${formatCount(1)} of ${formatCount(3)} loaded records match. ${PARTIAL_SEARCH_NOTE}`,
+      );
+    });
+    expect(liveCopiesOfMatchCount()).toHaveLength(1);
+  });
+
+  it('announces the paging footer politely as each page arrives', async () => {
+    const stub = pagingProvider('events', [
+      { data: [RENDER_RECORD], total: 40, nextOffset: 1 },
+      { data: [FETCH_RECORD], total: 40, nextOffset: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const coverage = await screen.findByText(
+      `${formatCount(1)} of ${formatCount(40)} records loaded`,
+    );
+    expect(coverage.getAttribute('aria-live')).toBe('polite');
+    expect(coverage.getAttribute('role')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The same region, still mounted, now carries the new count.
+    await waitFor(() => {
+      expect(coverage.textContent).toBe(`${formatCount(2)} of ${formatCount(40)} records loaded`);
+    });
+    expect(coverage.isConnected).toBe(true);
+  });
+
+  it('keeps the total in the polite footer while the next page is in flight', async () => {
+    // The second page is held open until the case settles it, so the footer can
+    // be read in the state a reader would hear while it loads.
+    const second: { settle?: (response: DataQueryResponse) => void } = {};
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'events',
+            data: [RENDER_RECORD],
+            total: 40,
+            nextOffset: 1,
+          })
+        : new Promise<DataQueryResponse>((resolve) => {
+            second.settle = resolve;
+          }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const loadedOne = `${formatCount(1)} of ${formatCount(40)} records loaded`;
+    const coverage = await screen.findByText(loadedOne);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    // In flight, the count keeps the total it was last given rather than
+    // announcing one that claims no total was ever reported.
+    expect(coverage.textContent).toBe(loadedOne);
+    expect(screen.queryByText(`${formatCount(1)} records loaded`)).toBeNull();
+
+    act(() => {
+      second.settle?.({ source: 'events', data: [FETCH_RECORD], total: 40, nextOffset: 2 });
+    });
+
+    await waitFor(() => {
+      expect(coverage.textContent).toBe(`${formatCount(2)} of ${formatCount(40)} records loaded`);
+    });
+  });
+});
+
+/**
+ * The component stylesheet, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents, so the working directory is
+ * irrelevant. The path is joined with `node:path` rather than resolved with
+ * `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ *
+ * Read because the strip's layout is decided there and nowhere else: the
+ * component measures nothing, and happy-dom lays nothing out, so the rules are
+ * the contract a case can hold.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/**
+ * The declaration block of one selector in {@link COMPONENT_STYLESHEET},
+ * failing when the rule is absent.
+ *
+ * @param selector The selector exactly as written at the start of its rule.
+ * @returns The text between the rule's braces.
+ */
+function ruleOf(selector: string): { readonly body: string } {
+  const start = COMPONENT_STYLESHEET.indexOf(`\n${selector} {`);
+  expect(start).toBeGreaterThanOrEqual(0);
+  const open = COMPONENT_STYLESHEET.indexOf('{', start);
+  const close = COMPONENT_STYLESHEET.indexOf('}', open);
+
+  return { body: COMPONENT_STYLESHEET.slice(open + 1, close) };
+}
 
 describe('EventLog attributes', () => {
   /** A value exactly as long as the preview bound a producer is held to. */
@@ -1151,6 +1681,11 @@ describe('EventLog attributes', () => {
     // The producer's own truncation marker survives: this view never re-parses,
     // re-expands or reconstructs a value it was handed.
     expect(preview.textContent?.endsWith(TRUNCATED_VALUE)).toBe(true);
+
+    // A chip the cell cuts short is readable on hover, and the hover shows the
+    // very preview the chip renders — never a fuller value than was captured.
+    expect(bounded.getAttribute('title')).toBe(bounded.textContent);
+    expect(preview.getAttribute('title')).toBe(preview.textContent);
 
     // No affordance offers more than the producer was permitted to capture: the
     // row holds no control at all, and the strip claims nothing is withheld.
@@ -1189,6 +1724,66 @@ describe('EventLog attributes', () => {
     expect(row.textContent).not.toContain('nested');
     expect(row.textContent).not.toContain('kept-for-the-detail-drawer');
   });
+
+  it('draws the pairs as shrinking chips, followed by a count that never shrinks', async () => {
+    const pairTexts = [
+      'example.first=alpha',
+      `example.value=${BOUNDED_VALUE}`,
+      'example.third=true',
+    ];
+    const record = makeEvent({
+      attributes: {
+        'example.first': 'alpha',
+        'example.value': BOUNDED_VALUE,
+        'example.third': true,
+        'example.fourth': 'delta',
+        'example.structured': { nested: 'kept-for-the-detail-drawer' },
+      },
+    });
+    const stub = resolvingProvider('events', [record]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const row = rowNamed(record.name);
+
+    // Every chip carries the class that lets it shrink inside the strip, and
+    // its own rendered text as its title.
+    const chips = pairTexts.map((text) => within(row).getByText(text));
+    for (const [index, chip] of chips.entries()) {
+      expect(chip.classList.contains('dg-code')).toBe(true);
+      expect(chip.classList.contains('dg-event-log__attr')).toBe(true);
+      expect(chip.getAttribute('title')).toBe(pairTexts[index]);
+    }
+
+    // The count carries the class that keeps it whole, and it is the strip's
+    // last item, directly after the chips — so the chips give way to it and
+    // never the other way round.
+    const more = within(row).getByText(`+${formatCount(2)} more`);
+    expect(more.classList.contains('dg-event-log__more')).toBe(true);
+    expect(more.classList.contains('dg-event-log__attr')).toBe(false);
+    expect(more.closest('.dg-event-log__attrs')).not.toBeNull();
+    expect(Array.from(more.parentElement?.children ?? [])).toEqual([...chips, more]);
+  });
+
+  it('declares the strip layout that keeps the count visible, with no measured width', () => {
+    // The chips start from nothing, grow no further than their own text, and
+    // ellipsize at their own border; the count never shrinks. Structural forms
+    // and permitted literals only (AAP 0.6.4).
+    const chip = ruleOf('.dg-event-log__attr');
+    for (const declaration of [
+      'flex: 1 1 0;',
+      'min-inline-size: 0;',
+      'max-inline-size: max-content;',
+      'overflow: hidden;',
+      'text-overflow: ellipsis;',
+      'white-space: nowrap;',
+    ]) {
+      expect(chip.body).toContain(declaration);
+    }
+
+    expect(ruleOf('.dg-event-log__more').body).toContain('flex: none;');
+  });
 });
 
 describe('EventLog interactions', () => {
@@ -1206,12 +1801,14 @@ describe('EventLog interactions', () => {
       throw new Error('the grid rendered no data row');
     }
 
-    // This list drives the host's record-detail drawer and keeps no selection
-    // of its own, so its rows deliberately report no selected state.
-    expect(row.getAttribute('aria-selected')).toBeNull();
+    // A row that can be activated has a selected state, and none is selected
+    // before the reader activates one.
+    expect(row.getAttribute('aria-selected')).toBe('false');
 
     await user.click(row);
 
+    // Outside a panel host the list marks the line last activated in it.
+    expect(dataRows()[0]?.getAttribute('aria-selected')).toBe('true');
     expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
 
     const [call] = spies.onSelectEvent.mock.calls;
@@ -1327,6 +1924,152 @@ describe('EventLog interactions', () => {
     expect(
       within(rowNamed(INTERACTION_RECORD.name)).queryByText(formatStatusLabel('error')),
     ).toBeNull();
+  });
+});
+
+describe('EventLog keyboard (B2-F19)', () => {
+  /** The reference a selection of `event` reports, in the shape the host receives. */
+  function refOf(event: TelemetryEvent): PanelEventRef {
+    return { eventId: event.id, spanId: event.spanId, traceId: event.traceId };
+  }
+
+  it('is one Tab stop, entered on the active row and left by the next Tab', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderBeforeControl(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    const chip = within(grid).getByRole('button', { name: SOURCE_CHIP_NAME });
+    const firstRow = rowNamed(RENDER_RECORD.name);
+
+    // The chip stays a real, focusable button, and leaves the Tab order.
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    // Before focus: one stop in the whole grid, and it is the active row.
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    // The kind picker is the toolbar's last control, so the next Tab enters the grid.
+    focusDirectly(kindPicker());
+    await user.tab();
+    expect(document.activeElement).toBe(firstRow);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    // And the one after it leaves the grid, past the chip of every row.
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: AFTER_LOG }));
+  });
+
+  it('reaches the source chip with ArrowRight and returns with ArrowLeft and Escape', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderBeforeControl(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    const chip = within(grid).getByRole('button', { name: SOURCE_CHIP_NAME });
+
+    focusDirectly(kindPicker());
+    await user.tab();
+    await user.keyboard('{ArrowDown}');
+
+    const chipRow = rowNamed(FETCH_RECORD.name);
+    expect(document.activeElement).toBe(chipRow);
+
+    // Into the row: the chip takes focus, and its full location opens with it.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(chip);
+    expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(true);
+    expect(tabStopsIn(grid)).toEqual([chipRow]);
+
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(chipRow);
+
+    // Escape takes two presses: the open description first, then back to the row.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Escape}');
+    expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(false);
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(chipRow);
+
+    // Moving through a row is not acting on it.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('selects a row with Enter, and opens source exactly once from a focused chip', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderBeforeControl(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    focusDirectly(kindPicker());
+    await user.tab();
+
+    // Enter on the row is the row's activation: the host hears that record.
+    await user.keyboard('{Enter}');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith(refOf(RENDER_RECORD));
+
+    // Enter on a control is the control's own key, and never also the row's.
+    await user.keyboard('{ArrowDown}{ArrowRight}{Enter}');
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).toHaveBeenCalledWith(BASE_SOURCE);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onFilterChange).not.toHaveBeenCalled();
+  });
+
+  it('keeps one Tab stop under virtualization, and reaches the last row with End', async () => {
+    // Far more records than the table renders without measuring, so only a
+    // window of rows is mounted and End has to bring the last one into it.
+    const recordCount = 240;
+    const lastIndex = recordCount - 1;
+    const records = Array.from({ length: recordCount }, (_unused, index) =>
+      makeEvent({
+        id: `event-example-log-${String(index).padStart(4, '0')}`,
+        spanId: spanIdFor(index + 1),
+        name: `example.record.${String(index)}`,
+        startTime: BASE_START_MS + index,
+        seq: index,
+        ingestSeq: index + 1,
+        source: index === lastIndex ? BASE_SOURCE : undefined,
+      }),
+    );
+    const stub = resolvingProvider('events', records, { total: recordCount });
+    const user = userEvent.setup();
+
+    renderBeforeControl(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    expect(dataRows().length).toBeLessThan(recordCount);
+    expect(tabStopsIn(grid)).toEqual([rowAtIndex(0)]);
+
+    focusDirectly(kindPicker());
+    await user.tab();
+    expect(document.activeElement).toBe(rowAtIndex(0));
+
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(rowAtIndex(lastIndex));
+    expect(tabStopsIn(grid)).toEqual([rowAtIndex(lastIndex)]);
+
+    // The last row's chip is reached from its row, and left back to it.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(
+      within(rowAtIndex(lastIndex)).getByRole('button', { name: SOURCE_CHIP_NAME }),
+    );
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(rowAtIndex(lastIndex));
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowAtIndex(0));
+    expect(tabStopsIn(grid)).toEqual([rowAtIndex(0)]);
   });
 });
 
@@ -1783,5 +2526,207 @@ describe('EventLog empty pages', () => {
     );
     expect(screen.queryByText(EMPTY_CAPTURE_PATTERN)).toBeNull();
     expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBeDefined();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The panel's shared selection (B2-F21, and the EventLog half of B2-F08)
+ *
+ * Under the panel host the selected line is the panel's one selection — the
+ * record any view or evidence chip last selected — rather than a state of this
+ * list (AAP 0.7.3: evidence chips "select the underlying events"), and it is
+ * marked the way every selected grid row is: `aria-selected` plus the grid's
+ * own `dg-is-selected`. These cases provide the selection directly through
+ * `PanelSelectionContext`, which is exactly what the host mounts.
+ * ---------------------------------------------------------------------------
+ */
+
+/** What {@link renderWithSelection} mounts the list inside. */
+interface SelectionContext {
+  /** The provider that resolves the node's query. */
+  readonly provider: DataProvider;
+
+  /** The actions to report to, or `undefined` for a surface that only displays. */
+  readonly actions: PanelActions | undefined;
+
+  /** The selection the host provides, or `undefined` for no host at all. */
+  readonly hosted: { readonly selection: PanelSelection | undefined } | undefined;
+}
+
+/**
+ * The list inside the host contexts a case names: always a provider and a
+ * session, actions only when given, and the panel's selection only when the
+ * case stands in for a host.
+ *
+ * @param node The node to draw.
+ * @param context What to mount it inside.
+ * @returns The element tree.
+ */
+function selectionTree(node: EventLogNode, context: SelectionContext): ReactElement {
+  const log = <EventLog node={node} />;
+  const withActions =
+    context.actions === undefined ? (
+      log
+    ) : (
+      <PanelActionsContext.Provider value={context.actions}>{log}</PanelActionsContext.Provider>
+    );
+  const withSelection =
+    context.hosted === undefined ? (
+      withActions
+    ) : (
+      <PanelSelectionContext.Provider value={context.hosted}>
+        {withActions}
+      </PanelSelectionContext.Provider>
+    );
+
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={SESSION_ID}>
+        {withSelection}
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
+/**
+ * Renders the list with {@link selectionTree}.
+ *
+ * @param node The node to draw.
+ * @param context What to mount it inside.
+ * @returns A function that re-renders the same mounted list inside another context.
+ */
+function renderWithSelection(
+  node: EventLogNode,
+  context: SelectionContext,
+): (next: SelectionContext) => void {
+  const { rerender } = render(selectionTree(node, context));
+
+  return (next: SelectionContext): void => {
+    rerender(selectionTree(node, next));
+  };
+}
+
+describe('EventLog shared selection', () => {
+  it('marks the line whose record the panel selection names, and no other', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+
+    renderWithSelection(makeNode(), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+      hosted: { selection: { eventId: FETCH_RECORD.id } },
+    });
+
+    await screen.findByRole('grid');
+
+    const selected = rowNamed(FETCH_RECORD.name);
+    expect(selected.getAttribute('aria-selected')).toBe('true');
+    expect(selected.classList.contains('dg-is-selected')).toBe(true);
+    expect(rowNamed(RENDER_RECORD.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(INTERACTION_RECORD.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(INTERACTION_RECORD.name).classList.contains('dg-is-selected')).toBe(false);
+  });
+
+  it('marks a line a selection names by its trace and span alone', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+
+    // Another record's id, but this record's own span in its own trace: the
+    // pair is the span's identity across tiers, so it names this line.
+    renderWithSelection(makeNode(), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+      hosted: {
+        selection: {
+          eventId: 'event-example-elsewhere',
+          traceId: RENDER_RECORD.traceId,
+          spanId: RENDER_RECORD.spanId,
+        },
+      },
+    });
+
+    await screen.findByRole('grid');
+
+    expect(rowNamed(RENDER_RECORD.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed(FETCH_RECORD.name).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('follows the panel selection instead of keeping one of its own', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const base = { provider: stub.provider, actions: spies.actions };
+
+    const rerender = renderWithSelection(makeNode(), { ...base, hosted: { selection: undefined } });
+
+    await screen.findByRole('grid');
+
+    // Under a host every line has a selected state, because any view may
+    // select one of these records — none is selected yet.
+    expect(dataRows().every((row) => row.getAttribute('aria-selected') === 'false')).toBe(true);
+
+    await user.click(rowNamed(INTERACTION_RECORD.name));
+
+    // The activation is reported with the record's own identifiers...
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: INTERACTION_RECORD.id,
+      spanId: INTERACTION_RECORD.spanId,
+      traceId: INTERACTION_RECORD.traceId,
+    });
+
+    // ...but the mark is the host's to move.
+    expect(rowNamed(INTERACTION_RECORD.name).getAttribute('aria-selected')).toBe('false');
+
+    rerender({ ...base, hosted: { selection: { eventId: INTERACTION_RECORD.id } } });
+    expect(rowNamed(INTERACTION_RECORD.name).getAttribute('aria-selected')).toBe('true');
+
+    // A selection made in another view moves the mark here as well.
+    rerender({ ...base, hosted: { selection: { eventId: RENDER_RECORD.id } } });
+    expect(rowNamed(INTERACTION_RECORD.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(RENDER_RECORD.name).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('marks no neighbour while the text filter hides the selected record', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderWithSelection(makeNode(), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+      hosted: { selection: { eventId: FETCH_RECORD.id } },
+    });
+
+    await screen.findByRole('grid');
+    await user.type(searchField(), 'click');
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([INTERACTION_RECORD.name]);
+    });
+    expect(rowNamed(INTERACTION_RECORD.name).getAttribute('aria-selected')).toBe('false');
+
+    // Clearing the filter draws the selected record again, marked.
+    await user.clear(searchField());
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+    });
+    expect(rowNamed(FETCH_RECORD.name).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('claims no selected state for a list that only displays', async () => {
+    const stub = resolvingProvider('events', PROVIDER_ORDER);
+
+    // No host and no actions: no line can ever become selected, so none reports
+    // a selected state — a grid of `aria-selected="false"` rows would claim a
+    // selection model that does not exist.
+    renderWithSelection(makeNode(), {
+      provider: stub.provider,
+      actions: undefined,
+      hosted: undefined,
+    });
+
+    await screen.findByRole('grid');
+
+    expect(dataRows()).toHaveLength(PROVIDER_ORDER.length);
+    expect(dataRows().every((row) => row.getAttribute('aria-selected') === null)).toBe(true);
   });
 });

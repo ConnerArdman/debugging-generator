@@ -260,6 +260,101 @@ export function alignHairline(value: number): number {
 
 /*
  * ---------------------------------------------------------------------------
+ * Canvas width
+ *
+ * The SVG views lay themselves out in CSS pixels: the component measures the
+ * inner width of its scroll viewport (`./measure`, the one module in `./utils`
+ * that touches the DOM) and draws a canvas exactly that wide, with a viewBox of
+ * the same size, so one user unit is one CSS pixel and an 11 px label renders
+ * at 11 px at every panel width. A fixed-width viewBox scaled to the container
+ * was the alternative, and it shrank every glyph with the panel — to a third
+ * of its size in a docked DevTools panel — while leaving the canvas's declared
+ * height standing as a blank band beneath the drawing.
+ *
+ * Where nothing has been measured — a test environment without layout, or a
+ * platform without `ResizeObserver` — a view lays out at
+ * {@link DEFAULT_CANVAS_WIDTH} and scales that drawing to its container
+ * instead, which is the only coordinate system available without a width.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The coordinate width a view lays out at before (or without) a measured
+ * container: the unmeasured fallback of {@link resolveCanvasWidth}.
+ *
+ * A thousand units keeps every placement in that mode a round per-mille of the
+ * plotted window, which is what the package's layout-free tests assert against.
+ */
+export const DEFAULT_CANVAS_WIDTH = 1000;
+
+/**
+ * The narrowest canvas a measured view draws, in CSS pixels.
+ *
+ * Below this a time axis has no room for more than a tick or two and a lane
+ * label column leaves nothing to plot, so a narrower container scrolls the
+ * canvas horizontally rather than squeezing it. It sits below the inner width
+ * of a phone-sized or docked DevTools panel (a 375 px viewport leaves roughly
+ * 350 px), so the common narrow case still fits without a scrollbar.
+ */
+export const MIN_CANVAS_WIDTH = 320;
+
+/** Options of {@link resolveCanvasWidth}. */
+export interface CanvasWidthOptions {
+  /**
+   * The narrowest canvas to draw, in CSS pixels. Defaults to
+   * {@link MIN_CANVAS_WIDTH}; a non-finite or negative value falls back to it.
+   */
+  readonly min?: number;
+  /**
+   * The width to lay out at when `measured` is unusable. Defaults to
+   * {@link DEFAULT_CANVAS_WIDTH}; a non-finite or non-positive value falls back
+   * to it.
+   */
+  readonly fallback?: number;
+}
+
+/**
+ * The width a view lays its canvas out at, given the measured inner width of
+ * its container.
+ *
+ * - A usable measurement (finite and at least one pixel) is floored to a whole
+ *   pixel — a fractional canvas would overflow its container by the fraction
+ *   and summon a scrollbar — and raised to `min`, below which the canvas
+ *   scrolls instead of shrinking.
+ * - Anything else (`undefined` before the first measurement, `0` where there is
+ *   no layout, `NaN`) yields `fallback`, the unmeasured coordinate width.
+ *
+ * Pair it with {@link isMeasuredWidth} to pick between the two drawing modes:
+ * a measured canvas is drawn at its size in pixels, an unmeasured one scaled
+ * to its container.
+ *
+ * @param measured The container's inner width in CSS pixels, if known.
+ * @param options Minimum and fallback widths.
+ * @returns A finite, positive canvas width.
+ */
+export function resolveCanvasWidth(
+  measured: number | undefined,
+  options: CanvasWidthOptions = {},
+): number {
+  const fallback = asPositive(options.fallback, DEFAULT_CANVAS_WIDTH);
+  if (!isMeasuredWidth(measured)) {
+    return fallback;
+  }
+  const min = asNonNegative(options.min, MIN_CANVAS_WIDTH);
+  return Math.max(Math.floor(measured), Math.floor(min), 1);
+}
+
+/**
+ * Whether `measured` is a usable container width: finite and at least one
+ * pixel. `0` is what a layout-free environment reports, so it is "unmeasured",
+ * never a zero-width canvas.
+ */
+export function isMeasuredWidth(measured: number | undefined): measured is number {
+  return typeof measured === 'number' && Number.isFinite(measured) && measured >= 1;
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * The linear time scale
  * ---------------------------------------------------------------------------
  */
@@ -994,6 +1089,39 @@ export function layoutLaneStack(
   }
 
   return { lanes, height };
+}
+
+/**
+ * Maps each depth present in a lane to a compact row index: the smallest depth
+ * becomes row `0`, the next distinct depth row `1`, and so on, with no row
+ * reserved for a depth nothing occupies.
+ *
+ * A lane of a tiered timeline holds the spans of one tier, and their trace
+ * depths are sparse within it — a database lane can hold a query at depth 1
+ * (an orphan attached to the trace root) and another at depth 5 (nested under
+ * a request, a route handler and a function that all sit in other lanes).
+ * Reserving one row per depth between the extremes would draw three empty rows
+ * between those two bars; ranking the depths keeps the nesting order — a
+ * deeper span still sits below a shallower one — without the gaps.
+ *
+ * A depth that is not a non-negative integer is read as `0`. Duplicates share a
+ * row. The input is not mutated.
+ *
+ * @param depths The depths present in one lane, in any order.
+ * @returns A map from each distinct depth to its row index, and the row count.
+ */
+export function rankLaneDepths(depths: readonly number[]): {
+  readonly rowOf: ReadonlyMap<number, number>;
+  readonly rowCount: number;
+} {
+  const distinct = [...new Set(depths.map((depth) => asNonNegativeInt(depth, 0)))].sort(
+    (left, right) => left - right,
+  );
+  const rowOf = new Map<number, number>();
+  for (const [row, depth] of distinct.entries()) {
+    rowOf.set(depth, row);
+  }
+  return { rowOf, rowCount: distinct.length };
 }
 
 /*
@@ -1844,6 +1972,68 @@ export function graphCanvasSize(
     width: columns <= 0 ? 0 : columns * nodeWidth + (columns - 1) * columnGap,
     height: rows <= 0 ? 0 : rows * nodeHeight + (rows - 1) * rowGap,
   };
+}
+
+/**
+ * The narrowest column gap {@link fitGraphColumnGap} will produce, in SVG user
+ * units: 32 — still wide enough that an edge's curve reads as a connector.
+ */
+export const MIN_GRAPH_COLUMN_GAP = 32;
+
+/**
+ * The widest column gap {@link fitGraphColumnGap} will produce, in SVG user
+ * units: 160 — past this, spreading a short graph across a wide panel pulls
+ * related participants so far apart that their connector reads as noise.
+ */
+export const MAX_GRAPH_COLUMN_GAP = 160;
+
+/** Options of {@link fitGraphColumnGap}. */
+export interface GraphColumnGapOptions {
+  /** Participant box width; defaults to {@link DEFAULT_GRAPH_NODE_WIDTH}. */
+  readonly nodeWidth?: number | undefined;
+  /** Narrowest gap; defaults to {@link MIN_GRAPH_COLUMN_GAP}. */
+  readonly minGap?: number | undefined;
+  /** Widest gap; defaults to {@link MAX_GRAPH_COLUMN_GAP}. */
+  readonly maxGap?: number | undefined;
+}
+
+/**
+ * The column gap that makes a layered graph of `layerCount` columns fill a
+ * container `containerWidth` pixels wide, kept within `[minGap, maxGap]`.
+ *
+ * The participant boxes keep their width — their labels are sized for it — so
+ * the gaps are what give: a graph narrower than its container spreads its
+ * columns (up to `maxGap`, after which it simply stops short of the right
+ * edge), and one wider tightens them (down to `minGap`, after which the canvas
+ * is wider than the container and its viewport scrolls). Either way the canvas
+ * is drawn at one user unit per CSS pixel, so its text never scales.
+ *
+ * Degenerate inputs, all deliberate:
+ *
+ * - an unusable `containerWidth` (see {@link isMeasuredWidth}) yields
+ *   {@link DEFAULT_GRAPH_COLUMN_GAP}, the unmeasured rhythm;
+ * - fewer than two columns have no gap to size, and yield the default too;
+ * - `minGap > maxGap` is resolved by swapping them.
+ *
+ * @param containerWidth The measured inner width of the graph's viewport.
+ * @param layerCount How many columns the layout uses.
+ * @param options Box width and gap bounds.
+ * @returns A finite, non-negative column gap.
+ */
+export function fitGraphColumnGap(
+  containerWidth: number | undefined,
+  layerCount: number,
+  options: GraphColumnGapOptions = {},
+): number {
+  const columns = asNonNegativeInt(layerCount, 0);
+  if (!isMeasuredWidth(containerWidth) || columns < 2) {
+    return DEFAULT_GRAPH_COLUMN_GAP;
+  }
+  const nodeWidth = asPositive(options.nodeWidth, DEFAULT_GRAPH_NODE_WIDTH);
+  const minGap = asNonNegative(options.minGap, MIN_GRAPH_COLUMN_GAP);
+  const maxGap = asNonNegative(options.maxGap, MAX_GRAPH_COLUMN_GAP);
+  const available = Math.floor(containerWidth) - columns * nodeWidth;
+  return Math.floor(clamp(available / (columns - 1), minGap, maxGap));
 }
 
 /**

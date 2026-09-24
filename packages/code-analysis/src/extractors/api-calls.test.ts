@@ -61,6 +61,23 @@
  *    other module its call sites; `extract` writes nothing; only `calls` edges
  *    are emitted; every recorded `file` is a project-relative POSIX path; and
  *    no absolute path reaches an id or a payload field.
+ * 5. **The owner cascade across every module kind** — a call inside an App
+ *    Router handler (plain, grouped, slotted, dynamic, catch-all, clause-
+ *    exported, under `src/`) or a Pages Router API default export starts at the
+ *    `api-route` node the graph holds, which proves the reproduced route
+ *    identity agrees with the extractor that emits it; every spelling the
+ *    reproduction cannot vouch for falls back to the `symbol` node; default
+ *    exports, export clauses, markup modules, class members, namespaces and
+ *    markup-bound handlers each start at the node kind the cascade names; and
+ *    the whole project assembles with no diagnostic at all.
+ * 6. **`XMLHttpRequest` pairing is conservative** — a construction is paired
+ *    with its `open` call only when its name has one binding in its own body
+ *    and one `open` follows; every re-binding, shadow, second construction,
+ *    second `open` or cross-function `open` leaves the target unknown.
+ * 7. **Failures are reported, never thrown** — an unattributable site costs
+ *    only its own node as a `warning` naming a syntax kind, a position and an
+ *    error class; a module that cannot be scanned is one file-level warning; a
+ *    context whose file is not project-relative is declined.
  *
  * ## How the cases are driven
  *
@@ -108,10 +125,12 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
+import { Project } from 'ts-morph';
 import type { SourceFile } from 'ts-morph';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
 import { isOk, isSafeRelativePath, joinPosix, noopLogger, toPosix } from '@debuggen/shared';
+import type { LogFields, LogLevel, Logger } from '@debuggen/shared';
 
 import { CodeGraph } from '../graph/graph.js';
 import { HTTP_METHOD_NAMES } from '../graph/types.js';
@@ -266,6 +285,9 @@ let shapes: ExtractedProject | undefined;
 
 /** The scratch project holding one unreadable module beside one intact module. */
 let torn: ExtractedProject | undefined;
+
+/** The scratch project holding every owner-cascade and `XMLHttpRequest` binding case. */
+let cascade: ExtractedProject | undefined;
 
 /**
  * The {@link ExtractorContext} for one file of an opened project, assembled
@@ -960,6 +982,382 @@ const TORN_MODULES: Readonly<Record<string, string>> = {
   ].join('\n'),
 };
 
+/**
+ * The owner cascade across every module kind and export form, and the
+ * `XMLHttpRequest` binding rules.
+ *
+ * Each module holds one `fetch` per owner under test, targeting a distinct
+ * `/scratch/…` path so a node is found by its target rather than by an index.
+ * The project ships its own configuration — `createScratchProject` writes the
+ * shared one first, and a module keyed `tsconfig.json` replaces it — because
+ * the component-module cases need markup, which only a `.tsx` module holds.
+ *
+ * The route modules are the point: the cascade's route step spells an
+ * `api-route` node id from a route path and a route entry position it
+ * *reproduces* rather than imports, so only an assembled graph that holds a
+ * node under exactly that id — and reports no `dangling-edge` — proves the
+ * reproduction agrees with the extractor that emits the node. A spelling the
+ * reproduction cannot vouch for must fall through to the `symbol` node instead.
+ */
+const CASCADE_MODULES: Readonly<Record<string, string>> = {
+  'tsconfig.json': `${JSON.stringify(
+    {
+      compilerOptions: {
+        target: 'ES2022',
+        lib: ['ES2022', 'DOM'],
+        module: 'esnext',
+        moduleResolution: 'bundler',
+        strict: true,
+        noEmit: true,
+        isolatedModules: true,
+        jsx: 'preserve',
+      },
+      include: ['**/*.ts', '**/*.tsx'],
+    },
+    undefined,
+    2,
+  )}\n`,
+
+  // App Router request-handler modules whose route identity is derivable.
+  'app/items/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-get'); }",
+    "export async function helper() { return fetch('/scratch/route-helper'); }",
+    'export class RouteHelpers {',
+    "  load() { return fetch('/scratch/route-member'); }",
+    '}',
+    '',
+  ].join('\n'),
+  'app/(storefront)/@panel/[id]/route.ts': [
+    "export const POST = async () => fetch('/scratch/route-grouped');",
+    '',
+  ].join('\n'),
+  'app/docs/[...slug]/route.ts': [
+    "async function handler() { return fetch('/scratch/route-catch-all'); }",
+    '',
+    'export { handler as PUT };',
+    '',
+  ].join('\n'),
+  'app/archive/[[...rest]]/route.ts': [
+    "export async function DELETE() { return fetch('/scratch/route-optional-catch-all'); }",
+    '',
+  ].join('\n'),
+  'src/app/nested/route.ts': [
+    "export async function PATCH() { return fetch('/scratch/route-src-prefixed'); }",
+    '',
+  ].join('\n'),
+
+  // App Router route modules whose identity the reproduction must refuse.
+  'app/_private/hidden/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-private'); }",
+    '',
+  ].join('\n'),
+  'app/(..)intercepted/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-intercepted'); }",
+    '',
+  ].join('\n'),
+  'app/[...slug]/tail/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-misplaced-catch-all'); }",
+    '',
+  ].join('\n'),
+  'app/bad[bracket]/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-malformed-bracket'); }",
+    '',
+  ].join('\n'),
+  'app/[[optional]]/route.ts': [
+    "export async function GET() { return fetch('/scratch/route-optional-without-spread'); }",
+    '',
+  ].join('\n'),
+
+  // App Router page modules: a page renders, so it has no route step.
+  'app/items/page.ts': [
+    "export default ((async () => fetch('/scratch/page-wrapped')) as () => Promise<Response>);",
+    '',
+  ].join('\n'),
+  'app/overview/page.ts': [
+    "export default async () => fetch('/scratch/page-default-arrow');",
+    '',
+  ].join('\n'),
+
+  // Pages Router modules: under `api/` the default export is the route.
+  'pages/api/items.ts': [
+    "export default async function handler() { return fetch('/scratch/pages-named-default'); }",
+    '',
+  ].join('\n'),
+  'pages/api/index.ts': [
+    "export default async () => fetch('/scratch/pages-index-arrow');",
+    '',
+  ].join('\n'),
+  'pages/api/[id].ts': [
+    "export default async function handler() { return fetch('/scratch/pages-dynamic'); }",
+    '',
+  ].join('\n'),
+  'pages/api/(grouped)/thing.ts': [
+    "export default async function handler() { return fetch('/scratch/pages-parenthesised'); }",
+    '',
+  ].join('\n'),
+  'pages/api/_hidden.ts': ["export default async () => fetch('/scratch/pages-private');", ''].join(
+    '\n',
+  ),
+  'pages/api/middleware.ts': [
+    "export default async function handler() { return fetch('/scratch/pages-middleware'); }",
+    '',
+  ].join('\n'),
+  'pages/about.ts': [
+    "export default async function about() { return fetch('/scratch/pages-document'); }",
+    '',
+  ].join('\n'),
+
+  // Server modules: default exports and export clauses.
+  'src/lib/default-arrow.ts': [
+    "export default async () => fetch('/scratch/lib-default-arrow');",
+    '',
+  ].join('\n'),
+  'src/lib/default-wrapped.ts': [
+    "export default ((async () => fetch('/scratch/lib-default-wrapped')) as () => Promise<Response>);",
+    '',
+  ].join('\n'),
+  'src/lib/default-call.ts': ["export default fetch('/scratch/lib-default-call');", ''].join('\n'),
+  'src/lib/export-equals.ts': ["export = fetch('/scratch/lib-export-equals');", ''].join('\n'),
+  'src/lib/clauses.ts': [
+    "async function load() { return fetch('/scratch/lib-clause'); }",
+    "async function purge() { return fetch('/scratch/lib-default-name'); }",
+    "async function internal() { return fetch('/scratch/lib-internal'); }",
+    'interface Shape { readonly ok: boolean }',
+    '',
+    'void internal;',
+    '',
+    'export { load as fetchAll };',
+    'export type { Shape };',
+    'export default purge;',
+    '',
+  ].join('\n'),
+
+  // Class members, a class expression, a function-local class and a namespace.
+  'src/lib/client-class.ts': [
+    'export class ApiClient {',
+    "  readonly loader = () => fetch('/scratch/class-property');",
+    '',
+    '  constructor() {',
+    "    void fetch('/scratch/class-constructor');",
+    '  }',
+    '',
+    "  load() { return fetch('/scratch/class-method'); }",
+    '',
+    "  get current() { return fetch('/scratch/class-getter'); }",
+    '',
+    "  ['computed' + 'Name']() { return fetch('/scratch/class-computed'); }",
+    '}',
+    '',
+    "export const Anonymous = class { run() { return fetch('/scratch/class-expression'); } };",
+    '',
+    'export function factory() {',
+    "  class Local { run() { return fetch('/scratch/class-local'); } }",
+    '  return Local;',
+    '}',
+    '',
+    'export namespace Api {',
+    "  export function load() { return fetch('/scratch/namespace-member'); }",
+    '}',
+    '',
+  ].join('\n'),
+
+  // Markup modules: a component-named function, a lower-case one, and a
+  // wrapped default export beside a component-named variable.
+  'src/components/Panel.tsx': [
+    'export function Panel() {',
+    "  void fetch('/scratch/component-module');",
+    '  return <div />;',
+    '}',
+    '',
+  ].join('\n'),
+  'src/components/render-list.tsx': [
+    'export function renderList() {',
+    "  void fetch('/scratch/lowercase-markup-module');",
+    '  return <ul />;',
+    '}',
+    '',
+  ].join('\n'),
+  'src/components/wrapped-default.tsx': [
+    'const Card = () => <p />;',
+    '',
+    'void Card;',
+    '',
+    "export default ((async () => fetch('/scratch/component-wrapped-default')) as () => Promise<Response>);",
+    '',
+  ].join('\n'),
+
+  // Markup bindings the handler step resolves: class members named through
+  // `this` (a method, an arrow property, and a method bound with `.bind`), an
+  // inline arrow, a called factory, a wrapped reference, and a parameter.
+  'src/components/HandlerForms.tsx': [
+    'function makeHandler(id: string) {',
+    '  return () => {',
+    "    void fetch('/scratch/handler-factory');",
+    '    void id;',
+    '  };',
+    '}',
+    '',
+    'export class ClassForm {',
+    "  onSave() { void fetch('/scratch/handler-class-method'); }",
+    '',
+    "  readonly onReset = () => { void fetch('/scratch/handler-class-property'); };",
+    '',
+    "  onBound() { void fetch('/scratch/handler-class-bound'); }",
+    '',
+    '  render() {',
+    '    return (',
+    '      <form>',
+    '        <button onClick={this.onSave} />',
+    '        <button onReset={this.onReset} />',
+    '        <button onFocus={this.onBound.bind(this)} />',
+    '      </form>',
+    '    );',
+    '  }',
+    '}',
+    '',
+    'export function InlineForm() {',
+    "  return <button onClick={() => { void fetch('/scratch/handler-inline'); }} />;",
+    '}',
+    '',
+    'export function FactoryForm() {',
+    "  return <button onClick={makeHandler('first')} />;",
+    '}',
+    '',
+    'export function WrappedForm() {',
+    "  const handle = () => { void fetch('/scratch/handler-wrapped'); };",
+    '  return <button onClick={(handle as () => void)} />;',
+    '}',
+    '',
+    'export function ParameterForm({ onPick }: { onPick: () => void }) {',
+    "  void fetch('/scratch/handler-parameter-component');",
+    '  return <button onClick={onPick} />;',
+    '}',
+    '',
+  ].join('\n'),
+
+  // Every `XMLHttpRequest` binding rule, one function per rule.
+  'src/lib/xhr-bindings.ts': [
+    'declare const spare: XMLHttpRequest;',
+    'declare const pending: readonly XMLHttpRequest[];',
+    'declare const verb: string;',
+    '',
+    'export function declaredThenAssigned(): void {',
+    '  let request;',
+    '  request = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-let-then-assign');",
+    '}',
+    '',
+    'export function reassigned(): void {',
+    '  let request = new XMLHttpRequest();',
+    "  request.open('POST', '/scratch/xhr-reassigned');",
+    '  request = spare;',
+    '}',
+    '',
+    'export function nullishReassigned(): void {',
+    '  let request: XMLHttpRequest | undefined = new XMLHttpRequest();',
+    "  request.open('POST', '/scratch/xhr-nullish-reassigned');",
+    '  request ??= spare;',
+    '}',
+    '',
+    'export function incremented(): void {',
+    '  let request: any = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-incremented');",
+    '  request++;',
+    '}',
+    '',
+    'export function decremented(): void {',
+    '  let request: any = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-decremented');",
+    '  --request;',
+    '}',
+    '',
+    'export function compared(): void {',
+    '  const request = new XMLHttpRequest();',
+    '  if (request === spare || request.readyState >= 2) {',
+    '    return;',
+    '  }',
+    "  request.open('PATCH', '/scratch/xhr-compared');",
+    '}',
+    '',
+    'export function shadowedInBlock(): void {',
+    '  const request = new XMLHttpRequest();',
+    '  {',
+    '    let request: XMLHttpRequest | undefined;',
+    '    void request;',
+    '  }',
+    "  request.open('GET', '/scratch/xhr-block-shadow');",
+    '}',
+    '',
+    'export function shadowedByLoop(): void {',
+    '  const request = new XMLHttpRequest();',
+    '  for (const request of pending) {',
+    '    void request;',
+    '  }',
+    "  request.open('GET', '/scratch/xhr-loop-shadow');",
+    '}',
+    '',
+    'export function shadowedByCatch(): void {',
+    '  const request = new XMLHttpRequest();',
+    '  try {',
+    '    request.send();',
+    '  } catch (request) {',
+    '    void request;',
+    '  }',
+    "  request.open('GET', '/scratch/xhr-catch-shadow');",
+    '}',
+    '',
+    'export function twoDeclarationsWithoutValue(): void {',
+    '  var request;',
+    '  var request;',
+    '  request = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-two-declarations');",
+    '}',
+    '',
+    'export function twoConstructions(): void {',
+    '  let request = new XMLHttpRequest();',
+    '  request = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-two-constructions');",
+    '}',
+    '',
+    'export function twoOpens(): void {',
+    '  const request = new XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-first-open');",
+    "  request.open('GET', '/scratch/xhr-second-open');",
+    '}',
+    '',
+    'export function openInCallback(): void {',
+    '  const request = new XMLHttpRequest();',
+    "  setTimeout(() => request.open('GET', '/scratch/xhr-callback-open'));",
+    '}',
+    '',
+    'export function viaWindow(): void {',
+    '  const request = new window.XMLHttpRequest();',
+    "  request.open('DELETE', '/scratch/xhr-window');",
+    '}',
+    '',
+    'export function computedVerb(): void {',
+    '  const request = new XMLHttpRequest();',
+    "  request.open(verb, '/scratch/xhr-computed-verb');",
+    '}',
+    '',
+    'export function unsupportedVerb(): void {',
+    '  const request = new XMLHttpRequest();',
+    "  request.open('TRACE', '/scratch/xhr-trace');",
+    '}',
+    '',
+    'export function propertyBound(holder: { request?: XMLHttpRequest }): void {',
+    '  holder.request = new XMLHttpRequest();',
+    "  holder.request.open('GET', '/scratch/xhr-property-bound');",
+    '}',
+    '',
+    'export function notAGlobal(factory: { XMLHttpRequest: new () => XMLHttpRequest }): void {',
+    '  const request = new factory.XMLHttpRequest();',
+    "  request.open('GET', '/scratch/xhr-not-global');",
+    '}',
+    '',
+  ].join('\n'),
+};
+
 /* -------------------------------------------------------------------------------------------------
  * Setup and teardown
  * ---------------------------------------------------------------------------------------------- */
@@ -968,6 +1366,7 @@ beforeAll(async () => {
   corpus = await openAndExtract(FIXTURE_ROOT);
   shapes = await createScratchProject('debuggen-api-calls-shapes-', SHAPE_MODULES);
   torn = await createScratchProject('debuggen-api-calls-torn-', TORN_MODULES);
+  cascade = await createScratchProject('debuggen-api-calls-cascade-', CASCADE_MODULES);
 });
 
 afterAll(() => {
@@ -1543,7 +1942,12 @@ function fileStateOf(root: string): readonly string[] {
 
 /** Every project this suite extracted, for the invariants that hold across all of them. */
 function everyProject(): readonly ExtractedProject[] {
-  return [corpusFixture(), scratchProject(shapes, 'shapes'), scratchProject(torn, 'torn')];
+  return [
+    corpusFixture(),
+    scratchProject(shapes, 'shapes'),
+    scratchProject(torn, 'torn'),
+    scratchProject(cascade, 'cascade'),
+  ];
 }
 
 describe('apiCallsExtractor: robustness, purity and determinism', () => {
@@ -1649,5 +2053,584 @@ describe('apiCallsExtractor: robustness, purity and determinism', () => {
         expect(JSON.stringify(edge)).not.toContain(root);
       }
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 5. The owner cascade across module kinds, export forms and route identities
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The cascade project, or a readable failure when `beforeAll` did not run.
+ *
+ * @returns The project.
+ */
+function cascadeFixture(): ExtractedProject {
+  return scratchProject(cascade, 'cascade');
+}
+
+/**
+ * The owner one cascade site's `calls` edge starts at, resolved in the assembled
+ * graph, together with the `symbol` the node carries.
+ *
+ * @param file The module's project-relative POSIX path.
+ * @param url The site's literal target, which is unique across the project.
+ * @returns The owner's kind and name, and the node's `symbol`.
+ */
+function cascadeOwnerOf(
+  file: string,
+  url: string,
+): { readonly kind: string; readonly name: string; readonly symbol: string | undefined } {
+  const project = cascadeFixture();
+  const node = nodeByUrl(apiCallsOf(project, file), url);
+  const owner = ownerNodeOf(project.graph, soleCallsEdgeTo(edgesOf(project, file), node.id));
+
+  return { kind: owner.kind, name: owner.name, symbol: node.symbol };
+}
+
+describe('apiCallsExtractor: the route step and the route identities it reproduces', () => {
+  it.each([
+    ['an App Router GET handler', 'app/items/route.ts', '/scratch/route-get', '/items', 'GET'],
+    [
+      'a handler under a group and a slot, exported as a const',
+      'app/(storefront)/@panel/[id]/route.ts',
+      '/scratch/route-grouped',
+      '/[id]',
+      'POST',
+    ],
+    [
+      'a handler exported through a clause, under a catch-all',
+      'app/docs/[...slug]/route.ts',
+      '/scratch/route-catch-all',
+      '/docs/[...slug]',
+      'handler',
+    ],
+    [
+      'a handler under an optional catch-all',
+      'app/archive/[[...rest]]/route.ts',
+      '/scratch/route-optional-catch-all',
+      '/archive/[[...rest]]',
+      'DELETE',
+    ],
+    [
+      'a handler under the src/ prefix',
+      'src/app/nested/route.ts',
+      '/scratch/route-src-prefixed',
+      '/nested',
+      'PATCH',
+    ],
+    [
+      'a Pages Router named default export',
+      'pages/api/items.ts',
+      '/scratch/pages-named-default',
+      '/api/items',
+      'handler',
+    ],
+    [
+      'a Pages Router index default arrow',
+      'pages/api/index.ts',
+      '/scratch/pages-index-arrow',
+      '/api',
+      'default',
+    ],
+    [
+      'a Pages Router dynamic module',
+      'pages/api/[id].ts',
+      '/scratch/pages-dynamic',
+      '/api/[id]',
+      'handler',
+    ],
+    [
+      'a Pages Router parenthesised directory, which is a static segment there',
+      'pages/api/(grouped)/thing.ts',
+      '/scratch/pages-parenthesised',
+      '/api/(grouped)/thing',
+      'handler',
+    ],
+  ])('attributes %s to the api-route node the graph holds', (_label, file, url, route, symbol) => {
+    // The id is reproduced from a route path and a route entry position this
+    // extractor derives itself; resolving it to a node proves the two agree.
+    expect(cascadeOwnerOf(file, url)).toStrictEqual({ kind: 'api-route', name: route, symbol });
+  });
+
+  it.each([
+    ['a private folder', 'app/_private/hidden/route.ts', '/scratch/route-private'],
+    ['an intercepting route', 'app/(..)intercepted/route.ts', '/scratch/route-intercepted'],
+    [
+      'a catch-all that is not last',
+      'app/[...slug]/tail/route.ts',
+      '/scratch/route-misplaced-catch-all',
+    ],
+    ['a malformed bracket', 'app/bad[bracket]/route.ts', '/scratch/route-malformed-bracket'],
+    [
+      'a double bracket without a spread',
+      'app/[[optional]]/route.ts',
+      '/scratch/route-optional-without-spread',
+    ],
+  ])('falls back to the symbol node for a route under %s', (_label, file, url) => {
+    // A spelling whose URL the reproduction cannot vouch for claims no route:
+    // the failure direction is a less specific edge, never a dangling one.
+    expect(cascadeOwnerOf(file, url)).toStrictEqual({ kind: 'symbol', name: 'GET', symbol: 'GET' });
+  });
+
+  it('keeps a route module’s non-handler export and its class member off the route node', () => {
+    // Neither is exported under an HTTP method's name, and the module is a
+    // route module, so neither is a server function either.
+    expect(cascadeOwnerOf('app/items/route.ts', '/scratch/route-helper')).toStrictEqual({
+      kind: 'symbol',
+      name: 'helper',
+      symbol: 'helper',
+    });
+    expect(cascadeOwnerOf('app/items/route.ts', '/scratch/route-member')).toStrictEqual({
+      kind: 'symbol',
+      name: 'load',
+      symbol: 'load',
+    });
+  });
+
+  it.each([
+    ['a private module', 'pages/api/_hidden.ts', '/scratch/pages-private', 'default'],
+    ['middleware', 'pages/api/middleware.ts', '/scratch/pages-middleware', 'handler'],
+    ['a page outside api/', 'pages/about.ts', '/scratch/pages-document', 'about'],
+  ])('falls back to the symbol node for a Pages Router %s', (_label, file, url, name) => {
+    expect(cascadeOwnerOf(file, url)).toStrictEqual({ kind: 'symbol', name, symbol: name });
+  });
+});
+
+describe('apiCallsExtractor: default exports, export clauses and markup modules', () => {
+  it.each([
+    [
+      'a default-exported arrow in a server module',
+      'src/lib/default-arrow.ts',
+      '/scratch/lib-default-arrow',
+      'server-function',
+      'default',
+    ],
+    [
+      'a wrapped default-exported arrow in a server module',
+      'src/lib/default-wrapped.ts',
+      '/scratch/lib-default-wrapped',
+      'server-function',
+      'default',
+    ],
+    [
+      'a default-exported call, which is no function',
+      'src/lib/default-call.ts',
+      '/scratch/lib-default-call',
+      'symbol',
+      'default',
+    ],
+    [
+      'an unwrapped default-exported arrow in a page module',
+      'app/overview/page.ts',
+      '/scratch/page-default-arrow',
+      'symbol',
+      'default',
+    ],
+    [
+      'a function exported only through an aliased clause',
+      'src/lib/clauses.ts',
+      '/scratch/lib-clause',
+      'server-function',
+      'load',
+    ],
+    [
+      'a function exported only as export default <name>',
+      'src/lib/clauses.ts',
+      '/scratch/lib-default-name',
+      'server-function',
+      'purge',
+    ],
+    [
+      'a function that does not leave its module',
+      'src/lib/clauses.ts',
+      '/scratch/lib-internal',
+      'symbol',
+      'internal',
+    ],
+    [
+      'a component-named function in a markup module',
+      'src/components/Panel.tsx',
+      '/scratch/component-module',
+      'symbol',
+      'Panel',
+    ],
+    [
+      'a lower-case function in a markup module',
+      'src/components/render-list.tsx',
+      '/scratch/lowercase-markup-module',
+      'server-function',
+      'renderList',
+    ],
+  ])('attributes %s to the node the graph holds', (_label, file, url, kind, name) => {
+    expect(cascadeOwnerOf(file, url)).toStrictEqual({ kind, name, symbol: name });
+  });
+
+  it.each([
+    ['a wrapped default export in a page module', 'app/items/page.ts', '/scratch/page-wrapped'],
+    [
+      'a wrapped default export in a markup module',
+      'src/components/wrapped-default.tsx',
+      '/scratch/component-wrapped-default',
+    ],
+    [
+      'export =, which no sibling records',
+      'src/lib/export-equals.ts',
+      '/scratch/lib-export-equals',
+    ],
+  ])('falls back to the file node for %s', (_label, file, url) => {
+    // Two siblings anchor a wrapped default export at different positions, so
+    // no single id is safe to spell; `export =` has no node at all.
+    expect(cascadeOwnerOf(file, url)).toStrictEqual({
+      kind: 'file',
+      name: file,
+      symbol: undefined,
+    });
+    expect('symbol' in nodeByUrl(apiCallsOf(cascadeFixture(), file), url)).toBe(false);
+  });
+});
+
+describe('apiCallsExtractor: class, namespace and function-local owners', () => {
+  const CLASS_MODULE = 'src/lib/client-class.ts';
+
+  it.each([
+    ['a property arrow', '/scratch/class-property', 'loader'],
+    ['the constructor', '/scratch/class-constructor', 'constructor'],
+    ['a method', '/scratch/class-method', 'load'],
+    ['a getter', '/scratch/class-getter', 'current'],
+    ['a computed-name method, owned by its class', '/scratch/class-computed', 'ApiClient'],
+    ['a class expression, owned by its binding', '/scratch/class-expression', 'Anonymous'],
+    ['a namespace member, owned by its namespace', '/scratch/namespace-member', 'Api'],
+  ])('attributes a call in %s to a symbol node', (_label, url, name) => {
+    // A class member shares its class's name space rather than the module's,
+    // so it is never a server function whatever its class's export status.
+    expect(cascadeOwnerOf(CLASS_MODULE, url)).toStrictEqual({ kind: 'symbol', name, symbol: name });
+  });
+
+  it('walks past a function-local class to the exported function around it', () => {
+    expect(cascadeOwnerOf(CLASS_MODULE, '/scratch/class-local')).toStrictEqual({
+      kind: 'server-function',
+      name: 'factory',
+      symbol: 'factory',
+    });
+  });
+
+  it.each([
+    ['a method bound through this', '/scratch/handler-class-method', 'onSave'],
+    ['an arrow property bound through this', '/scratch/handler-class-property', 'onReset'],
+    ['a method bound with .bind(this)', '/scratch/handler-class-bound', 'onBound'],
+    ['an inline arrow, named for its attribute', '/scratch/handler-inline', 'onClick'],
+    ['the factory a binding calls', '/scratch/handler-factory', 'makeHandler'],
+    ['a reference wrapped in an assertion', '/scratch/handler-wrapped', 'handle'],
+  ])('attributes a call inside %s to the handler node the graph holds', (_label, url, name) => {
+    // The handler step outranks every declaration step: a class member bound in
+    // markup is a handler before it is a symbol.
+    expect(cascadeOwnerOf('src/components/HandlerForms.tsx', url)).toStrictEqual({
+      kind: 'handler',
+      name,
+      symbol: name,
+    });
+  });
+
+  it('does not let a parameter-bound handler claim the component body that receives it', () => {
+    // `onPick` arrives from the caller, so no call site here sits inside it; the
+    // component's own call keeps the component's symbol.
+    expect(
+      cascadeOwnerOf('src/components/HandlerForms.tsx', '/scratch/handler-parameter-component'),
+    ).toStrictEqual({ kind: 'symbol', name: 'ParameterForm', symbol: 'ParameterForm' });
+  });
+
+  it('assembles the whole cascade project with no dangling edge and no other finding', () => {
+    const project = cascadeFixture();
+
+    // Every owner id spelled above, the reproduced route ids included, names a
+    // node another extractor emitted.
+    expect(project.graph.diagnostics).toStrictEqual([]);
+    expect(allDiagnosticsOf(project)).toStrictEqual([]);
+
+    for (const edge of allEdgesOf(project)) {
+      expect(ownerNodeOf(project.graph, edge).id).toBe(edge.from);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 6. XMLHttpRequest binding rules
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('apiCallsExtractor: XMLHttpRequest binding rules', () => {
+  const XHR_MODULE = 'src/lib/xhr-bindings.ts';
+
+  /** The module's XMLHttpRequest nodes. */
+  function xhrNodes(): readonly CodeNodeOf<'api-call'>[] {
+    return apiCallsOf(cascadeFixture(), XHR_MODULE);
+  }
+
+  it.each([
+    [
+      'a let declared first and assigned later',
+      'declaredThenAssigned',
+      '/scratch/xhr-let-then-assign',
+      'GET',
+    ],
+    ['a binding only compared, never re-bound', 'compared', '/scratch/xhr-compared', 'PATCH'],
+    ['a construction on the window receiver', 'viaWindow', '/scratch/xhr-window', 'DELETE'],
+  ])('pairs %s with its one open call', (_label, symbol, url, method) => {
+    const node = nodeBySymbol(xhrNodes(), symbol);
+
+    expect(node.data).toStrictEqual({ dynamic: false, url, method });
+  });
+
+  it('records the target but no method when open states a computed or unsupported verb', () => {
+    // `open()` has no platform default, so a verb that is not a literal of the
+    // shared vocabulary leaves the field absent rather than guessed.
+    expect(nodeBySymbol(xhrNodes(), 'computedVerb').data).toStrictEqual({
+      dynamic: false,
+      url: '/scratch/xhr-computed-verb',
+    });
+    expect(nodeBySymbol(xhrNodes(), 'unsupportedVerb').data).toStrictEqual({
+      dynamic: false,
+      url: '/scratch/xhr-trace',
+    });
+  });
+
+  it.each([
+    ['a plain reassignment', 'reassigned'],
+    ['a logical assignment', 'nullishReassigned'],
+    ['a postfix increment', 'incremented'],
+    ['a prefix decrement', 'decremented'],
+    ['a declaration in a nested block', 'shadowedInBlock'],
+    ['a for-of head', 'shadowedByLoop'],
+    ['a catch clause', 'shadowedByCatch'],
+    ['two value-free declarations', 'twoDeclarationsWithoutValue'],
+    ['two open calls', 'twoOpens'],
+    ['an open call inside a callback', 'openInCallback'],
+    ['a property assignment rather than a name', 'propertyBound'],
+  ])('leaves a request unpaired when the body has %s', (_label, symbol) => {
+    // A wrong target is worse than a missing one: anything short of one
+    // binding and one following open call records an unknown target.
+    expect(nodeBySymbol(xhrNodes(), symbol).data).toStrictEqual({ dynamic: true });
+  });
+
+  it('leaves both of two constructions on one name unpaired', () => {
+    const nodes = xhrNodes().filter((node) => node.symbol === 'twoConstructions');
+
+    expect(nodes.map((node) => node.data)).toStrictEqual([{ dynamic: true }, { dynamic: true }]);
+    expect(new Set(nodes.map((node) => node.id)).size).toBe(2);
+  });
+
+  it('does not recognise a construction on a receiver that is not a global', () => {
+    const urls = JSON.stringify(xhrNodes());
+
+    expect(xhrNodes().map((node) => node.symbol)).not.toContain('notAGlobal');
+    expect(urls).not.toContain('/scratch/xhr-not-global');
+    expect(xhrNodes()).toHaveLength(18);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * 7. What it reports instead of throwing
+ * ---------------------------------------------------------------------------------------------- */
+
+/** One log record a {@link recordingLogger} captured. */
+interface RecordedLog {
+  /** The severity it was emitted at. */
+  readonly level: LogLevel;
+
+  /** The message. */
+  readonly message: string;
+
+  /** The structured fields, when the call passed any. */
+  readonly fields: LogFields | undefined;
+}
+
+/**
+ * A logger that records instead of printing, plus the list it records into.
+ *
+ * @param failDebugWith What `debug` throws after recording, or `undefined` for
+ * a logger that never throws.
+ * @returns The logger and its records.
+ */
+function recordingLogger(failDebugWith?: () => unknown): {
+  readonly logger: Logger;
+  readonly records: RecordedLog[];
+} {
+  const records: RecordedLog[] = [];
+  const capture =
+    (level: LogLevel) =>
+    (message: string, fields?: LogFields): void => {
+      records.push({ level, message, fields });
+
+      if (level === 'debug' && failDebugWith !== undefined) {
+        throw failDebugWith();
+      }
+    };
+  const logger: Logger = {
+    level: 'trace',
+    trace: capture('trace'),
+    debug: capture('debug'),
+    info: capture('info'),
+    warn: capture('warn'),
+    error: capture('error'),
+    fatal: capture('fatal'),
+    child: () => logger,
+  };
+
+  return { logger, records };
+}
+
+/**
+ * The context for one cascade module, with a logger of the case's choosing.
+ *
+ * @param file The module's project-relative POSIX path.
+ * @param logger The logger to hand the extractor.
+ * @returns The context.
+ */
+function cascadeContext(file: string, logger: Logger): ExtractorContext {
+  const { loaded } = cascadeFixture();
+  const sourceFile = loaded
+    .sourceFiles()
+    .find((candidate) => loaded.projectRelative(candidate.getFilePath()) === file);
+
+  if (sourceFile === undefined) {
+    throw new Error(`the cascade project holds no module at ${file}`);
+  }
+
+  return { ...contextFor(loaded, sourceFile, file), logger };
+}
+
+describe('apiCallsExtractor: what it reports instead of throwing', () => {
+  it('logs the two incomplete-but-correct attributions at debug, naming no source text', () => {
+    const fileOwned = recordingLogger();
+    const unsupported = recordingLogger();
+
+    apiCallsExtractor.extract(cascadeContext('src/lib/export-equals.ts', fileOwned.logger));
+    apiCallsExtractor.extract(cascadeContext('src/lib/xhr-bindings.ts', unsupported.logger));
+
+    expect(fileOwned.records.map((record) => [record.level, record.fields])).toStrictEqual([
+      [
+        'debug',
+        {
+          extractorId: API_CALLS_EXTRACTOR_ID,
+          file: 'src/lib/export-equals.ts',
+          shape: 'fetch',
+          line: 1,
+        },
+      ],
+    ]);
+
+    const trace = nodeBySymbol(
+      apiCallsOf(cascadeFixture(), 'src/lib/xhr-bindings.ts'),
+      'unsupportedVerb',
+    );
+
+    expect(unsupported.records.map((record) => [record.level, record.fields])).toStrictEqual([
+      [
+        'debug',
+        {
+          extractorId: API_CALLS_EXTRACTOR_ID,
+          file: 'src/lib/xhr-bindings.ts',
+          shape: 'xhr',
+          line: trace.line,
+          column: trace.column,
+        },
+      ],
+    ]);
+    // The verb itself is source text and is never logged.
+    expect(JSON.stringify(unsupported.records)).not.toContain('TRACE');
+  });
+
+  it('costs one unattributable site its node, reports it as a warning, and keeps every other site', () => {
+    const file = 'src/lib/xhr-bindings.ts';
+    const { logger } = recordingLogger(() => new TypeError('refused /scratch/xhr-trace'));
+    const result = apiCallsExtractor.extract(cascadeContext(file, logger));
+    const text = readFileSync(join(cascadeFixture().root, file), 'utf8');
+    const construction = positionAt(
+      text,
+      soleOffsetOf(text, "new XMLHttpRequest();\n  request.open('TRACE'"),
+    );
+
+    // The unsupported-verb site is the only one that logs, so it is the only one
+    // whose attribution fails; the other seventeen keep their node and edge.
+    expect(result.nodes).toHaveLength(17);
+    expect(result.edges).toHaveLength(17);
+    expect(result.nodes.map((node) => node.symbol)).not.toContain('unsupportedVerb');
+    expect(result.diagnostics).toStrictEqual([
+      {
+        severity: 'warning',
+        code: 'extractor-failed',
+        message: `${API_CALLS_EXTRACTOR_ID} could not read a NewExpression at line ${String(construction.line)}, column ${String(construction.column)}; the rest of the file was indexed`,
+        file,
+        extractorId: API_CALLS_EXTRACTOR_ID,
+        detail: 'threw TypeError',
+      },
+    ]);
+    // The thrown message quoted a target; only the error's class is repeated.
+    expect(JSON.stringify(result.diagnostics)).not.toContain('/scratch/xhr-trace');
+  });
+
+  it('describes a thrown value that is not an Error by its type alone', () => {
+    const { logger } = recordingLogger(() => 'a bare string');
+    const result = apiCallsExtractor.extract(cascadeContext('src/lib/export-equals.ts', logger));
+
+    expect(result.nodes).toStrictEqual([]);
+    expect(result.diagnostics?.map((diagnostic) => diagnostic.detail)).toStrictEqual([
+      'threw a non-error value of type string',
+    ]);
+  });
+
+  it('declines a context whose file is not a project-relative path, and warns without naming it', () => {
+    const { logger, records } = recordingLogger();
+    const context = {
+      ...cascadeContext('src/lib/default-arrow.ts', logger),
+      file: '../outside.ts',
+    };
+
+    expect(apiCallsExtractor.extract(context)).toStrictEqual({ nodes: [], edges: [] });
+    expect(records.map((record) => [record.level, record.fields])).toStrictEqual([
+      ['warn', { extractorId: API_CALLS_EXTRACTOR_ID }],
+    ]);
+  });
+
+  it('reports a module it could not scan at all as one file-level warning', () => {
+    // Detaching the module's syntax tree is the one deterministic way to make
+    // the markup scan throw, and it is done to a project of its own so no other
+    // case is affected.
+    const project = new Project({ useInMemoryFileSystem: true });
+    const sourceFile = project.createSourceFile(
+      '/memory/src/detached.ts',
+      "export function detached() { return fetch('/scratch/detached'); }\n",
+    );
+    const loaded: LoadedProject = {
+      project,
+      projectRoot: '/memory',
+      tsConfigFilePath: undefined,
+      sourceFiles: () => project.getSourceFiles(),
+      projectRelative: (absolutePath: string) =>
+        absolutePath.startsWith('/memory/') ? absolutePath.slice('/memory/'.length) : undefined,
+    };
+
+    sourceFile.forget();
+
+    const result = apiCallsExtractor.extract({
+      loaded,
+      sourceFile,
+      file: 'src/detached.ts',
+      projectRoot: '/memory',
+      logger: noopLogger,
+    });
+
+    expect(result.nodes).toStrictEqual([]);
+    expect(result.edges).toStrictEqual([]);
+    expect(result.diagnostics).toHaveLength(1);
+    expect(result.diagnostics?.[0]).toMatchObject({
+      severity: 'warning',
+      code: 'extractor-failed',
+      message: `${API_CALLS_EXTRACTOR_ID} could not index this file; no API call site was recorded for it`,
+      file: 'src/detached.ts',
+      extractorId: API_CALLS_EXTRACTOR_ID,
+    });
+    expect(result.diagnostics?.[0]?.detail).toMatch(/^threw \w+$/);
+    expect(JSON.stringify(result.diagnostics)).not.toContain('/scratch/detached');
   });
 });

@@ -30,8 +30,9 @@
  *     span whose parent is not loaded is marked "Parent not loaded" — never
  *     "Re-attached" — until a later page brings the parent.
  *   - **Partial results say so.** A `spans` page states how much of the result it
- *     holds and offers to load more; a `trace` the correlator truncated says that
- *     instead of implying completeness.
+ *     holds and offers to load more; a `trace` walk stopped at its row bound
+ *     states N of M and offers to show more; a `trace` the correlator truncated
+ *     says that, with the refine route, instead of implying completeness.
  *   - **Paging follows the service.** Each further page is requested at the
  *     `nextOffset` the previous response named, at the same page size, and
  *     appended with each record once; the loaded rows stay on screen while a
@@ -46,10 +47,11 @@
  *     a text alternative, so its bars are deliberately outside the accessibility
  *     tree; the keyboard-reachable equivalent below it must therefore list every
  *     row and be operable (AAP 0.6.4).
- *   - **Descriptions are not hover-only.** The focused row drives the detail
- *     strip, whose name is a focusable tooltip trigger, and the focused row's
- *     own name is one Tab away — in that row only, so the table body does not
- *     grow a tab stop per row.
+ *   - **Descriptions are not hover-only.** A row that holds keyboard focus
+ *     shows its description in its Operation cell, dismissed by Escape, and no
+ *     row's name is a tab stop, so the table body stays one roving stop; the
+ *     focused row drives the detail strip, whose name is the pointer's trigger
+ *     for the same description and no tab stop of its own.
  *   - **The three states of a query-backed view** and the **click-to-source
  *     payload** that AAP 0.8.3 asks of every component suite in this folder.
  *
@@ -72,11 +74,15 @@
  *   - **Generic fixture vocabulary only** (AAP 0.5.4): span names, a file path and
  *     a symbol belonging to no application, demonstration or otherwise — in the
  *     fixtures and in the comments alike.
- *   - **Nothing about layout is stubbed.** No `getBoundingClientRect` override and
- *     no `ResizeObserver` polyfill: the canvas is a fixed logical `viewBox` scaled
- *     by CSS, so an environment with no layout draws exactly what a browser draws.
- *     A case that needed such a stub would be reporting a measurement dependency
- *     in the component, to be removed rather than accommodated.
+ *   - **Layout is not stubbed, with one declared exception.** No
+ *     `getBoundingClientRect` override and no `ResizeObserver` polyfill: with no
+ *     layout the viewport reports no width, so the canvas lays out at its
+ *     unmeasured fallback width and its labels are measured by the deterministic
+ *     estimate of `../utils/measure` — a pure function of the data, which is what
+ *     every case asserts against. The exception is the measured-mode cases in
+ *     "Timeline canvas geometry", which report a width for the timeline's
+ *     viewport element only, through a `clientWidth` getter restored after each
+ *     case: the pixel-canvas contract cannot be observed any other way here.
  *   - **Queries by role and accessible name.** The canvas, the grid, its rows, the
  *     chips, the tooltips and the footer control are all reached that way; a class
  *     is read only off an element already obtained semantically, since no
@@ -90,8 +96,12 @@
  * @see ../utils/scale for the children-only trace walk the trace branch uses.
  */
 
-import { DATA_QUERY_DEFAULT_LIMIT, DATA_QUERY_MAX_LIMIT } from '@debuggen/panel-schema';
-import type { DataQuery, TimelineNode } from '@debuggen/panel-schema';
+import {
+  DATA_QUERY_DEFAULT_LIMIT,
+  DATA_QUERY_DEFAULT_OFFSET,
+  DATA_QUERY_MAX_LIMIT,
+} from '@debuggen/panel-schema';
+import type { DataQuery, FlameNode, TimelineNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type {
@@ -103,17 +113,24 @@ import type {
   TraceNodeLineage,
   TraceTree,
 } from '@debuggen/telemetry';
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { ReactElement } from 'react';
+import { useMemo, useState } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type {
+  PanelActions,
+  PanelEventRef,
+  PanelSelection,
+  PanelSelectionState,
+} from '../host/PanelActions';
 import { kindColorVar, tierColorVar } from '../utils/color';
+import { ELLIPSIS, createEstimateMeasure, splitGraphemes } from '../utils/measure';
 import {
   KIND_LABELS,
   NOT_AVAILABLE_LABEL,
@@ -125,7 +142,8 @@ import {
   formatOffset,
   formatTierLabel,
 } from '../utils/format';
-import { alignHairline } from '../utils/scale';
+import { alignHairline, layoutHeight, rowY } from '../utils/scale';
+import { FlameChart } from './FlameChart';
 import { Timeline } from './Timeline';
 
 /*
@@ -201,6 +219,34 @@ const RETRY_NAME = 'Retry';
 
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
+
+/*
+ * The shared error-state contract, spelled out rather than imported: these are
+ * the words every query-backed node shows a reader, so a change to any of them
+ * is a change this suite should notice (B1-F16, B2-F14).
+ */
+
+/** The title of a view whose own data could not be loaded. */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+
+/** The sentence every view failure's message opens with, before the provider's cause. */
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+
+/** The title of a failed next page below rows that stay on screen. */
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+
+/** The sentence a failed next page's message opens with. */
+const PAGE_FAILURE_LEAD =
+  'The next page of this view could not be loaded. The rows already shown are unaffected.';
+
+/** The title of a node whose query names a source this view cannot draw. */
+const UNSUPPORTED_TITLE = 'This view cannot draw the requested data';
+
+/** The key the retry control carries so the host can hand focus back to it after a remount. */
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** The visible summary of the closed technical-details disclosure. */
+const TECHNICAL_DETAILS_LABEL = 'Technical details';
 
 /** The flag the equivalent row carries for a node the correlator re-attached. */
 const REATTACHED_FLAG = 'Re-attached';
@@ -850,10 +896,17 @@ function barsOf(canvas: HTMLElement): Element[] {
   return Array.from(canvas.querySelectorAll('rect.dg-timeline__bar'));
 }
 
-/** The text drawn beside each bar, in that same order. */
+/** The text of each bar's label, in that same order; an unlabelled bar contributes nothing. */
 function barLabelsOf(canvas: HTMLElement): string[] {
   return Array.from(canvas.querySelectorAll('text.dg-timeline__bar-label')).map(
     (label) => label.textContent ?? '',
+  );
+}
+
+/** Whether each of those labels is drawn inside its bar or beside it, in the same order. */
+function barLabelPlacementsOf(canvas: HTMLElement): ('inside' | 'beside')[] {
+  return Array.from(canvas.querySelectorAll('text.dg-timeline__bar-label')).map((label) =>
+    label.classList.contains('dg-timeline__bar-label--inside') ? 'inside' : 'beside',
   );
 }
 
@@ -900,10 +953,13 @@ function dataRows(): HTMLElement[] {
 /**
  * The operation name of one equivalent row.
  *
- * Read off the row's header cell — obtained by role — and then off the element
- * the row's tooltip describes, which is the name run and nothing else: the cell
- * also holds the description bubble and any correlation flag, so the cell's own
- * text would not be the name.
+ * Read off the row's header cell — obtained by role — and then off the trigger
+ * box of the row's tooltip, which holds the name run and nothing else: the cell
+ * also holds any correlation flag, and the description bubble, which stays
+ * mounted open or closed, so the cell's own text would not be the name. The
+ * trigger box is read rather than the element found through
+ * `aria-describedby`, so finding a row never depends on the description link
+ * the keyboard cases assert.
  *
  * @param row A data row.
  * @returns The name exactly as the capture carried it.
@@ -911,7 +967,7 @@ function dataRows(): HTMLElement[] {
 function nameOf(row: HTMLElement): string {
   const header = within(row).getByRole('rowheader');
 
-  return header.querySelector('[aria-describedby]')?.textContent ?? '';
+  return header.querySelector('.dg-tooltip__trigger')?.textContent ?? '';
 }
 
 /** The operation name of each equivalent row, in document order. */
@@ -935,9 +991,40 @@ function rowNamed(name: string): HTMLElement {
   return row;
 }
 
-/** One row's description, as the tooltip in its header cell states it. */
-function descriptionOf(row: HTMLElement): string {
-  return within(row).getByRole('tooltip').textContent ?? '';
+/** The open description bubble inside `scope`, or `null` while every bubble in it is closed. */
+function openBubbleIn(scope: Element): HTMLElement | null {
+  return scope.querySelector<HTMLElement>('.dg-tooltip__bubble.dg-is-open');
+}
+
+/**
+ * One row's description, as the tooltip in its header cell states it.
+ *
+ * Opened the way a pointer opens it — by resting on the row's name — read
+ * while open, and closed again by moving away. A closed bubble is never read:
+ * whether it stays in the document while closed is the primitive's decision,
+ * not something this view's contract depends on.
+ *
+ * @param row A data row.
+ * @returns The description's text.
+ */
+async function descriptionOf(row: HTMLElement): Promise<string> {
+  const user = userEvent.setup();
+  const trigger = nameTriggerOf(row);
+
+  await user.hover(trigger);
+
+  const bubble = await waitFor(() => {
+    const open = openBubbleIn(row);
+    if (open === null) {
+      throw new Error('the row’s description did not open on hover');
+    }
+    return open;
+  });
+  const text = bubble.textContent ?? '';
+
+  await user.unhover(trigger);
+
+  return text;
 }
 
 /** The single query a stub provider received, failing on any other count. */
@@ -1012,12 +1099,19 @@ describe('Timeline states', () => {
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.closest('.dg-timeline__empty')).not.toBeNull();
 
+    // Announced as the settled status, with the empty capture's own short title
+    // and a decorative glyph beside the sentence, like every other view's.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe(NOTHING_CAPTURED_TITLE);
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty trace is a success, so it is drawn as an absence and not as a
     // failure — and there is nothing to place on an axis.
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
   });
 
   it('renders its own empty message, not an error, when no trace matched the query', async () => {
@@ -1034,7 +1128,7 @@ describe('Timeline states', () => {
     // No alert and so no retry, and nothing placed on an axis or in the table.
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
@@ -1079,6 +1173,79 @@ describe('Timeline states', () => {
     expect(screen.queryAllByRole('row')).toHaveLength(0);
   });
 
+  it('renders a provider rejection through the shared error-state contract, naming the query it asked', async () => {
+    const hint = 'Start the local service, then retry.';
+    const details = { attempts: 3, endpoint: 'panel-data' };
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.', {
+        hint,
+        details,
+      }),
+    );
+    const user = userEvent.setup();
+
+    // A span node authoring no page size or offset: the query the view asks is
+    // the authored one with both filled in, and that — not the authored one —
+    // is what failed and what the reader must be shown.
+    renderComponent(makeNode({ query: { source: 'spans', filter: { traceId: TRACE_ID } } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // A lone failure is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-timeline__error')).not.toBeNull();
+
+    // The one title, and the one message: the generic lead, then the
+    // provider's own cause as a sentence of its own.
+    const title = within(alert).getByText(VIEW_FAILURE_TITLE);
+    expect(title.classList.contains('dg-error-state__title')).toBe(true);
+    const message = within(alert).getByText((text) => text.startsWith(VIEW_FAILURE_LEAD));
+    expect(message.classList.contains('dg-error-state__message')).toBe(true);
+    expect(message.textContent).toContain('The channel to the service is closed.');
+
+    // What the reader can do, on its own line, and the machine code as a chip.
+    expect(within(alert).getByText(hint).classList.contains('dg-error-state__message')).toBe(true);
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
+      true,
+    );
+
+    // The query block holds exactly the query the provider received, in the
+    // one pretty-printed form every node prints. Looked up by name: the closed
+    // details disclosure below it is a group too.
+    // The expected text is built from a literal written in the formatter's
+    // member order (source, filter, sort, limit, offset), so the spelling is
+    // pinned independently of the order the query object was assembled in.
+    const expected = {
+      source: 'spans',
+      filter: { traceId: TRACE_ID },
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    };
+    const asked = soleQuery(stub);
+    expect(asked).toEqual(expected);
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(asked);
+    expect(shown.textContent).toBe(JSON.stringify(expected, null, 2));
+
+    // Developer detail stays behind the closed disclosure, never on the lines
+    // a panel reader meets first.
+    const disclosure = within(alert).getByText(TECHNICAL_DETAILS_LABEL).closest('details');
+    expect(disclosure).not.toBeNull();
+    expect(disclosure?.open).toBe(false);
+    expect(JSON.parse(disclosure?.querySelector('pre')?.textContent ?? '')).toEqual(details);
+
+    // The retry carries the key the host restores focus by, and re-asks the
+    // very query that failed.
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retry.getAttribute('data-dg-focus-key')).toBe(RETRY_FOCUS_KEY);
+
+    await user.click(retry);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual(asked);
+  });
+
   it('reports a node whose query names a source it cannot place on an axis, and asks for nothing', async () => {
     const stub = resolvingTrace(crossTierTree());
 
@@ -1089,6 +1256,13 @@ describe('Timeline states', () => {
 
     const alert = await screen.findByRole('alert');
     expect(alert.closest('.dg-timeline__error')).not.toBeNull();
+
+    // The shared wording for a panel defect: what this view reads, from the
+    // catalog, beside what it was asked for, under the panel-defect code.
+    expect(within(alert).getByText(UNSUPPORTED_TITLE)).toBeTruthy();
+    expect(alert.textContent).toContain('"trace" or "spans"');
+    expect(alert.textContent).toContain('"renders"');
+    expect(within(alert).getByText('PANEL_INVALID').classList.contains('dg-badge')).toBe(true);
 
     // The node's own query is what the reader is shown, and no retry is offered:
     // re-issuing it cannot change the answer.
@@ -1137,10 +1311,15 @@ describe('Timeline cross-tier chain', () => {
     // than as the raw millisecond number the capture carried.
     expect(within(rowNamed(INTERACTION_EVENT.name)).getByText('1.175 s')).toBeDefined();
 
-    // Each bar's own label is that same name with a compact duration beside it.
+    // Each bar's own label is that same name with a compact duration beside it,
+    // whole wherever it fits. Every bar of the chain has room for its label: the
+    // three that run almost to the window's end hold theirs inside the bar, and
+    // the query, which ends well before the window does, has it after the bar,
+    // on the lane surface.
     expect(barLabelsOf(canvas)).toEqual(
       CHAIN_EVENTS.map((event) => `${event.name} · ${formatDurationCompact(event.duration)}`),
     );
+    expect(barLabelPlacementsOf(canvas)).toEqual(['inside', 'inside', 'inside', 'beside']);
 
     // The summary strip states the shape of what was drawn.
     const summary = screen.getByRole('group', { name: 'Timeline summary' });
@@ -1490,9 +1669,14 @@ describe('Timeline paging', () => {
     await screen.findByText(`Showing ${formatCount(2)} of ${formatCount(4)} spans.`);
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
-    // The failure is reported below the rows, never in place of them.
+    // The failure is reported below the rows, never in place of them, in the
+    // page scope of the shared contract: its own title, and a lead saying the
+    // rows above are unaffected before the provider's cause.
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain(PAGE_FAILURE.message);
+    expect(within(alert).getByText(PAGE_FAILURE_TITLE)).toBeTruthy();
+    expect(within(alert).queryByText(VIEW_FAILURE_TITLE)).toBeNull();
+    const message = within(alert).getByText((text) => text.startsWith(PAGE_FAILURE_LEAD));
+    expect(message.textContent).toContain(PAGE_FAILURE.message);
     expect(alert.textContent).toContain(PAGE_FAILURE.code);
     expect(renderedNames()).toEqual([INTERACTION_EVENT.name, FETCH_EVENT.name]);
     expect(barsOf(screen.getByRole('img'))).toHaveLength(2);
@@ -1817,12 +2001,20 @@ async function expectEmptyState(title: string, message: string): Promise<void> {
   expect(slot).not.toBeNull();
   expect(slot?.querySelector('.dg-empty-state__title')?.textContent).toBe(title);
 
+  // The settled answer is the polite status, and only the empty capture
+  // carries the view's decorative glyph: an empty page or a count-only answer
+  // is a statement about paging, named by its title.
+  expect(screen.getByRole('status')).toBe(slot?.querySelector('.dg-empty-state'));
+  expect(slot?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden') ?? null).toBe(
+    message === NOTHING_CAPTURED_MESSAGE ? 'true' : null,
+  );
+
   // An empty state is a success drawn as an absence: no canvas, no table, no
   // failure and no loading indicator.
   expect(screen.queryByRole('img')).toBeNull();
   expect(screen.queryByRole('grid')).toBeNull();
   expect(screen.queryByRole('alert')).toBeNull();
-  expect(screen.queryByRole('status')).toBeNull();
+  expect(screen.queryByRole('status', { busy: true })).toBeNull();
 }
 
 describe('Timeline empty pages', () => {
@@ -2030,6 +2222,64 @@ describe('Timeline empty pages', () => {
   );
 });
 
+/** The trace walk's default row bound, restated so the counts below are stated. */
+const TRACE_ROW_BOUND = 2000;
+
+/** Children under the wide trace's root: past the bound, by less than one step. */
+const WIDE_CHILD_COUNT = 2500;
+
+/** The control that raises a trace walk's row bound. */
+const SHOW_MORE_SPANS_NAME = 'Show more spans';
+
+/** The refine route the footer gives for a trace the correlator bounded. */
+const REFINE_TRUNCATED_TRACE = 'Narrow the query or capture a shorter interaction to see the rest.';
+
+/**
+ * A trace wider than the walk's row bound: one root and
+ * {@link WIDE_CHILD_COUNT} back-to-back 1 ms operations under it.
+ *
+ * @returns The correlated trace.
+ */
+function wideTrace(): TraceTree {
+  const rootSpanId = spanIdFor(5000);
+  const children = Array.from({ length: WIDE_CHILD_COUNT }, (_unused, index) =>
+    makeTraceNode(
+      makeEvent({
+        id: `event-example-wide-${String(index).padStart(4, '0')}`,
+        spanId: spanIdFor(6000 + index),
+        parentSpanId: rootSpanId,
+        kind: 'function',
+        name: `example.step.${String(index).padStart(4, '0')}`,
+        tier: 'server',
+        startTime: BASE_START_MS + index,
+        duration: 1,
+        producerId: SERVER_PRODUCER_ID,
+        seq: index + 1,
+        ingestSeq: index + 2,
+      }),
+      { depth: 1 },
+    ),
+  );
+
+  return makeTree([
+    makeTraceNode(
+      makeEvent({
+        id: 'event-example-wide-root',
+        spanId: rootSpanId,
+        kind: 'route.handler',
+        name: 'example.batch',
+        tier: 'server',
+        startTime: BASE_START_MS,
+        duration: WIDE_CHILD_COUNT,
+        producerId: SERVER_PRODUCER_ID,
+        seq: 0,
+        ingestSeq: 1,
+      }),
+      { depth: 0, children },
+    ),
+  ]);
+}
+
 describe('Timeline partial results', () => {
   it('says how much of a span result is on screen and asks for the next page', async () => {
     // A page of one record out of twenty-five, then the next page the component
@@ -2101,18 +2351,59 @@ describe('Timeline partial results', () => {
 
     await findCanvas();
 
-    // The correlator's own truncation, stated as the sentence it is.
+    // The correlator's own truncation, stated as the sentence it is, with the
+    // one route that reaches the rest.
     expect(
       screen.getByText(
-        `${formatCount(CHAIN_EVENTS.length)} spans shown. More were captured than this view holds.`,
+        `${formatCount(CHAIN_EVENTS.length)} spans shown. More were captured than this view holds. ${REFINE_TRUNCATED_TRACE}`,
       ),
     ).toBeDefined();
     expect(
       within(screen.getByRole('group', { name: 'Timeline summary' })).getByText('Partial result'),
     ).toBeDefined();
 
-    // A trace is not a paged source, so there is no wider window to ask for.
+    // A trace is not a paged source, and nothing more of this one is in memory,
+    // so there is neither a page nor a larger bound to ask for.
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE_SPANS_NAME })).toBeNull();
+  });
+
+  it('states a walk’s row bound as N of M and shows more spans on request', async () => {
+    const tree = wideTrace();
+    const stub = resolvingTrace(tree);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // The walk stopped at its bound: the footer and the picture state the
+    // subset of the whole, and the summary marks it as partial.
+    const firstFooter = `${formatCount(TRACE_ROW_BOUND)} of ${formatCount(tree.nodeCount)} spans shown.`;
+    const footer = screen.getByText(firstFooter);
+    expect(footer.getAttribute('aria-live')).toBe('polite');
+    expect(canvas.getAttribute('aria-label')).toContain(
+      `${formatCount(TRACE_ROW_BOUND)} of ${formatCount(tree.nodeCount)} spans`,
+    );
+    expect(barsOf(canvas)).toHaveLength(TRACE_ROW_BOUND);
+    expect(within(summaryStrip()).getByText('Partial result')).toBeDefined();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // The trace is in memory whole, so showing more asks the provider nothing.
+    await user.click(screen.getByRole('button', { name: SHOW_MORE_SPANS_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+    // The step was capped at the trace's own count, so everything is shown:
+    // the bare count, no partial mark, no control — and focus, whose control
+    // is gone, lands on the table's tab stop rather than on the document.
+    const allCanvas = await findCanvas();
+    expect(barsOf(allCanvas)).toHaveLength(tree.nodeCount);
+    expect(screen.getByText(`${formatCount(tree.nodeCount)} spans shown.`)).toBeDefined();
+    expect(within(summaryStrip()).queryByText('Partial result')).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE_SPANS_NAME })).toBeNull();
+    const focused = document.activeElement;
+    expect(focused?.closest('.dg-timeline__equivalent')).not.toBeNull();
+    expect(focused?.getAttribute('tabindex')).toBe('0');
   });
 });
 
@@ -2210,7 +2501,7 @@ describe('Timeline correlation honesty', () => {
 
     // And its description names the mechanism and the candidates that were not
     // chosen, so the alternatives stay inspectable rather than being discarded.
-    const description = descriptionOf(row);
+    const description = await descriptionOf(row);
     expect(description).toContain(ASYNC_CONTINUATION);
     expect(description).toContain('More than one parent was possible');
     expect(description).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
@@ -2248,7 +2539,7 @@ describe('Timeline correlation honesty', () => {
     const row = rowNamed(CONTINUATION_EVENT.name);
 
     expect(within(row).getByText(AMBIGUOUS_FLAG)).toBeDefined();
-    expect(descriptionOf(row)).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
+    expect(await descriptionOf(row)).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
     expect(barTitled(canvas, CONTINUATION_EVENT.name).classList.contains('dg-is-ambiguous')).toBe(
       true,
     );
@@ -2284,7 +2575,7 @@ describe('Timeline correlation honesty', () => {
     // application actually had.
     const row = rowNamed(ORPHAN_EVENT.name);
     expect(within(row).getByText(REATTACHED_FLAG)).toBeDefined();
-    expect(descriptionOf(row)).toContain(`Re-attached to the root (${MISSING_PARENT})`);
+    expect(await descriptionOf(row)).toContain(`Re-attached to the root (${MISSING_PARENT})`);
 
     const bar = barTitled(canvas, ORPHAN_EVENT.name);
     expect(bar.classList.contains('dg-is-orphan')).toBe(true);
@@ -2489,7 +2780,7 @@ describe('Timeline span order', () => {
     expect(within(server).getByText(PARENT_NOT_LOADED_FLAG)).toBeDefined();
     expect(within(server).queryByText(REATTACHED_FLAG)).toBeNull();
 
-    const description = descriptionOf(server);
+    const description = await descriptionOf(server);
     expect(description).toContain(spanIdFor(2));
     expect(description).not.toContain(REATTACHED_FLAG);
 
@@ -2624,7 +2915,7 @@ describe('Timeline span order', () => {
     expect(renderedNames()).toEqual([collidingRoot.name, secondTraceChild.name]);
     const child = rowNamed(secondTraceChild.name);
     expect(within(child).getByText(PARENT_NOT_LOADED_FLAG)).toBeDefined();
-    expect(descriptionOf(child)).toContain(spanIdFor(0x71));
+    expect(await descriptionOf(child)).toContain(spanIdFor(0x71));
     expect(within(rowNamed(collidingRoot.name)).queryByText(PARENT_NOT_LOADED_FLAG)).toBeNull();
     expect(edgesOf(screen.getByRole('img'))).toHaveLength(0);
 
@@ -2758,12 +3049,13 @@ describe('Timeline span order', () => {
  * ---------------------------------------------------------------------------
  * Keyboard-reachable descriptions
  *
- * A row's full description is carried by a `Tooltip`, which opens on focus, so
- * its trigger has to be reachable by the keyboard — and reachable without the
- * table growing a tab stop per row. These readers address the two triggers the
- * view has: the name in the detail strip above the table, and the name in each
- * row's Operation cell. A class is read only off an element already obtained
- * semantically, per the harness note at the top of this file.
+ * A row's full description is carried by a `Tooltip` on its name, which a
+ * pointer opens on hover; the keyboard reads the same description while the row
+ * itself holds focus, without the table growing a tab stop per row or any stop
+ * at all. These readers address the two triggers the view has: the name in each
+ * row's Operation cell and the name in the detail strip above the table. A
+ * class is read only off an element already obtained semantically, per the
+ * harness note at the top of this file.
  * ---------------------------------------------------------------------------
  */
 
@@ -2772,34 +3064,53 @@ function detailSlot(): Element | null {
   return document.querySelector('.dg-timeline__tooltip');
 }
 
+/**
+ * The element a tooltip wraps inside `scope`: the one child of its trigger box.
+ *
+ * Located structurally rather than by `aria-describedby`, so the lookup never
+ * depends on the description link the cases below assert with `describes`.
+ */
+function tooltipTriggerIn(scope: Element | null | undefined): HTMLElement | null {
+  return scope?.querySelector<HTMLElement>('.dg-tooltip__trigger > *') ?? null;
+}
+
 /** The trigger of the detail strip's description: the focused, hovered or selected row's name. */
 function detailTrigger(): HTMLElement {
-  const trigger = detailSlot()?.querySelector('[aria-describedby]');
+  const trigger = tooltipTriggerIn(detailSlot());
 
-  if (!(trigger instanceof HTMLElement)) {
-    throw new Error('the detail strip shows no described row name');
+  if (trigger === null) {
+    throw new Error('the detail strip shows no row name');
   }
 
   return trigger;
 }
 
-/** The detail strip's description bubble. */
-function detailBubble(): HTMLElement {
+/** The detail strip's description bubble while it is open, or `null` while it is closed. */
+function openDetailBubble(): HTMLElement | null {
   const slot = detailSlot();
 
-  if (!(slot instanceof HTMLElement)) {
-    throw new Error('the detail strip is not rendered');
+  if (slot === null) {
+    throw new Error('the detail strip shows no row');
   }
 
-  return within(slot).getByRole('tooltip');
+  return openBubbleIn(slot);
+}
+
+/** The open bubble a case expects, failing with a readable message when it is closed. */
+function expectOpen(bubble: HTMLElement | null): HTMLElement {
+  if (bubble === null) {
+    throw new Error('the description is expected to be open');
+  }
+
+  return bubble;
 }
 
 /** The trigger of one row's description: the name in its Operation cell. */
 function nameTriggerOf(row: HTMLElement): HTMLElement {
-  const trigger = within(row).getByRole('rowheader').querySelector('[aria-describedby]');
+  const trigger = tooltipTriggerIn(within(row).getByRole('rowheader'));
 
-  if (!(trigger instanceof HTMLElement)) {
-    throw new Error('the row header holds no described name');
+  if (trigger === null) {
+    throw new Error('the row header holds no name trigger');
   }
 
   return trigger;
@@ -2815,8 +3126,67 @@ function describes(trigger: HTMLElement, bubble: HTMLElement): boolean {
   return (trigger.getAttribute('aria-describedby') ?? '').split(/\s+/u).includes(bubble.id);
 }
 
+/** The detail strip itself: always drawn beside a settled canvas, by its accessible name. */
+function detailStrip(): HTMLElement {
+  return screen.getByRole('group', { name: 'Span detail' });
+}
+
+describe('Timeline detail strip', () => {
+  it('reserves the strip before anything is hovered, focused or selected, with a resting line', async () => {
+    const stub = resolvingTrace(crossTierTree());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+
+    // In the layout already, between the canvas and the table, holding the
+    // resting line and no trigger: the first Tab still lands on the table.
+    const strip = detailStrip();
+    expect(strip.classList.contains('dg-timeline__detail')).toBe(true);
+    expect(strip.textContent).toBe('Select a span, or point at a bar, to see its detail here.');
+    expect(detailSlot()).toBeNull();
+
+    const grid = screen.getByRole('grid');
+    expect(strip.compareDocumentPosition(grid) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+  });
+
+  it('shows the selection, previews a hovered bar in its place, and returns to the selection', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const strip = detailStrip();
+
+    await user.click(rowNamed(SERVER_EVENT.name));
+    // Clicking a row focuses it, and the focused row IS the selected one.
+    expect(detailTrigger().textContent).toBe(SERVER_EVENT.name);
+    expect(strip.textContent).toContain('Selected');
+
+    // Focus leaves the view, so only the selection drives the strip.
+    act(() => {
+      (document.activeElement as HTMLElement | null)?.blur();
+    });
+    expect(detailTrigger().textContent).toBe(SERVER_EVENT.name);
+    expect(strip.textContent).toContain('Selected');
+
+    // A hovered bar is a preview, named as one, and never replaces the strip.
+    await user.hover(barTitled(canvas, FETCH_EVENT.name));
+    expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
+    expect(strip.textContent).toContain('Preview');
+    expect(detailStrip()).toBe(strip);
+
+    // The pointer leaves: back to the selected span, in the same element.
+    await user.unhover(barTitled(canvas, FETCH_EVENT.name));
+    expect(detailTrigger().textContent).toBe(SERVER_EVENT.name);
+    expect(strip.textContent).toContain('Selected');
+    expect(detailStrip()).toBe(strip);
+  });
+});
+
 describe('Timeline keyboard-reachable descriptions', () => {
-  it('drives the detail strip from the focused row, and opens its description on focus', async () => {
+  it('drives the detail strip from the focused row, whose name is described but is no tab stop', async () => {
     const stub = resolvingTrace(crossTierTree());
     const user = userEvent.setup();
 
@@ -2842,31 +3212,38 @@ describe('Timeline keyboard-reachable descriptions', () => {
     expect(document.activeElement).toBe(secondRow);
     expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
 
-    // The strip's name is a focusable trigger one Shift+Tab away, and its
-    // description opens the moment it takes focus.
-    expect(detailTrigger().getAttribute('tabindex')).toBe('0');
-    expect(detailBubble().classList.contains('dg-is-open')).toBe(false);
+    // The strip's name is not a stop of its own: it carries no tab index, so
+    // Shift+Tab from the row never lands on it. The keyboard reads the same
+    // description in the focused row's own Operation cell (the case below).
+    expect(detailTrigger().getAttribute('tabindex')).toBeNull();
+    expect(openDetailBubble()).toBeNull();
 
     await user.tab({ shift: true });
+    expect(document.activeElement?.closest('.dg-timeline__tooltip') ?? null).toBeNull();
+    await user.tab();
+    expect(document.activeElement).toBe(secondRow);
 
+    // The full name stays on the strip, and its description opens for a
+    // pointer on hover — the bubble the name is described by.
     const trigger = detailTrigger();
-    const bubble = detailBubble();
-    expect(document.activeElement).toBe(trigger);
-    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    expect(trigger.textContent).toBe(FETCH_EVENT.name);
+    expect(openDetailBubble()).toBeNull();
+
+    await user.hover(trigger);
+    const bubble = await waitFor(() => expectOpen(openDetailBubble()));
     expect(describes(trigger, bubble)).toBe(true);
     expect(bubble.textContent).toContain(FETCH_EVENT.name);
     expect(bubble.textContent).toContain(formatDuration(FETCH_EVENT.duration));
 
-    // Focus moved within the view, so the strip still shows the row it came from.
-    expect(trigger.textContent).toBe(FETCH_EVENT.name);
+    // Focus never moved to it, and it still shows the row focus is on.
+    expect(document.activeElement).toBe(secondRow);
+    expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
 
-    // Escape dismisses it without moving focus.
-    await user.keyboard('{Escape}');
-    expect(detailBubble().classList.contains('dg-is-open')).toBe(false);
-    expect(document.activeElement).toBe(trigger);
+    await user.unhover(trigger);
+    expect(openDetailBubble()).toBeNull();
   });
 
-  it("makes the focused row's own name a tab stop that opens its description, and no other row's", async () => {
+  it("reveals the keyboard-focused row's description without making any name a tab stop", async () => {
     const stub = resolvingTrace(crossTierTree());
     const user = userEvent.setup();
 
@@ -2874,7 +3251,7 @@ describe('Timeline keyboard-reachable descriptions', () => {
 
     await findCanvas();
 
-    // Before focus enters the table no row's name is in the tab order.
+    // No row's name is in the tab order, before focus enters the table or after.
     expect(nameTabIndexes()).toEqual([null, null, null, null]);
 
     await user.tab();
@@ -2885,31 +3262,68 @@ describe('Timeline keyboard-reachable descriptions', () => {
     }
 
     expect(document.activeElement).toBe(firstRow);
-    expect(nameTabIndexes()).toEqual(['0', null, null, null]);
+    expect(nameTabIndexes()).toEqual([null, null, null, null]);
 
-    // One Tab from the row reaches its name, and focus opens the description.
-    await user.tab();
-
+    // The row itself holds keyboard focus, so its description is open under its
+    // name — one tooltip, still the one the name is described by.
     const trigger = nameTriggerOf(firstRow);
-    const bubble = within(firstRow).getByRole('tooltip');
-    expect(document.activeElement).toBe(trigger);
-    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    const bubble = expectOpen(openBubbleIn(firstRow));
+    expect(document.activeElement).toBe(firstRow);
+    // Exactly one description belongs to the name, shown or hidden: the
+    // revealed bubble stands in for the pointer's, never beside it.
+    const nameCell = within(firstRow).getByRole('rowheader');
+    expect(within(nameCell).getAllByRole('tooltip', { hidden: true })).toEqual([bubble]);
     expect(describes(trigger, bubble)).toBe(true);
+    // Placed by the primitive's own measurement, as a hovered bubble is: an open
+    // bubble is fixed to the viewport, and one nothing placed paints at its corner.
+    expect(bubble.style.getPropertyValue('--dgc-tooltip-block')).not.toBe('');
+    expect(bubble.style.getPropertyValue('--dgc-tooltip-inline')).not.toBe('');
     expect(bubble.textContent).toContain(INTERACTION_EVENT.name);
 
-    // Back to the row closes it; moving down moves the stop rather than adding one.
-    await user.tab({ shift: true });
+    // Escape dismisses it and leaves focus on the row.
+    await user.keyboard('{Escape}');
     expect(document.activeElement).toBe(firstRow);
-    expect(bubble.classList.contains('dg-is-open')).toBe(false);
+    expect(openBubbleIn(firstRow)).toBeNull();
 
+    // Moving down moves the reveal with the focus rather than adding a stop.
     await user.keyboard('{ArrowDown}');
     expect(document.activeElement).toBe(secondRow);
-    expect(nameTabIndexes()).toEqual([null, '0', null, null]);
+    expect(openBubbleIn(firstRow)).toBeNull();
+    expect(expectOpen(openBubbleIn(secondRow)).textContent).toContain(FETCH_EVENT.name);
+    expect(nameTabIndexes()).toEqual([null, null, null, null]);
 
-    // The body holds the table's roving stop and the focused row's name, and
-    // nothing else carrying a tab index, however many rows it renders.
+    // The body holds the table's single roving stop and nothing else carrying a
+    // tab index, however many rows it renders.
     const grid = screen.getByRole('grid');
-    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(2);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+  });
+
+  it('does not reveal a description for the focus a pointer press causes', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+
+    const [, secondRow] = dataRows();
+    if (secondRow === undefined) {
+      throw new Error('the equivalent rendered fewer than two rows');
+    }
+
+    await user.click(secondRow);
+
+    expect(document.activeElement).toBe(secondRow);
+    expect(openBubbleIn(secondRow)).toBeNull();
+
+    // The keyboard reveals it again on the next row it reaches.
+    await user.keyboard('{ArrowDown}');
+    const [, , thirdRow] = dataRows();
+    if (thirdRow === undefined) {
+      throw new Error('the equivalent rendered fewer than three rows');
+    }
+    expect(document.activeElement).toBe(thirdRow);
+    expectOpen(openBubbleIn(thirdRow));
   });
 
   it('forgets the focused row once focus leaves the view', async () => {
@@ -2934,9 +3348,14 @@ describe('Timeline keyboard-reachable descriptions', () => {
       firstRow.blur();
     });
 
-    // No row is focused, hovered or selected any more: the strip is gone and no
-    // row's name is left in the tab order.
+    // No row is focused, hovered or selected any more: the strip is gone, no
+    // description is left open and no row's name is in the tab order.
     expect(detailSlot()).toBeNull();
+    expect(
+      screen
+        .getAllByRole('tooltip', { hidden: true })
+        .filter((bubble) => bubble.classList.contains('dg-is-open')),
+    ).toHaveLength(0);
     expect(nameTabIndexes()).toEqual([null, null, null, null]);
   });
 
@@ -2956,13 +3375,58 @@ describe('Timeline keyboard-reachable descriptions', () => {
     const row = rowNamed(CONTINUATION_EVENT.name);
     expect(document.activeElement).toBe(row);
 
-    await user.tab();
-
-    const bubble = within(row).getByRole('tooltip');
-    expect(document.activeElement).toBe(nameTriggerOf(row));
-    expect(bubble.classList.contains('dg-is-open')).toBe(true);
+    // The row itself holds keyboard focus, so its description is open already;
+    // no further Tab and no stop on the name is needed to read it.
+    const bubble = expectOpen(openBubbleIn(row));
+    expect(describes(nameTriggerOf(row), bubble)).toBe(true);
+    expect(nameTriggerOf(row).getAttribute('tabindex')).toBeNull();
     // The lineage notes a hover would show are in it too.
     expect(bubble.textContent).toContain(AMBIGUOUS_CANDIDATE_SPAN_ID);
+  });
+
+  it("keeps a row's source chip out of the Tab order, reached by the table's arrow keys", async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await findCanvas();
+    await user.tab();
+    await user.keyboard('{End}');
+
+    const row = rowNamed(QUERY_EVENT.name);
+    const nameCell = within(row).getByRole('rowheader');
+    const chip = within(row).getByRole('button', { name: SOURCE_CHIP_NAME });
+    expect(document.activeElement).toBe(row);
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+    expectOpen(openBubbleIn(nameCell));
+
+    // Tab leaves the table from its one stop rather than landing on the chip,
+    // and Shift+Tab comes back to the row.
+    await user.tab();
+    expect(row.contains(document.activeElement)).toBe(false);
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(row);
+
+    // The arrow keys move into the row. Focus on the chip is not the row's, so
+    // the row's description closes, and the strip still shows the row the chip
+    // belongs to.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(chip);
+    expect(openBubbleIn(nameCell)).toBeNull();
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+
+    // Enter is the chip's own: it opens the location it shows and selects nothing.
+    await user.keyboard('{Enter}');
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).toHaveBeenCalledWith(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Back on the row, its description is revealed again.
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(row);
+    expectOpen(openBubbleIn(nameCell));
   });
 });
 
@@ -3151,5 +3615,1172 @@ describe('Timeline determinism', () => {
     // wrong twice.
     expect(firstLanes).toEqual([...CHAIN_LANE_LABELS]);
     expect(firstRows).toEqual([...CHAIN_NAMES]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shared selection
+ *
+ * Under a panel host the selected span is the host's, not this chart's: the
+ * bar, the table row and the strip's "Selected" line mark whatever the host's
+ * selection context carries, and an activation is reported for the host to
+ * record rather than kept here. These cases provide that context directly, and
+ * then through a minimal host that feeds each report back into it — the one
+ * wiring `PanelHost` performs — with a flame chart over the same trace beside
+ * the timeline, so the two charts can be seen to agree.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The four host contexts around `children`, the selection context included.
+ *
+ * @param children The views to mount.
+ * @param provider The provider that resolves their queries.
+ * @param actions The actions they report to.
+ * @param selection The selection the host provides.
+ * @returns The element tree to render.
+ */
+function hostedTree(
+  children: ReactNode,
+  provider: DataProvider,
+  actions: PanelActions,
+  selection: PanelSelectionState,
+): ReactElement {
+  return (
+    <DataProviderContext.Provider value={provider}>
+      <PanelSessionContext.Provider value={SESSION_ID}>
+        <PanelActionsContext.Provider value={actions}>
+          <PanelSelectionContext.Provider value={selection}>
+            {children}
+          </PanelSelectionContext.Provider>
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
+/** The props of {@link SelectionHost}. */
+interface SelectionHostProps {
+  /** The provider that resolves every view's query. */
+  readonly provider: DataProvider;
+  /** The spies each report is forwarded to after it is recorded. */
+  readonly spies: ActionSpies;
+  /** The views sharing the selection. */
+  readonly children: ReactNode;
+}
+
+/**
+ * The smallest host that shares a selection: it records every reported event
+ * as the current selection and provides it back to every view beneath, which
+ * is exactly the wiring `PanelHost` performs around a panel's layout.
+ *
+ * @param props See {@link SelectionHostProps}.
+ * @returns The hosted views.
+ */
+function SelectionHost(props: SelectionHostProps): ReactElement {
+  const { provider, spies, children } = props;
+  const [selection, setSelection] = useState<PanelSelection | undefined>(undefined);
+
+  const actions = useMemo<PanelActions>(
+    () => ({
+      onSelectEvent: (ref: PanelEventRef) => {
+        setSelection(ref);
+        spies.onSelectEvent(ref);
+      },
+      onOpenSource: spies.onOpenSource,
+    }),
+    [spies],
+  );
+  const state = useMemo<PanelSelectionState>(() => ({ selection }), [selection]);
+
+  return hostedTree(children, provider, actions, state);
+}
+
+/** A `flame` node over the same trace the timeline fixtures draw. */
+function flameNode(): FlameNode {
+  return {
+    type: 'flame',
+    id: 'layout.1.flame',
+    query: { source: 'trace', filter: { traceId: TRACE_ID } },
+  };
+}
+
+/** A rendered block by its documented class, failing when it is not on the page. */
+function blockOf(className: string): HTMLElement {
+  const block = document.querySelector<HTMLElement>(`.${className}`);
+
+  if (block === null) {
+    throw new Error(`no .${className} block is rendered`);
+  }
+
+  return block;
+}
+
+/** The timeline's canvas, read inside its own block so a second chart's canvas is never taken. */
+function timelineCanvas(): HTMLElement {
+  return within(blockOf('dg-timeline')).getByRole('img');
+}
+
+/** The timeline bars carrying the selected state. */
+function selectedBars(): Element[] {
+  return Array.from(timelineCanvas().querySelectorAll('rect.dg-timeline__bar.dg-is-selected'));
+}
+
+/** The flame chart's tree row whose name control is `name`. */
+function flameRowNamed(name: string): HTMLElement {
+  const row = within(blockOf('dg-flame'))
+    .getAllByRole('treeitem')
+    .find((candidate) => within(candidate).queryByRole('button', { name }) !== null);
+
+  if (row === undefined) {
+    throw new Error(`the flame chart lists no frame named "${name}"`);
+  }
+
+  return row;
+}
+
+/** The first line of each flame frame's SVG title that carries the selected state. */
+function selectedFlameFrames(): string[] {
+  return Array.from(
+    within(blockOf('dg-flame'))
+      .getByRole('img')
+      .querySelectorAll('rect.dg-flame__frame.dg-is-selected'),
+  ).map((frame) => (frame.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '');
+}
+
+describe('Timeline shared selection', () => {
+  it('marks the span the panel selection names, by event id or by trace and span, and keeps none of its own', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const byId: PanelSelectionState = { selection: { eventId: FETCH_EVENT.id } };
+
+    const { rerender } = render(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, byId),
+    );
+    await findCanvas();
+
+    // The provided selection is what the three marks show, and only it.
+    expect(rowNamed(FETCH_EVENT.name).getAttribute('aria-selected')).toBe('true');
+    expect(barTitled(timelineCanvas(), FETCH_EVENT.name).classList.contains('dg-is-selected')).toBe(
+      true,
+    );
+    expect(selectedBars()).toHaveLength(1);
+    expect(detailStrip().textContent).toContain('Selected');
+    expect(detailStrip().textContent).toContain(FETCH_EVENT.name);
+
+    // Another record's id naming this trace and this span still lands on the
+    // span: that pair is the span's identity across tiers.
+    const bySpan: PanelSelectionState = {
+      selection: {
+        eventId: 'event-example-elsewhere',
+        traceId: TRACE_ID,
+        spanId: SERVER_EVENT.spanId,
+      },
+    };
+    rerender(hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, bySpan));
+
+    expect(rowNamed(SERVER_EVENT.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed(FETCH_EVENT.name).getAttribute('aria-selected')).toBe('false');
+    expect(
+      barTitled(timelineCanvas(), SERVER_EVENT.name).classList.contains('dg-is-selected'),
+    ).toBe(true);
+
+    // Activating a row reports it and leaves the marking to the host: a host
+    // that has not recorded the report still shows its own selection.
+    await user.click(rowNamed(QUERY_EVENT.name));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: QUERY_EVENT.id,
+      spanId: QUERY_EVENT.spanId,
+      traceId: QUERY_EVENT.traceId,
+    });
+    expect(rowNamed(QUERY_EVENT.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(SERVER_EVENT.name).getAttribute('aria-selected')).toBe('true');
+
+    // A host with nothing selected marks nothing.
+    rerender(
+      hostedTree(<Timeline node={makeNode()} />, stub.provider, spies.actions, {
+        selection: undefined,
+      }),
+    );
+
+    expect(dataRows().map((row) => row.getAttribute('aria-selected'))).toEqual([
+      'false',
+      'false',
+      'false',
+      'false',
+    ]);
+    expect(selectedBars()).toHaveLength(0);
+  });
+
+  it('mirrors a selection made in the timeline or the flame chart in the other, under one host', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    render(
+      <SelectionHost provider={stub.provider} spies={spies}>
+        <Timeline node={makeNode()} />
+        <FlameChart node={flameNode()} />
+      </SelectionHost>,
+    );
+
+    expect(await screen.findAllByRole('img')).toHaveLength(2);
+    await screen.findByRole('tree');
+
+    // Nothing is selected in either chart yet.
+    expect(selectedBars()).toHaveLength(0);
+    expect(selectedFlameFrames()).toEqual([]);
+
+    // A row activated in the timeline is marked in the flame chart too: its
+    // tree row and its frame.
+    await user.click(rowNamed(SERVER_EVENT.name));
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: SERVER_EVENT.id,
+      spanId: SERVER_EVENT.spanId,
+      traceId: SERVER_EVENT.traceId,
+    });
+    expect(rowNamed(SERVER_EVENT.name).getAttribute('aria-selected')).toBe('true');
+    expect(flameRowNamed(SERVER_EVENT.name).classList.contains('dg-is-selected')).toBe(true);
+    expect(flameRowNamed(SERVER_EVENT.name).getAttribute('aria-current')).toBe('true');
+    expect(selectedFlameFrames()).toEqual([SERVER_EVENT.name]);
+
+    // A frame activated in the flame chart moves the timeline's marks with it:
+    // its bar, its table row and its strip, and nothing is left on the old span.
+    await user.click(
+      within(flameRowNamed(QUERY_EVENT.name)).getByRole('button', { name: QUERY_EVENT.name }),
+    );
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: QUERY_EVENT.id,
+      spanId: QUERY_EVENT.spanId,
+      traceId: QUERY_EVENT.traceId,
+    });
+    expect(rowNamed(QUERY_EVENT.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed(SERVER_EVENT.name).getAttribute('aria-selected')).toBe('false');
+    expect(selectedBars()).toEqual([barTitled(timelineCanvas(), QUERY_EVENT.name)]);
+    expect(selectedFlameFrames()).toEqual([QUERY_EVENT.name]);
+    expect(flameRowNamed(SERVER_EVENT.name).classList.contains('dg-is-selected')).toBe(false);
+    expect(detailStrip().textContent).toContain('Selected');
+    expect(detailStrip().textContent).toContain(QUERY_EVENT.name);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Reaching and dismissing a preview (WCAG 1.4.13)
+ *
+ * A preview is content that appears on hover or focus, so it has to be
+ * hoverable — the pointer can move onto it without it disappearing — and
+ * dismissible — Escape removes it without moving the pointer or focus — while
+ * the selection it stands in for stays exactly where it was.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The strip's resting line, as the reader sees it while nothing is shown. */
+const RESTING_LINE = 'Select a span, or point at a bar, to see its detail here.';
+
+describe('Timeline preview reach and dismissal', () => {
+  it("keeps a bar's preview while the pointer travels onto the strip, and ends it in the table", async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const canvas = await findCanvas();
+    const strip = detailStrip();
+
+    await user.hover(barTitled(canvas, QUERY_EVENT.name));
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+
+    // Off the bar, across the empty canvas and onto the strip's source chip:
+    // the preview holds the whole way, so the chip it shows is the chip the
+    // pointer arrives at.
+    await user.hover(canvas);
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+
+    const chip = within(strip).getByRole('button', { name: SOURCE_CHIP_NAME });
+    await user.hover(chip);
+    expect(within(strip).getByRole('button', { name: SOURCE_CHIP_NAME })).toBe(chip);
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+
+    // Moving on into the table ends it: nothing is selected or focused, so the
+    // strip is back at its resting line, in the same element.
+    await user.hover(rowNamed(INTERACTION_EVENT.name));
+    expect(strip.textContent).toBe(RESTING_LINE);
+    expect(detailStrip()).toBe(strip);
+
+    // The chip reached through a preview is a working control: it opens the
+    // location it shows and selects nothing.
+    await user.hover(barTitled(canvas, QUERY_EVENT.name));
+    const reached = within(strip).getByRole('button', { name: SOURCE_CHIP_NAME });
+    await user.hover(reached);
+    await user.click(reached);
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).toHaveBeenCalledWith(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Focus is inside the strip now, and it holds the row the strip shows: the
+    // pointer moving into the table does not pull the focused chip away.
+    await user.hover(rowNamed(INTERACTION_EVENT.name));
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+    expect(document.activeElement).toBe(reached);
+    expect(strip.contains(reached)).toBe(true);
+  });
+
+  it('dismisses a pointer preview with Escape pressed anywhere, and keeps the selection', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const strip = detailStrip();
+
+    await user.click(rowNamed(SERVER_EVENT.name));
+    act(() => {
+      (document.activeElement as HTMLElement | null)?.blur();
+    });
+    expect(strip.textContent).toContain('Selected');
+
+    await user.hover(barTitled(canvas, FETCH_EVENT.name));
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
+
+    // The pointer does not move focus, so the key arrives at the page body. It
+    // dismisses the preview there and is not consumed: a dialog or a shortcut
+    // above the panel still sees it.
+    expect(document.activeElement).toBe(document.body);
+    expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
+
+    expect(strip.textContent).toContain('Selected');
+    expect(detailTrigger().textContent).toBe(SERVER_EVENT.name);
+    expect(detailStrip()).toBe(strip);
+
+    // The selection itself is untouched, on the bar and on the row.
+    expect(rowNamed(SERVER_EVENT.name).getAttribute('aria-selected')).toBe('true');
+    expect(barTitled(canvas, SERVER_EVENT.name).classList.contains('dg-is-selected')).toBe(true);
+
+    // The next bar the pointer enters previews as before.
+    await user.hover(barTitled(canvas, INTERACTION_EVENT.name));
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+
+    // The same dismissal through the keyboard as a reader presses it.
+    await user.keyboard('{Escape}');
+    expect(detailTrigger().textContent).toBe(SERVER_EVENT.name);
+  });
+
+  it("dismisses a focused row's preview with Escape, keeping focus and its tab stop, until focus moves on", async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+    const strip = detailStrip();
+
+    await user.tab();
+    const [firstRow, secondRow] = dataRows();
+
+    if (firstRow === undefined || secondRow === undefined) {
+      throw new Error('the equivalent rendered fewer than two rows');
+    }
+
+    expect(document.activeElement).toBe(firstRow);
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+    expectOpen(openBubbleIn(firstRow));
+
+    // Escape peels one layer per press, each consumed because it dismissed
+    // something: first the description the focused row reveals in its own
+    // Operation cell, which leaves the strip's preview in place, then that
+    // preview. Focus and the table's one tab stop are exactly where they were.
+    expect(fireEvent.keyDown(firstRow, { key: 'Escape' })).toBe(false);
+    expect(openBubbleIn(firstRow)).toBeNull();
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+
+    expect(fireEvent.keyDown(firstRow, { key: 'Escape' })).toBe(false);
+    expect(strip.textContent).toBe(RESTING_LINE);
+    expect(document.activeElement).toBe(firstRow);
+    expect(firstRow.getAttribute('tabindex')).toBe('0');
+    expect(nameTabIndexes()).toEqual([null, null, null, null]);
+
+    // A third press has nothing of this view's to dismiss and is left alone.
+    expect(fireEvent.keyDown(firstRow, { key: 'Escape' })).toBe(true);
+
+    // Focus moving to another row previews it, and coming back previews the
+    // first row again: the dismissal belonged to that one visit.
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(secondRow);
+    expect(detailTrigger().textContent).toBe(FETCH_EVENT.name);
+
+    await user.keyboard('{ArrowUp}');
+    expect(document.activeElement).toBe(firstRow);
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+
+    // A focused row that IS the selection is not a preview: once the row's own
+    // revealed description is dismissed, Escape there dismisses nothing and
+    // the selection stays shown.
+    await user.keyboard('{Enter}');
+    expect(strip.textContent).toContain('Selected');
+    expect(fireEvent.keyDown(firstRow, { key: 'Escape' })).toBe(false);
+    expect(openBubbleIn(firstRow)).toBeNull();
+    expect(strip.textContent).toContain('Selected');
+    expect(fireEvent.keyDown(firstRow, { key: 'Escape' })).toBe(true);
+    expect(strip.textContent).toContain('Selected');
+    expect(detailTrigger().textContent).toBe(INTERACTION_EVENT.name);
+  });
+
+  it('leaves the strip as it is when Escape is pressed while focus is on the strip itself', async () => {
+    const stub = resolvingTrace(crossTierTree());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await findCanvas();
+    const strip = detailStrip();
+    await user.tab();
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(rowNamed(QUERY_EVENT.name));
+    expect(strip.textContent).toContain('Preview');
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+
+    // Nothing in the strip is a tab stop, so focus reaches it only through a
+    // pointer: a click on the strip's source chip.
+    const chip = within(strip).getByRole('button', { name: SOURCE_CHIP_NAME });
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+    await user.click(chip);
+    expect(document.activeElement).toBe(chip);
+
+    // The chip's own description opens with its focus. The first press closes
+    // it, the second finds nothing it may dismiss and is left alone:
+    // dismissing the strip would unmount the very chip that holds focus.
+    expectOpen(openBubbleIn(strip));
+    await user.keyboard('{Escape}');
+    expect(openBubbleIn(strip)).toBeNull();
+
+    expect(fireEvent.keyDown(chip, { key: 'Escape' })).toBe(true);
+    expect(within(detailStrip()).getByRole('button', { name: SOURCE_CHIP_NAME })).toBe(chip);
+    expect(detailTrigger().textContent).toBe(QUERY_EVENT.name);
+    expect(strip.textContent).toContain('Preview');
+    expect(document.activeElement).toBe(chip);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Canvas geometry
+ *
+ * A deeper, sparser trace than the chain above, shaped like the interactions
+ * this view is opened on: a request nested four levels into the server, a
+ * render and a commit after it in the browser lane, and a short query whose
+ * parent never arrived, re-attached to the root. Its database lane holds a
+ * span at depth 1 and another at depth 5, which is what exposes a lane that
+ * reserves a row per depth between its extremes, and its late, short spans
+ * sit where a label has no room after the bar, which is what exposes a label
+ * placed without measuring it.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The interaction at the root of the nested trace. */
+const NESTED_ROOT = makeEvent({
+  id: 'event-example-0301',
+  spanId: spanIdFor(0x31),
+  kind: 'interaction',
+  name: 'example.click',
+  tier: 'browser',
+  startTime: BASE_START_MS,
+  duration: 1175,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 0,
+  ingestSeq: 1,
+});
+
+/** The request the interaction made. */
+const NESTED_REQUEST = makeEvent({
+  id: 'event-example-0302',
+  spanId: spanIdFor(0x32),
+  parentSpanId: spanIdFor(0x31),
+  kind: 'fetch',
+  name: 'GET /example/report',
+  tier: 'browser',
+  startTime: BASE_START_MS + 8,
+  duration: 1112,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 1,
+  ingestSeq: 2,
+});
+
+/** The server span that answered the request. */
+const NESTED_SERVER = makeEvent({
+  id: 'event-example-0303',
+  spanId: spanIdFor(0x33),
+  parentSpanId: spanIdFor(0x32),
+  kind: 'http.server',
+  name: 'serve /example/report',
+  tier: 'server',
+  startTime: BASE_START_MS + 12,
+  duration: 1100,
+  producerId: SERVER_PRODUCER_ID,
+  seq: 0,
+  ingestSeq: 3,
+});
+
+/** The route handler inside it, whose name is longer than any room beside its bar. */
+const NESTED_ROUTE = makeEvent({
+  id: 'event-example-0304',
+  spanId: spanIdFor(0x34),
+  parentSpanId: spanIdFor(0x33),
+  kind: 'route.handler',
+  name: 'executing example route handler /example/report',
+  tier: 'server',
+  startTime: BASE_START_MS + 16,
+  duration: 1094,
+  producerId: SERVER_PRODUCER_ID,
+  seq: 1,
+  ingestSeq: 4,
+});
+
+/** The service function the handler called. */
+const NESTED_FUNCTION = makeEvent({
+  id: 'event-example-0305',
+  spanId: spanIdFor(0x35),
+  parentSpanId: spanIdFor(0x34),
+  kind: 'function',
+  name: 'loadExampleReport',
+  tier: 'server',
+  startTime: BASE_START_MS + 20,
+  duration: 1080,
+  producerId: SERVER_PRODUCER_ID,
+  seq: 2,
+  ingestSeq: 5,
+});
+
+/** The slow query at depth 5 — the deepest span, in the database lane. */
+const NESTED_QUERY = makeEvent({
+  id: 'event-example-0306',
+  spanId: spanIdFor(0x36),
+  parentSpanId: spanIdFor(0x35),
+  kind: 'db.query',
+  name: 'example.query.slow',
+  tier: 'db',
+  startTime: BASE_START_MS + 28,
+  duration: 940,
+  producerId: SERVER_PRODUCER_ID,
+  seq: 3,
+  ingestSeq: 6,
+});
+
+/** A render after the response, under the request. */
+const NESTED_RENDER = makeEvent({
+  id: 'event-example-0307',
+  spanId: spanIdFor(0x37),
+  parentSpanId: spanIdFor(0x32),
+  kind: 'render',
+  name: 'render ExamplePanel',
+  tier: 'browser',
+  startTime: BASE_START_MS + 1128,
+  duration: 47,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 2,
+  ingestSeq: 7,
+});
+
+/** The commit that ends the window: a 4 ms span at the very right edge. */
+const NESTED_COMMIT = makeEvent({
+  id: 'event-example-0308',
+  spanId: spanIdFor(0x38),
+  parentSpanId: spanIdFor(0x31),
+  kind: 'commit',
+  name: 'commit',
+  tier: 'browser',
+  startTime: BASE_START_MS + 1175,
+  duration: 4,
+  producerId: BROWSER_PRODUCER_ID,
+  seq: 3,
+  ingestSeq: 8,
+});
+
+/** A short query whose parent never arrived, re-attached to the root at depth 1. */
+const NESTED_ORPHAN_QUERY = makeEvent({
+  id: 'event-example-0309',
+  spanId: spanIdFor(0x39),
+  parentSpanId: spanIdFor(0x3f),
+  kind: 'db.query',
+  name: 'example.query.fast',
+  tier: 'db',
+  startTime: BASE_START_MS + 1000,
+  duration: 12,
+  producerId: SERVER_PRODUCER_ID,
+  seq: 4,
+  ingestSeq: 9,
+  attributes: { orphaned: true, orphanedParentSpanId: spanIdFor(0x3f) },
+});
+
+/**
+ * The nested trace as a tree, with the depth-5 query replaceable so a case can
+ * give it a hostile name.
+ *
+ * @param query The event drawn at depth 5 in the database lane.
+ * @returns The nine-node tree.
+ */
+function nestedTree(query: TelemetryEvent = NESTED_QUERY): TraceTree {
+  return makeTree([
+    makeTraceNode(NESTED_ROOT, {
+      depth: 0,
+      children: [
+        makeTraceNode(NESTED_REQUEST, {
+          depth: 1,
+          children: [
+            makeTraceNode(NESTED_SERVER, {
+              depth: 2,
+              children: [
+                makeTraceNode(NESTED_ROUTE, {
+                  depth: 3,
+                  children: [
+                    makeTraceNode(NESTED_FUNCTION, {
+                      depth: 4,
+                      children: [makeTraceNode(query, { depth: 5 })],
+                    }),
+                  ],
+                }),
+              ],
+            }),
+            makeTraceNode(NESTED_RENDER, { depth: 2 }),
+          ],
+        }),
+        makeTraceNode(NESTED_ORPHAN_QUERY, {
+          depth: 1,
+          orphaned: true,
+          orphanReason: MISSING_PARENT,
+          missingParentSpanId: spanIdFor(0x3f),
+        }),
+        makeTraceNode(NESTED_COMMIT, { depth: 1 }),
+      ],
+    }),
+  ]);
+}
+
+/** The lane background bands, top to bottom — the accent stripes carry a style and are excluded. */
+function laneBandsOf(canvas: HTMLElement): Element[] {
+  return Array.from(canvas.querySelectorAll('rect.dg-timeline__lane')).filter(
+    (lane) => lane.getAttribute('style') === null,
+  );
+}
+
+/** The canvas's `viewBox` as its four numbers. */
+function viewBoxOf(canvas: HTMLElement): readonly [number, number, number, number] {
+  const parts = (canvas.getAttribute('viewBox') ?? '').split(' ').map(Number);
+  const [minX = Number.NaN, minY = Number.NaN, width = Number.NaN, height = Number.NaN] = parts;
+
+  return [minX, minY, width, height];
+}
+
+/** A numeric SVG attribute, failing loudly when it is absent. */
+function numericAttribute(element: Element, name: string): number {
+  const value = element.getAttribute(name);
+  if (value === null) {
+    throw new Error(`the element has no "${name}" attribute`);
+  }
+
+  return Number(value);
+}
+
+/**
+ * Reports `width` as the inner width of the timeline's viewport element — and of
+ * no other element — for the rest of the case. The only layout stub in this
+ * suite (see the harness note); `vi.restoreAllMocks` in `afterEach` removes it.
+ *
+ * @param width The viewport width, in CSS pixels.
+ */
+function stubViewportWidth(width: number): void {
+  const native = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function (
+    this: HTMLElement,
+  ) {
+    if (this.classList.contains('dg-timeline__viewport')) {
+      return width;
+    }
+    const value: unknown = native?.get?.call(this);
+    return typeof value === 'number' ? value : 0;
+  });
+}
+
+/**
+ * The measure the component fits its labels with in this environment: the
+ * deterministic estimate at the label size, since no font can be resolved
+ * without a stylesheet or canvas metrics. Reading a drawn label's width through
+ * it is reading exactly the width the component placed.
+ */
+const LABEL_MEASURE = createEstimateMeasure();
+
+/** A drawn bar label, with the horizontal run it covers. */
+interface DrawnLabel {
+  readonly text: string;
+  readonly start: number;
+  readonly end: number;
+  readonly inside: boolean;
+}
+
+/** The backdrop drawn under a label beside its bar. */
+interface DrawnBackdrop {
+  readonly start: number;
+  readonly end: number;
+  readonly y: number;
+  readonly height: number;
+}
+
+/** One drawn span: its bar's run and row, its description, its label and that label's backdrop. */
+interface DrawnRow {
+  readonly title: string;
+  readonly x: number;
+  readonly end: number;
+  /** The bar's top edge, which every bar on the same row shares. */
+  readonly y: number;
+  readonly height: number;
+  readonly label: DrawnLabel | undefined;
+  readonly backdrop: DrawnBackdrop | undefined;
+}
+
+/** Every span as drawn, in the canvas's own order, read from its row group. */
+function drawnRowsOf(canvas: HTMLElement): DrawnRow[] {
+  return Array.from(canvas.querySelectorAll('g.dg-timeline__row')).map((group) => {
+    const bar = group.querySelector('rect.dg-timeline__bar');
+    if (bar === null) {
+      throw new Error('a drawn row holds no bar');
+    }
+    const x = numericAttribute(bar, 'x');
+    const text = group.querySelector('text.dg-timeline__bar-label');
+    let label: DrawnLabel | undefined;
+    if (text !== null) {
+      const content = text.textContent ?? '';
+      const width = LABEL_MEASURE(content);
+      const at = numericAttribute(text, 'x');
+      const start = text.getAttribute('text-anchor') === 'end' ? at - width : at;
+      label = {
+        text: content,
+        start,
+        end: start + width,
+        inside: text.classList.contains('dg-timeline__bar-label--inside'),
+      };
+    }
+
+    const backdropRect = group.querySelector('rect.dg-timeline__bar-label-backdrop');
+    const backdrop =
+      backdropRect === null
+        ? undefined
+        : {
+            start: numericAttribute(backdropRect, 'x'),
+            end: numericAttribute(backdropRect, 'x') + numericAttribute(backdropRect, 'width'),
+            y: numericAttribute(backdropRect, 'y'),
+            height: numericAttribute(backdropRect, 'height'),
+          };
+
+    return {
+      title: bar.querySelector('title')?.textContent ?? '',
+      x,
+      end: x + numericAttribute(bar, 'width'),
+      y: numericAttribute(bar, 'y'),
+      height: numericAttribute(bar, 'height'),
+      label,
+      backdrop,
+    };
+  });
+}
+
+/** The drawn span whose description names `name`. */
+function drawnRowNamed(rows: readonly DrawnRow[], name: string): DrawnRow {
+  const row = rows.find((candidate) => candidate.title.startsWith(`${name} `));
+  if (row === undefined) {
+    throw new Error(`no drawn span is described as "${name}"`);
+  }
+
+  return row;
+}
+
+/** Whether two horizontal runs share any width. */
+function runsOverlap(
+  left: { readonly start: number; readonly end: number },
+  right: { readonly start: number; readonly end: number },
+): boolean {
+  return left.start < right.end && right.start < left.end;
+}
+
+/**
+ * Asserts the placement contract for every label on the canvas: a label beside
+ * its bar lies between the lane-label column and the canvas's right edge on a
+ * backdrop that covers it and no bar, a label inside its bar lies within it
+ * with no backdrop, and no label overlaps another bar or another label on its
+ * row.
+ *
+ * @param canvas The canvas.
+ * @param laneColumn Where the lane-label column ends: the left edge of a bar
+ *   that starts at the window's start.
+ * @returns The rows it checked, for further assertions.
+ */
+function expectLabelsClear(canvas: HTMLElement, laneColumn: number): DrawnRow[] {
+  const rows = drawnRowsOf(canvas);
+  const [, , canvasWidth] = viewBoxOf(canvas);
+
+  for (const row of rows) {
+    const label = row.label;
+    if (label === undefined) {
+      expect(row.backdrop, `the unlabelled "${row.title}" has no backdrop`).toBeUndefined();
+      continue;
+    }
+    const named = `the label "${label.text}"`;
+
+    if (label.inside) {
+      expect(label.start, `${named} starts inside its bar`).toBeGreaterThanOrEqual(row.x);
+      expect(label.end, `${named} ends inside its bar`).toBeLessThanOrEqual(row.end);
+      expect(row.backdrop, `${named} has no backdrop`).toBeUndefined();
+    } else {
+      expect(label.start, `${named} clears the lane labels`).toBeGreaterThanOrEqual(laneColumn);
+      expect(label.end, `${named} stays on the canvas`).toBeLessThanOrEqual(canvasWidth);
+      expect(runsOverlap(label, { start: row.x, end: row.end }), `${named} is off its bar`).toBe(
+        false,
+      );
+
+      // The backdrop spans the label and the bar's height, and touches no bar.
+      const backdrop = row.backdrop;
+      if (backdrop === undefined) {
+        throw new Error(`${named} is beside its bar with no backdrop`);
+      }
+      expect(backdrop.start, `${named}'s backdrop starts before it`).toBeLessThan(label.start);
+      expect(backdrop.end, `${named}'s backdrop ends after it`).toBeGreaterThan(label.end);
+      expect([backdrop.y, backdrop.height]).toEqual([row.y, row.height]);
+      for (const other of rows) {
+        if (other.y === row.y) {
+          expect(
+            runsOverlap(backdrop, { start: other.x, end: other.end }),
+            `${named}'s backdrop covers the bar of "${other.title}"`,
+          ).toBe(false);
+        }
+      }
+    }
+
+    for (const other of rows) {
+      if (other === row || other.y !== row.y) {
+        continue;
+      }
+      expect(
+        runsOverlap(label, { start: other.x, end: other.end }),
+        `${named} crosses the bar of "${other.title}"`,
+      ).toBe(false);
+      if (other.label !== undefined) {
+        expect(runsOverlap(label, other.label), `${named} crosses "${other.label.text}"`).toBe(
+          false,
+        );
+      }
+    }
+  }
+
+  return rows;
+}
+
+/**
+ * A 243-code-unit name made mostly of emoji ZWJ sequences, each five code units
+ * and one grapheme: a cut by code unit or by code point would split one.
+ */
+const HOSTILE_NAME = `example.${'\u{1F469}\u200D\u{1F4BB}'.repeat(47)}`;
+
+/** The slow query under that name. */
+const HOSTILE_QUERY = makeEvent({
+  id: NESTED_QUERY.id,
+  spanId: NESTED_QUERY.spanId,
+  parentSpanId: NESTED_QUERY.parentSpanId,
+  kind: NESTED_QUERY.kind,
+  name: HOSTILE_NAME,
+  tier: NESTED_QUERY.tier,
+  startTime: NESTED_QUERY.startTime,
+  duration: NESTED_QUERY.duration,
+  producerId: NESTED_QUERY.producerId,
+  seq: NESTED_QUERY.seq,
+  ingestSeq: NESTED_QUERY.ingestSeq,
+});
+
+describe('Timeline canvas geometry', () => {
+  it('gives each lane one row per distinct depth, with no band for a depth it does not hold', async () => {
+    const tree = nestedTree();
+    const stub = resolvingTrace(tree);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    expect(barsOf(canvas)).toHaveLength(tree.nodeCount);
+    expect(laneLabelsOf(canvas)).toEqual([...CHAIN_LANE_LABELS]);
+
+    // Browser: depths 0, 1 and 2. Server: depths 2, 3 and 4. Database: depths
+    // 1 and 5 — two rows, not the five between its extremes.
+    const bands = laneBandsOf(canvas);
+    expect(bands.map((band) => numericAttribute(band, 'height'))).toEqual([
+      layoutHeight(3),
+      layoutHeight(3),
+      layoutHeight(2),
+    ]);
+
+    // The shallower span sits in the lane's first row and the deeper one in
+    // the row directly beneath it: nesting order kept, no empty row between.
+    const databaseBand = bands[2];
+    if (databaseBand === undefined) {
+      throw new Error('the canvas drew no database lane');
+    }
+    const bandTop = numericAttribute(databaseBand, 'y');
+    const bandBottom = bandTop + numericAttribute(databaseBand, 'height');
+    const orphanBar = barTitled(canvas, NESTED_ORPHAN_QUERY.name);
+    const queryBar = barTitled(canvas, NESTED_QUERY.name);
+    const orphanTop = numericAttribute(orphanBar, 'y');
+    const queryTop = numericAttribute(queryBar, 'y');
+    expect(queryTop - orphanTop).toBe(rowY(1));
+    expect(orphanTop).toBeGreaterThanOrEqual(bandTop);
+    expect(queryTop + numericAttribute(queryBar, 'height')).toBeLessThanOrEqual(bandBottom);
+
+    // Two spans at depth 1 in the browser lane share its second row.
+    expect(numericAttribute(barTitled(canvas, NESTED_COMMIT.name), 'y')).toBe(
+      numericAttribute(barTitled(canvas, NESTED_REQUEST.name), 'y'),
+    );
+  });
+
+  it('spans the lane bands across the whole canvas, which scales to its container without layout', async () => {
+    const stub = resolvingTrace(nestedTree());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // No layout, so no measured width: the fallback coordinate space, scaled
+    // uniformly to the container.
+    const [minX, minY, viewWidth, viewHeight] = viewBoxOf(canvas);
+    expect([minX, minY]).toEqual([0, 0]);
+    expect(canvas.getAttribute('width')).toBe('100%');
+    expect(canvas.getAttribute('preserveAspectRatio')).toBe('xMinYMin meet');
+    expect(numericAttribute(canvas, 'height')).toBe(viewHeight);
+
+    const bands = laneBandsOf(canvas);
+    expect(bands).toHaveLength(CHAIN_LANE_TIERS.length);
+    for (const band of bands) {
+      expect(numericAttribute(band, 'x')).toBe(0);
+      expect(numericAttribute(band, 'width')).toBe(viewWidth);
+    }
+  });
+
+  it('lays the canvas out in CSS pixels at the width its viewport measures', async () => {
+    const measuredWidth = 1400;
+    stubViewportWidth(measuredWidth);
+
+    const stub = resolvingTrace(nestedTree());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+
+    // One user unit per CSS pixel: the declared size IS the viewBox, and there
+    // is no aspect ratio left to reconcile.
+    await waitFor(() => {
+      expect(canvas.getAttribute('width')).toBe(String(measuredWidth));
+    });
+    const [, , viewWidth, viewHeight] = viewBoxOf(canvas);
+    expect(viewWidth).toBe(measuredWidth);
+    expect(numericAttribute(canvas, 'height')).toBe(viewHeight);
+    expect(canvas.getAttribute('preserveAspectRatio')).toBeNull();
+
+    for (const band of laneBandsOf(canvas)) {
+      expect(numericAttribute(band, 'width')).toBe(measuredWidth);
+    }
+
+    // The root spans the whole window, so its bar spans the whole plot: from
+    // the lane-label column to the canvas edge less a trailing gutter narrower
+    // than that column. It ends past the entire fallback width, so the plot is
+    // laid out in measured pixels rather than scaled up from the fallback.
+    const root = barTitled(canvas, NESTED_ROOT.name);
+    const rootStart = numericAttribute(root, 'x');
+    const rootEnd = rootStart + numericAttribute(root, 'width');
+    expect(rootStart).toBeGreaterThan(0);
+    expect(rootEnd).toBeGreaterThan(1000);
+    expect(rootEnd).toBeLessThanOrEqual(measuredWidth);
+    expect(measuredWidth - rootEnd).toBeLessThan(rootStart);
+  });
+
+  it.each([
+    { viewport: undefined, mode: 'unmeasured' },
+    { viewport: 360, mode: 'a 360 px viewport' },
+    { viewport: 768, mode: 'a 768 px viewport' },
+    { viewport: 1400, mode: 'a 1400 px viewport' },
+  ])(
+    'keeps every label clear of the lane labels, the canvas edge, foreign bars and other labels ($mode)',
+    async ({ viewport }) => {
+      if (viewport !== undefined) {
+        stubViewportWidth(viewport);
+      }
+      const tree = nestedTree();
+      const stub = resolvingTrace(tree);
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      const canvas = await findCanvas();
+      if (viewport !== undefined) {
+        await waitFor(() => {
+          expect(canvas.getAttribute('width')).toBe(String(viewport));
+        });
+      }
+
+      // The root starts at the window's start, so its bar starts at the end of
+      // the lane-label column.
+      const laneColumn = numericAttribute(barTitled(canvas, NESTED_ROOT.name), 'x');
+      const rows = expectLabelsClear(canvas, laneColumn);
+      expect(rows).toHaveLength(tree.nodeCount);
+
+      // Most spans are labelled at every width, and every label drawn whole is
+      // the whole "name · duration" text; a shortened one ends its name in an
+      // ellipsis and is a prefix of that name.
+      const labelled = rows.filter((row) => row.label !== undefined);
+      expect(labelled.length).toBeGreaterThanOrEqual(tree.nodeCount - 1);
+      for (const event of flattenFixture(tree.roots).map((node) => node.event)) {
+        const label = drawnRowNamed(rows, event.name).label;
+        if (label === undefined) {
+          continue;
+        }
+        const whole = `${event.name} · ${formatDurationCompact(event.duration)}`;
+        if (label.text !== whole) {
+          const [namePart = ''] = label.text.split(' · ');
+          expect(namePart.endsWith(ELLIPSIS) || namePart === event.name).toBe(true);
+          expect(event.name.startsWith(namePart.replace(ELLIPSIS, ''))).toBe(true);
+        }
+      }
+    },
+  );
+
+  it('draws no label over a foreign bar: a late span with no room beside it goes unlabelled', async () => {
+    const stub = resolvingTrace(nestedTree());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const rows = drawnRowsOf(canvas);
+
+    // The commit ends the window and shares its row with the request, which
+    // runs until just before it: no room after it, none inside it, and before
+    // it only the few units between the two bars — too few for four letters
+    // of its name. It is left unlabelled rather than drawn across the request,
+    // and its name is still in its description and in the table.
+    const commit = drawnRowNamed(rows, NESTED_COMMIT.name);
+    const request = drawnRowNamed(rows, NESTED_REQUEST.name);
+    expect(commit.y).toBe(request.y);
+    expect(commit.label).toBeUndefined();
+    expect(commit.title.startsWith(`${NESTED_COMMIT.name} `)).toBe(true);
+    expect(renderedNames()).toContain(NESTED_COMMIT.name);
+
+    // The request's own label is drawn inside it, clear of the commit.
+    expect(request.label?.inside).toBe(true);
+    expect(request.label?.text).toBe(
+      `${NESTED_REQUEST.name} · ${formatDurationCompact(NESTED_REQUEST.duration)}`,
+    );
+
+    // A late span alone on its row has room before its bar, and its label is
+    // drawn there whole, end-anchored, on the lane surface.
+    const render = drawnRowNamed(rows, NESTED_RENDER.name);
+    expect(render.label?.inside).toBe(false);
+    expect(render.label?.text).toBe(
+      `${NESTED_RENDER.name} · ${formatDurationCompact(NESTED_RENDER.duration)}`,
+    );
+    expect(render.label?.end).toBeLessThanOrEqual(render.x);
+  });
+
+  it('shortens a label by measured width: the duration kept when the name has room beside it, the name alone when it has not', async () => {
+    stubViewportWidth(360);
+    const narrow = resolvingTrace(nestedTree());
+
+    renderComponent(makeNode(), { provider: narrow.provider, actions: makeActions().actions });
+
+    const narrowCanvas = await findCanvas();
+    await waitFor(() => {
+      expect(narrowCanvas.getAttribute('width')).toBe('360');
+    });
+
+    // At 360 px the route handler's label fits nowhere whole; the widest room
+    // is inside its bar, where its name is cut to an ellipsis and its duration
+    // kept, and the text fits the bar.
+    const route = drawnRowNamed(drawnRowsOf(narrowCanvas), NESTED_ROUTE.name);
+    const suffix = ` · ${formatDurationCompact(NESTED_ROUTE.duration)}`;
+    expect(route.label?.inside).toBe(true);
+    expect(route.label?.text.endsWith(`${ELLIPSIS}${suffix}`)).toBe(true);
+    const cut = (route.label?.text ?? '').slice(0, -`${ELLIPSIS}${suffix}`.length);
+    expect(cut.length).toBeGreaterThan(0);
+    expect(NESTED_ROUTE.name.startsWith(cut)).toBe(true);
+    expect(route.label?.end ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(route.end);
+
+    cleanup();
+    vi.restoreAllMocks();
+    stubViewportWidth(1400);
+    const wide = resolvingTrace(nestedTree());
+
+    renderComponent(makeNode(), { provider: wide.provider, actions: makeActions().actions });
+
+    const wideCanvas = await findCanvas();
+    await waitFor(() => {
+      expect(wideCanvas.getAttribute('width')).toBe('1400');
+    });
+
+    // At 1400 px the room between the request and the commit holds the
+    // commit's name but not its duration as well, so the name is drawn alone,
+    // before the bar and clear of the request.
+    const rows = drawnRowsOf(wideCanvas);
+    const commit = drawnRowNamed(rows, NESTED_COMMIT.name);
+    const request = drawnRowNamed(rows, NESTED_REQUEST.name);
+    expect(commit.label?.text).toBe(NESTED_COMMIT.name);
+    expect(commit.label?.inside).toBe(false);
+    expect(commit.label?.end ?? Number.POSITIVE_INFINITY).toBeLessThanOrEqual(commit.x);
+    expect(commit.label?.start ?? 0).toBeGreaterThan(request.end);
+  });
+
+  it('cuts a hostile emoji name at a grapheme boundary, inside its bar, and keeps the whole name elsewhere', async () => {
+    expect(HOSTILE_NAME).toHaveLength(243);
+    const tree = nestedTree(HOSTILE_QUERY);
+    const stub = resolvingTrace(tree);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const canvas = await findCanvas();
+    const laneColumn = numericAttribute(barTitled(canvas, NESTED_ROOT.name), 'x');
+    const rows = expectLabelsClear(canvas, laneColumn);
+
+    const query = drawnRowNamed(rows, HOSTILE_NAME);
+    const label = query.label;
+    if (label === undefined) {
+      throw new Error('the hostile span was left unlabelled');
+    }
+
+    // The widest room is inside the long bar: the name is cut there, the
+    // duration kept after the ellipsis, and the whole text fits the bar.
+    const suffix = ` · ${formatDurationCompact(HOSTILE_QUERY.duration)}`;
+    expect(label.inside).toBe(true);
+    expect(label.text.endsWith(`${ELLIPSIS}${suffix}`)).toBe(true);
+    expect(label.end).toBeLessThanOrEqual(query.end);
+
+    // The cut falls between graphemes: the kept prefix is exactly the name's
+    // first graphemes, it ends in a whole emoji sequence, and no surrogate is
+    // left unpaired.
+    const kept = label.text.slice(0, -`${ELLIPSIS}${suffix}`.length);
+    const keptGraphemes = splitGraphemes(kept);
+    expect(keptGraphemes.length).toBeGreaterThan(1);
+    expect(splitGraphemes(HOSTILE_NAME).slice(0, keptGraphemes.length).join('')).toBe(kept);
+    expect(keptGraphemes.at(-1)).toBe('\u{1F469}\u200D\u{1F4BB}');
+    // Under the `u` flag a paired surrogate is one code point, so this class
+    // matches only a surrogate left alone.
+    expect(label.text).not.toMatch(/[\uD800-\uDFFF]/u);
+
+    // The whole name is still what the table and the bar's description carry.
+    expect(renderedNames()).toContain(HOSTILE_NAME);
+    expect(query.title.startsWith(`${HOSTILE_NAME} `)).toBe(true);
   });
 });

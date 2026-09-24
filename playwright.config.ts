@@ -292,6 +292,16 @@ export default defineConfig<DebuggenTestOptions>({
   // competing instance - two services on one port mean EADDRINUSE at best and a silent
   // answer from a stale process at worst. In CI it is false, so the run owns its service
   // and a leftover process is an error rather than a silent dependency.
+  //
+  // `url` is a readiness probe and nothing more: Playwright reads its status code only -
+  // a 2xx, 3xx, 400, 401, 402 or 403 counts as ready - and never its body, so it cannot
+  // tell which build or which protocol version is answering. The body of `GET /health`
+  // is `{ version, protocolVersion, pairingAvailable }`, defined once as
+  // `healthResponseSchema` in `@debuggen/protocol` and answered by
+  // apps/local-service/src/main.ts. A helper that must know whether the service it was
+  // handed speaks this build's protocol calls `HttpClient.health()` from that package and
+  // compares the returned `protocolVersion` with `isCompatibleProtocolVersion`, rather
+  // than parsing the body itself.
   webServer: {
     name: 'debuggen local service',
     command: 'node apps/local-service/dist/main.js',

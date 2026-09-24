@@ -72,8 +72,15 @@
  *   header is ever set, so a web page cannot read a response even if one were
  *   answered.
  * - **`GET /health`**, unauthenticated — one of the two auth-exempt operations
- *   of AAP 0.5.6 — answering `{ status, protocolVersion }` from the moment the
- *   server listens, because that is what the Playwright `webServer` block polls.
+ *   of AAP 0.5.6 — answering from the moment the server listens with "version
+ *   and pairing availability only": `{ version, protocolVersion,
+ *   pairingAvailable }`, the `HealthResponse` of `@debuggen/protocol`. Its one
+ *   definition is that package's strict `healthResponseSchema`, which this
+ *   handler validates the body against before sending it and which
+ *   `HttpClient.health()` applies to what it receives, so the service and every
+ *   client — VS Code service discovery, the DevTools "Service not running" and
+ *   pairing states — read one shape. The Playwright `webServer` probe reads the
+ *   status code only, never the body.
  * - **`app.onError`**, which logs the failure and answers `500` with
  *   `{ code: 'INTERNAL', message }`. A caught value never reaches a response
  *   body.
@@ -132,7 +139,13 @@ import { serve, type ServerType } from '@hono/node-server';
 import { config as loadDotenvFile } from 'dotenv';
 import { Hono } from 'hono';
 
-import { PROTOCOL_VERSION } from '@debuggen/protocol';
+import {
+  HTTP_ROUTES,
+  PROTOCOL_VERSION,
+  parseHttpResponse,
+  type HealthResponse,
+  type HttpOperationId,
+} from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
@@ -187,11 +200,52 @@ const SUBSYSTEM_SERVER = 'server';
 /**
  * The path of the unauthenticated health route.
  *
- * Stated as a constant because it is a contract with two readers outside this
- * repository's source: the `webServer.url` of the root `playwright.config.ts`
- * and the service-discovery probe of the VS Code extension.
+ * Read from the protocol's route table rather than restated, because it is a
+ * contract with readers outside this workspace — the `webServer.url` of the
+ * root `playwright.config.ts`, the service-discovery probe of the VS Code
+ * extension and `HttpClient.health()`, which builds its request from the same
+ * `HTTP_ROUTES.health` row — so the path this service registers and the path
+ * every client requests have one definition.
  */
-const HEALTH_ROUTE = '/health';
+const HEALTH_ROUTE = HTTP_ROUTES.health.pattern;
+
+/**
+ * This service build's version: the `version` field of the `GET /health` body.
+ *
+ * The same string as the `version` of `apps/local-service/package.json`, kept
+ * in step by hand and held to it by `main.test.ts`, which reads that manifest
+ * and fails when the two differ. It is a literal because no way of reading the
+ * manifest holds in every layout this module runs in:
+ *
+ * - `import`ing `../package.json` puts a file outside this project's `include`
+ *   (`src/**` and `test/**`) into the program and makes the manifest a bundle
+ *   input;
+ * - a build-time substitution needs a `define` in `tsup.config.ts`, which
+ *   forbids injecting anything into the bundle, and would be absent under
+ *   `tsx watch src/main.ts`;
+ * - reading `new URL('../package.json', import.meta.url)` at run time finds this
+ *   package's manifest from `src/main.ts` and `dist/main.js` only: the VS Code
+ *   extension re-bundles these sources to `dist/service/main.js`, where the same
+ *   URL names the extension's manifest.
+ *
+ * Clients display and log it and never parse it — the protocol validates it as
+ * a non-empty opaque token — and compatibility is decided by `protocolVersion`,
+ * never by this value.
+ */
+const SERVICE_VERSION = '0.1.0';
+
+/**
+ * The two operations of the pairing flow of AAP 0.5.6, in the order a pairing
+ * runs: the editor mints a one-time code, the DevTools extension redeems it.
+ *
+ * Named by their `HTTP_ROUTES` ids rather than by method and path, so the
+ * methods and patterns {@link servesPairingFlow} looks for are the protocol's
+ * own and cannot drift from the table clients build their requests from.
+ */
+const PAIRING_OPERATIONS = [
+  'pair.start',
+  'pair.complete',
+] as const satisfies readonly HttpOperationId[];
 
 /**
  * How long a statement waits for the write lock before SQLite gives up, in
@@ -929,6 +983,78 @@ function formatServiceUrl(host: string, port: number): string {
 }
 
 /**
+ * Whether `app` serves the pairing flow of AAP 0.5.6 — a handler at both
+ * `POST /pair/start` and `POST /pair/complete` — which is what the
+ * `pairingAvailable` field of the `GET /health` body reports.
+ *
+ * Derived from the application's own route registry rather than stated as a
+ * literal, so the flag cannot claim a flow the service does not answer: the
+ * DevTools panel reads `pairingAvailable` to decide whether to offer its pairing
+ * dialog, and a `true` from a service that answers both routes `404` would offer
+ * a dialog that cannot succeed. A flow served by half is not available, hence
+ * `every`.
+ *
+ * Each operation is matched on the method and pattern of its `HTTP_ROUTES` row
+ * against `app.routes`, which Hono records with the method upper-cased and the
+ * path merged with the app's base path — the same form the table states. An
+ * entry registered through `use` carries the method `ALL` and is middleware
+ * that passes the request on rather than a handler that answers it, so it never
+ * satisfies a match.
+ *
+ * This is the service-side precondition of `pairingAvailable`, not the whole of
+ * it: the protocol defines the field as "a pairing code can be requested right
+ * now", and `false` also covers the case of no editor client being connected to
+ * display a code, which is a fact of the WebSocket client registry rather than
+ * of the route table. {@link createServiceApp} registers neither pairing
+ * operation and this composition attaches no WebSocket surface through which an
+ * editor could connect, so both conditions are unmet and the application it
+ * builds reports `false`.
+ *
+ * Exported so the derivation can be exercised against applications that do
+ * register the pairing routes, which the service this module starts does not.
+ *
+ * @param app The composed application.
+ * @returns `true` only when both pairing operations have a handler registered at
+ * their protocol method and pattern.
+ *
+ * @example
+ * ```ts
+ * const app = new Hono();
+ * servesPairingFlow(app); // false
+ * app.post('/pair/start', mint).post('/pair/complete', redeem);
+ * servesPairingFlow(app); // true
+ * ```
+ */
+export function servesPairingFlow(app: Hono): boolean {
+  return PAIRING_OPERATIONS.every((operation) => {
+    const { method, pattern } = HTTP_ROUTES[operation];
+    return app.routes.some((route) => route.method === method && route.path === pattern);
+  });
+}
+
+/**
+ * Builds and validates the `GET /health` body for `app`.
+ *
+ * The body is held to its one definition twice. `satisfies HealthResponse`
+ * fixes its field set to the protocol's type at compile time, so a field added
+ * or dropped here does not build; `parseHttpResponse('health', …)` then applies
+ * `healthResponseSchema` — the strict schema `HttpClient.health()` parses the
+ * reply with — to its values, so a version string the protocol would refuse
+ * (empty, or longer than its bound) is caught here rather than by every client.
+ *
+ * @param app The composed application, read for {@link servesPairingFlow}.
+ * @returns `ok(body)`, or `err` with `PROTOCOL_INVALID_MESSAGE` naming the field
+ * that fails the schema.
+ */
+function buildHealthResponse(app: Hono): Result<HealthResponse, DebuggenError> {
+  return parseHttpResponse('health', {
+    version: SERVICE_VERSION,
+    protocolVersion: PROTOCOL_VERSION,
+    pairingAvailable: servesPairingFlow(app),
+  } satisfies HealthResponse);
+}
+
+/**
  * Builds the service's Hono application: the origin guard, `GET /health` and
  * the error handler.
  *
@@ -962,11 +1088,24 @@ function createServiceApp(logger: Logger): Hono {
   });
 
   // Unauthenticated by design — one of the two auth-exempt operations of AAP
-  // 0.5.6 — and therefore limited to what an unauthenticated caller may learn:
-  // that a Debug Generator service is here, and which protocol version it
-  // speaks. Nothing about the developer's machine, the session store or the
-  // configuration belongs in this body.
-  app.get(HEALTH_ROUTE, (c) => c.json({ status: 'ok', protocolVersion: PROTOCOL_VERSION }));
+  // 0.5.6 — and therefore limited to "version and pairing availability only":
+  // the service build's version, the protocol version it speaks and whether
+  // pairing can be requested. Nothing about the developer's machine, the session
+  // store or the configuration belongs in this body.
+  //
+  // The body is `@debuggen/protocol`'s `HealthResponse`, validated against
+  // `healthResponseSchema` on every request by `buildHealthResponse`. Evaluated
+  // per request rather than once, so `pairingAvailable` describes the routes the
+  // app serves when it answers. A body that fails the schema is thrown to
+  // `app.onError` below — logged with the failing field, answered `500` — and is
+  // never sent, because a client would refuse it anyway.
+  app.get(HEALTH_ROUTE, (c) => {
+    const body = buildHealthResponse(app);
+    if (isErr(body)) {
+      throw body.error;
+    }
+    return c.json(body.value);
+  });
 
   // The last boundary: a handler that threw, or a middleware that rejected.
   // The caught value is logged with the request that produced it and never

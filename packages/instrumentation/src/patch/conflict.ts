@@ -495,7 +495,10 @@ export interface FileMissingVerdict extends ConflictVerdictBase, ConflictingVerd
  *
  * Surfaced rather than silently closed: the record stays open, the backup path
  * is reported, and the file is left instrumented rather than being "restored"
- * from content nobody verified.
+ * from content nobody verified. The report's reason names what was observed:
+ * `'backup-corrupt'` when a backup is there but fails its own digest
+ * (`backup.reason === 'digest-mismatch'`), `'backup-missing'` when it is gone,
+ * unreadable or cannot be located.
  */
 export interface BackupUnavailableVerdict extends ConflictVerdictBase, ConflictingVerdictParts {
   readonly kind: 'backup-unavailable';
@@ -898,18 +901,28 @@ export async function detectConflict(
       });
     }
 
-    // The content is ours, but the only copy of the original is not readable,
-    // so there is nothing verified to write back. Reported, not closed.
-    logger.warn('conflict detection: the recorded original cannot be read back', {
-      recordId: record.id,
-      sessionId: record.sessionId,
-      file: record.file,
-      backupPath: backup.state.path,
-      reason: backup.state.reason,
-    });
+    // The content is ours, but the only copy of the original is not usable, so
+    // there is nothing verified to write back. Reported, not closed — and named
+    // for what was observed: a backup that is there but fails its own digest is
+    // `backup-corrupt`, which a developer can inspect, while one that is gone or
+    // cannot be read is `backup-missing`.
+    const corrupt = backup.state.reason === 'digest-mismatch';
+
+    logger.warn(
+      corrupt
+        ? 'conflict detection: the recorded original does not hash to the digest it is filed under'
+        : 'conflict detection: the recorded original cannot be read back',
+      {
+        recordId: record.id,
+        sessionId: record.sessionId,
+        file: record.file,
+        backupPath: backup.state.path,
+        reason: backup.state.reason,
+      },
+    );
 
     const parts = composeConflictParts({
-      reason: 'backup-missing',
+      reason: corrupt ? 'backup-corrupt' : 'backup-missing',
       record,
       detectedAt,
       actualHash,
@@ -1198,11 +1211,20 @@ async function inspectBackup(
   if (isErr(read)) {
     const storeReason = storeReasonOf(read.error);
 
+    // The store's own vocabulary, mapped onto the verdict's: nothing there is
+    // `missing`, and a stored file that fails its own name is the same
+    // `digest-mismatch` the hash below detects — it was read, it is simply not
+    // the original — rather than `unreadable`.
     return {
       state: {
         available: false,
         path: record.backupPath,
-        reason: storeReason === 'backup-missing' ? 'missing' : 'unreadable',
+        reason:
+          storeReason === 'backup-missing'
+            ? 'missing'
+            : storeReason === 'stored-digest-mismatch'
+              ? 'digest-mismatch'
+              : 'unreadable',
         detail: storeReason ?? read.error.code,
       },
     };
@@ -1634,29 +1656,75 @@ function composeDefaultMessage(
     const where = withPath ? ` at '${backup.path}'` : " in this session's backup directory";
 
     if (input.reason === 'file-missing') {
-      const fate = backup.available
-        ? `The recorded original is retained${where}.`
-        : `The recorded original could not be read back${where} (${backup.reason}).`;
+      return `'${file}' is no longer present, so this modification could not be reverted and nothing was written. ${backupFate(backup, where)}${sizeClause}`;
+    }
 
-      return `'${file}' is no longer present, so this modification could not be reverted and nothing was written. ${fate}${sizeClause}`;
+    if (input.reason === 'backup-corrupt') {
+      return `'${file}' still holds the content this tool wrote, but the recorded original${where} no longer hashes to the digest it was filed under, so it cannot be trusted and nothing was written to it. The backup was kept for inspection.${sizeClause}`;
     }
 
     if (input.reason === 'backup-missing') {
-      const detail = backup.available ? 'unknown' : backup.reason;
+      const why = backup.available ? 'unknown' : unavailableDetail(backup);
 
-      return `'${file}' still holds the content this tool wrote, but the recorded original could not be read back${where} (${detail}), so nothing was written to it.${sizeClause}`;
+      return `'${file}' still holds the content this tool wrote, but the recorded original could not be read back${where} (${why}), so nothing was written to it.${sizeClause}`;
     }
 
-    const fate = backup.available
-      ? `The recorded original is retained${where}.`
-      : `The recorded original could not be read back${where} (${backup.reason}).`;
-
-    return `'${file}' was changed after it was instrumented, so nothing was written to it. ${fate}${sizeClause}`;
+    return `'${file}' was changed after it was instrumented, so nothing was written to it. ${backupFate(backup, where)}${sizeClause}`;
   };
 
   const withPath = compose(true);
 
   return withPath.length <= CONFLICT_MESSAGE_CHARACTER_LIMIT ? withPath : compose(false);
+}
+
+/**
+ * The sentence that says what became of the recorded original, for a report
+ * whose headline is about the file rather than the backup.
+ *
+ * Three different facts, worded as three: the original is retained; it is
+ * there but no longer hashes to the digest it was filed under, so it cannot be
+ * trusted; or it could not be read back at all, with the reason and — where it
+ * adds something — the errno or store reason behind it.
+ *
+ * @param backup The backup state the verdict carries.
+ * @param where Where the original is, as the caller's path-bearing or path-free
+ * form words it.
+ * @returns One sentence.
+ */
+function backupFate(backup: BackupState, where: string): string {
+  if (backup.available) {
+    return `The recorded original is retained${where}.`;
+  }
+
+  if (backup.reason === 'digest-mismatch') {
+    return `The recorded original${where} no longer hashes to the digest it was filed under, so it cannot be trusted; it was kept for inspection.`;
+  }
+
+  return `The recorded original could not be read back${where} (${unavailableDetail(backup)}).`;
+}
+
+/**
+ * Why an unavailable backup could not be read back, as the parenthesis of a
+ * message: the {@link BackupUnavailableReason}, followed by its `detail` where
+ * the detail is an errno or an enumerated store reason that adds something.
+ *
+ * The detail of a `digest-mismatch` is the digest the bytes hashed to, which
+ * says nothing a developer can act on and describes content, so it never
+ * reaches a message; nor does a `missing` backup's, which only restates the
+ * reason.
+ *
+ * @param backup An unavailable backup's state.
+ * @returns The parenthesised text, without the parentheses.
+ */
+function unavailableDetail(backup: Extract<BackupState, { available: false }>): string {
+  if (
+    backup.detail !== undefined &&
+    (backup.reason === 'unreadable' || backup.reason === 'unusable-path')
+  ) {
+    return `${backup.reason}: ${backup.detail}`;
+  }
+
+  return backup.reason;
 }
 
 /**

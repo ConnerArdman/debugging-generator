@@ -1232,6 +1232,48 @@ describe('an unwrappable declaration', () => {
       expectReadableRefusal(refusal);
     });
   }
+
+  /** How many times `needle` occurs in `haystack`. */
+  function occurrences(haystack: string, needle: string): number {
+    return haystack.split(needle).length - 1;
+  }
+
+  it('says what a class target is once, without a second clause about its body', () => {
+    const refusal = refusalFor({ file: FILES.controller, symbol: 'KilnController' });
+
+    expect(refusal.code).toBe('unsupported-declaration');
+    // The patcher's own wording: "…but not as a function … can replace: it is
+    // the class itself, whose body runs field initialisers …".
+    expect(refusal.reason).toContain(
+      `'${FILES.controller}' declares 'KilnController', but not as a function a timing wrapper can replace: it is the class itself`,
+    );
+    expect(occurrences(refusal.reason, 'whose body')).toBe(1);
+    expect(refusal.reason).not.toContain('whose body no timing wrapper');
+    expectReadableRefusal(refusal);
+  });
+
+  it('names a constructor target as a constructor, without claiming a body it would then deny', () => {
+    const refusal = refusalFor({ file: FILES.controller, symbol: 'KilnController.constructor' });
+
+    expect(refusal.code).toBe('unsupported-declaration');
+    expect(refusal.reason).toBe(
+      `'${FILES.controller}' declares 'KilnController.constructor', but not as a function a timing wrapper can replace: it is a constructor`,
+    );
+    expect(refusal.reason).not.toContain('whose body');
+    expectReadableRefusal(refusal);
+  });
+
+  it('reads as one fragment after the developer-facing "Could not enable" prefix', () => {
+    for (const symbol of ['KilnController', 'KilnController.constructor', 'segments']) {
+      const refusal = refusalFor({ file: FILES.controller, symbol });
+
+      // A fragment, not a sentence: no terminal full stop and no second clause
+      // about the body appended after the one that says what was found.
+      expect(refusal.reason).not.toMatch(/[.!?]$/u);
+      expect(occurrences(refusal.reason, ', but not as a function')).toBe(1);
+      expect(refusal.reason).not.toContain('whose body no timing wrapper');
+    }
+  });
 });
 
 /* -------------------------------------------------------------------------------------------------

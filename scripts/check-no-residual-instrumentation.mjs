@@ -46,10 +46,10 @@
  */
 
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readFileSync } from 'node:fs';
+import { lstatSync, readFileSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import process from 'node:process';
-import { fileURLToPath, pathToFileURL } from 'node:url';
+import { fileURLToPath } from 'node:url';
 
 /** Repository-relative directory checked when `--path` is not given. */
 export const DEFAULT_TARGET_PATH = 'apps/demo-app';
@@ -222,7 +222,10 @@ function normalizeTarget(repoRoot, target) {
     typeof target === 'string' && target.trim() !== '' ? target.trim() : DEFAULT_TARGET_PATH;
   const absolute = path.resolve(repoRoot, requested);
   const relative = path.relative(repoRoot, absolute);
-  if (relative.startsWith('..') || path.isAbsolute(relative)) {
+  // Outside means the relative path climbs out through a `..` *segment*. A bare prefix test would
+  // also refuse an in-repository directory whose name merely starts with two dots, such as
+  // `..cache`, and report it as outside the repository when it is not.
+  if (relative === '..' || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) {
     throw usageError(`--path must stay inside the repository; got ${requested}`);
   }
   if (relative === '') {
@@ -310,7 +313,16 @@ function snippet(line) {
   if (printable.length <= MAX_SNIPPET_LENGTH) {
     return printable;
   }
-  return `${printable.slice(0, MAX_SNIPPET_LENGTH - 3)}...`;
+  // Lengths are UTF-16 code units, so the cut can land between the two halves of a surrogate pair
+  // (an emoji, say). A lone high surrogate is not well-formed text: it prints as U+FFFD and reaches
+  // the `--json` report as an unpaired `\ud83d` escape that strict JSON parsers reject. Back off by
+  // one unit in that case; the excerpt stays within the limit either way.
+  let end = MAX_SNIPPET_LENGTH - 3;
+  const lastUnit = printable.charCodeAt(end - 1);
+  if (lastUnit >= 0xd800 && lastUnit <= 0xdbff) {
+    end -= 1;
+  }
+  return `${printable.slice(0, end)}...`;
 }
 
 /**
@@ -730,10 +742,40 @@ export async function main(argv = []) {
   }
 }
 
-const invokedPath = process.argv[1];
-if (
-  invokedPath !== undefined &&
-  import.meta.url === pathToFileURL(path.resolve(invokedPath)).href
-) {
+/**
+ * `file` with every symbolic link resolved, or merely made absolute when it cannot be resolved.
+ *
+ * @param {string} file
+ * @returns {string}
+ */
+function canonicalPath(file) {
+  try {
+    return realpathSync(file);
+  } catch {
+    return path.resolve(file);
+  }
+}
+
+/**
+ * Whether this module is the process entry point, so importing it (the tests, the end-to-end
+ * helpers) never runs the command line.
+ *
+ * Both sides are canonicalized. Node reports `import.meta.url` as a real path but leaves
+ * `process.argv[1]` as typed, so comparing the two as they come makes a run through any symbolic
+ * link - a symlinked checkout, a linked workspace, macOS's `/tmp` - skip `main` entirely and exit 0
+ * without printing a word: a gate that passes without looking, which is the one outcome it exists
+ * to rule out.
+ *
+ * @returns {boolean}
+ */
+function isEntryPoint() {
+  const entry = process.argv[1];
+  if (entry === undefined || entry === '') {
+    return false;
+  }
+  return canonicalPath(fileURLToPath(import.meta.url)) === canonicalPath(entry);
+}
+
+if (isEntryPoint()) {
   process.exitCode = await main(process.argv.slice(2));
 }

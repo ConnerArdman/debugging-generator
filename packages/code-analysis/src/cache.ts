@@ -718,11 +718,12 @@ export function createIndexCache(options: IndexCacheOptions): IndexCache {
       const serialized = JSON.stringify(entry);
 
       // The directory may have been removed since the cache was created, by
-      // the service's retention job or by hand, so it is (re)created and
-      // tightened to `0700` on every save rather than once at construction.
-      // An existing directory with looser permissions is repaired here; one
-      // that cannot be made private throws `FS_UNSAFE_PATH`, which becomes
-      // this call's `Err` instead of an exception.
+      // the service's retention job or by hand, so it is (re)created at
+      // `0700` on every save rather than once at construction. An existing
+      // directory is judged as it stands and never has its mode changed: one
+      // that grants group or other access, is a link or belongs to another
+      // account throws `FS_UNSAFE_PATH`, which becomes this call's `Err`
+      // instead of an exception, and nothing is written into it.
       ensureSecureDir(cacheDir);
 
       // Temporary sibling, `0600`, flushed, then renamed over the entry path:

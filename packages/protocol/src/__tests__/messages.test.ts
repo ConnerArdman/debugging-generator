@@ -99,7 +99,20 @@
  * and `toPayload()` alike. Unknown types, the five HTTP-only operation names
  * among them, are refused at the discriminator. `./envelope.test.ts` owns the
  * envelope fields themselves; the pairing of `type` with `payload` is asserted
- * here.
+ * here. So is the one cross-field rule every member carries: a routing
+ * `sessionId` naming a different session than the payload does — its own
+ * `sessionId`, or a session record's `id` — is refused at `sessionId` without
+ * echoing either id, for every type whose fixture names a session, while the
+ * six payloads that name none accept any routing key (AAP §0.5.6).
+ *
+ * ## The parse helpers, one table
+ *
+ * Every `parse*` function the messages barrel exports is exercised by one
+ * table-driven suite at the end of this file: a valid input comes back
+ * deep-equal, and an input refused for one reason while carrying the sentinel
+ * in another value is rejected with `PROTOCOL_INVALID_MESSAGE` and echoes the
+ * sentinel nowhere. A guard compares the table with the barrel's own exports,
+ * so a helper added without a row fails the suite.
  */
 
 import { describe, expect, it } from 'vitest';
@@ -132,7 +145,7 @@ import {
   isOk,
   sourceLocationSchema,
 } from '@debuggen/shared';
-import type { SourceLocation } from '@debuggen/shared';
+import type { Result, SourceLocation } from '@debuggen/shared';
 import {
   METRIC_IDS,
   TELEMETRY_KINDS,
@@ -211,6 +224,7 @@ import {
   unavailableSignalSchema,
 } from '../messages/index.js';
 import type { MessageType } from '../messages/index.js';
+import * as messagesBarrel from '../messages/index.js';
 import {
   CLEANUP_STATUSES,
   PROMPT_STAGE_KEYS,
@@ -4260,4 +4274,477 @@ describe('parseMessage — a payload is accepted only under its own type', () =>
       expect(surface).not.toContain(SENTINEL);
     }
   });
+});
+
+/**
+ * A well-formed session id that no fixture names: the routing key a
+ * confused-deputy frame claims while its payload names {@link SESSION_ID}.
+ */
+const OTHER_SESSION_ID = 'ses_0z9y8x7w6v5u4t3s';
+
+/**
+ * The message types whose payload names no session at all, written out.
+ *
+ * Not derived from the registry, so the partition the next suite iterates is
+ * itself an assertion: a payload that gains or loses a session subject moves a
+ * type across this line and fails the first case below.
+ */
+const SUBJECTLESS_TYPES = [
+  'client.hello',
+  'agent.ready',
+  'tab.navigated',
+  'session.unbind',
+  'telemetry.event',
+  'error',
+] as const;
+
+/**
+ * The session a payload is *about*: its own `sessionId`, or else the record `id`
+ * of a `session.created` / `session.updated` broadcast.
+ *
+ * Restated structurally rather than imported — `../envelope.ts` keeps its reader
+ * module-private — so the cases below hold the envelope to the rule instead of
+ * agreeing with whatever the implementation happens to do.
+ *
+ * @param payload Any message payload.
+ * @returns The session the payload names, or `undefined` when it names none.
+ */
+function payloadSubjectOf(payload: unknown): string | undefined {
+  const own = routingKeyOf(payload);
+
+  if (own !== undefined) {
+    return own;
+  }
+  if (typeof payload !== 'object' || payload === null || !('session' in payload)) {
+    return undefined;
+  }
+
+  const { session } = payload;
+
+  if (typeof session !== 'object' || session === null || !('id' in session)) {
+    return undefined;
+  }
+
+  return typeof session.id === 'string' ? session.id : undefined;
+}
+
+/** The registered types whose fixture payload names a session, in tuple order. */
+const SUBJECT_TYPES = MESSAGE_TYPES.filter(
+  (type) => payloadSubjectOf(VALID_PAYLOADS[type]) !== undefined,
+);
+
+// The envelope's `sessionId` is what the service routes and authorizes by; the
+// payload's subject is what a handler acts on. A devtools principal is
+// authorized only for its bound session (AAP §0.5.6), so every member of the
+// union must refuse a frame whose two answers differ — the rule lives in one
+// place in `../envelope.ts`, and this suite proves it reached all twenty-five.
+describe('parseMessage — every member refuses a routing key that contradicts its payload', () => {
+  it('partitions the registry into payloads that name a session and six that name none', () => {
+    const subjectless = MESSAGE_TYPES.filter(
+      (type) => payloadSubjectOf(VALID_PAYLOADS[type]) === undefined,
+    );
+
+    expect([...subjectless].sort()).toEqual([...SUBJECTLESS_TYPES].sort());
+    expect(SUBJECT_TYPES.length + subjectless.length).toBe(MESSAGE_TYPES.length);
+    for (const type of SUBJECT_TYPES) {
+      expect(payloadSubjectOf(VALID_PAYLOADS[type])).toBe(SESSION_ID);
+    }
+  });
+
+  it.each(SUBJECT_TYPES)(
+    '%s: refuses a routing key naming another session than its payload, echoing neither',
+    (type) => {
+      const payload = VALID_PAYLOADS[type];
+      const frame = { ...frameOf(type, payload), sessionId: OTHER_SESSION_ID };
+
+      // Precondition: the same frame routed to its own subject is accepted, so the
+      // refusal below is about the routing key and nothing else.
+      expect(isOk(parseMessage({ ...frame, sessionId: SESSION_ID }))).toBe(true);
+
+      const parsed = parseMessage(frame);
+
+      expect(isErr(parsed)).toBe(true);
+      if (!isErr(parsed)) {
+        return;
+      }
+
+      const { error } = parsed;
+
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.message).toBe(
+        'Invalid protocol message: sessionId (custom label=routing-matches-payload)',
+      );
+      expect(renderedIssuePaths(error)).toEqual(['sessionId']);
+      for (const surface of renderedSurfaces(error)) {
+        expect(surface).not.toContain(OTHER_SESSION_ID);
+        expect(surface).not.toContain(SESSION_ID);
+      }
+    },
+  );
+
+  it.each([...SUBJECTLESS_TYPES])(
+    '%s: accepts any routing key, because its payload names no session',
+    (type) => {
+      const parsed = parseMessage({
+        ...frameOf(type, VALID_PAYLOADS[type]),
+        sessionId: OTHER_SESSION_ID,
+      });
+
+      expect(isOk(parsed)).toBe(true);
+      if (!isOk(parsed)) {
+        return;
+      }
+      expect(parsed.value.type).toBe(type);
+      expect(parsed.value.sessionId).toBe(OTHER_SESSION_ID);
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// The parse helpers — every exported `parse*` function, one table
+//
+// Every suite above validates a schema; this one calls the helpers the three
+// apps actually import. Each helper wraps its schema in the same sequence —
+// `safeParse`, then `protocolParseError` — and a helper that attached the
+// `ZodError`, forwarded an issue message or threw would pass every schema case
+// above while leaking or crashing at the socket. So each row proves the two
+// halves of the helper's contract directly: a valid input comes back as the
+// same value, and an input refused for one reason while the sentinel sits in
+// another value is answered with `PROTOCOL_INVALID_MESSAGE`, names the field it
+// was refused for, and echoes the sentinel in no rendering (AAP §0.5.2).
+//
+// The table is keyed by the barrel's own export names, so it is exhaustive at
+// compile time, and a guard case compares it with the barrel at run time too.
+// ---------------------------------------------------------------------------
+
+/** The name of every `parse*` function the messages barrel exports. */
+type ParseHelperName = Extract<keyof typeof messagesBarrel, `parse${string}`>;
+
+/** The value a helper answers with when it accepts its input. */
+type ParsedBy<N extends ParseHelperName> = Extract<
+  ReturnType<(typeof messagesBarrel)[N]>,
+  { readonly ok: true }
+>['value'];
+
+/** One row of {@link PARSE_HELPER_CASES}. */
+interface ParseHelperCase<N extends ParseHelperName> {
+  /**
+   * An input the helper accepts, typed as what it answers with — so a fixture
+   * that stops matching the helper's own result type is a compile error.
+   */
+  readonly valid: ParsedBy<N>;
+  /**
+   * An input the helper refuses for the reason in `refusedFor`, with
+   * {@link SENTINEL} planted in a different value, so the sentinel had every
+   * opportunity to be rendered.
+   */
+  readonly invalid: unknown;
+  /** The rendered issue the refusal must be for: a field path and issue code. */
+  readonly refusedFor: string;
+}
+
+/**
+ * A valid and a refused input for every parse helper, keyed by helper name.
+ *
+ * The mapped type over {@link ParseHelperName} is the compile-time half of the
+ * coverage guarantee: a helper added to the barrel without a row here fails
+ * `tsc -b`. Valid inputs reuse {@link VALID_PAYLOADS} for every message payload;
+ * the seven request and response bodies of the five HTTP-only operations in
+ * `../messages/capture.ts` and `../messages/session.ts` are written out from
+ * their schemas.
+ */
+const PARSE_HELPER_CASES: { readonly [N in ParseHelperName]: ParseHelperCase<N> } = {
+  parseClientHelloPayload: {
+    valid: VALID_PAYLOADS['client.hello'],
+    invalid: { ...VALID_PAYLOADS['client.hello'], token: SENTINEL, version: '1.0' },
+    refusedFor: 'version (invalid_format format=regex)',
+  },
+  parseAgentReadyPayload: {
+    valid: VALID_PAYLOADS['agent.ready'],
+    invalid: { ...VALID_PAYLOADS['agent.ready'], url: SENTINEL_URL, tabId: -1 },
+    refusedFor: 'tabId (too_small',
+  },
+  parseAgentConfigPayload: {
+    valid: VALID_PAYLOADS['agent.config'],
+    invalid: {
+      ...VALID_PAYLOADS['agent.config'],
+      captureId: SENTINEL,
+      hooks: without(validAgentHookConfig(), 'react'),
+    },
+    refusedFor: 'hooks.react (invalid_type expected=boolean)',
+  },
+  parseServerAgentConfigPayload: {
+    valid: VALID_PAYLOADS['server-agent.config'],
+    invalid: {
+      ...VALID_PAYLOADS['server-agent.config'],
+      captureId: SENTINEL,
+      signals: without(validServerAgentSignals(), 'pg'),
+    },
+    refusedFor: 'signals.pg (invalid_type expected=boolean)',
+  },
+  parseSessionBindPayload: {
+    valid: VALID_PAYLOADS['session.bind'],
+    invalid: { ...VALID_PAYLOADS['session.bind'], url: SENTINEL_URL, origin: `${PAGE_ORIGIN}/` },
+    refusedFor: 'origin (custom label=serialized-origin)',
+  },
+  parseSessionBoundPayload: {
+    valid: VALID_PAYLOADS['session.bound'],
+    invalid: { ...VALID_PAYLOADS['session.bound'], url: SENTINEL_URL, reason: 'not-a-reason' },
+    refusedFor: 'reason (invalid_value',
+  },
+  parseTabNavigatedPayload: {
+    valid: VALID_PAYLOADS['tab.navigated'],
+    invalid: { url: SENTINEL_URL, tabId: -1 },
+    refusedFor: 'tabId (too_small',
+  },
+  parseSessionUnbindPayload: {
+    valid: VALID_PAYLOADS['session.unbind'],
+    invalid: { ...VALID_PAYLOADS['session.unbind'], url: SENTINEL_URL },
+    refusedFor: '<root> (unrecognized_keys keys=url)',
+  },
+  parseSessionCreatedPayload: {
+    valid: VALID_PAYLOADS['session.created'],
+    invalid: { session: { ...validSessionRecord(), question: SENTINEL, status: 'paused' } },
+    refusedFor: 'session.status (invalid_value',
+  },
+  parseSessionUpdatedPayload: {
+    valid: VALID_PAYLOADS['session.updated'],
+    invalid: { session: { ...validSessionRecord(), question: SENTINEL, followUps: 'none' } },
+    refusedFor: 'session.followUps (invalid_type expected=array)',
+  },
+  parseSessionProgressPayload: {
+    valid: VALID_PAYLOADS['session.progress'],
+    invalid: { ...VALID_PAYLOADS['session.progress'], detail: SENTINEL, stage: 'deploy' },
+    refusedFor: 'stage (invalid_value',
+  },
+  parseAnalysisCompletedPayload: {
+    valid: VALID_PAYLOADS['analysis.completed'],
+    invalid: {
+      sessionId: SESSION_ID,
+      analysis: { ...validResult(), observed: [{ statement: SENTINEL, evidence: [] }] },
+    },
+    refusedFor: 'analysis.observed[0].evidence (too_small origin=array min=1)',
+  },
+  parseSessionCreateRequest: {
+    valid: {
+      projectRoot: PROJECT_ROOT,
+      question: 'Why does this action take so long?',
+      target: validSelectedTarget(),
+    },
+    invalid: { projectRoot: '', question: SENTINEL, target: validSelectedTarget() },
+    refusedFor: 'projectRoot (too_small origin=string min=1)',
+  },
+  parseSessionQuestionRequest: {
+    valid: { question: 'Why did that step run twice?' },
+    invalid: { question: SENTINEL, followUp: true },
+    refusedFor: '<root> (unrecognized_keys keys=followUp)',
+  },
+  parseSessionEndRequest: {
+    valid: {},
+    invalid: { force: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=force)',
+  },
+  parseCaptureStartedPayload: {
+    valid: VALID_PAYLOADS['capture.started'],
+    invalid: { sessionId: SENTINEL, captureId: '' },
+    refusedFor: 'captureId (too_small origin=string min=1)',
+  },
+  parseCaptureStoppedPayload: {
+    valid: VALID_PAYLOADS['capture.stopped'],
+    invalid: { sessionId: SESSION_ID, captureId: SENTINEL, summary: null },
+    refusedFor: 'summary (custom label=CaptureSummary)',
+  },
+  parseCaptureStartRequest: {
+    valid: {},
+    invalid: { captureId: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=captureId)',
+  },
+  parseCaptureStartResponse: {
+    valid: { captureId: CAPTURE_ID },
+    invalid: { captureId: CAPTURE_ID, sessionId: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=sessionId)',
+  },
+  parseCaptureStopRequest: {
+    valid: {},
+    invalid: { hooks: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=hooks)',
+  },
+  parseCaptureStopResponse: {
+    valid: { summary: CAPTURE_SUMMARY },
+    invalid: { summary: [SENTINEL] },
+    refusedFor: 'summary (custom label=CaptureSummary)',
+  },
+  parseInstrumentationPlanPayload: {
+    valid: VALID_PAYLOADS['instrumentation.plan'],
+    invalid: {
+      sessionId: SESSION_ID,
+      plan: { ...validPlan(), objective: SENTINEL, planVersion: -1 },
+    },
+    refusedFor: 'plan.planVersion (too_small',
+  },
+  parseInstrumentationReadyPayload: {
+    valid: VALID_PAYLOADS['instrumentation.ready'],
+    invalid: {
+      ...VALID_PAYLOADS['instrumentation.ready'],
+      applied: [{ ...validModification(), diff: SENTINEL, instrumentedHash: 'short' }],
+    },
+    refusedFor: 'applied[0].instrumentedHash',
+  },
+  parseInstrumentationFailedPayload: {
+    valid: VALID_PAYLOADS['instrumentation.failed'],
+    invalid: {
+      sessionId: SESSION_ID,
+      error: {
+        ...VALID_PAYLOADS['instrumentation.failed'].error,
+        message: SENTINEL,
+        code: 'NOT_A_CODE',
+      },
+    },
+    refusedFor: 'error.code (invalid_value',
+  },
+  parseTelemetryEventPayload: {
+    valid: VALID_PAYLOADS['telemetry.event'],
+    invalid: { events: [{ ...validIngressEvent(), name: SENTINEL, traceId: 'not-a-trace-id' }] },
+    refusedFor: 'events[0].traceId',
+  },
+  parseTelemetryTailPayload: {
+    valid: VALID_PAYLOADS['telemetry.tail'],
+    invalid: {
+      sessionId: SESSION_ID,
+      events: [{ ...validPersistedEvent(), name: SENTINEL, ingestSeq: 0 }],
+    },
+    refusedFor: 'events[0].ingestSeq (too_small',
+  },
+  parsePanelGeneratedPayload: {
+    valid: VALID_PAYLOADS['panel.generated'],
+    invalid: {
+      sessionId: SESSION_ID,
+      panelId: PANEL_ID,
+      panel: {
+        ...validPanelSpec(),
+        title: '   ',
+        summary: { headline: SENTINEL, observed: [], likelyCauses: [] },
+      },
+    },
+    refusedFor: 'panel.title',
+  },
+  parseSourceOpenPayload: {
+    valid: VALID_PAYLOADS['source.open'],
+    invalid: {
+      sessionId: SESSION_ID,
+      location: { ...validSourceLocation(), symbol: SENTINEL, line: 0 },
+    },
+    refusedFor: 'location.line (too_small',
+  },
+  parseTargetRequestPayload: {
+    valid: VALID_PAYLOADS['target.request'],
+    invalid: { ...VALID_PAYLOADS['target.request'], selector: SENTINEL },
+    refusedFor: '<root> (unrecognized_keys keys=selector)',
+  },
+  parseTargetSelectedPayload: {
+    valid: VALID_PAYLOADS['target.selected'],
+    invalid: {
+      sessionId: SESSION_ID,
+      target: { ...validSelectedTarget(), text: SENTINEL, componentChain: [''] },
+    },
+    refusedFor: 'target.componentChain[0]',
+  },
+  parseCleanupCompletedPayload: {
+    valid: VALID_PAYLOADS['cleanup.completed'],
+    invalid: {
+      ...VALID_PAYLOADS['cleanup.completed'],
+      status: 'partially-clean',
+      conflicts: [{ ...validModificationConflict(), message: SENTINEL }],
+    },
+    refusedFor: 'status (invalid_value',
+  },
+  parseErrorPayload: {
+    valid: VALID_PAYLOADS.error,
+    invalid: { code: 'NOT_A_CODE', message: SENTINEL },
+    refusedFor: 'code (invalid_value',
+  },
+};
+
+/**
+ * Whether a string names a row of {@link PARSE_HELPER_CASES}.
+ *
+ * @param name A candidate helper name.
+ * @returns `true` when the table has a row under that name.
+ */
+function isParseHelperName(name: string): name is ParseHelperName {
+  return Object.hasOwn(PARSE_HELPER_CASES, name);
+}
+
+/** The table's helper names, in declaration order, typed for indexing. */
+const PARSE_HELPER_NAMES: readonly ParseHelperName[] =
+  Object.keys(PARSE_HELPER_CASES).filter(isParseHelperName);
+
+/**
+ * The helper a row is about, read from the barrel by name and widened to the
+ * one signature every helper shares, so a single case body can call any of them.
+ *
+ * @param name The helper's export name.
+ * @returns That export of `../messages/index.ts`.
+ */
+function parseHelperNamed(
+  name: ParseHelperName,
+): (value: unknown) => Result<unknown, DebuggenError> {
+  return messagesBarrel[name];
+}
+
+describe('the parse helpers — every exported parse* function accepts, refuses and never echoes', () => {
+  it('has a row for exactly the parse* functions the messages barrel exports', () => {
+    // The run-time half of the coverage guarantee, read from the module
+    // namespace itself: a helper exported without a row, or a row whose helper
+    // was renamed or removed, makes the two sets differ.
+    const exported = Object.entries(messagesBarrel)
+      .filter(([name, value]) => name.startsWith('parse') && typeof value === 'function')
+      .map(([name]) => name);
+
+    expect([...PARSE_HELPER_NAMES].sort()).toEqual(exported.sort());
+    expect(Object.keys(PARSE_HELPER_CASES)).toHaveLength(PARSE_HELPER_NAMES.length);
+  });
+
+  it.each(PARSE_HELPER_NAMES)('%s accepts its valid input and returns it unchanged', (name) => {
+    const { valid } = PARSE_HELPER_CASES[name];
+    const parsed = parseHelperNamed(name)(valid);
+
+    // Reported with the rendered issue paths, so a failure names the field that
+    // was refused rather than printing `false`.
+    expect(isOk(parsed) ? name : { name, issues: renderedIssuePaths(parsed.error) }).toEqual(name);
+    if (!isOk(parsed)) {
+      return;
+    }
+    expect(parsed.value).toStrictEqual(valid);
+  });
+
+  it.each(PARSE_HELPER_NAMES)(
+    '%s refuses its invalid input as PROTOCOL_INVALID_MESSAGE, without echoing the sentinel',
+    (name) => {
+      const { invalid, refusedFor } = PARSE_HELPER_CASES[name];
+
+      // Precondition: the sentinel really is in the refused input.
+      expect(JSON.stringify(invalid)).toContain(SENTINEL);
+
+      const parsed = parseHelperNamed(name)(invalid);
+
+      expect(isErr(parsed)).toBe(true);
+      if (!isErr(parsed)) {
+        return;
+      }
+
+      const { error } = parsed;
+
+      expect(DebuggenError.is(error)).toBe(true);
+      expect(error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(error.cause).toBeUndefined();
+      // Refused for the planted reason alone — one field — and not for some
+      // other fault in the fixture, the sentinel's own field included.
+      expect(error.message).toContain(refusedFor);
+      expect(new Set(renderedIssuePaths(error)).size).toBe(1);
+      for (const surface of renderedSurfaces(error)) {
+        expect(surface).not.toContain(SENTINEL);
+      }
+    },
+  );
 });

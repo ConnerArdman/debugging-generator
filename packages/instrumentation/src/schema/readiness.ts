@@ -102,13 +102,42 @@ const MAX_SYMBOL_LENGTH = 200;
 const MAX_ADAPTER_ID_LENGTH = 64;
 
 /**
- * Longest accepted `reason` or `hint`, in characters.
+ * Longest accepted readiness `reason`, in characters.
  *
- * Generous because a hint legitimately carries a command: AAP §0.5.5 requires
- * the server-signal hint to name the exact relaunch command when the dev server
- * was started without the preload.
+ * A reason is the fragment that reads after "Could not enable ‹signal›: "
+ * (AAP §0.5.5): one explanation, never a command or a stack trace, so five
+ * hundred characters is far more than an honest one needs. It is narrower than
+ * the 2000 characters `@debuggen/protocol` allows on `instrumentation.ready`'s
+ * reason, which is the safe direction: a reason this layer accepts is one the
+ * transport accepts too.
+ *
+ * Exported so an adapter composing a reason at runtime measures it against this
+ * number rather than restating it.
  */
-const MAX_MESSAGE_LENGTH = 500;
+export const READINESS_REASON_MAX_LENGTH = 500;
+
+/**
+ * Longest accepted readiness `hint`, in characters.
+ *
+ * Wider than {@link READINESS_REASON_MAX_LENGTH} because a hint legitimately
+ * carries a command: AAP §0.5.5 requires the server-signal hint to name the
+ * exact relaunch command when the dev server was started without the preload,
+ * and that command embeds an absolute project root, a preload specifier and a
+ * dev command whose lengths this product does not choose. A bound sized for a
+ * sentence would cut exactly the part of the row a developer copies.
+ *
+ * Equal to `@debuggen/protocol`'s `MAX_HINT_LENGTH`, the bound on the same
+ * words when they travel as `instrumentation.ready`'s unavailable-signal hint
+ * and as `instrumentation.failed`'s error hint: a hint this layer accepts can
+ * never be refused by the transport, and none the transport could carry is
+ * refused here. The equality is stated here rather than imported because
+ * `@debuggen/protocol` depends on this package, not the reverse, and keeps its
+ * own constant module-local.
+ *
+ * Exported so an adapter composing a hint at runtime can fit it to this number
+ * — dropping prose before it would ever cut a command — rather than restating it.
+ */
+export const READINESS_HINT_MAX_LENGTH = 1000;
 
 /**
  * Most readiness rows one report may carry.
@@ -489,11 +518,12 @@ export const readinessSignalSchema = z.strictObject({
    *
    * Reads after "Could not enable ‹signal›: ", so it is a fragment stating the
    * obstacle — not a sentence about the product, and never a stack trace.
+   * Bounded by {@link READINESS_REASON_MAX_LENGTH}.
    */
   reason: z
     .string()
     .min(1)
-    .max(MAX_MESSAGE_LENGTH)
+    .max(READINESS_REASON_MAX_LENGTH)
     .refine(isSingleLineText, { error: `reason ${SINGLE_LINE_RULE_MESSAGE}` })
     .optional(),
 
@@ -503,11 +533,13 @@ export const readinessSignalSchema = z.strictObject({
    * The recovery path of AAP §0.5.5, and the reason that section's failures are
    * actionable rather than merely honest: for a missing server signal this is
    * the exact command that relaunches the dev server with the preload attached.
+   * Bounded by {@link READINESS_HINT_MAX_LENGTH}, which is wider than the
+   * reason's because a command carries paths a sentence does not.
    */
   hint: z
     .string()
     .min(1)
-    .max(MAX_MESSAGE_LENGTH)
+    .max(READINESS_HINT_MAX_LENGTH)
     .refine(isSingleLineText, { error: `hint ${SINGLE_LINE_RULE_MESSAGE}` })
     .optional(),
 });

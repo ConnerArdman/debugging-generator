@@ -330,6 +330,79 @@ const PRISMA_CLIENT_BINDING = 'PrismaClient';
 /** The binding a module imports when it constructs a connection pool. */
 const PG_POOL_BINDING = 'Pool';
 
+/*
+ * The tooling-path vocabulary behind {@link isToolingModulePath}. Every entry is
+ * a published convention of a common tool — the ORM's default seed module and
+ * migrations directory, the test runners' colocated directories and filename
+ * markers, a framework's `*.config.*` module — and none names anything a
+ * particular project chose, which is AAP 0.5.4's rule for product source.
+ */
+
+/**
+ * Basename stems of a data-seeding module, and directory names that hold them.
+ *
+ * `seed` is the ORM's default seed entry (`prisma db seed` runs `prisma/seed.ts`
+ * by convention) and `seeds` is the query builders' directory convention.
+ * Matched exactly: `seedling.ts` or `seed-utils.ts` is application code that
+ * happens to share a prefix.
+ */
+const SEED_NAMES: readonly string[] = Object.freeze(['seed', 'seeds']);
+
+/**
+ * Directory names that hold tooling modules wherever they sit in the tree:
+ * schema migrations, and the test runners' colocated test, mock and fixture
+ * directories.
+ */
+const TOOLING_DIRECTORY_NAMES: readonly string[] = Object.freeze([
+  'migrations',
+  '__tests__',
+  '__mocks__',
+  '__fixtures__',
+]);
+
+/**
+ * Directory names that hold tooling modules only as the project's **top-level**
+ * directory: operational scripts and out-of-tree test suites.
+ *
+ * Deliberately not matched deeper: `src/test/` or `src/scripts/` can be an
+ * application feature, while a top-level `scripts/` or `test/` is by convention
+ * run by the project's own tooling.
+ */
+const TOP_LEVEL_TOOLING_DIRECTORIES: readonly string[] = Object.freeze([
+  'scripts',
+  'script',
+  'test',
+  'tests',
+  'e2e',
+]);
+
+/**
+ * Inner basename markers of a tooling module: `*.test.*`, `*.spec.*`,
+ * `*.stories.*` and `*.config.*`.
+ *
+ * Matched only as an inner dot-separated part — never the stem and never the
+ * extension — so `config.ts` or `test.ts` alone is not classified by this rule.
+ */
+const TOOLING_BASENAME_MARKERS: readonly string[] = Object.freeze([
+  'test',
+  'spec',
+  'stories',
+  'config',
+]);
+
+/**
+ * How a module qualifying as a handle's construction site is ranked, lowest
+ * first; see {@link findConstructionModule}.
+ */
+const CONSTRUCTION_MODULE_RANKS = Object.freeze({
+  /** An application module at least one other application module imports. */
+  sharedApplicationModule: 0,
+  /** An application module nothing else in the application imports. */
+  applicationModule: 1,
+  /** A module the project runs from its own tooling ({@link isToolingModulePath}). */
+  toolingModule: 2,
+});
+
 /** File stems that mark a framework document module at the root of a router tree. */
 const ROOT_DOCUMENT_STEMS: readonly string[] = Object.freeze(['layout', 'template']);
 
@@ -1016,9 +1089,19 @@ export function detectPackageManager(
  * schema file — the import alone is accepted. Neither signal can name a module
  * on its own, and a driver with no call sites is never given a module at all.
  *
- * Where several modules qualify, the lexicographically first project-relative
- * path is reported so that the answer is stable across runs, and a path that is
- * not a safe project-relative path is skipped.
+ * ## Which module is reported when several qualify
+ *
+ * A project routinely constructs the same handle more than once: the shared
+ * module the application imports, and a seed or maintenance script that builds
+ * its own. Only the first is the module a developer means by "where the client
+ * lives" — the script runs in a process of its own, never inside the dev server
+ * whose queries an investigation observes — so qualifying modules are ranked:
+ * an application module that another application module imports, then any
+ * other application module, then a module the project runs from its own tooling
+ * ({@link isToolingModulePath}). Within a rank the lexicographically first
+ * project-relative path wins, so the answer is stable across runs, and a project
+ * whose only construction site is a tooling module still reports it. A path
+ * that is not a safe project-relative path is skipped.
  *
  * @param graph The project's code graph, or `undefined` when none was built.
  * @param manifest The parsed manifest view, or `undefined` when there is none.
@@ -1080,6 +1163,95 @@ export function detectDatabaseAccess(
   }
 
   return info;
+}
+
+/**
+ * Whether a project-relative POSIX path names a module the project runs from
+ * its own tooling rather than inside the application.
+ *
+ * ## Why the distinction matters
+ *
+ * Database query spans are runtime hooks the Node preload installs inside the
+ * **dev-server process** only (AAP 0.5.1). A seed, migration, operational
+ * script, test or configuration module runs in a process of its own — the
+ * ORM's seed command, a test runner, a command-line tool reading its
+ * configuration — so no query it issues can ever be observed by a capture, and
+ * an instrumentation plan anchored on one promises evidence that never
+ * arrives. {@link detectDatabaseAccess} uses this classifier to prefer the
+ * application's shared handle module over a script that builds its own, and
+ * the Prisma and Postgres adapters of `@debuggen/instrumentation` use it to
+ * leave such modules out of the query sites they anchor on.
+ *
+ * ## The rule
+ *
+ * Conservative on purpose, and built from published tool conventions only —
+ * never from anything a particular project chose (AAP 0.5.4). A path is a
+ * tooling module when any of these holds:
+ *
+ * | Signal | Examples |
+ * | --- | --- |
+ * | the basename, up to its first dot, is exactly `seed` or `seeds` | `prisma/seed.ts`, `db/seeds.mjs` |
+ * | a directory segment is `seed`, `seeds`, `migrations`, `__tests__`, `__mocks__` or `__fixtures__` | `db/seeds/accounts.ts`, `db/migrations/0001.ts`, `src/__tests__/cart.ts` |
+ * | the top-level directory is `scripts`, `script`, `test`, `tests` or `e2e` | `scripts/load.ts`, `tests/cart.ts` |
+ * | an inner basename part is `test`, `spec`, `stories` or `config` | `cart.test.ts`, `next.config.ts` |
+ *
+ * Everything else is application code, including names that merely share a
+ * prefix (`src/seedling.ts`, `src/lib/seed-utils.ts`), a stem or extension that
+ * happens to be a marker word (`src/config.ts`, `src/test.ts`) and a nested
+ * directory whose top-level meaning does not carry (`src/scripts/editor.ts`).
+ * Matching is case-sensitive, because every convention is spelled in lower case
+ * by the tool that defines it, and a component module named `Seed.tsx` is
+ * application code.
+ *
+ * The one trade-off the rule accepts: a module the dev server itself serves
+ * from a seed-named path — a request handler under a `seed` directory — is
+ * classified as tooling too. Telling it apart would need the router's view of
+ * the tree, which a path classifier does not have, and the cost is bounded:
+ * the database instrumentation is process-wide, so that handler's queries are
+ * still captured whenever any other anchor arms the signal.
+ *
+ * Total over strings and never throws: backslash separators are converted,
+ * empty and `.` segments are ignored, and an empty path is not a tooling
+ * module.
+ *
+ * @param file A project-relative POSIX path, as graph nodes carry it.
+ * @returns `true` when the module is run by the project's own tooling.
+ *
+ * @example
+ * ```ts
+ * isToolingModulePath('prisma/seed.ts'); // true
+ * isToolingModulePath('scripts/load.ts'); // true
+ * isToolingModulePath('src/server/db/client.ts'); // false
+ * ```
+ */
+export function isToolingModulePath(file: string): boolean {
+  const segments = toPosix(file)
+    .split('/')
+    .filter((segment) => segment.length > 0 && segment !== '.');
+  const basename = segments.at(-1);
+  if (basename === undefined) {
+    return false;
+  }
+
+  const directories = segments.slice(0, -1);
+  const [topLevel] = directories;
+  if (topLevel !== undefined && TOP_LEVEL_TOOLING_DIRECTORIES.includes(topLevel)) {
+    return true;
+  }
+  if (
+    directories.some(
+      (directory) => SEED_NAMES.includes(directory) || TOOLING_DIRECTORY_NAMES.includes(directory),
+    )
+  ) {
+    return true;
+  }
+
+  const parts = basename.split('.');
+  const [stem] = parts;
+  if (stem !== undefined && SEED_NAMES.includes(stem)) {
+    return true;
+  }
+  return parts.slice(1, -1).some((part) => TOOLING_BASENAME_MARKERS.includes(part));
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2019,8 +2191,15 @@ function workspacePackageManagerFallback(
  * the recognised specifier alone. Type-only imports are ignored: a module that
  * imports a client's *types* constructs nothing.
  *
- * Where more than one module qualifies the lexicographically first
- * project-relative path is returned, so the answer is the same on every run.
+ * Where more than one module qualifies they are ranked by
+ * {@link CONSTRUCTION_MODULE_RANKS} — an application module another
+ * application module imports, then any other application module, then a
+ * tooling module ({@link isToolingModulePath}) — and the lexicographically
+ * first project-relative path wins within a rank, so the answer is the same on
+ * every run. The rank is what keeps a seed script that constructs its own
+ * client from being reported ahead of the shared module the application's
+ * services import: the path order alone favours whichever directory name sorts
+ * first, which says nothing about where the application's handle lives.
  *
  * @param graph The project's graph.
  * @param driver Which driver's construction site to look for.
@@ -2034,7 +2213,7 @@ function findConstructionModule(
   corroborated: boolean,
 ): string | undefined {
   const binding = driver === 'prisma' ? PRISMA_CLIENT_BINDING : PG_POOL_BINDING;
-  const candidates: string[] = [];
+  const candidates: { readonly file: string; readonly rank: number }[] = [];
 
   for (const node of graph.nodesByKind('file')) {
     const data = node.data;
@@ -2054,13 +2233,49 @@ function findConstructionModule(
         continue;
       }
       if (imported.names.includes(binding) || (corroborated && imported.names.length === 0)) {
-        candidates.push(node.file);
+        candidates.push({ file: node.file, rank: constructionModuleRank(graph, node) });
         break;
       }
     }
   }
 
-  return candidates.sort(compareStrings)[0];
+  candidates.sort((left, right) => left.rank - right.rank || compareStrings(left.file, right.file));
+  return candidates[0]?.file;
+}
+
+/**
+ * How strongly a qualifying construction module is the application's own
+ * handle module; see {@link CONSTRUCTION_MODULE_RANKS}.
+ *
+ * An importer counts only when it is itself an application module: a handle
+ * module that nothing but a test or a seed script imports is not what the
+ * application's services reach the database through. The `imports` edges are
+ * file-to-file and resolved by the indexer, so this is one adjacency lookup per
+ * candidate rather than a scan of the graph.
+ *
+ * @param graph The project's graph.
+ * @param module The qualifying module's `file` node.
+ * @returns The module's rank, lowest first.
+ */
+function constructionModuleRank(
+  graph: CodeGraph,
+  module: { readonly id: string; readonly file: string },
+): number {
+  if (isToolingModulePath(module.file)) {
+    return CONSTRUCTION_MODULE_RANKS.toolingModule;
+  }
+
+  for (const edge of graph.incoming(module.id, 'imports')) {
+    if (edge.from === module.id) {
+      continue;
+    }
+    const importer = graph.nodeById(edge.from);
+    if (importer !== undefined && !isToolingModulePath(importer.file)) {
+      return CONSTRUCTION_MODULE_RANKS.sharedApplicationModule;
+    }
+  }
+
+  return CONSTRUCTION_MODULE_RANKS.applicationModule;
 }
 
 /**

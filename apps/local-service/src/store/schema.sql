@@ -385,8 +385,14 @@ CREATE TABLE IF NOT EXISTS telemetry_events (
 -- The first two indexes are the ones the panel data layer depends on: the
 -- default page of one capture in canonical start order, and the spans of one
 -- trace in start order for the correlated tree. The rest serve kind-filtered
--- views, parent and child span lookups while correlating, duplicate-request
--- grouping by keyed hash, and the per-producer ordering probe.
+-- counts, parent and child span lookups while correlating, duplicate-request
+-- counts and grouping by keyed hash, and the per-producer ordering probe.
+--
+-- The trace, span and parent span indexes serve their lookups with session_id
+-- applied as a residual filter on the rows they return: those ids are
+-- selective across the whole table, so ./telemetry-repo.ts writes the session
+-- term of such a read in the form the planner cannot use to choose a
+-- session-leading index, which would walk every row of the session instead.
 CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_capture_id_start_time
   ON telemetry_events (session_id, capture_id, start_time);
 CREATE INDEX IF NOT EXISTS idx_telemetry_events_trace_id_start_time
@@ -406,6 +412,13 @@ CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_producer_id_seq
 -- indexes idx_telemetry_events_start_time_ingest_seq and
 -- idx_telemetry_events_session_id_start_time_ingest_seq, so every bounded purge
 -- batch is an ordered index range read rather than a full scan and a sort.
+--
+-- Schema version 3, applied by ./migrations.ts, adds the two ordered lookup
+-- indexes idx_telemetry_events_session_id_kind_start_time_id and
+-- idx_telemetry_events_session_id_request_key_start_time_producer_id_seq, so a
+-- page of one kind in the panel order and the occurrences of one request group
+-- in the canonical order are each an ordered index range read rather than a
+-- scan of the whole session and a sort.
 
 -- -----------------------------------------------------------------------------
 -- panels - the generated debugging panels of a session. Owner: ./panels-repo.ts

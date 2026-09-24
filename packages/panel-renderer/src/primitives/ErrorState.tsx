@@ -45,12 +45,35 @@
  * ## Tier 3, and the narrowest possible composition
  *
  * It composes four primitives from this folder and nothing else from the
- * package: `Text` for the copy, `Code` for the query block, `Button` for the
- * retry control and `Badge` for the optional machine code. It imports no layout
- * primitive, no visualization component, no host module, no panel schema, no
- * protocol type and no transport, so the only thing above it in the package's
- * dependency order is whoever renders it — which is what lets the whole catalog
- * and the host layer use it with no risk of a cycle (AAP 0.2.2, 0.6.2).
+ * package: `Text` for the copy, `Code` for the query and diagnostics blocks,
+ * `Button` for the retry control and `Badge` for the optional machine code.
+ * The one import from outside the package is the default glyph,
+ * `TriangleAlert` from `lucide-react` — the icon set AAP 0.6.1 sanctions and
+ * `Select` already draws from. It imports no layout primitive, no
+ * visualization component, no host module, no panel schema, no protocol type,
+ * no `@debuggen/*` workspace and no transport, so the only thing above it in
+ * the package's dependency order is whoever renders it — which is what lets
+ * the whole catalog and the host layer use it with no risk of a cycle
+ * (AAP 0.2.2, 0.6.2).
+ *
+ * ## One contract, one wording
+ *
+ * Every query-backed node reaches this component through the same path, and a
+ * reader comparing two failed nodes must see two instances of one design, not
+ * two designs (B1-F16, B2-F14). So the parts are fixed and ordered — glyph,
+ * title, message, hint, code, query, technical details, action — and the words
+ * that fill them are composed once, in `host/useQuery`
+ * (`queryFailureProps`, `formatDataQuery`), rather than by each component:
+ *
+ *   - **The message** is for the reader: a generic lead ("The data for this
+ *     view could not be loaded.") followed by the cause the provider stated.
+ *   - **The hint** is what the reader can do about it, on its own line.
+ *   - **The technical details** are for a developer: the error's diagnostic
+ *     context, already serialised, behind a native disclosure that starts
+ *     closed. Integration instructions ("pass the sessionId …") live there and
+ *     never on the hint line a panel user reads first.
+ *   - **The query** is serialised by one formatter, so every node prints the
+ *     same request the same way.
  *
  * ## Why `query` is a `string`
  *
@@ -63,9 +86,12 @@
  * the schema).
  *
  * So the caller — `host/useQuery` or `host/NodeRenderer`, which already hold
- * the typed object — serialises it exactly once, in pretty-printed JSON form,
- * and hands over the resulting string. This is a deliberate API decision, not
- * an oversight, and it must not be "improved" into a typed prop.
+ * the typed object — serialises it exactly once, in pretty-printed JSON form
+ * (`formatDataQuery` in `host/useQuery` is that one serialiser), and hands over
+ * the resulting string. This is a deliberate API decision, not an oversight,
+ * and it must not be "improved" into a typed prop. The same holds for
+ * `details`: the diagnostic object belongs to `@debuggen/shared`, which this
+ * folder does not import, so it arrives as a string too.
  *
  * This file also never serialises anything itself. A value handed to a
  * serialiser can be cyclic or carry a throwing accessor, and the inside of an
@@ -79,8 +105,10 @@
  *
  * Everything this component renders arrives already redacted. Telemetry
  * attributes, request targets and statements pass through the redaction layer
- * at ingest before any of them can reach a panel (AAP 0.5.2), so this file
- * performs no redaction of its own and — just as importantly — never reverses,
+ * at ingest before any of them can reach a panel (AAP 0.5.2), and an error's
+ * diagnostic details are restricted by `DebuggenErrorOptions.details` to values
+ * that are safe to show in a user interface, so this file performs no
+ * redaction of its own and — just as importantly — never reverses,
  * re-parses, reformats, truncates, stores or logs what it is handed. There is
  * no `console` call anywhere in this module: a diagnostic written from here
  * would copy a message and a query into a log this product's privacy model
@@ -99,19 +127,31 @@
  *
  * ## Live regions: the division of labour across the three states
  *
- * This component owns `role="alert"` — the assertive announcement, warranted
- * precisely once: when something failed. The other two states are deliberately
- * different and must stay that way: `LoadingState` owns the busy announcement
- * (`role="status"`, `aria-live="polite"`, `aria-busy="true"`) while a query is
- * in flight, and `EmptyState` carries no live region at all, because "nothing
- * was captured" is a resting state a reader navigates to rather than an event
- * worth interrupting for. Exactly one of the three can speak at a time, which
- * is what keeps a panel resolving eight queries from talking over itself.
+ * This component owns the failure announcement. By default it is
+ * `role="alert"` — the assertive announcement, warranted when something
+ * failed. The other two states are deliberately different and must stay that
+ * way: `LoadingState` owns the busy announcement (`role="status"`,
+ * `aria-live="polite"`, `aria-busy="true"`) while a query is in flight, and
+ * `EmptyState` is the settled polite `role="status"` without `aria-busy`,
+ * which states what the load resolved to ("nothing was captured") without
+ * interrupting the reader.
+ *
+ * Assertive is right for one failure and wrong for twelve. When the service
+ * goes away every query-backed node of a panel fails within a few
+ * milliseconds, and twelve simultaneous alerts interrupt each other until the
+ * reader hears none of them (B2-F14). So the politeness is a prop,
+ * `announce`: `"assertive"` renders `role="alert"`, and `"polite"` renders
+ * `role="status"`, an implicitly polite live region that is still announced
+ * and still reachable, but queued behind the one alert instead of cutting it
+ * off. Which failure of a burst gets to be the assertive one is not something
+ * a pure component can know — it needs to see every other failure — so the
+ * decision is made once, when each query settles, by `host/useQuery`, and
+ * reaches this component through `queryFailureProps`.
  *
  * The role is set before the caller's attributes are spread, so it is the
  * default rather than a fixture: a caller rendering several failures inside a
- * region that already alerted can quiet the inner ones. That is not the normal
- * case, and an unqualified error state alerts.
+ * region that already alerted can still override it outright. That is not the
+ * normal case, and an unqualified error state alerts.
  *
  * ## Appearance is class names, and nothing else
  *
@@ -133,10 +173,15 @@
  *   dg-error-state__title       the first line, which `Text` already renders at
  *                               the `--dg-text-md` role, the raised weight and
  *                               the `--dg-danger` tone
- *   dg-error-state__message     the required explanation, which `Text` already
- *                               renders at the `--dg-text-sm` role in
+ *   dg-error-state__message     the required explanation and, when present, the
+ *                               hint line beneath it — two paragraphs of the
+ *                               same register, which `Text` already renders at
+ *                               the `--dg-text-sm` role in
  *                               `--dg-text-secondary`
- *   dg-error-state__query       the query block, which `Code` already asks for
+ *   dg-error-state__query       the query block and the technical-details
+ *                               block — the same kind of content, preformatted
+ *                               machine text, so the same box — which `Code`
+ *                               already asks for
  *                               at the `--dg-mono-sm` role; a scrollable,
  *                               wrapping box inside `--dg-border-strong` with
  *                               its text in `--dg-text-primary`. Its rule must
@@ -159,14 +204,27 @@
  * it from the block (`.dg-error-state > .dg-badge`) rather than through a
  * sixth element this file would have to invent.
  *
+ * No class is declared for the technical-details disclosure either. It is a
+ * native `<details>`/`<summary>` pair: the browser supplies the closed-by-
+ * default state, the keyboard toggle, the disclosure triangle and the
+ * expanded/collapsed announcement, none of which a hook-free component could
+ * reproduce, and the elements take their spacing from the block's gap, their
+ * summary text from the `Text` primitive inside it and their body from the
+ * `dg-error-state__query` box. Raw markup is legitimate here: AAP 0.6.4 asks
+ * for library primitives over raw buttons, inputs, selects, tables and
+ * headings, and this package has no disclosure primitive a raw `<details>`
+ * would bypass.
+ *
  * The two global utilities of `../styles/base.css` are reused and never
- * redefined: `dg-icon` is the square the caller puts on its glyph, and
- * `dg-visually-hidden` stays available to callers without being needed here —
- * the query block is named with `aria-label` rather than an id reference,
- * because generating an id would mean a hook, and this component has none.
+ * redefined: `dg-icon` is the square on the glyph — the default one below and
+ * any glyph a caller passes — and `dg-visually-hidden` stays available to
+ * callers without being needed here — the query block is named with
+ * `aria-label` rather than an id reference, because generating an id would
+ * mean a hook, and this component has none.
  */
 
 import clsx from 'clsx';
+import { TriangleAlert } from 'lucide-react';
 import type { HTMLAttributes, ReactElement, ReactNode } from 'react';
 
 import { Badge } from './Badge';
@@ -194,7 +252,52 @@ const DEFAULT_TITLE = 'Could not load this view';
 const DEFAULT_RETRY_LABEL = 'Retry';
 
 /**
- * The accessible name of the query block.
+ * The attribute that marks a control as recognisable again after a remount.
+ *
+ * A retry replaces this component's subtree: the query returns to loading, the
+ * node draws its `LoadingState`, and a moment later either the recovered view
+ * or a fresh `ErrorState` takes its place. The button the reader pressed is
+ * gone by then, and a focused element that leaves the document hands focus to
+ * `<body>` — which, for a keyboard or screen-reader user, is the same as being
+ * thrown back to the top of the panel (B1-F14, B2-F12).
+ *
+ * The cure cannot live here: this component is pure and holds no reference to
+ * anything it rendered before, so it cannot know that it is the successor of a
+ * control that had focus. What it can do is label the control with a stable
+ * key, and that label is the whole of its side of the contract. The other side
+ * belongs to the host's node frame (`host/NodeRenderer`), the one element that
+ * outlives every state its node passes through: a control carrying this
+ * attribute can be recognised again after a remount, so the frame can hand
+ * focus back to the equivalent control — or to the node's own region when no
+ * equivalent control exists any more.
+ *
+ * A `data-*` attribute rather than an id: ids must be unique in the document,
+ * and a panel may render a dozen error states at once, each with a retry that
+ * is equivalent only to its own successor.
+ */
+export const FOCUS_KEY_ATTRIBUTE = 'data-dg-focus-key';
+
+/**
+ * The {@link FOCUS_KEY_ATTRIBUTE} value of the retry control.
+ *
+ * One value for every error state: the frame that restores focus searches only
+ * inside its own node, so the key needs to say which control of a node it is,
+ * never which node.
+ */
+export const ERROR_STATE_RETRY_FOCUS_KEY = 'error-state-retry';
+
+/**
+ * The attributes spread onto the retry control, hoisted so the key is written
+ * once and the attribute name is the exported constant rather than a second
+ * copy of its spelling.
+ */
+const RETRY_FOCUS_ATTRIBUTES = {
+  [FOCUS_KEY_ATTRIBUTE]: ERROR_STATE_RETRY_FOCUS_KEY,
+} as const;
+
+/**
+ * The accessible name of the query block when the caller names it nothing
+ * else (see {@link ErrorStateProps.queryLabel}).
  *
  * The block is a focusable, scrollable region of preformatted text, so it needs
  * a name of its own: without one, a screen-reader user reaching it by keyboard
@@ -203,7 +306,49 @@ const DEFAULT_RETRY_LABEL = 'Retry';
  * visually hidden sibling, because a reference needs a generated id, a
  * generated id needs a hook, and this component has no hooks by contract.
  */
-const QUERY_ACCESSIBLE_NAME = 'Failing query';
+const DEFAULT_QUERY_ACCESSIBLE_NAME = 'Failing query';
+
+/**
+ * The visible summary of the technical-details disclosure, and the accessible
+ * name of the block it reveals.
+ *
+ * Plain words for a reader who is not the developer: it says that what is
+ * inside is technical, which is exactly the signal that lets everyone else
+ * leave it closed.
+ */
+const DETAILS_LABEL = 'Technical details';
+
+/**
+ * The glyph an error state draws when its caller passes no `icon` at all.
+ *
+ * One glyph for every failure, so a reader scanning a panel recognises an
+ * error box by its shape as well as by its words and its danger edge — before
+ * this default, only the nodes whose component happened to pass a glyph had
+ * one (B2-F14). It carries the global `dg-icon` class and nothing else: its
+ * square and `currentColor` come from `base.css`, the danger tint from the
+ * `dg-error-state__icon` box, and no numeric size or colour prop is written
+ * (AAP 0.6.4). Hoisted because a React element is an immutable description,
+ * so one instance serves every render.
+ */
+const DEFAULT_ICON = <TriangleAlert className="dg-icon" />;
+
+/** The two politenesses {@link ErrorStateProps.announce} accepts, read off the prop itself. */
+type ErrorStateAnnouncement = NonNullable<ErrorStateProps['announce']>;
+
+/**
+ * The live-region role each announcement politeness renders as.
+ *
+ * `alert` is the implicitly assertive live region and `status` the implicitly
+ * polite one; neither needs an `aria-live` restating it. A total lookup over
+ * the union, so a third politeness cannot be added without choosing its role.
+ */
+const ANNOUNCE_ROLE: Readonly<Record<ErrorStateAnnouncement, 'alert' | 'status'>> = {
+  assertive: 'alert',
+  polite: 'status',
+};
+
+/** The politeness an unqualified error state announces itself with. */
+const DEFAULT_ANNOUNCE: ErrorStateAnnouncement = 'assertive';
 
 /**
  * The role the query block carries so that its name is legitimate.
@@ -231,12 +376,16 @@ const QUERY_ROLE = 'group';
  * value is ever coerced into visible text — AAP 0.6.4's defensive rule is that
  * "null" and "undefined" must never reach the screen as words.
  *
+ * It is applied to the glyph after the default has been substituted for an
+ * omitted `icon`, so `undefined` reaching it means nothing at all, while an
+ * explicit `null`, `false` or `''` is how a caller asks for no glyph.
+ *
  * The predicate is local, exactly as it is in `EmptyState`: it is three
  * comparisons over a React type and nothing about it is design-system
  * vocabulary, so it stays private to this module rather than becoming a shared
  * utility the primitives layer would have to import from somewhere.
  *
- * @param node The slot content a caller supplied, if any.
+ * @param node The glyph to draw, if any.
  * @returns `true` when the node contributes visible or announced content.
  */
 function isRenderable(node: ReactNode): boolean {
@@ -246,19 +395,21 @@ function isRenderable(node: ReactNode): boolean {
 /**
  * Whether an optional string carries text worth rendering.
  *
- * An absent value and an empty string are treated alike — both mean "this part
- * is not present" — so a caller forwarding an optional value it may not have
- * gets the same result as one that omitted the prop, and no part of this state
- * is ever rendered as an empty box or a blank line.
+ * An absent value, an empty string and a string of nothing but whitespace are
+ * treated alike — all three mean "this part is not present" — so a caller
+ * forwarding an optional value it may not have gets the same result as one
+ * that omitted the prop, and no part of this state is ever rendered as an
+ * empty box, a blank line or a control whose name is a space. The test trims;
+ * the value rendered never is.
  *
  * It is a type predicate so the narrowed `string` can be handed to a primitive
  * that requires one, with no cast and no non-null assertion.
  *
  * @param value The prop as the caller passed it, if at all.
- * @returns `true` when the value is a non-empty string.
+ * @returns `true` when the value holds at least one non-whitespace character.
  */
 function hasText(value: string | undefined): value is string {
-  return value !== undefined && value !== '';
+  return value !== undefined && value.trim() !== '';
 }
 
 /**
@@ -289,7 +440,10 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * capture does not hold — and this file supplies no default for it, because a
    * default would have to be vague enough to be useless. Write what failed, not
    * what it might mean: an inference about a cause belongs to a validated
-   * analysis, never to an error box (AAP 0.5.5).
+   * analysis, never to an error box (AAP 0.5.5). A node on the query path takes
+   * it from `queryFailureProps` in `host/useQuery`, which composes one generic
+   * lead and the cause the provider stated, so every node words the same
+   * failure the same way.
    *
    * Rendered as body text through `Text` at the `--dg-text-sm` role in
    * `--dg-text-secondary`, beneath the title.
@@ -309,14 +463,28 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    *
    * Passing the empty string suppresses the line entirely, for a caller that
    * has stated the failure fully in `message` and wants no second line. The
-   * region still announces itself as an alert and the stylesheet still marks
-   * the box, so the failure remains unmistakable.
+   * region still announces itself as a live region and the stylesheet still
+   * marks the box, so the failure remains unmistakable.
    *
    * This repurposes the inherited HTML `title` attribute: the value is rendered
    * as the line above, and is not forwarded to the container as a tooltip. A
    * hover explanation belongs to the `Tooltip` primitive.
    */
   title?: string | undefined;
+
+  /**
+   * What the reader can do about the failure, in one sentence — "Retry to
+   * request the data again." — on its own line beneath the message.
+   *
+   * Written for whoever is reading the panel, never for whoever integrated it:
+   * an instruction about how a host or provider must be wired belongs in
+   * `details`, where only the reader who opens the disclosure meets it. Rendered
+   * through `Text` as a second paragraph of the message's register, at the
+   * `--dg-text-sm` role in `--dg-text-secondary`.
+   *
+   * Omitted, absent or blank, no line is rendered.
+   */
+  hint?: string | undefined;
 
   /**
    * A short machine-readable code for the failure — the kind a developer can
@@ -337,8 +505,9 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * It is a `string` deliberately — see this module's header for the full
    * rationale: the typed query object belongs to the panel schema, which this
    * folder does not depend on, so `host/useQuery` or `host/NodeRenderer`
-   * serialises it once (pretty-printed JSON is the expected form) and hands the
-   * result over. Nothing in this file serialises, re-parses or reformats it.
+   * serialises it once — through `formatDataQuery`, the one pretty-printed JSON
+   * form every node uses — and hands the result over. Nothing in this file
+   * serialises, re-parses or reformats it.
    *
    * Rendered through `Code` in its block form at the `--dg-mono-sm` role, with
    * wrapping on and preserved exactly as given: every newline, every space and
@@ -355,6 +524,50 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
   query?: string | undefined;
 
   /**
+   * The accessible name of the query block. Defaults to `"Failing query"`.
+   *
+   * For a caller whose block holds something other than a data query — the
+   * node definition an unrenderable node reports, say — so that a
+   * screen-reader user is told what the text actually is. Blank falls back to
+   * the default, because a focusable block with an empty name announces as
+   * nothing. Ignored when no `query` is rendered.
+   */
+  queryLabel?: string | undefined;
+
+  /**
+   * Developer diagnostics for the failure, already serialised to a string by
+   * the caller — the error's details object as pretty-printed JSON is the
+   * expected form, which `queryFailureProps` in `host/useQuery` produces.
+   *
+   * Rendered, when present, as a native disclosure that starts **closed**: a
+   * `<summary>` reading "Technical details", which the keyboard toggles, over
+   * a `Code` block in the same box as the query, named "Technical details" on
+   * a `group` role. Closed by default because its audience is the developer
+   * wiring a host or reporting a fault, not the reader of the panel: the
+   * message and the hint are what that reader needs, and a block of
+   * diagnostics in front of them is noise. Preserved exactly as given, like
+   * `query`, and never parsed, shortened or reformatted here.
+   *
+   * Omitted, absent or blank, no disclosure is rendered.
+   */
+  details?: string | undefined;
+
+  /**
+   * How urgently the failure is announced. Defaults to `"assertive"`.
+   *
+   * `"assertive"` renders the container as `role="alert"`, which interrupts
+   * whatever a screen reader is saying; `"polite"` renders it as
+   * `role="status"`, which waits its turn. One failure warrants the first. A
+   * burst of failures — every node of a panel whose service went away — warrants
+   * one alert and a queue of polite statuses, and the query layer decides which
+   * is which as each query settles (see this module's header). Either way the
+   * region remains a live region, so no failure goes unannounced.
+   *
+   * An explicit `role` among the caller's own attributes still wins over both.
+   */
+  announce?: 'assertive' | 'polite' | undefined;
+
+  /**
    * What to do when the reader asks for the query to be tried again.
    *
    * The retry affordance is rendered **only** when this callback is supplied. A
@@ -369,6 +582,11 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
    * rate-limits itself after a click: deciding whether a retry is in flight,
    * whether to back off and what to render next belongs to the host layer that
    * owns the query (AAP 0.4.2).
+   *
+   * The control carries {@link FOCUS_KEY_ATTRIBUTE} set to
+   * {@link ERROR_STATE_RETRY_FOCUS_KEY}, so that when the retry replaces this
+   * subtree the host's node frame can recognise the equivalent control in what
+   * replaces it and keep keyboard focus inside the node.
    */
   onRetry?: (() => void) | undefined;
 
@@ -384,22 +602,24 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
   retryLabel?: string | undefined;
 
   /**
-   * A decorative glyph above the copy.
+   * A decorative glyph above the copy. Omitted (`undefined`), the default
+   * warning triangle is drawn, so every error state carries the same glyph
+   * unless its caller says otherwise.
    *
    * It is rendered inside a wrapper this component marks `aria-hidden="true"`,
-   * so it is never part of the accessible name — the copy and the alert role
-   * carry the whole meaning, and the glyph reinforces it (AAP 0.6.4: colour and
-   * iconography are never the sole indicator of a state).
+   * so it is never part of the accessible name — the copy and the live-region
+   * role carry the whole meaning, and the glyph reinforces it (AAP 0.6.4:
+   * colour and iconography are never the sole indicator of a state).
    *
-   * Pass the glyph already carrying the global `dg-icon` class —
+   * Pass a replacement already carrying the global `dg-icon` class —
    * `icon={<SomeGlyph className="dg-icon" />}` — so it takes its square and its
    * `currentColor` from `../styles/base.css` and scales with the type role
    * around it; the box tints it with `--dg-danger`. Never pass an icon
    * library's numeric size or colour prop: those are hardcoded values, which
-   * AAP 0.6.4 forbids. This module imports no icon library at all.
+   * AAP 0.6.4 forbids. The default is drawn the same way.
    *
-   * Omitted, absent or blank, no wrapper is rendered and the column starts at
-   * the title.
+   * `null`, `false` or `''` renders no glyph at all: no wrapper is rendered and
+   * the column starts at the title.
    */
   icon?: ReactNode | undefined;
 
@@ -416,42 +636,58 @@ export interface ErrorStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 'c
 }
 
 /**
- * Renders the error state of a node: an optional glyph, the title, the required
- * message, an optional failure code, the optional failing query and an optional
- * retry control, in that order.
+ * Renders the error state of a node: a glyph (the default one unless the
+ * caller replaces or suppresses it), the title, the required message, an
+ * optional hint, an optional failure code, the optional failing query, an
+ * optional closed technical-details disclosure and an optional retry control,
+ * in that order.
  *
  * Presentational and pure — no state, no effects, no hooks, no timers, nothing
  * read from the document while rendering, and no memoization. It re-renders
  * with its parent deliberately: this package's own render behaviour is
  * something the product measures and reports on, so a primitive here does not
  * smooth it over. The output is a function of the props alone, plus the one
- * callback it raises.
+ * callback it raises; even the disclosure's open state is the browser's, not
+ * this component's.
  *
  * @param props The props documented on {@link ErrorStateProps}.
- * @returns The alert container with the parts the caller supplied — no wrapper
- *   for an omitted part, no inline style, no geometry.
+ * @returns The live-region container with the parts the caller supplied — no
+ *   wrapper for an omitted part, no inline style, no geometry.
  *
  * @example
- * // The complete form, as the host layer renders it: the failure as observed,
- * // a code to search for, the serialised query, and one retry.
+ * // The query path, as every query-backed node renders it: one composed set of
+ * // props from the query hook's result and the query that failed.
+ * const result = useQuery(query);
+ * if (result.status === 'error') {
+ *   return <ErrorState {...queryFailureProps(result, query)} />;
+ * }
+ *
+ * @example
+ * // A hand-assembled failure with every part present.
  * <ErrorState
- *   icon={<SomeGlyph className="dg-icon" />}
- *   message={failure.message}
- *   code={failure.code}
- *   query={serialisedQuery}
+ *   message={message}
+ *   hint="Retry to request the data again."
+ *   code="TRANSPORT_DISCONNECTED"
+ *   query={formattedQuery}
+ *   details={formattedDetails}
+ *   announce="polite"
  *   onRetry={retryQuery}
  * />
  *
  * @example
- * // The minimal form: a failure a second attempt cannot change.
- * <ErrorState message={failure.message} />
+ * // The minimal form: a failure a second attempt cannot change, with no glyph.
+ * <ErrorState message={failure.message} icon={null} />
  */
 export function ErrorState(props: ErrorStateProps): ReactElement {
   const {
     message,
     title = DEFAULT_TITLE,
+    hint,
     code,
     query,
+    queryLabel,
+    details,
+    announce = DEFAULT_ANNOUNCE,
     onRetry,
     retryLabel,
     icon,
@@ -460,19 +696,25 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
   } = props;
 
   // A control that announces nothing is not shippable, so a blank label falls
-  // back to the default rather than reaching `Button` as empty children.
+  // back to the default rather than reaching `Button` as empty children. The
+  // query block's name follows the same rule for the same reason.
   const retryText = hasText(retryLabel) ? retryLabel : DEFAULT_RETRY_LABEL;
+  const queryName = hasText(queryLabel) ? queryLabel : DEFAULT_QUERY_ACCESSIBLE_NAME;
 
-  // `className` is merged deliberately and the alert role is set before the
-  // caller's attributes are spread, which leaves the role overridable (see the
-  // file note on live regions) while keeping the composed class name beyond
+  // Only an omitted glyph is defaulted: an explicit `null`, `false` or `''` is a
+  // caller asking for none, and `isRenderable` honours it below.
+  const glyph = icon === undefined ? DEFAULT_ICON : icon;
+
+  // `className` is merged deliberately and the live-region role is set before
+  // the caller's attributes are spread, which leaves the role overridable (see
+  // the file note on live regions) while keeping the composed class name beyond
   // reach of a stray passthrough. The order below is the contract: glyph,
-  // title, message, code, query, action.
+  // title, message, hint, code, query, technical details, action.
   return (
-    <div className={clsx('dg-error-state', className)} role="alert" {...rest}>
-      {isRenderable(icon) ? (
+    <div className={clsx('dg-error-state', className)} role={ANNOUNCE_ROLE[announce]} {...rest}>
+      {isRenderable(glyph) ? (
         <span className="dg-error-state__icon" aria-hidden="true">
-          {icon}
+          {glyph}
         </span>
       ) : null}
       {hasText(title) ? (
@@ -483,6 +725,11 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
       <Text as="p" size="sm" tone="secondary" className="dg-error-state__message">
         {message}
       </Text>
+      {hasText(hint) ? (
+        <Text as="p" size="sm" tone="secondary" className="dg-error-state__message">
+          {hint}
+        </Text>
+      ) : null}
       {hasText(code) ? <Badge tone="danger">{code}</Badge> : null}
       {hasText(query) ? (
         <Code
@@ -491,14 +738,36 @@ export function ErrorState(props: ErrorStateProps): ReactElement {
           size="sm"
           className="dg-error-state__query"
           role={QUERY_ROLE}
-          aria-label={QUERY_ACCESSIBLE_NAME}
+          aria-label={queryName}
         >
           {query}
         </Code>
       ) : null}
+      {hasText(details) ? (
+        // Native and closed by default: the browser owns the open state, the
+        // keyboard toggle and its announcement, which is what keeps this
+        // component free of state (see the class contract in the header).
+        <details>
+          <summary>
+            <Text as="span" size="sm" tone="secondary">
+              {DETAILS_LABEL}
+            </Text>
+          </summary>
+          <Code
+            block
+            wrap
+            size="sm"
+            className="dg-error-state__query"
+            role={QUERY_ROLE}
+            aria-label={DETAILS_LABEL}
+          >
+            {details}
+          </Code>
+        </details>
+      ) : null}
       {onRetry === undefined ? null : (
         <div className="dg-error-state__action">
-          <Button variant="secondary" size="sm" onClick={onRetry}>
+          <Button variant="secondary" size="sm" onClick={onRetry} {...RETRY_FOCUS_ATTRIBUTES}>
             {retryText}
           </Button>
         </div>

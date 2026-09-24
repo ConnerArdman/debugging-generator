@@ -860,11 +860,74 @@ WHERE ingest_seq IN (
 )`;
 
 /**
+ * The session scope of a read that may be planned on a session-leading index.
+ *
+ * The default first term of every filtered read. It leaves the planner free to
+ * choose any index whose first column is `session_id` — the capture page, the
+ * version-3 kind and request-group composites, the purge index — which is the
+ * right access path whenever nothing more selective than the session is named.
+ */
+const SESSION_TERM = 'session_id = ?';
+
+/**
+ * The session scope of a read keyed on an id that is selective across the whole
+ * table: the same bound session id in the same position, applied to the rows
+ * the read returns rather than used to find them.
+ *
+ * The unary `+` is SQLite's documented way to disqualify a `WHERE` term from
+ * driving an index (Query Planner Checklist, "Disqualifying WHERE Clause Terms
+ * using Unary-+"); the term still filters, so the result set is unchanged. It
+ * is needed because the store never runs `ANALYZE`: under the planner's default
+ * estimates a session-leading index that also satisfies the leading
+ * `start_time` term of the ordering outranks a single-column index on the id,
+ * and the read then walks every row of the session. Without the session term
+ * as a candidate, a span, parent-span or trace lookup is answered from
+ * `idx_telemetry_events_span_id`, `idx_telemetry_events_parent_span_id` or
+ * `idx_telemetry_events_trace_id_start_time`, and an event-id lookup from
+ * `sqlite_autoindex_telemetry_events_1` (the index behind `id`'s `UNIQUE`
+ * constraint) — each a handful of rows. `./migrations.ts` explains why those
+ * ids get no session-leading composite instead.
+ */
+const RESIDUAL_SESSION_TERM = '+session_id = ?';
+
+/**
+ * The capture narrowing of a read that may be planned on the capture index.
+ *
+ * The default form of the term, which lets
+ * `idx_telemetry_events_session_id_capture_id_start_time` serve a capture's
+ * page — the default page of the event log and of every panel source.
+ */
+const CAPTURE_TERM = 'capture_id = ?';
+
+/**
+ * The capture narrowing of a read keyed on a request group: the same bound
+ * capture id in the same position, applied to the group's rows rather than used
+ * to find them.
+ *
+ * A request group holds the occurrences of one request, so it is far narrower
+ * than a capture. Both `(session_id, capture_id, start_time)` and the version-3
+ * request-group composite are matched by two equalities and both yield the
+ * leading `start_time` term of the panel-data order, which leaves the planner a
+ * tie it breaks towards the capture index, walking the whole capture. Written
+ * with the unary `+` (see {@link RESIDUAL_SESSION_TERM}), the capture term can no
+ * longer drive that index, and the group is read from
+ * `idx_telemetry_events_session_id_request_key_start_time_producer_id_seq`
+ * under every ordering. The term still filters, so the result set is unchanged.
+ */
+const RESIDUAL_CAPTURE_TERM = '+capture_id = ?';
+
+/**
  * Selects the subset of a column's values that a session holds.
  *
  * Used for both existence lookups, so the two cannot drift on scoping or on
  * chunking. `DISTINCT` matters: one id may match many rows for `trace_id`, and
  * the caller wants the set, not the multiplicity.
+ *
+ * Both columns are globally indexed, so the session term is always the
+ * residual {@link RESIDUAL_SESSION_TERM}, and a capture narrowing is a plain
+ * residual too: no index leads with `capture_id`. An `id` lookup is therefore
+ * read from `sqlite_autoindex_telemetry_events_1` and a `trace_id` lookup from
+ * `idx_telemetry_events_trace_id_start_time`, one index probe per listed value.
  *
  * @param column `'id'` or `'trace_id'` — an identifier from this module, never
  * caller input.
@@ -876,7 +939,7 @@ function existenceSql(column: string, slots: number, byCapture: boolean): string
   const capture = byCapture ? ' AND capture_id = ?' : '';
 
   return `SELECT DISTINCT ${column} FROM ${TABLE}
-WHERE session_id = ?${capture} AND ${column} IN (${placeholders(slots)})`;
+WHERE ${RESIDUAL_SESSION_TERM}${capture} AND ${column} IN (${placeholders(slots)})`;
 }
 
 /**
@@ -970,9 +1033,11 @@ export interface TelemetryQuery {
   readonly captureId?: CaptureId | undefined;
 
   /**
-   * Narrow to one correlated interaction. Served by the
-   * `(trace_id, start_time)` index, which is what makes the timeline and flame
-   * views cheap.
+   * Narrow to one correlated interaction. Served by
+   * `idx_telemetry_events_trace_id_start_time`, with the session scope and
+   * every other narrowing applied to the trace's rows as residual filters (see
+   * {@link RESIDUAL_SESSION_TERM}), which is what makes the timeline and flame
+   * views cheap: the read touches one trace, never the whole session.
    */
   readonly traceId?: string | undefined;
 
@@ -1029,9 +1094,14 @@ export interface TelemetryQuery {
   /**
    * Keep only events sharing this request grouping key.
    *
-   * The key is the keyed hash computed at ingest, never a URL, and is served by
-   * the `(session_id, request_key)` index so duplicate-request grouping is an
-   * indexed read.
+   * The key is the keyed hash computed at ingest, never a URL.
+   * {@link TelemetryRepo.listByRequestKey} reads a group's rows from
+   * `idx_telemetry_events_session_id_request_key_start_time_producer_id_seq`
+   * (schema version 3), which yields its canonical order without a sort, and
+   * the group's count from that index or from
+   * `idx_telemetry_events_session_id_request_key`, both matched on
+   * `(session_id, request_key)`, so duplicate-request grouping is an indexed
+   * read.
    */
   readonly requestKey?: string | undefined;
 
@@ -1438,7 +1508,10 @@ export interface TelemetryRepo {
    * Every event sharing one request grouping key.
    *
    * The indexed read behind duplicate-request detection: the occurrences of one
-   * group, in the order they happened.
+   * group, in the order they happened. Read in that canonical order, as a range
+   * that stops at the page's end, from
+   * `idx_telemetry_events_session_id_request_key_start_time_producer_id_seq`
+   * (schema version 3; see {@link TelemetryQuery.requestKey}).
    */
   listByRequestKey(
     sessionId: SessionId,
@@ -2125,6 +2198,13 @@ function refuseBlank(
  * which keeps the bind count minimal and the number of distinct statement texts
  * bounded by the vocabulary widths rather than by the caller's input.
  *
+ * The session scope is always the first term and the first bound value. It is
+ * written as {@link RESIDUAL_SESSION_TERM} when the filter names a trace, span
+ * or parent-span id, and as {@link SESSION_TERM} otherwise. A capture narrowing
+ * is written as {@link RESIDUAL_CAPTURE_TERM} when the filter also names a
+ * request group, and as {@link CAPTURE_TERM} otherwise. Each is a choice of
+ * access path only, never of which rows match.
+ *
  * @param filter What to match.
  * @param operation The calling method, for a refusal's `details`.
  * @returns The clause and values, the `'nothing'` verdict for a filter that
@@ -2157,11 +2237,25 @@ function buildFilter(filter: InternalFilter, operation: string): Result<FilterPl
     }
   }
 
-  const clauses: string[] = ['session_id = ?'];
+  // A span, parent-span or trace id is selective across the whole table, and
+  // its own index answers the read in a handful of rows; the session term is
+  // then a residual filter, so the planner cannot prefer a session-leading
+  // index that walks the whole session. Any other filter keeps the plain term,
+  // which is what lets the capture, kind and request-group indexes serve it.
+  // The bound value and its position are the same either way.
+  const keyedOnGlobalId =
+    filter.traceId !== undefined ||
+    filter.spanId !== undefined ||
+    filter.parentSpanId !== undefined;
+  const clauses: string[] = [keyedOnGlobalId ? RESIDUAL_SESSION_TERM : SESSION_TERM];
   const values: BoundValue[] = [filter.sessionId];
 
   if (filter.captureId !== undefined) {
-    clauses.push('capture_id = ?');
+    // A request group is narrower than a capture, so a read naming both keeps
+    // the capture as a residual filter and is served by the request-group
+    // composite rather than by a walk of the whole capture. Same bound value,
+    // same position.
+    clauses.push(filter.requestKey !== undefined ? RESIDUAL_CAPTURE_TERM : CAPTURE_TERM);
     values.push(filter.captureId);
   }
 

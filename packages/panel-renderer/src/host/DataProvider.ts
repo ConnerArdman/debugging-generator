@@ -462,8 +462,13 @@ export interface DataQueryOptions {
  *    presented as a successful analysis. An empty result is legitimate only when
  *    the capture genuinely holds nothing for the query.
  * 3. **Reject with a typed error where possible.** `DebuggenError` from
- *    `@debuggen/shared` carries the code and hint the error state renders; any
- *    other rejection is wrapped by the caller, losing that detail.
+ *    `@debuggen/shared` carries the code and hint the error state renders, and
+ *    its details reach the error state's "Technical details" disclosure. Any
+ *    other rejection is mapped by the caller as faithfully as it allows — an
+ *    HTTP status or a timeout, network or abort error to the code it means —
+ *    but loses whatever hint a typed error could have carried. Write the hint
+ *    for the reader of the panel and put integration instructions in
+ *    `details`, as this module's own refusals do.
  * 4. **Honour `options.signal`.** Stop the work and reject with an abort-shaped
  *    error; do not resolve an aborted call.
  * 5. **Resolve one page, as given, in the view form.** Pass `filter`, `sort`,
@@ -890,11 +895,17 @@ function recordGuard<Shape>(spec: RecordGuardSpec<Shape>): PayloadGuard {
  * the source resolves to. `trace` and `componentTree` accept `null`, the
  * wire's "nothing matched" (a view renders its empty state for it); `graph`
  * does not, because an empty graph is `{ nodes: [], edges: [] }`.
+ *
+ * The two tree-shaped sources also require the members their views read
+ * before drawing — a trace's `nodeCount`; a snapshot's `origin`, `degraded`
+ * and `nodeCount` — so a payload missing one is refused here, on the one path
+ * every failure takes through `./useQuery` (its announcement, its wording, its
+ * retry), rather than being caught later by a view's own shape check.
  */
 const DATA_PAYLOAD_GUARDS: { readonly [Source in DataQuerySource]: PayloadGuard } = {
   trace: recordGuard<DataResultFor<'trace'>>({
     nullable: true,
-    keys: ['traceId'],
+    keys: ['traceId', 'nodeCount'],
     lists: ['roots'],
   }),
   spans: listGuard<DataResultFor<'spans'>>(['id', 'traceId', 'spanId', 'kind', 'tier']),
@@ -902,7 +913,7 @@ const DATA_PAYLOAD_GUARDS: { readonly [Source in DataQuerySource]: PayloadGuard 
   renders: listGuard<DataResultFor<'renders'>>(['id', 'component', 'renderCount']),
   componentTree: recordGuard<DataResultFor<'componentTree'>>({
     nullable: true,
-    keys: ['capturedAt'],
+    keys: ['capturedAt', 'origin', 'degraded', 'nodeCount'],
     lists: ['roots'],
   }),
   requests: listGuard<DataResultFor<'requests'>>(['id', 'method', 'url', 'count']),
@@ -1035,24 +1046,84 @@ function readPageEcho(
 }
 
 /**
- * The response form a check was applied to, which decides the hint a refusal
+ * The response form a check was applied to, which decides the remedy a refusal
  * carries: each names the factory that produces the form the check expected.
  */
 type ResponseForm = 'wire' | 'view';
 
-/** The recovery hint of a refused response, per the form it was checked as. */
-const RESPONSE_FORM_HINTS: { readonly [Form in ResponseForm]: string } = {
+/*
+ * Two audiences, two fields (B1-F16).
+ *
+ * A refusal is read by two different people. The reader of the panel sees the
+ * error state's message and hint first, and can do exactly two things about a
+ * refused response: ask again, or report it. The developer who wrote the host
+ * or the provider needs the integration instruction — which form to return,
+ * which factory maps it — and finds it in the error's details, which the error
+ * state shows behind a closed "Technical details" disclosure. So the hint is
+ * written for the first audience and `details.remedy` for the second, and no
+ * integration vocabulary (a factory name, a context name, "provider") reaches
+ * the hint line or the message. Every remedy below is a constant: none of them
+ * interpolates anything, so none can quote a refused value.
+ */
+
+/**
+ * The hint every refused response carries: what a panel reader can do about it.
+ *
+ * Exported for the views whose own shape check refuses a payload this module's
+ * structural check let through (a correlated trace or a component-tree
+ * snapshot whose deeper members are unusable), so that refusal carries the
+ * same words as every other one rather than a copy of them.
+ */
+export const REFUSED_RESPONSE_HINT =
+  'Retry to request the data again. If it keeps failing, report it with the technical details shown here.';
+
+/**
+ * The reader-facing sentence of a payload that arrived in a form its view
+ * cannot read.
+ *
+ * One sentence for every such refusal — this module's structural check and a
+ * view's deeper shape check alike — naming only the source that was asked
+ * for. What exactly was wrong is developer detail, carried in the refusal's
+ * `details` and shown behind the error state's closed disclosure.
+ *
+ * @param source - The source that was requested.
+ * @returns The message.
+ */
+export function unreadableDataMessage(source: DataQuerySource): string {
+  return `The "${source}" data for this view arrived in a form it cannot read.`;
+}
+
+/** The hint of a query refused before it was sent: nothing a retry can change. */
+const UNADDRESSED_QUERY_HINT =
+  'Reload the panel. If it keeps failing, report it with the technical details shown here.';
+
+/** The integration remedy of a malformed response, per the form it was checked as. */
+const RESPONSE_FORM_REMEDIES: { readonly [Form in ResponseForm]: string } = {
   wire: "Return the service's panel-data body for the requested source unchanged: its payload under the source-named key and, for a paged source, all four of total, limit, offset and nextOffset.",
   view: 'Return the view form for the requested source: its payload under data, with any paging counters as non-negative integers. A service body belongs behind createPanelDataProvider, which maps it.',
 };
+
+/** The integration remedy of a response answering for another known source. */
+const MISROUTED_RESPONSE_REMEDY =
+  'Return the response for the source that was requested; a view reads the payload according to it.';
+
+/** The integration remedy of a response naming no known source. */
+const UNNAMED_SOURCE_REMEDY =
+  'Echo the requested source on the response; a view reads the payload according to it.';
+
+/** The integration remedy of a query addressed to no session. */
+const UNADDRESSED_QUERY_REMEDY =
+  'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.';
 
 /**
  * The error a response that fails a structural check is refused with.
  *
  * `PROTOCOL_INVALID_MESSAGE`, like the protocol's own parse failures: the
- * response broke the panel-data contract. The details repeat the defect in
- * machine-readable form and hold only the source, a field path and two kind
- * phrases — nothing read out of the payload.
+ * response broke the panel-data contract. The message states the defect in
+ * reader terms; the hint says what the reader can do; the details repeat the
+ * defect in machine-readable form — the source, a field path and two kind
+ * phrases, nothing read out of the payload — beside the integration `remedy`
+ * for the developer.
  *
  * @param source - The source that was requested.
  * @param defect - What was wrong, and where.
@@ -1064,20 +1135,23 @@ function malformedResponseError(
   defect: ResponseDefect,
   form: ResponseForm,
 ): DebuggenError {
-  return new DebuggenError(
-    'PROTOCOL_INVALID_MESSAGE',
-    `The data provider's "${source}" response is malformed: ${defect.path} should be ${defect.expected}, but is ${defect.received}.`,
-    {
-      hint: RESPONSE_FORM_HINTS[form],
-      details: {
-        source,
-        form,
-        field: defect.path,
-        expected: defect.expected,
-        received: defect.received,
-      },
+  // The message names the source and nothing structural: the field path and
+  // the two kind phrases are developer detail, and they travel in `details`,
+  // which the error state keeps behind its closed "Technical details"
+  // disclosure (B1-F16). A view whose own, deeper shape check refuses a
+  // payload words it with this same sentence, so a reader meets one fault in
+  // one form whichever check caught it.
+  return new DebuggenError('PROTOCOL_INVALID_MESSAGE', unreadableDataMessage(source), {
+    hint: REFUSED_RESPONSE_HINT,
+    details: {
+      source,
+      form,
+      field: defect.path,
+      expected: defect.expected,
+      received: defect.received,
+      remedy: RESPONSE_FORM_REMEDIES[form],
     },
-  );
+  });
 }
 
 /**
@@ -1085,7 +1159,9 @@ function malformedResponseError(
  *
  * The received source is named only when it is a member of the source
  * vocabulary. Anything else in that position is not a source at all, may be
- * any value a producer put there, and is reported by its kind instead.
+ * any value a producer put there, and is reported by its kind instead. Both
+ * branches carry the reader hint and put the integration remedy in the
+ * details, as {@link malformedResponseError} does.
  *
  * @param requested - The source that was requested.
  * @param received - The value the response carried as its `source`.
@@ -1100,10 +1176,10 @@ function sourceMismatchError(
   if (isDataQuerySource(received)) {
     return new DebuggenError(
       'PROTOCOL_INVALID_MESSAGE',
-      `The data provider answered a "${requested}" query with a "${received}" response.`,
+      `The "${requested}" data for this view was answered with "${received}" data.`,
       {
-        hint: 'Return the response for the source that was requested; a view reads the payload according to it.',
-        details: { requested, received, form },
+        hint: REFUSED_RESPONSE_HINT,
+        details: { requested, received, form, remedy: MISROUTED_RESPONSE_REMEDY },
       },
     );
   }
@@ -1112,10 +1188,10 @@ function sourceMismatchError(
 
   return new DebuggenError(
     'PROTOCOL_INVALID_MESSAGE',
-    `The data provider answered a "${requested}" query with a response naming no known source (its source is ${receivedKind}).`,
+    `The "${requested}" data for this view was answered with data naming no known source (its source is ${receivedKind}).`,
     {
-      hint: 'Echo the requested source on the response; a view reads the payload according to it.',
-      details: { requested, receivedKind, form },
+      hint: REFUSED_RESPONSE_HINT,
+      details: { requested, receivedKind, form, remedy: UNNAMED_SOURCE_REMEDY },
     },
   );
 }
@@ -1177,6 +1253,10 @@ function payloadDefect(
  * The error both factories refuse a call naming no usable session with, before
  * their resolver runs.
  *
+ * A retry asks with the same missing session, so the reader hint points at a
+ * reload instead; the integration remedy — which argument to pass, and where
+ * `PanelHost` provides it — is in the details.
+ *
  * @param source - The source of the query that could not be addressed. The
  * unusable session value itself is not echoed.
  * @returns A fresh error.
@@ -1184,10 +1264,10 @@ function payloadDefect(
 function unaddressedQueryError(source: DataQuerySource): DebuggenError {
   return new DebuggenError(
     'PROTOCOL_INVALID_MESSAGE',
-    `The data provider was asked for a "${source}" query without a session to address it to.`,
+    `The "${source}" data for this view was requested without a session to address it to.`,
     {
-      hint: 'Pass the sessionId of the panel being rendered; PanelHost provides it through PanelSessionContext.',
-      details: { source },
+      hint: UNADDRESSED_QUERY_HINT,
+      details: { source, remedy: UNADDRESSED_QUERY_REMEDY },
     },
   );
 }

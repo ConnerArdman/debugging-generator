@@ -434,6 +434,108 @@ const CROWDED_FILES: Readonly<Record<string, string>> = Object.freeze({
   'src/depot/run-book.ts': crowdedModuleSource(),
 });
 
+/** The module that constructs the pool in the reachability and tooling projects. */
+const SLATE_HANDLE_SOURCE = [
+  "import { Pool } from 'pg';",
+  '',
+  'export const slateBerth = new Pool({ max: 2 });',
+  '',
+].join('\n');
+
+/**
+ * One module with a single exported function that sends one statement.
+ *
+ * @param handleSpecifier Where the module imports the pool from.
+ * @param symbol The function's name.
+ * @param table The table its statement reads.
+ * @returns The module source.
+ */
+function slateLedgerSource(handleSpecifier: string, symbol: string, table: string): string {
+  return [
+    `import { slateBerth } from '${handleSpecifier}';`,
+    '',
+    `export async function ${symbol}(laneId: string): Promise<number> {`,
+    '  const result = await slateBerth.query(',
+    `    'select lane_id from ${table} where lane_id = $1',`,
+    '    [laneId],',
+    '  );',
+    '',
+    '  return result.rows.length;',
+    '}',
+    '',
+  ].join('\n');
+}
+
+/**
+ * The project that separates *reachable* query sites from merely *present*
+ * ones, and application modules from tooling modules.
+ *
+ * `app/api/wicket/route.ts` answers a request through a desk function that
+ * calls one querying function directly and a second through a relay, so both
+ * sit several hops below the route. The farther one's module (`abacus-ledger`)
+ * sorts before the nearer one's (`wicket-ledger`), an unrelated querying module
+ * nothing calls (`aardvark-ledger`) sorts before both, and a seed module and a
+ * top-level script — processes of their own, never the dev server — sort before
+ * every `src/` module.
+ */
+const REACHABILITY_FILES: Readonly<Record<string, string>> = Object.freeze({
+  'tsconfig.json': SCRATCH_TSCONFIG,
+  'src/back/handles.ts': SLATE_HANDLE_SOURCE,
+  'app/api/wicket/route.ts': [
+    "import { gatherWicketDigest } from '../../../src/back/wicket-desk';",
+    '',
+    'export async function GET(): Promise<unknown> {',
+    "  return gatherWicketDigest('lane-1');",
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-desk.ts': [
+    "import { relayWicketTally } from './wicket-relay';",
+    "import { tallyWicketRows } from './wicket-ledger';",
+    '',
+    'export async function gatherWicketDigest(laneId: string): Promise<number> {',
+    '  const direct = await tallyWicketRows(laneId);',
+    '  const relayed = await relayWicketTally(laneId);',
+    '',
+    '  return direct + relayed;',
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-relay.ts': [
+    "import { tallyAbacusRows } from './abacus-ledger';",
+    '',
+    'export async function relayWicketTally(laneId: string): Promise<number> {',
+    '  return tallyAbacusRows(laneId);',
+    '}',
+    '',
+  ].join('\n'),
+  'src/back/wicket-ledger.ts': slateLedgerSource('./handles', 'tallyWicketRows', 'wicket_lanes'),
+  'src/back/abacus-ledger.ts': slateLedgerSource('./handles', 'tallyAbacusRows', 'abacus_lanes'),
+  'src/back/aardvark-ledger.ts': slateLedgerSource(
+    './handles',
+    'countAardvarkRows',
+    'aardvark_lanes',
+  ),
+  'prisma/seed.ts': slateLedgerSource('../src/back/handles', 'plantWicketLanes', 'wicket_lanes'),
+  'scripts/rebuild-lanes.ts': slateLedgerSource(
+    '../src/back/handles',
+    'rebuildLaneTotals',
+    'wicket_lanes',
+  ),
+});
+
+/** A project whose only driver query sites are in a seed module and a script. */
+const TOOLING_ONLY_FILES: Readonly<Record<string, string>> = Object.freeze({
+  'tsconfig.json': SCRATCH_TSCONFIG,
+  'src/back/handles.ts': SLATE_HANDLE_SOURCE,
+  'prisma/seed.ts': slateLedgerSource('../src/back/handles', 'plantWicketLanes', 'wicket_lanes'),
+  'scripts/rebuild-lanes.ts': slateLedgerSource(
+    '../src/back/handles',
+    'rebuildLaneTotals',
+    'wicket_lanes',
+  ),
+});
+
 /* -------------------------------------------------------------------------------------------------
  * Query-site facts, computed from the graph
  * ---------------------------------------------------------------------------------------------- */
@@ -1269,6 +1371,12 @@ let databaseFreeProject: IndexedProject;
 /** A project whose query sites outnumber the anchor budget. */
 let crowdedProject: IndexedProject;
 
+/** A project with reachable, unreachable and tooling-module query sites. */
+let reachabilityProject: IndexedProject;
+
+/** A project whose only query sites are in tooling modules. */
+let toolingOnlyProject: IndexedProject;
+
 /** Tokens and shapes derived from every indexed project's statements. */
 let leakGuard: LeakGuard;
 
@@ -1301,6 +1409,8 @@ beforeAll(async () => {
   prismaOnlyProject = await indexScratchProject('client-only', PRISMA_ONLY_FILES);
   databaseFreeProject = await indexScratchProject('database-free', DATABASE_FREE_FILES);
   crowdedProject = await indexScratchProject('crowded', CROWDED_FILES);
+  reachabilityProject = await indexScratchProject('reachability', REACHABILITY_FILES);
+  toolingOnlyProject = await indexScratchProject('tooling-only', TOOLING_ONLY_FILES);
 
   leakGuard = leakGuardFor([fixture, pgOnlyProject, prismaOnlyProject, crowdedProject]);
   fixturePgOwners = querySiteOwners(fixture, 'pg');
@@ -1902,6 +2012,153 @@ describe('createPlan', () => {
       expectNoLeak(actionStrings(actions));
       expectNoLeak(logStrings(probe.logs));
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * createPlan: tooling modules, reachability from the question's route, and no padding
+ *
+ * The driver's spans come from the preload inside the dev-server process, so a
+ * seed or a script (each run in a process of its own) can never contribute one;
+ * a question about a route is answered with the query sites that route reaches;
+ * and once anything narrowed the question, nothing it says nothing about is
+ * added to fill the anchor budget.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The request path the reachability project's route module answers. */
+const WICKET_ROUTE = '/api/wicket';
+
+/** The reachability project's modules the adapter must never anchor on. */
+const TOOLING_MODULES: readonly string[] = Object.freeze([
+  'prisma/seed.ts',
+  'scripts/rebuild-lanes.ts',
+]);
+
+/**
+ * The reachability project's driver owner in one module.
+ *
+ * @param file The module.
+ * @returns The owner, derived from the graph.
+ */
+function reachabilityOwner(file: string): QuerySiteOwner {
+  const owner = querySiteOwners(reachabilityProject, 'pg').find(
+    (candidate) => candidate.file === file,
+  );
+  if (owner === undefined) {
+    throw new Error(`the reachability project must record a driver query owner in ${file}`);
+  }
+  return owner;
+}
+
+describe('createPlan: tooling modules, reachability and no padding', () => {
+  it('stands on a project whose tooling owners sort first and whose route reaches two owners', () => {
+    const owners = querySiteOwners(reachabilityProject, 'pg');
+
+    // Without the exclusion, a proposal in file order would open on the seed
+    // and the script.
+    expect(new Set(owners.slice(0, 2).map((owner) => owner.file))).toEqual(
+      new Set(TOOLING_MODULES),
+    );
+
+    const route = reachabilityProject.queries.routeForUrl(WICKET_ROUTE);
+    const routeNode = route?.node?.nodeId ?? '';
+    expect(routeNode).not.toBe('');
+
+    const near = reachabilityOwner('src/back/wicket-ledger.ts');
+    const far = reachabilityOwner('src/back/abacus-ledger.ts');
+    const unrelated = reachabilityOwner('src/back/aardvark-ledger.ts');
+    const depthTo = (owner: QuerySiteOwner): number | undefined =>
+      reachabilityProject.queries.pathBetween(routeNode, { file: owner.file, symbol: owner.symbol })
+        ?.depth;
+
+    expect(depthTo(near)).toBeGreaterThan(1);
+    expect(depthTo(far)).toBeGreaterThan(depthTo(near) ?? Number.POSITIVE_INFINITY);
+    expect(depthTo(unrelated)).toBeUndefined();
+    expect(compareText(far.file, near.file)).toBeLessThan(0);
+    expect(compareText(unrelated.file, far.file)).toBeLessThan(0);
+  });
+
+  it('never anchors on a seed or script query site, even for an unnarrowed question', async () => {
+    const applicationOwners = querySiteOwners(reachabilityProject, 'pg').filter(
+      (owner) => !TOOLING_MODULES.includes(owner.file),
+    );
+    const probe = harnessFor(reachabilityProject);
+    const actions = await createPostgresAdapter().createPlan(probe.context, databaseQuestion);
+
+    // The unnarrowed fallback still offers every application owner, in order,
+    // and nothing else.
+    expect(applicationOwners.length).toBeLessThanOrEqual(POSTGRES_ADAPTER_DEFAULTS.maxTargets);
+    expect(anchorKeys(actions)).toEqual(ownerKeys(applicationOwners));
+    for (const action of actions) {
+      expect(TOOLING_MODULES).not.toContain(action.file);
+    }
+    expectNoFileAccess(probe);
+  });
+
+  it('proposes nothing when every driver query site is in a tooling module', async () => {
+    const probe = harnessFor(toolingOnlyProject);
+
+    expect(querySiteOwners(toolingOnlyProject, 'pg')).toHaveLength(TOOLING_MODULES.length);
+    await expect(
+      createPostgresAdapter().createPlan(probe.context, databaseQuestion),
+    ).resolves.toEqual([]);
+    expect(probe.logs.map((record) => record.message)).toContain(
+      'proposing nothing: every driver query site belongs to a tooling module',
+    );
+    expectQuietLog(probe);
+  });
+
+  it('anchors only on the query sites a named route reaches, nearest first', async () => {
+    const near = reachabilityOwner('src/back/wicket-ledger.ts');
+    const far = reachabilityOwner('src/back/abacus-ledger.ts');
+    const routeQuestion = understandingFor(['pg'], [{ kind: 'route', name: WICKET_ROUTE }]);
+    const probe = harnessFor(reachabilityProject);
+
+    const actions = await createPostgresAdapter().createPlan(probe.context, routeQuestion);
+
+    // The anchor budget has room for more, and the unrelated owner is not added
+    // to fill it: the nearer owner comes first although its module sorts later.
+    expect(actions.length).toBeLessThan(POSTGRES_ADAPTER_DEFAULTS.maxTargets);
+    expect(anchorKeys(actions)).toEqual(ownerKeys([near, far]));
+
+    const single = await createPostgresAdapter({ maxTargets: 1 }).createPlan(
+      harnessFor(reachabilityProject).context,
+      routeQuestion,
+    );
+    expect(anchorKeys(single)).toEqual(ownerKeys([near]));
+  });
+
+  it('pads a named-caller proposal with nothing the question does not reach', async () => {
+    const owners = querySiteOwners(pgOnlyProject, 'pg');
+    const reached = owners.find(
+      (owner) =>
+        pgOnlyProject.queries.whoCalls({ file: owner.file, symbol: owner.symbol }).length > 0,
+    );
+    const [reference] =
+      reached === undefined
+        ? []
+        : pgOnlyProject.queries.whoCalls({ file: reached.file, symbol: reached.symbol });
+    expect(reached).toBeDefined();
+    expect(reference).toBeDefined();
+
+    const actions = await createPostgresAdapter().createPlan(
+      harnessFor(pgOnlyProject).context,
+      understandingFor(
+        ['pg'],
+        [
+          {
+            kind: 'function',
+            name: reference?.caller.name ?? '',
+            file: reference?.caller.file ?? '',
+          },
+        ],
+      ),
+    );
+
+    // Two owners and a budget of four: the one the named caller does not reach
+    // stays out of the proposal.
+    expect(owners.length).toBeLessThan(POSTGRES_ADAPTER_DEFAULTS.maxTargets);
+    expect(anchorKeys(actions)).toEqual(ownerKeys(reached === undefined ? [] : [reached]));
   });
 });
 

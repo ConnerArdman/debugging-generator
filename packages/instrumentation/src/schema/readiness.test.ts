@@ -57,6 +57,8 @@ import {
   CAPTURE_SIGNAL_TO_TELEMETRY_KIND,
   DISABLED_SERVER_AGENT_SIGNALS,
   DORMANT_AGENT_HOOK_CONFIG,
+  READINESS_HINT_MAX_LENGTH,
+  READINESS_REASON_MAX_LENGTH,
   READINESS_STATUSES,
   SERVER_AGENT_SIGNAL_KEYS,
   SERVER_CAPTURE_SIGNALS,
@@ -451,12 +453,27 @@ describe('readinessSignalSchema', () => {
   });
 
   it('bounds the explanation and the hint', () => {
-    const tooLong = 'x'.repeat(501);
-    expect(readinessSignalSchema.safeParse(readinessRow({ reason: tooLong })).success).toBe(false);
-    expect(readinessSignalSchema.safeParse(readinessRow({ hint: tooLong })).success).toBe(false);
-    expect(readinessSignalSchema.safeParse(readinessRow({ hint: 'x'.repeat(500) })).success).toBe(
-      true,
+    // Asserted through the exported constants, which is how an adapter fits a
+    // composed string to them: a bound that moved here without moving there
+    // would be a refusal at the boundary rather than a failing test.
+    expect(READINESS_REASON_MAX_LENGTH).toBe(500);
+    expect(READINESS_HINT_MAX_LENGTH).toBe(1000);
+
+    const reasonAt = 'x'.repeat(READINESS_REASON_MAX_LENGTH);
+    const reasonOver = 'x'.repeat(READINESS_REASON_MAX_LENGTH + 1);
+    const hintAt = 'x'.repeat(READINESS_HINT_MAX_LENGTH);
+    const hintOver = 'x'.repeat(READINESS_HINT_MAX_LENGTH + 1);
+
+    expect(readinessSignalSchema.safeParse(readinessRow({ reason: reasonAt })).success).toBe(true);
+    expect(readinessSignalSchema.safeParse(readinessRow({ reason: reasonOver })).success).toBe(
+      false,
     );
+    expect(readinessSignalSchema.safeParse(readinessRow({ hint: hintAt })).success).toBe(true);
+    expect(readinessSignalSchema.safeParse(readinessRow({ hint: hintOver })).success).toBe(false);
+
+    // A hint is wider than a reason because it carries a command (AAP §0.5.5):
+    // a hint past the reason's bound is still a hint.
+    expect(readinessSignalSchema.safeParse(readinessRow({ hint: reasonOver })).success).toBe(true);
   });
 });
 

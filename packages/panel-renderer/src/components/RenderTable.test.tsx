@@ -37,7 +37,9 @@
  *     this component, asserted exactly.
  *  2. **Rows, figures and column order**: one row per component, counts and
  *     durations formatted by the package's own helpers rather than by literals
- *     restated here, and the ten columns in their display order.
+ *     restated here, and the ten columns in their display order — each with a
+ *     non-zero floor, so a narrow panel scrolls instead of squeezing a column
+ *     to nothing.
  *  3. **Prop names only, never values** (AAP 0.5.2): the names render, no
  *     control exists to reveal a value, no cell pairs a name with one, and the
  *     expanded row states that values are never captured.
@@ -51,20 +53,45 @@
  *     page of a non-empty result says so with its position and total instead
  *     of claiming an empty capture; and a row whose per-render list the
  *     producer truncated says so when it is expanded.
- *  5. **The interaction contract**: the very `SourceLocation` a row carries
- *     reaches `onOpenSource` field for field; an individual render selects
- *     itself through `onSelectEvent`; and an **aggregate row selects nothing**,
+ *  5. **The interaction contract**: the component name itself is the link to
+ *     its declaration (AAP 0.6.2, "component name → `onOpenSource`"), the
+ *     row's only source control, and clicking it hands `onOpenSource` the very
+ *     `SourceLocation` the row carries, once; a name with no location is text
+ *     with its full name as a tooltip and no control; an individual render
+ *     selects itself through `onSelectEvent`; and an **aggregate row selects nothing**,
  *     because it stands for many events and has no id of its own — a
  *     fabricated coordinate would open a details drawer on evidence the reader
  *     never pointed at.
  *  6. **Ordering belongs to the data layer**: rows appear in the provider's own
  *     order, and a sort gesture is a re-query carrying the mapped
  *     `DataQuerySort` rather than a local re-ranking of one page — and it
- *     starts the page sequence over.
- *  7. **Tooltips are reachable from the keyboard** (AAP 0.6.2): every header
- *     description opens when its trigger takes focus and none sits inside a
- *     sortable header's button, and an in-row description is a tab stop only in
- *     the row the reader is standing on.
+ *     starts the page sequence over. Neither gesture unmounts the control it
+ *     came from: the toolbar's select and a header's sort button stay the same
+ *     focused element while the re-ordered first page loads, fails, comes back
+ *     empty or arrives, with no row of the previous order in between.
+ *  7. **The grid is one Tab stop, and the keyboard reaches everything in it**
+ *     (AAP 0.6.2, 0.6.4): exactly one element in the grid is in the Tab order —
+ *     the active row — so Tab enters on it and the next Tab leaves; every
+ *     control in a cell, an open detail row and the header is `tabIndex={-1}`
+ *     and reached by the grid's arrow keys, ArrowRight first opening a
+ *     collapsed row; every description — a header definition, an outlier's
+ *     explanation, an unlinked component's full name — opens as an arrow key
+ *     lands on its trigger, none sits inside a sortable header's button, and Escape closes
+ *     an open one before it returns to the row. Every bubble stays mounted and
+ *     resolves through `aria-describedby`, yet none is shown at rest: a closed
+ *     one is `hidden`, and a pointer resting on a marked figure shows its
+ *     explanation until the pointer leaves.
+ *  8. **Names identify their row, and state lives where ARIA allows it**: a
+ *     disclosure toggle carries `aria-expanded` and an `aria-controls` that
+ *     resolves to the detail row it opened (never the row itself, which a
+ *     `grid` does not allow), toggle and selection names carry the component
+ *     name and the visible offset, the order control has a name no other
+ *     table shares, and the footer's count is a polite live region.
+ *  9. **One selection, shared** (AAP 0.7.3): the render that is the panel's
+ *     selected event is marked by `dg-is-selected` and `aria-pressed` alike —
+ *     the view's own last selection outside a host, the host's shared
+ *     selection under one, matched by event id or by trace and span — and an
+ *     evidence chip of the summary and a render in the table move one mark.
  *
  * ## Harness conventions (shared with `./SpanTable.test.tsx`)
  *
@@ -108,8 +135,9 @@ import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
+  PANEL_SPEC_VERSION,
 } from '@debuggen/panel-schema';
-import type { DataQuery, DataQuerySort, RenderTableNode } from '@debuggen/panel-schema';
+import type { DataQuery, DataQuerySort, PanelSpec, RenderTableNode } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import { RENDER_PHASES, RENDER_STAT_ID_PREFIX, RENDER_TRIGGERS } from '@debuggen/telemetry';
@@ -121,22 +149,25 @@ import type {
   RenderTrigger,
   RenderTriggerHistogram,
 } from '@debuggen/telemetry';
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { PanelHost } from '../host/PanelHost';
 import {
   formatCount,
   formatDuration,
   formatOffset,
   formatRenderTriggerLabel,
+  formatSourceTooltip,
 } from '../utils/format';
 import { RenderTable } from './RenderTable';
+import { sourceLinkAccessibleName } from './SourceLink';
 
 /*
  * ---------------------------------------------------------------------------
@@ -179,6 +210,53 @@ const WIDGET_SOURCE: SourceLocation = {
 /** The accessible name `SourceLink` gives its interactive form. */
 const SOURCE_CHIP_NAME = `Open ${SOURCE_FILE}:${String(SOURCE_LINE)}:${String(SOURCE_COLUMN)}`;
 
+/**
+ * The accessible name of a row's linked component name, computed by
+ * `SourceLink`'s own exported rule from the props the component passes it: the
+ * name it shows, then the location it opens.
+ *
+ * @param component The component name the chip is captioned with.
+ * @param location The location the chip opens.
+ * @returns The chip's accessible name.
+ */
+function nameChipName(component: string, location: SourceLocation = WIDGET_SOURCE): string {
+  return sourceLinkAccessibleName({ location, label: component, compact: true });
+}
+
+/**
+ * A component name far longer than any column is wide, yet well inside the
+ * shared preview budget, so every surface that shows it must show it whole: the
+ * column's width may ellipsize it on screen, and nothing may shorten its text.
+ */
+const LONG_COMPONENT = 'ExampleWidgetWithADeliberatelyLongDescriptiveName';
+
+/**
+ * The grid track of each column, in display order, as the component declares
+ * them: a `ch` floor sized to the header and the column's content, and a share
+ * of the spare width. Pinned exactly, because a floor of zero is the defect
+ * this list guards against — every column collapsing to its padding in a narrow
+ * panel, and a name, a chip or a header painting over the column beside it.
+ */
+const COLUMN_TRACKS = [
+  'minmax(26ch, 3fr)',
+  'minmax(10ch, 0.5fr)',
+  'minmax(11ch, 0.6fr)',
+  'minmax(11ch, 0.6fr)',
+  'minmax(11ch, 0.6fr)',
+  'minmax(26ch, 3fr)',
+  'minmax(14ch, 0.8fr)',
+  'minmax(14ch, 0.8fr)',
+  'minmax(22ch, 2fr)',
+  'minmax(16ch, 1fr)',
+] as const;
+
+/**
+ * A track with a non-zero `ch` floor and a fractional share, capturing both.
+ * `ch` is the only unit a floor is written in: a `px` or `rem` one would be a
+ * hardcoded value (AAP 0.6.4).
+ */
+const FLOORED_TRACK_PATTERN = /^minmax\(([1-9]\d*(?:\.\d+)?ch), (\d+(?:\.\d+)?)fr\)$/u;
+
 /** The fixture trace every render below belongs to: 32 lower-case hex digits. */
 const TRACE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 
@@ -217,24 +295,86 @@ const GRID_NAME = 'Render statistics per component';
 /** The empty sentence AAP 0.6.2 gives this node type, asserted exactly. */
 const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
 
+/** The first line above {@link EMPTY_MESSAGE}: the empty capture's short title. */
+const NOTHING_CAPTURED_TITLE = 'No renders';
+
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
 
 /** The error state's retry control. */
 const RETRY_NAME = 'Retry';
 
+/**
+ * The shared error-state contract, spelled out rather than imported so a drift
+ * in the one place that words it fails here too (B1-F16, B2-F14): the titles of
+ * a failed view and of a failed next page, the generic lead each message opens
+ * with, and the focus key the retry control carries.
+ */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+const PAGE_FAILURE_LEAD =
+  'The next page of this view could not be loaded. The rows already shown are unaffected.';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** A provider rejection as the contract renders it: its sentence, code and hint. */
+const PROVIDER_FAILURE_MESSAGE = 'The channel to the service is closed.';
+const PROVIDER_FAILURE_CODE = 'TRANSPORT_DISCONNECTED';
+const PROVIDER_FAILURE_HINT = 'Start the local service, then retry.';
+
 /** The footer control that asks for a larger page. */
 const LOAD_MORE_NAME = 'Load more';
 
-/** The toolbar's order control. */
-const SORT_CONTROL_NAME = 'Order';
+/**
+ * The toolbar's order control: named for what it orders, so it is not one of
+ * several controls in a panel all announced as the same word.
+ */
+const SORT_CONTROL_NAME = 'Order renders';
 
-/** The disclosure control's two names. */
-const EXPAND_NAME = 'Show individual renders';
-const COLLAPSE_NAME = 'Hide individual renders';
+/**
+ * The disclosure control's name while its row is collapsed. It names the
+ * component of its row, so no two rows' toggles are announced alike.
+ *
+ * @param component The component name the row draws.
+ * @returns The toggle's accessible name.
+ */
+function expandNameOf(component: string): string {
+  return `Show individual renders of ${component}`;
+}
 
-/** The control that selects one individual render as the panel's evidence. */
-const SELECT_OCCURRENCE_NAME = 'Select this render';
+/**
+ * The disclosure control's name while its row is open.
+ *
+ * @param component The component name the row draws.
+ * @returns The toggle's accessible name.
+ */
+function collapseNameOf(component: string): string {
+  return `Hide individual renders of ${component}`;
+}
+
+/**
+ * The name of the control that selects one individual render as the panel's
+ * evidence. It contains the offset the control shows, verbatim (WCAG 2.5.3),
+ * and the component the render belongs to.
+ *
+ * @param component The component name the row draws.
+ * @param offset The offset text the control shows.
+ * @returns The control's accessible name.
+ */
+function selectOccurrenceNameOf(component: string, offset: string): string {
+  return `Select ${component} render at ${offset}`;
+}
+
+/**
+ * Matches the select control of any individual render of one component,
+ * whatever offset it shows — for the cases that count or pick them.
+ *
+ * @param component The component name the row draws.
+ * @returns A pattern anchored at the start of the name.
+ */
+function selectOccurrencePatternOf(component: string): RegExp {
+  return new RegExp(`^Select ${component} render at `);
+}
 
 /**
  * The columns in display order, by the header each one shows.
@@ -724,8 +864,10 @@ function detailRows(): HTMLElement[] {
  * The component name of each data row, in document order.
  *
  * Read off the row's header cell — obtained by role — and then from the
- * component's own name element inside it, so a row carrying a source chip
- * contributes its component name and nothing else.
+ * component's own name element inside it: the text of an unlinked name, or the
+ * visible caption of the source link a linked name is. The link's glyph has no
+ * text and its tooltip sits outside it, so each row contributes its component
+ * name and nothing else.
  *
  * @returns One name per row.
  */
@@ -751,6 +893,62 @@ function rowFor(component: string): HTMLElement {
   }
 
   return row;
+}
+
+/**
+ * The element that draws a row's component name: the text of an unlinked
+ * name, or the source-link button a linked name is.
+ *
+ * Read from the row's header cell, where the name is the only element carrying
+ * the name class, so the case holds the very element a reader sees and clicks.
+ *
+ * @param row The data row.
+ * @returns The name element.
+ */
+function nameOf(row: HTMLElement): HTMLElement {
+  const name = within(row)
+    .getByRole('rowheader')
+    .querySelector<HTMLElement>('.dg-render-table__component-cell');
+
+  if (name === null) {
+    throw new Error('the row header draws no component name');
+  }
+
+  return name;
+}
+
+/**
+ * Splits a grid track template at its top-level spaces, so the space after the
+ * comma inside `minmax(26ch, 3fr)` stays inside the track it belongs to.
+ *
+ * @param template The value of `--dgc-columns`.
+ * @returns One string per track.
+ */
+function splitTracks(template: string): string[] {
+  const tracks: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const character of template.trim()) {
+    if (character === ' ' && depth === 0) {
+      if (current !== '') {
+        tracks.push(current);
+      }
+      current = '';
+      continue;
+    }
+    if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth -= 1;
+    }
+    current += character;
+  }
+  if (current !== '') {
+    tracks.push(current);
+  }
+
+  return tracks;
 }
 
 /**
@@ -788,8 +986,8 @@ function cellFor(row: HTMLElement, label: ColumnLabel): HTMLElement {
  * The header cell of the column with the given header text.
  *
  * Matched by prefix rather than by equality: five of the ten headers carry a
- * `Tooltip`, whose content stays in the accessibility tree while it is closed,
- * so the cell's text is its label followed by its description.
+ * `Tooltip`, whose bubble stays mounted — hidden — while it is closed, so the
+ * cell's text is its label followed by its description.
  *
  * @param label The column's header, from {@link COLUMN_LABELS}.
  * @returns That header cell.
@@ -899,6 +1097,123 @@ function onlyDetailRow(): HTMLElement {
   return row;
 }
 
+/**
+ * The disclosure toggle of one data row: the one button in its component cell
+ * that reports an expanded state.
+ *
+ * Found by role and then narrowed by `aria-expanded`, whatever its current
+ * name, so a case can read the toggle's state in either direction without
+ * restating which of its two names it carries at that moment.
+ *
+ * @param component The component name of the row.
+ * @returns That row's toggle.
+ */
+function toggleOf(component: string): HTMLElement {
+  const toggles = within(cellFor(rowFor(component), 'Component'))
+    .getAllByRole('button')
+    .filter((button) => button.hasAttribute('aria-expanded'));
+
+  expect(toggles).toHaveLength(1);
+
+  const [toggle] = toggles;
+
+  if (toggle === undefined) {
+    throw new Error(`the row "${component}" has no disclosure toggle`);
+  }
+
+  return toggle;
+}
+
+/**
+ * Asserts that an open toggle reports its state and names the detail row it
+ * revealed, by an id that resolves in the document to exactly that element —
+ * the `aria-controls` relationship an assistive technology follows.
+ *
+ * @param toggle The row's disclosure toggle.
+ * @param detail The detail row the grid rendered for that row.
+ */
+function expectControlsDetail(toggle: HTMLElement, detail: HTMLElement): void {
+  const controls = toggle.getAttribute('aria-controls');
+
+  expect(toggle.getAttribute('aria-expanded')).toBe('true');
+  expect(controls).not.toBeNull();
+  expect(controls).toBe(detail.id);
+  expect(document.getElementById(controls ?? '')).toBe(detail);
+}
+
+/**
+ * The `role="tooltip"` elements a trigger is described by, resolved through
+ * its `aria-describedby` exactly as an assistive technology resolves them.
+ * Every id it names must resolve: a description pointing at nothing is a
+ * defect in itself.
+ *
+ * `Tooltip` keeps its bubble mounted for the trigger's whole life, with its
+ * `id` and `role` fixed, so a closed trigger is described by its bubble too —
+ * one carrying `hidden`, which no role query finds and no reader is shown.
+ * Whether a description is being shown is {@link isShownBubble}'s question.
+ *
+ * @param trigger The trigger.
+ * @returns Its tooltip descriptions, shown or not.
+ */
+function describingBubbles(trigger: HTMLElement): HTMLElement[] {
+  const described = (trigger.getAttribute('aria-describedby') ?? '')
+    .split(/\s+/u)
+    .filter((id) => id.length > 0)
+    .map((id) => document.getElementById(id));
+
+  expect(described).not.toContain(null);
+
+  return described.filter(
+    (element): element is HTMLElement => element?.getAttribute('role') === 'tooltip',
+  );
+}
+
+/**
+ * Whether a tooltip bubble is being shown.
+ *
+ * `Tooltip` writes the two halves of that state together: open, the bubble
+ * carries `dg-is-open` and no `hidden` attribute; closed, it carries `hidden`
+ * — out of the accessibility tree and of every role query — and no open class.
+ * The halves are asserted to agree, because a bubble with one and not the
+ * other would be shown to one audience and withheld from another.
+ *
+ * @param bubble A `role="tooltip"` element.
+ * @returns `true` while the bubble is open.
+ */
+function isShownBubble(bubble: HTMLElement): boolean {
+  const open = bubble.classList.contains('dg-is-open');
+
+  expect(bubble.hidden).toBe(!open);
+
+  return open;
+}
+
+/**
+ * The descriptions of every tooltip inside `scope`, each opened the way a
+ * keyboard reader opens it — focus arriving on its trigger — read while it is
+ * shown, and closed again as focus leaves.
+ *
+ * Only a shown bubble's text counts: every bubble is mounted, so its text is
+ * in the document even while closed, and a description that did not open on
+ * focus is one the reader never heard.
+ *
+ * @param scope The element whose tooltips to read.
+ * @returns One text per opened description, in document order.
+ */
+function openedDescriptions(scope: HTMLElement): string[] {
+  return [...scope.querySelectorAll<HTMLElement>('.dg-tooltip__trigger > *')].flatMap((trigger) => {
+    fireEvent.focus(trigger);
+    const texts = describingBubbles(trigger)
+      .filter(isShownBubble)
+      .map((bubble) => bubble.textContent ?? '');
+    fireEvent.blur(trigger);
+
+    expect(describingBubbles(trigger).filter(isShownBubble)).toHaveLength(0);
+
+    return texts;
+  });
+}
+
 /*
  * ---------------------------------------------------------------------------
  * The rows most cases draw
@@ -985,7 +1300,7 @@ describe('RenderTable states', () => {
     // failure — and there is no grid to hold rows, and no order control, since
     // reordering nothing is a control that cannot act.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('combobox', { name: SORT_CONTROL_NAME })).toBeNull();
   });
@@ -1027,6 +1342,48 @@ describe('RenderTable states', () => {
 
     // No rows were invented behind the failure.
     expect(screen.queryAllByRole('row')).toHaveLength(0);
+  });
+
+  it('renders a provider rejection through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError(PROVIDER_FAILURE_CODE, PROVIDER_FAILURE_MESSAGE, {
+        hint: PROVIDER_FAILURE_HINT,
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // One failure on its own is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+    expect(alert.classList.contains('dg-render-table__error')).toBe(true);
+
+    // The glyph every error state draws, decorative and hidden from the name.
+    const glyph = alert.querySelector('.dg-error-state__icon');
+    expect(glyph?.getAttribute('aria-hidden')).toBe('true');
+    expect(glyph?.querySelector('svg.dg-icon')).not.toBeNull();
+
+    // The shared title, then the generic lead followed by the provider's own
+    // cause, then the provider's hint on a line of its own.
+    const title = within(alert).getByText(VIEW_FAILURE_TITLE);
+    expect(title.classList.contains('dg-error-state__title')).toBe(true);
+    const lines = Array.from(alert.querySelectorAll('.dg-error-state__message')).map(
+      (line) => line.textContent ?? '',
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[0]?.startsWith(VIEW_FAILURE_LEAD)).toBe(true);
+    expect(lines[0]).toContain(PROVIDER_FAILURE_MESSAGE);
+    expect(lines[1]).toBe(PROVIDER_FAILURE_HINT);
+
+    // The code as a chip, not as prose.
+    expect(within(alert).getByText(PROVIDER_FAILURE_CODE).closest('.dg-badge')).not.toBeNull();
+
+    // The query block holds exactly the query that was asked.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the host frame restores focus by.
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retry.getAttribute('data-dg-focus-key')).toBe(RETRY_FOCUS_KEY);
   });
 });
 
@@ -1121,7 +1478,7 @@ describe('RenderTable rows', () => {
     // and the cell states what the mark means rather than passing a heuristic
     // off as a verdict.
     expect(figure.querySelector('.dg-icon')).not.toBeNull();
-    expect(marked.textContent ?? '').toMatch(/median of the loaded rows/i);
+    expect(openedDescriptions(marked).join(' ')).toMatch(/median of the loaded rows/i);
 
     // And no quiet row is marked: their cells are the figure and nothing else.
     for (const stat of quiet) {
@@ -1146,6 +1503,39 @@ describe('RenderTable rows', () => {
 
     await screen.findByRole('grid', { name: GRID_NAME });
     expect(soleQuery(stub).source).toBe('renders');
+  });
+
+  it('gives every column a non-zero floor, so a narrow panel scrolls instead of squeezing', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    const tracks = splitTracks(grid.style.getPropertyValue('--dgc-columns'));
+
+    // One track per column, and not one of them the floorless `minmax(0, …)`
+    // that let the name, the histogram and the prop list collapse to their
+    // padding in a narrow panel while their content painted over the next
+    // column's.
+    expect(tracks).toHaveLength(COLUMN_LABELS.length);
+    for (const track of tracks) {
+      expect(track.startsWith('minmax(0')).toBe(false);
+      expect(track).toMatch(FLOORED_TRACK_PATTERN);
+    }
+
+    // The measured floors and the shares a wide panel lays out with, exactly.
+    expect(tracks).toEqual([...COLUMN_TRACKS]);
+
+    // The name column is never narrower than any other: it is what identifies
+    // the row, and the link to its declaration.
+    const floors = tracks.map((track) => FLOORED_TRACK_PATTERN.exec(track)?.[1] ?? '');
+    const widths = floors.map((floor) => Number.parseFloat(floor));
+    expect(widths[0]).toBe(Math.max(...widths));
+
+    // Every floor reaches the grid's own minimum inline size, which is what
+    // turns a panel narrower than the columns need into a horizontal scroll.
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toBe(`calc(${floors.join(' + ')})`);
+    expect(grid.style.getPropertyValue('--dgc-column-count')).toBe(String(COLUMN_LABELS.length));
   });
 });
 
@@ -1193,9 +1583,11 @@ describe('RenderTable trigger attribution', () => {
 
     // Each column states its own definition in full rather than leaving the
     // difference to be inferred from two adjacent words.
-    expect(headerFor(STABLE_INPUTS_COLUMN).textContent ?? '').toMatch(/none of them had changed/i);
+    expect(openedDescriptions(headerFor(STABLE_INPUTS_COLUMN)).join(' ')).toMatch(
+      /none of them had changed/i,
+    );
 
-    const unclassifiedHeader = headerFor(UNCLASSIFIED_COLUMN).textContent ?? '';
+    const unclassifiedHeader = openedDescriptions(headerFor(UNCLASSIFIED_COLUMN)).join(' ');
     expect(unclassifiedHeader).toMatch(/could not be evaluated/i);
     expect(unclassifiedHeader).toMatch(/never as a stable-input render/i);
   });
@@ -1323,7 +1715,11 @@ describe('RenderTable changed props', () => {
 
     await screen.findByRole('grid', { name: GRID_NAME });
 
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     const detail = onlyDetailRow();
 
@@ -1391,19 +1787,28 @@ describe('RenderTable expansion', () => {
 
     await screen.findByRole('grid', { name: GRID_NAME });
 
+    // The disclosure state lives on the toggle, never on the row: a `grid` row
+    // does not support `aria-expanded`. Closed, the toggle names no controlled
+    // element, because the detail row it would name is not in the document.
     const row = rowFor(WIDGET_COMPONENT);
-    expect(row.getAttribute('aria-expanded')).toBe('false');
+    const toggle = toggleOf(WIDGET_COMPONENT);
+    expect(row.getAttribute('aria-expanded')).toBeNull();
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(toggle.getAttribute('aria-controls')).toBeNull();
     expect(detailRows()).toHaveLength(0);
 
-    await user.click(within(row).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(within(row).getByRole('button', { name: expandNameOf(WIDGET_COMPONENT) }));
 
     // The state after the gesture, with this node's id and the row's own id, so
     // a host with two render tables can tell them apart and persist either.
     expect(spies.onExpand).toHaveBeenCalledTimes(1);
     expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, COMPLETE_ROW.id, true);
 
+    // Open, the toggle reports it and names the detail row that is now
+    // rendered — by an id that resolves to exactly that element.
     const detail = onlyDetailRow();
-    expect(rowFor(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBe('true');
+    expectControlsDetail(toggleOf(WIDGET_COMPONENT), detail);
+    expect(rowFor(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBeNull();
 
     // The list says how much of the component's work it holds, and this row's
     // list is complete, so no truncation note is shown.
@@ -1420,9 +1825,9 @@ describe('RenderTable expansion', () => {
       expect(within(detail).getByText(formatDuration(occurrence.durationMs))).toBeDefined();
     }
     expect(detail.textContent).not.toContain(String(BASE_START_MS));
-    expect(within(detail).getAllByRole('button', { name: SELECT_OCCURRENCE_NAME })).toHaveLength(
-      OCCURRENCES.length,
-    );
+    expect(
+      within(detail).getAllByRole('button', { name: selectOccurrencePatternOf(WIDGET_COMPONENT) }),
+    ).toHaveLength(OCCURRENCES.length);
 
     // Each render states its own trigger, in the same vocabulary the histogram
     // uses — including the one that means "stable inputs".
@@ -1430,11 +1835,17 @@ describe('RenderTable expansion', () => {
     expect(within(detail).getByText('unchanged')).toBeDefined();
 
     // Collapsing is reported as the state it produced, not as a toggle.
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: COLLAPSE_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: collapseNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     expect(spies.onExpand).toHaveBeenCalledTimes(2);
     expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, COMPLETE_ROW.id, false);
     expect(detailRows()).toHaveLength(0);
+    expect(toggleOf(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBe('false');
+    expect(toggleOf(WIDGET_COMPONENT).getAttribute('aria-controls')).toBeNull();
 
     // A disclosure is not a query: the page on screen is the page that was
     // resolved, and expanding it asked the provider for nothing.
@@ -1457,7 +1868,11 @@ describe('RenderTable expansion', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('grid', { name: GRID_NAME });
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     const detail = onlyDetailRow();
     expect(within(detail).getByText(/listing 2 of 12 renders/i)).toBeDefined();
@@ -1471,18 +1886,24 @@ describe('RenderTable expansion', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('grid', { name: GRID_NAME });
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     const detail = onlyDetailRow();
     expect(within(detail).getByText(/no individual renders were reported/i)).toBeDefined();
-    expect(within(detail).queryAllByRole('button', { name: SELECT_OCCURRENCE_NAME })).toHaveLength(
-      0,
-    );
+    expect(
+      within(detail).queryAllByRole('button', {
+        name: selectOccurrencePatternOf(WIDGET_COMPONENT),
+      }),
+    ).toHaveLength(0);
   });
 });
 
 describe('RenderTable interactions', () => {
-  it('hands the host the very location a component resolved to, and selects nothing', async () => {
+  it('makes the component name the link to its declaration, handing the host that very location once', async () => {
     const located = makeRenderStat({ source: WIDGET_SOURCE });
     const stub = resolvingProvider([located]);
     const spies = makeActions();
@@ -1495,7 +1916,18 @@ describe('RenderTable interactions', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
-    const chip = await screen.findByRole('button', { name: SOURCE_CHIP_NAME });
+    const chip = await screen.findByRole('button', { name: nameChipName(WIDGET_COMPONENT) });
+
+    // The control IS the name (AAP 0.6.2, "component name → onOpenSource"): the
+    // element that draws the component name in the row header is this button,
+    // captioned with the name, and the row offers its location through nothing
+    // else — no second chip beside the name.
+    const row = rowFor(WIDGET_COMPONENT);
+    expect(nameOf(row)).toBe(chip);
+    expect(chip.textContent).toBe(WIDGET_COMPONENT);
+    expect(within(row).getByRole('rowheader').contains(chip)).toBe(true);
+    expect(within(row).getAllByRole('button', { name: /open src\//iu })).toEqual([chip]);
+    expect(row.querySelectorAll('.dg-source-link')).toHaveLength(1);
 
     // Rendering a chip is not activating it: nothing opens an editor until the
     // developer asks.
@@ -1512,9 +1944,12 @@ describe('RenderTable interactions', () => {
 
     const received = call[0];
 
-    // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
-    // `confidence` and an invented extra field both fail here. Every hop after
-    // this one acts on the object it is handed (AAP 0.4.2).
+    // The very object the row carried, by reference — not a copy and not a
+    // rebuilt location — and therefore equal with the same key set: a dropped
+    // `symbol`, `resolvedBy` or `confidence` and an invented extra field both
+    // fail here. Every hop after this one acts on the object it is handed
+    // (AAP 0.4.2).
+    expect(received).toBe(WIDGET_SOURCE);
     expect(received).toEqual(WIDGET_SOURCE);
     expect(Object.keys(received).toSorted()).toEqual(expectedKeys);
     expect(received.file).toBe(SOURCE_FILE);
@@ -1530,6 +1965,79 @@ describe('RenderTable interactions', () => {
     expect(spies.onFilterChange).not.toHaveBeenCalled();
   });
 
+  it('describes a linked name by its full text and location, and keeps the name in its row header', async () => {
+    // A name far wider than its column, declared at a symbol of the same name:
+    // the column may ellipsize the caption, so the description is where a
+    // reader finds it whole — beside the place it links to.
+    const location: SourceLocation = { ...WIDGET_SOURCE, symbol: LONG_COMPONENT };
+    const stub = resolvingProvider([
+      makeRenderStat({ component: LONG_COMPONENT, source: location }),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const row = rowFor(LONG_COMPONENT);
+    const link = nameOf(row);
+
+    // Captioned with the whole name: the column's width clips it on screen and
+    // nothing shortens its text.
+    expect(link.textContent).toBe(LONG_COMPONENT);
+
+    // The description resolves exactly as an assistive technology resolves it,
+    // to a tooltip naming the component in full and the place it links to.
+    const bubble = document.getElementById(link.getAttribute('aria-describedby') ?? '');
+    expect(bubble?.getAttribute('role')).toBe('tooltip');
+    expect(bubble?.textContent).toBe(formatSourceTooltip(location));
+    expect(bubble?.textContent ?? '').toContain(LONG_COMPONENT);
+    expect(bubble?.textContent ?? '').toContain(SOURCE_CHIP_NAME.replace(/^Open /u, ''));
+
+    // Focus is how a keyboard reader opens it.
+    act(() => {
+      link.focus();
+    });
+    expect(bubble?.classList.contains('dg-is-open')).toBe(true);
+  });
+
+  it('keeps a linked name in its row header even when the location names no symbol', async () => {
+    // The link is named by its location, so without the name escorted beside it
+    // a location with no symbol would leave the row header — which a screen
+    // reader announces for every cell of the row — without the component.
+    const unnamed: SourceLocation = {
+      file: SOURCE_FILE,
+      line: SOURCE_LINE,
+      column: SOURCE_COLUMN,
+      resolvedBy: 'code-graph',
+      confidence: 0.9,
+    };
+    const stub = resolvingProvider([
+      makeRenderStat({ component: LONG_COMPONENT, source: unnamed }),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const row = rowFor(LONG_COMPONENT);
+    expect(nameOf(row).getAttribute('aria-label')).toBe(nameChipName(LONG_COMPONENT, unnamed));
+    expect(
+      within(row).getByRole('rowheader', {
+        name: (accessibleName) => accessibleName.includes(LONG_COMPONENT),
+      }),
+    ).toBe(within(row).getByRole('rowheader'));
+
+    // The chip's own name carries the component, so no hidden copy escorts it:
+    // a second one would make a screen reader announce the name twice. A
+    // closed tooltip bubble is visually hidden too, so it is set aside by role.
+    const escorts = [
+      ...within(row)
+        .getByRole('rowheader')
+        .querySelectorAll('.dg-visually-hidden:not([role="tooltip"])'),
+    ];
+    expect(escorts).toHaveLength(0);
+  });
+
   it('draws no chip for a component the capture could not resolve to a location', async () => {
     const stub = resolvingProvider([WIDGET_ROW]);
 
@@ -1539,7 +2047,40 @@ describe('RenderTable interactions', () => {
 
     const row = rowFor(WIDGET_COMPONENT);
     expect(within(row).queryByRole('button', { name: /^Open / })).toBeNull();
+    expect(row.querySelector('.dg-source-link')).toBeNull();
     expect(row.textContent).not.toContain(SOURCE_FILE);
+  });
+
+  it('draws an unlinked name as text described by its full name, with no control', async () => {
+    const stub = resolvingProvider([makeRenderStat({ component: LONG_COMPONENT })]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const row = rowFor(LONG_COMPONENT);
+    const name = nameOf(row);
+
+    // Text, whole: no button, no link, and the disclosure toggle is the row
+    // header's only control.
+    expect(name.tagName).toBe('SPAN');
+    expect(name.closest('button')).toBeNull();
+    expect(name.textContent).toBe(LONG_COMPONENT);
+    expect(within(row).getByRole('rowheader').querySelectorAll('button')).toHaveLength(1);
+    expect(
+      within(within(row).getByRole('rowheader')).getByRole('button').getAttribute('aria-label'),
+    ).toBe(expandNameOf(LONG_COMPONENT));
+
+    // Described by its full name, so an ellipsized name is still readable.
+    const bubble = document.getElementById(name.getAttribute('aria-describedby') ?? '');
+    expect(bubble?.getAttribute('role')).toBe('tooltip');
+    expect(bubble?.textContent).toBe(LONG_COMPONENT);
+
+    // Clicking a label opens nothing.
+    await user.click(name);
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
   });
 
   it('selects an individual render as the one captured event it stands for', async () => {
@@ -1567,10 +2108,16 @@ describe('RenderTable interactions', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
     await screen.findByRole('grid', { name: GRID_NAME });
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     const detail = onlyDetailRow();
-    await user.click(within(detail).getByRole('button', { name: SELECT_OCCURRENCE_NAME }));
+    await user.click(
+      within(detail).getByRole('button', { name: selectOccurrencePatternOf(WIDGET_COMPONENT) }),
+    );
 
     expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
 
@@ -1704,6 +2251,400 @@ describe('RenderTable ordering', () => {
     expect(stub.resolve).toHaveBeenCalledTimes(1);
     expect(ariaSortOf(RENDERS_SORT_NAME)).toBe('descending');
     expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+  });
+});
+
+describe('RenderTable focus across an order change', () => {
+  /*
+   * A new order is a new page sequence: the gesture releases every loaded row,
+   * and the view has none to draw until the re-ordered first page arrives. The
+   * control the reader used must survive that moment — the same element, still
+   * in the document, still focused — or keyboard focus falls to the document
+   * after every change. The stub below answers the first query at once and
+   * holds every later one open until the case answers it by its order, so the
+   * moment between the gesture and the answer is asserted on its own rather
+   * than raced, and a case cannot pass by answering the wrong request.
+   */
+
+  /** The two outcomes of one request the stub is holding open. */
+  interface HeldRequest {
+    /** Answers the request. */
+    readonly resolve: (response: DataQueryResponse) => void;
+
+    /** Fails the request. */
+    readonly reject: (error: DebuggenError) => void;
+  }
+
+  /** The stub, the queries it received and the handles that answer a held request. */
+  interface HeldStub {
+    /** The provider to hand to {@link renderComponent}. */
+    readonly provider: DataProvider;
+
+    /** Every query received, in call order. */
+    readonly queries: readonly DataQuery[];
+
+    /** Answers the request held open for `sort` with `page`. */
+    readonly settle: (sort: DataQuerySort, page: RenderPage) => void;
+
+    /** Fails the request held open for `sort` with `error`. */
+    readonly fail: (sort: DataQuerySort, error: DebuggenError) => void;
+  }
+
+  /** The chronological member of the vocabulary: reachable from the toolbar, ranked by no column. */
+  const EARLIEST_FIRST: DataQuerySort = 'start_asc';
+
+  /** A third component, so three answers can each order the rows differently. */
+  const CARD_COMPONENT = 'ExampleCard';
+
+  const CARD_ROW = makeRenderStat({
+    component: CARD_COMPONENT,
+    renderCount: 2,
+    totalDurationMs: 24,
+    averageDurationMs: 12,
+    maxDurationMs: 16,
+    triggers: makeTriggers({ props: 1, unchanged: 1 }),
+    phaseCounts: makePhases({ mount: 1, update: 1 }),
+  });
+
+  /** The first page, answering the node's own `count_desc`. */
+  const OPENING_ROWS: readonly RenderStat[] = [LIST_ROW, WIDGET_ROW, CARD_ROW];
+
+  /** The page the service answers a `duration_desc` request with. */
+  const LONGEST_TOTAL_ROWS: readonly RenderStat[] = [WIDGET_ROW, CARD_ROW, LIST_ROW];
+
+  /**
+   * The reader's three changes from the toolbar, in turn, each with the page
+   * the service answers it with. Every page orders the same rows differently
+   * from the page before it, so rows that followed the answer cannot be
+   * mistaken for rows left over from the order just left — and the last change
+   * returns to the opening order with a different answer, so a restored
+   * earlier page cannot pass for a re-query either.
+   */
+  const ORDER_CHANGES: readonly {
+    readonly sort: DataQuerySort;
+    readonly rows: readonly RenderStat[];
+  }[] = [
+    { sort: LONGEST_TOTAL_FIRST, rows: LONGEST_TOTAL_ROWS },
+    { sort: EARLIEST_FIRST, rows: [CARD_ROW, LIST_ROW, WIDGET_ROW] },
+    { sort: MOST_RENDERS_FIRST, rows: [WIDGET_ROW, LIST_ROW, CARD_ROW] },
+  ];
+
+  /**
+   * The component names of a page, in its order.
+   *
+   * @param rows The page's rows.
+   * @returns Their names.
+   */
+  function namesOf(rows: readonly RenderStat[]): string[] {
+    return rows.map((stat) => stat.component);
+  }
+
+  /**
+   * The response a page stands for, with its counters present only when set.
+   *
+   * @param page The page.
+   * @returns The response.
+   */
+  function responseOf(page: RenderPage): DataQueryResponse {
+    return {
+      source: 'renders',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    };
+  }
+
+  /**
+   * Builds the stub: the first query is answered with `opening`, every later
+   * one is held open under its own order.
+   *
+   * @param opening The first page.
+   * @returns The stub.
+   */
+  function heldProvider(opening: RenderPage): HeldStub {
+    const queries: DataQuery[] = [];
+    const held = new Map<DataQuerySort, HeldRequest>();
+
+    const provider = createDataProvider((query) => {
+      queries.push(query);
+
+      if (queries.length === 1) {
+        return Promise.resolve(responseOf(opening));
+      }
+
+      const sort = query.sort;
+
+      if (sort === undefined) {
+        return Promise.reject(new Error('the view sent a re-query that names no order'));
+      }
+
+      return new Promise<DataQueryResponse>((resolve, reject) => {
+        held.set(sort, { resolve, reject });
+      });
+    });
+
+    const take = (sort: DataQuerySort): HeldRequest => {
+      const request = held.get(sort);
+
+      if (request === undefined) {
+        throw new Error(`no request ordered by "${sort}" is being held`);
+      }
+
+      held.delete(sort);
+
+      return request;
+    };
+
+    return {
+      provider,
+      queries,
+      settle: (sort, page) => {
+        take(sort).resolve(responseOf(page));
+      },
+      fail: (sort, error) => {
+        take(sort).reject(error);
+      },
+    };
+  }
+
+  /**
+   * Asserts that `element` is still the element in the document with focus —
+   * not a replacement for it, and not the document itself.
+   *
+   * @param element The control the reader operated.
+   */
+  function expectStillFocused(element: HTMLElement): void {
+    expect(element.isConnected).toBe(true);
+    expect(document.activeElement).toBe(element);
+  }
+
+  /**
+   * Asserts the moment between an order gesture and its first page: the
+   * silhouette beneath a header that is still mounted, no row of the order just
+   * left, and no count line, because a first page in flight has nothing to
+   * count.
+   */
+  function expectReloading(): void {
+    const busy = screen.getByRole('status');
+    expect(busy.getAttribute('aria-busy')).toBe('true');
+    expect(busy.classList.contains('dg-render-table__loading')).toBe(true);
+
+    expect(screen.getByRole('grid', { name: GRID_NAME })).toBeDefined();
+    expect(screen.getAllByRole('columnheader')).toHaveLength(COLUMN_LABELS.length);
+    expect(dataRows()).toHaveLength(0);
+    for (const name of namesOf(OPENING_ROWS)) {
+      expect(screen.queryByText(name)).toBeNull();
+    }
+
+    expect(screen.queryByText(/components loaded\.$|^Showing /)).toBeNull();
+    expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+  }
+
+  it('keeps the order control focused, as the same element, through three changes and their reloads', async () => {
+    const stub = heldProvider({ data: OPENING_ROWS });
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    expect(renderedNames()).toEqual(namesOf(OPENING_ROWS));
+
+    // The reader's control, captured once: every assertion below is about this
+    // very element, never about whichever select happens to be on screen.
+    const select = orderControl();
+    act(() => {
+      select.focus();
+    });
+    expectStillFocused(select);
+
+    for (const [index, change] of ORDER_CHANGES.entries()) {
+      await user.selectOptions(select, change.sort);
+
+      // A re-query for the chosen order, from the first page.
+      expect(stub.queries).toHaveLength(index + 2);
+      expect(stub.queries.at(-1)).toEqual({
+        source: 'renders',
+        sort: change.sort,
+        limit: DATA_QUERY_DEFAULT_LIMIT,
+      });
+
+      // While it is in flight, the reader is still on the control they used,
+      // and it names the order that was requested.
+      expect(orderControl()).toBe(select);
+      expectStillFocused(select);
+      expect(select.value).toBe(change.sort);
+      expectReloading();
+
+      stub.settle(change.sort, { data: change.rows });
+
+      // The rows follow the answer, and the control is still the one in hand.
+      await waitFor(() => {
+        expect(renderedNames()).toEqual(namesOf(change.rows));
+      });
+      expect(orderControl()).toBe(select);
+      expectStillFocused(select);
+      expect(select.value).toBe(change.sort);
+      expect(screen.queryByRole('status')).toBeNull();
+      expect(
+        screen.getByText(`${formatCount(change.rows.length)} components loaded.`),
+      ).toBeDefined();
+    }
+
+    // Each change was one report to the host, in the order it was made.
+    expect(spies.onFilterChange.mock.calls).toEqual(
+      ORDER_CHANGES.map((change) => [NODE_ID, { sort: change.sort }]),
+    );
+  });
+
+  it('keeps a sortable header focused, as the same element, while its order reloads', async () => {
+    const stub = heldProvider({ data: OPENING_ROWS });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const header = screen.getByRole('button', { name: TOTAL_SORT_NAME });
+    await user.click(header);
+
+    expect(stub.queries.map((query) => query.sort)).toEqual([
+      MOST_RENDERS_FIRST,
+      LONGEST_TOTAL_FIRST,
+    ]);
+
+    // The header the reader activated is still the focused element, and the
+    // grid reports the order that was requested while its rows are on the way.
+    expect(screen.getByRole('button', { name: TOTAL_SORT_NAME })).toBe(header);
+    expectStillFocused(header);
+    expectReloading();
+    expect(ariaSortOf(TOTAL_SORT_NAME)).toBe('descending');
+    expect(ariaSortOf(RENDERS_SORT_NAME)).toBe('none');
+
+    stub.settle(LONGEST_TOTAL_FIRST, { data: LONGEST_TOTAL_ROWS });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(namesOf(LONGEST_TOTAL_ROWS));
+    });
+    expect(screen.getByRole('button', { name: TOTAL_SORT_NAME })).toBe(header);
+    expectStillFocused(header);
+    expect(orderControl().value).toBe(LONGEST_TOTAL_FIRST);
+  });
+
+  it('keeps the controls, and focus, when the re-ordered first page fails, and retries that order', async () => {
+    const stub = heldProvider({ data: OPENING_ROWS });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const select = orderControl();
+    await user.selectOptions(select, LONGEST_TOTAL_FIRST);
+    stub.fail(
+      LONGEST_TOTAL_FIRST,
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+    );
+
+    // The failure of the first page, with the query that failed, drawn beneath
+    // the header — and no row of either order behind it.
+    const alert = await screen.findByRole('alert');
+    expect(alert.classList.contains('dg-render-table__error')).toBe(true);
+    expect(within(alert).getByText(/could not be loaded/i)).toBeDefined();
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'renders',
+      sort: LONGEST_TOTAL_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+    });
+    expect(screen.getByRole('grid', { name: GRID_NAME })).toBeDefined();
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.queryByRole('button', { name: /^Load/ })).toBeNull();
+
+    // The reader is still on the control they used, so another order is one
+    // keystroke away rather than a search for the control.
+    expect(orderControl()).toBe(select);
+    expectStillFocused(select);
+
+    // And the retry re-requests the order that failed.
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    expect(stub.queries.map((query) => query.sort)).toEqual([
+      MOST_RENDERS_FIRST,
+      LONGEST_TOTAL_FIRST,
+      LONGEST_TOTAL_FIRST,
+    ]);
+    expect(stub.queries.at(-1)).toEqual(stub.queries.at(-2));
+
+    stub.settle(LONGEST_TOTAL_FIRST, { data: LONGEST_TOTAL_ROWS });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(namesOf(LONGEST_TOTAL_ROWS));
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(orderControl()).toBe(select);
+  });
+
+  it('keeps the controls, and focus, when the re-ordered result comes back empty', async () => {
+    const stub = heldProvider({ data: OPENING_ROWS });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const select = orderControl();
+    await user.selectOptions(select, EARLIEST_FIRST);
+    stub.settle(EARLIEST_FIRST, { data: [], total: 0 });
+
+    // The node's own empty sentence, in its own box, beneath the header — the
+    // same empty capture the block draws before any order is chosen: its title,
+    // its decorative glyph, and the polite status, never the busy one.
+    const message = await screen.findByText(EMPTY_MESSAGE);
+    const box = message.closest('.dg-render-table__empty');
+    expect(box).not.toBeNull();
+    expect(box?.querySelector('.dg-empty-state__title')?.textContent).toBe(NOTHING_CAPTURED_TITLE);
+    expect(box?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+    expect(screen.getByRole('grid', { name: GRID_NAME })).toBeDefined();
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.getByRole('status')).toBe(box);
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
+    expect(screen.queryByRole('alert')).toBeNull();
+    expect(screen.queryByText(/components loaded\.$|^Showing /)).toBeNull();
+
+    expect(orderControl()).toBe(select);
+    expectStillFocused(select);
+    expect(select.value).toBe(EARLIEST_FIRST);
+  });
+
+  it('keeps the controls, and offers the next page, when the re-ordered page is empty but names one', async () => {
+    const stub = heldProvider({ data: OPENING_ROWS });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    const select = orderControl();
+    await user.selectOptions(select, EARLIEST_FIRST);
+    stub.settle(EARLIEST_FIRST, { data: [], total: 42, nextOffset: DATA_QUERY_DEFAULT_LIMIT });
+
+    // The page is described as a page, and the paging line is exactly the one
+    // an empty page that names a next page has before any order is chosen.
+    const message = await screen.findByText(
+      'This page of render statistics held no components. More of the result remains to be loaded.',
+    );
+    expect(message.closest('.dg-render-table__empty')).not.toBeNull();
+    expect(screen.queryAllByText(EMPTY_MESSAGE)).toHaveLength(0);
+    expect(
+      screen.getByText(`Showing ${formatCount(0)} of ${formatCount(42)} components.`),
+    ).toBeDefined();
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBeDefined();
+
+    expect(orderControl()).toBe(select);
+    expectStillFocused(select);
   });
 });
 
@@ -1860,7 +2801,7 @@ describe('RenderTable page size', () => {
     );
 
     await waitFor(() => {
-      expect(screen.queryByRole('status')).toBeNull();
+      expect(screen.queryByRole('status', { busy: true })).toBeNull();
     });
 
     expect(soleQuery(stub).limit).toBe(sent);
@@ -1973,16 +2914,16 @@ describe('RenderTable empty results', () => {
       message: 'This view requests a count without rows, and no total was reported for its query.',
     },
     {
-      description: 'keeps the empty-capture sentence for a result counted as empty',
+      description: 'shows total 0 on page 1 as empty capture',
       total: 0,
-      title: undefined,
+      title: NOTHING_CAPTURED_TITLE,
       message: EMPTY_MESSAGE,
     },
     {
-      description: 'keeps the empty-capture sentence for a result counted as empty, at any offset',
+      description: 'shows total 0 on page 2 as empty capture',
       offset: 200,
       total: 0,
-      title: undefined,
+      title: NOTHING_CAPTURED_TITLE,
       message: EMPTY_MESSAGE,
     },
     {
@@ -2046,8 +2987,16 @@ describe('RenderTable empty results', () => {
     expect(box).not.toBeNull();
     expect(box?.querySelector('.dg-empty-state__title')?.textContent ?? undefined).toBe(title);
 
-    // The empty-capture sentence appears only for the cases that are one.
+    // The empty-capture sentence appears only for the cases that are one, and
+    // only that case carries the view's decorative glyph.
     expect(screen.queryAllByText(EMPTY_MESSAGE)).toHaveLength(message === EMPTY_MESSAGE ? 1 : 0);
+    expect(box?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden') ?? null).toBe(
+      message === EMPTY_MESSAGE ? 'true' : null,
+    );
+
+    // Every settled empty state is the polite status, never the busy one.
+    expect(screen.getByRole('status')).toBe(box);
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
 
     // An answer, not a failure or a table, with nothing further to load: one
     // request, carrying the authored page exactly.
@@ -2233,7 +3182,7 @@ describe('RenderTable page sequence', () => {
     // While it is in flight, the loaded rows stay where the reader is reading,
     // under their total, with a busy control rather than the block's silhouette.
     expect(renderedNames()).toEqual([LIST_COMPONENT, WIDGET_COMPONENT]);
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(
       screen.getByText(`Showing ${formatCount(2)} of ${formatCount(4)} components.`),
     ).toBeDefined();
@@ -2409,11 +3358,12 @@ describe('RenderTable page sequence', () => {
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
     // The failure is reported beneath the rows, with the query that failed —
-    // at the reported offset — and the rows already loaded are untouched.
+    // at the reported offset — and the rows already loaded are untouched. The
+    // page scope of the shared contract says so in its title and lead, and the
+    // provider's own cause follows the lead.
     const alert = await screen.findByRole('alert');
-    expect(
-      within(alert).getByText(/next page of render statistics could not be loaded/i),
-    ).toBeDefined();
+    expect(within(alert).getByText(PAGE_FAILURE_TITLE)).toBeDefined();
+    expect(alert.textContent).toContain(`${PAGE_FAILURE_LEAD} ${PROVIDER_FAILURE_MESSAGE}`);
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
     const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
     expect(JSON.parse(shown.textContent ?? '')).toEqual({
@@ -2458,7 +3408,11 @@ describe('RenderTable page sequence', () => {
       within(cellFor(rowFor(WIDGET_COMPONENT), 'Renders')).getByText(formatCount(40));
     expect(figure().classList.contains('dg-is-outlier')).toBe(false);
 
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
     expect(detailRows()).toHaveLength(1);
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
@@ -2469,11 +3423,11 @@ describe('RenderTable page sequence', () => {
     // Five loaded rows with a median of two: the loud one now stands out, and
     // the row the reader opened is still open.
     expect(figure().classList.contains('dg-is-outlier')).toBe(true);
-    expect(cellFor(rowFor(WIDGET_COMPONENT), 'Renders').textContent ?? '').toMatch(
+    expect(openedDescriptions(cellFor(rowFor(WIDGET_COMPONENT), 'Renders')).join(' ')).toMatch(
       /median of the loaded rows/i,
     );
-    expect(rowFor(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBe('true');
-    expect(detailRows()).toHaveLength(1);
+    expectControlsDetail(toggleOf(WIDGET_COMPONENT), onlyDetailRow());
+    expect(rowFor(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBeNull();
   });
 
   it('offers the next page after a resolved page that held no rows but named one', async () => {
@@ -2558,7 +3512,11 @@ describe('RenderTable page sequence', () => {
     await waitFor(() => {
       expect(dataRows()).toHaveLength(4);
     });
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
     expect(detailRows()).toHaveLength(1);
 
     view.rerender(
@@ -2590,7 +3548,185 @@ describe('RenderTable page sequence', () => {
   });
 });
 
-describe('RenderTable keyboard descriptions', () => {
+describe('RenderTable accessible names', () => {
+  /** Two individual renders of one component, 320 ms apart. */
+  const NAMED_OCCURRENCES: readonly RenderOccurrence[] = [
+    makeOccurrence({
+      eventId: 'event-example-0031',
+      spanId: spanIdFor(31),
+      startTime: BASE_START_MS,
+      durationMs: 12,
+      trigger: 'props',
+    }),
+    makeOccurrence({
+      eventId: 'event-example-0032',
+      spanId: spanIdFor(32),
+      startTime: BASE_START_MS + 320,
+      durationMs: 24,
+      trigger: 'unchanged',
+    }),
+  ];
+
+  /** A row whose per-render list holds both of them. */
+  const LISTED_ROW = makeRenderStat({
+    renderCount: 2,
+    totalDurationMs: 36,
+    averageDurationMs: 18,
+    maxDurationMs: 24,
+    triggers: makeTriggers({ props: 1, unchanged: 1 }),
+    phaseCounts: makePhases({ mount: 1, update: 1 }),
+    occurrences: NAMED_OCCURRENCES,
+    occurrencesTruncated: false,
+  });
+
+  it('names each disclosure toggle after the component of its own row', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // Each toggle is named from its row's data, so no two rows' toggles are
+    // announced alike and none carries the bare generic stem.
+    for (const component of PROVIDER_ORDER_NAMES) {
+      const toggle = toggleOf(component);
+
+      expect(toggle.getAttribute('aria-label')).toBe(expandNameOf(component));
+      expect(within(rowFor(component)).getByRole('button', { name: expandNameOf(component) })).toBe(
+        toggle,
+      );
+    }
+    expect(
+      screen.queryAllByRole('button', { name: /^(Show|Hide) individual renders$/ }),
+    ).toHaveLength(0);
+
+    // Opening one row renames its toggle, and only its toggle.
+    await user.click(toggleOf(WIDGET_COMPONENT));
+
+    expect(toggleOf(WIDGET_COMPONENT).getAttribute('aria-label')).toBe(
+      collapseNameOf(WIDGET_COMPONENT),
+    );
+    expect(toggleOf(LIST_COMPONENT).getAttribute('aria-label')).toBe(expandNameOf(LIST_COMPONENT));
+  });
+
+  it('names each individual render by its component and by the offset it shows', async () => {
+    const stub = resolvingProvider([LISTED_ROW]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(toggleOf(WIDGET_COMPONENT));
+
+    const detail = onlyDetailRow();
+    const buttons = within(detail).getAllByRole('button', {
+      name: selectOccurrencePatternOf(WIDGET_COMPONENT),
+    });
+
+    expect(buttons).toHaveLength(NAMED_OCCURRENCES.length);
+
+    for (const [index, occurrence] of NAMED_OCCURRENCES.entries()) {
+      const offset = formatOffset(occurrence.startTime, LISTED_ROW.firstStartTime);
+      const button = buttons[index];
+
+      if (button === undefined) {
+        throw new Error(`no select control was drawn for render ${String(index + 1)}`);
+      }
+
+      // The name contains exactly the text the control shows (label in name),
+      // and the component the render belongs to.
+      expect(button.textContent).toBe(offset);
+      expect(button.getAttribute('aria-label')).toBe(
+        selectOccurrenceNameOf(WIDGET_COMPONENT, offset),
+      );
+      expect(button.getAttribute('aria-label') ?? '').toContain(button.textContent);
+    }
+  });
+
+  it('falls back to the generic names for a row whose component name is blank', async () => {
+    const blankName = '   ';
+    const blank = makeRenderStat({ ...LISTED_ROW, id: 'render-stat-blank', component: blankName });
+    const stub = resolvingProvider([blank]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // No name ends in a dangling "of": the stem stands alone.
+    expect(toggleOf(blankName).getAttribute('aria-label')).toBe('Show individual renders');
+
+    await user.click(toggleOf(blankName));
+
+    expect(toggleOf(blankName).getAttribute('aria-label')).toBe('Hide individual renders');
+
+    const [first] = NAMED_OCCURRENCES;
+    if (first === undefined) {
+      throw new Error('the fixture lists no render');
+    }
+    const offset = formatOffset(first.startTime, blank.firstStartTime);
+
+    expect(
+      within(onlyDetailRow()).getAllByRole('button', { name: `Select render at ${offset}` }),
+    ).toHaveLength(1);
+  });
+
+  it('gives the order control a name of its own, and announces the count politely as pages load', async () => {
+    const stub = pagingProvider([
+      { data: [WIDGET_ROW], total: 2, nextOffset: 1 },
+      { data: [LIST_ROW], total: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    // The toolbar's control says what it orders; the bare word two other
+    // tables of a panel could share names nothing here.
+    expect(orderControl().value).toBe(MOST_RENDERS_FIRST);
+    expect(screen.queryByRole('combobox', { name: 'Order' })).toBeNull();
+
+    // The count is a polite live region, read whole, and it is the same
+    // element before and after a page is appended — so the change itself is
+    // what an assistive technology announces.
+    const count = screen.getByText(`Showing ${formatCount(1)} of ${formatCount(2)} components.`);
+    expect(count.getAttribute('aria-live')).toBe('polite');
+    expect(count.getAttribute('aria-atomic')).toBe('true');
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await waitFor(() => {
+      expect(count.textContent).toBe(`Showing ${formatCount(2)} of ${formatCount(2)} components.`);
+    });
+    expect(count.isConnected).toBe(true);
+  });
+
+  it('announces the count of an empty page that still names a next one', async () => {
+    const stub = resolvingProvider([], { total: 2, nextOffset: 2 });
+
+    renderComponent(
+      makeNode({ query: { source: 'renders', sort: MOST_RENDERS_FIRST, limit: 2 } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    const count = await screen.findByText(
+      `Showing ${formatCount(0)} of ${formatCount(2)} components.`,
+    );
+    expect(count.getAttribute('aria-live')).toBe('polite');
+    expect(count.getAttribute('aria-atomic')).toBe('true');
+  });
+});
+
+describe('RenderTable keyboard model', () => {
+  /**
+   * How long a case waits for a hovered description to be shown: comfortably
+   * past `Tooltip`'s hover dwell, so a busy host does not turn the dwell into a
+   * flake.
+   */
+  const HOVER_OPEN_WAIT_MS = 2_000;
+
   /** The five columns whose header carries a definition, in display order. */
   const DESCRIBED_COLUMNS: readonly ColumnLabel[] = [
     'Triggers',
@@ -2601,14 +3737,82 @@ describe('RenderTable keyboard descriptions', () => {
   ];
 
   /**
-   * The tooltip trigger inside an element: the one descendant carrying an
-   * `aria-describedby`, which `Tooltip` merges onto the trigger it clones.
+   * Everything a grid descendant can be focused as, whatever its Tab index —
+   * the same selector `../primitives/DataTable` walks with its arrow keys.
+   */
+  const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
+
+  /** The line the individual render below was declared at, distinct from the row's own. */
+  const OCCURRENCE_LINE = SOURCE_LINE + 3;
+
+  /** Where the individual render below was declared. */
+  const OCCURRENCE_SOURCE: SourceLocation = { ...WIDGET_SOURCE, line: OCCURRENCE_LINE };
+
+  /** The accessible name of that render's compact source chip. */
+  const OCCURRENCE_CHIP_NAME = `Open ${SOURCE_FILE}:${String(OCCURRENCE_LINE)}:${String(SOURCE_COLUMN)}`;
+
+  /**
+   * A loud component carrying every kind of control this view renders: a
+   * source chip beside its name, a count far above the median (so its figure
+   * is marked and explained), and one individual render with its own trigger
+   * description and source chip.
+   */
+  const LOUD_WIDGET = makeRenderStat({
+    renderCount: 40,
+    totalDurationMs: 1_600,
+    source: WIDGET_SOURCE,
+    occurrences: [
+      makeOccurrence({
+        eventId: 'event-example-0021',
+        spanId: spanIdFor(21),
+        startTime: BASE_START_MS + 96,
+        durationMs: 8,
+        trigger: 'context',
+        source: OCCURRENCE_SOURCE,
+      }),
+    ],
+    occurrencesTruncated: true,
+  });
+
+  /** A second loud component, so a case can move between two marked rows. */
+  const LOUD_LIST = makeRenderStat({
+    component: LIST_COMPONENT,
+    renderCount: 50,
+    totalDurationMs: 2_000,
+  });
+
+  /** The component of the first quiet row, which follows the two loud ones. */
+  const FIRST_QUIET_COMPONENT = 'ExampleCard';
+
+  /** Three quiet components: the median of two the loud rows stand out from. */
+  const QUIET_ROWS: readonly RenderStat[] = [
+    FIRST_QUIET_COMPONENT,
+    'ExamplePanel',
+    'ExampleForm',
+  ].map((component) =>
+    makeRenderStat({
+      component,
+      renderCount: 2,
+      totalDurationMs: 24,
+      averageDurationMs: 12,
+      maxDurationMs: 16,
+      triggers: makeTriggers({ props: 1, unchanged: 1 }),
+      phaseCounts: makePhases({ mount: 1, update: 1 }),
+    }),
+  );
+
+  /** The page the keyboard cases draw, in provider order. */
+  const KEYBOARD_ROWS: readonly RenderStat[] = [LOUD_WIDGET, LOUD_LIST, ...QUIET_ROWS];
+
+  /**
+   * The tooltip trigger inside an element: the one element `Tooltip` wraps in
+   * its trigger slot, which exists whether the bubble is open or not.
    *
    * @param container Where to look.
    * @returns The trigger.
    */
   function triggerIn(container: HTMLElement): HTMLElement {
-    const triggers = [...container.querySelectorAll<HTMLElement>('[aria-describedby]')];
+    const triggers = [...container.querySelectorAll<HTMLElement>('.dg-tooltip__trigger > *')];
 
     expect(triggers).toHaveLength(1);
 
@@ -2622,31 +3826,238 @@ describe('RenderTable keyboard descriptions', () => {
   }
 
   /**
-   * The bubble a trigger is described by, resolved through its
+   * The one bubble a trigger is described by, resolved through its
    * `aria-describedby` exactly as an assistive technology resolves it.
+   * `Tooltip` keeps that bubble mounted whether or not it is shown, so it
+   * resolves for a closed trigger as well as for an open one.
    *
    * @param trigger The trigger.
    * @returns The bubble.
    */
   function bubbleOf(trigger: HTMLElement): HTMLElement {
-    const id = trigger.getAttribute('aria-describedby') ?? '';
-    const bubble = document.getElementById(id);
+    const bubbles = describingBubbles(trigger);
+    const [bubble] = bubbles;
 
-    if (bubble === null) {
-      throw new Error(`aria-describedby "${id}" resolves to no element`);
+    if (bubble === undefined || bubbles.length !== 1) {
+      throw new Error(`expected one describing bubble, found ${String(bubbles.length)}`);
     }
-
-    expect(bubble.getAttribute('role')).toBe('tooltip');
 
     return bubble;
   }
 
-  /** Whether a bubble is being shown, by the class `Tooltip` couples to that state. */
-  function isOpen(bubble: HTMLElement): boolean {
-    return bubble.classList.contains('dg-is-open');
+  /**
+   * Whether a trigger's description is being shown: its one bubble — mounted
+   * either way — is in the shown state {@link isShownBubble} reads. A closed
+   * trigger is still described by its bubble; none is shown.
+   *
+   * @param trigger The trigger.
+   * @returns `true` while the bubble is open.
+   */
+  function isOpen(trigger: HTMLElement): boolean {
+    return isShownBubble(bubbleOf(trigger));
   }
 
-  it('opens every header definition when Tab reaches it, and nests none in a sort button', async () => {
+  /**
+   * Every focusable element inside a container, in document order.
+   *
+   * @param container Where to look.
+   * @returns The elements matching {@link FOCUSABLE_SELECTOR}.
+   */
+  function focusablesIn(container: HTMLElement): HTMLElement[] {
+    return [...container.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)];
+  }
+
+  /**
+   * Whether the Tab key can land on an element: not disabled, and either
+   * natively focusable with no `tabindex` or carrying a non-negative one. Read
+   * off the attribute, which is what the component writes.
+   *
+   * @param element A focusable element.
+   * @returns `true` when the element is in the Tab order.
+   */
+  function isTabStop(element: HTMLElement): boolean {
+    if (element.hasAttribute('disabled')) {
+      return false;
+    }
+
+    const tabIndex = element.getAttribute('tabindex');
+
+    return tabIndex === null || Number.parseInt(tabIndex, 10) >= 0;
+  }
+
+  /**
+   * The grid's Tab stops, in document order.
+   *
+   * @param grid The grid.
+   * @returns Every element inside it the Tab key can land on.
+   */
+  function tabStopsIn(grid: HTMLElement): HTMLElement[] {
+    return focusablesIn(grid).filter(isTabStop);
+  }
+
+  /**
+   * The count figure of one row, under the `Renders` column.
+   *
+   * @param component The row's component name.
+   * @param count The count the row reports.
+   * @returns The figure element.
+   */
+  function figureOf(component: string, count: number): HTMLElement {
+    return within(cellFor(rowFor(component), 'Renders')).getByText(formatCount(count));
+  }
+
+  /**
+   * The trigger chip of the one individual render an open detail row lists.
+   *
+   * @param detail The open detail row.
+   * @returns That chip.
+   */
+  function occurrenceTriggerChip(detail: HTMLElement): HTMLElement {
+    const chip = detail.querySelector<HTMLElement>('[data-trigger]');
+
+    if (chip === null) {
+      throw new Error('the open detail row lists no trigger chip');
+    }
+
+    return chip;
+  }
+
+  it('keeps the grid one Tab stop: Tab enters on the active row and the next Tab leaves it', async () => {
+    const stub = resolvingProvider(KEYBOARD_ROWS, {
+      total: KEYBOARD_ROWS.length + 4,
+      nextOffset: KEYBOARD_ROWS.length,
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+    const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+
+    // Every row's toggle, the source chip, both marked figures, the two sort
+    // buttons and the five header definitions are all focusable — and the
+    // only element in the Tab order is the active row, the first one.
+    const rowsInGrid = dataRows();
+    const controls = focusablesIn(grid).filter((element) => !rowsInGrid.includes(element));
+    expect(controls.length).toBeGreaterThanOrEqual(
+      KEYBOARD_ROWS.length + 1 + 2 + 2 + DESCRIBED_COLUMNS.length,
+    );
+    for (const control of controls) {
+      expect(control.getAttribute('tabindex')).toBe('-1');
+    }
+    expect(tabStopsIn(grid)).toEqual([rowFor(WIDGET_COMPONENT)]);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+
+    // Tab from the control before the grid lands on the active row, and the
+    // next Tab leaves the grid for the control after it.
+    act(() => {
+      orderControl().focus();
+    });
+    await user.tab();
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+    await user.tab();
+    expect(document.activeElement).toBe(loadMore);
+
+    // Shift+Tab walks back the same way: onto the row, then out before it.
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(orderControl());
+
+    // The stop roves: after ArrowDown the next row is the one Tab enters on.
+    act(() => {
+      rowFor(WIDGET_COMPONENT).focus();
+    });
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowFor(LIST_COMPONENT));
+    expect(tabStopsIn(grid)).toEqual([rowFor(LIST_COMPONENT)]);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+
+    // An open detail row adds its select button, its trigger chip and its
+    // source chip — each focusable, none a Tab stop.
+    await user.click(toggleOf(WIDGET_COMPONENT));
+    const detailControls = focusablesIn(onlyDetailRow());
+    expect(detailControls).toHaveLength(3);
+    for (const control of detailControls) {
+      expect(control.getAttribute('tabindex')).toBe('-1');
+    }
+    expect(tabStopsIn(grid)).toEqual([rowFor(WIDGET_COMPONENT)]);
+
+    act(() => {
+      loadMore.focus();
+    });
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+  });
+
+  it('opens a collapsed row with ArrowRight, then walks its controls and its open detail', async () => {
+    const stub = resolvingProvider(KEYBOARD_ROWS);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid', { name: GRID_NAME });
+
+    act(() => {
+      rowFor(WIDGET_COMPONENT).focus();
+    });
+
+    // The first ArrowRight opens the collapsed row, reports it to the host
+    // exactly as the toggle would, and leaves focus on the row.
+    await user.keyboard('{ArrowRight}');
+    expect(spies.onExpand).toHaveBeenCalledTimes(1);
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, LOUD_WIDGET.id, true);
+    const detail = onlyDetailRow();
+    expectControlsDetail(toggleOf(WIDGET_COMPONENT), detail);
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+
+    // Each further ArrowRight moves to the next control, in document order,
+    // across the row and on into its open detail.
+    const row = rowFor(WIDGET_COMPONENT);
+    const figure = figureOf(WIDGET_COMPONENT, 40);
+    const chip = occurrenceTriggerChip(detail);
+    const expected: readonly HTMLElement[] = [
+      toggleOf(WIDGET_COMPONENT),
+      within(row).getByRole('button', { name: nameChipName(WIDGET_COMPONENT) }),
+      figure,
+      within(detail).getByRole('button', { name: selectOccurrencePatternOf(WIDGET_COMPONENT) }),
+      chip,
+      within(detail).getByRole('button', { name: OCCURRENCE_CHIP_NAME }),
+    ];
+
+    for (const control of expected) {
+      await user.keyboard('{ArrowRight}');
+      expect(document.activeElement).toBe(control);
+
+      // A description opens the moment an arrow key lands on its trigger.
+      if (control === figure || control === chip) {
+        expect(isOpen(control)).toBe(true);
+      }
+    }
+
+    const [first] = expected;
+    const last = expected.at(-1);
+
+    // The last control holds; Home and End jump to either end of the scope;
+    // ArrowLeft from the first control goes back to the row.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(last);
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(first);
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(last);
+    await user.keyboard('{Home}{ArrowLeft}');
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+
+    // ArrowLeft on the open row closes it, reported as the state it produced.
+    await user.keyboard('{ArrowLeft}');
+    expect(detailRows()).toHaveLength(0);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, LOUD_WIDGET.id, false);
+    expect(toggleOf(WIDGET_COMPONENT).getAttribute('aria-expanded')).toBe('false');
+  });
+
+  it('reaches every header definition from the first row, and nests none in a sort button', async () => {
     const stub = resolvingProvider(PROVIDER_ORDER);
     const user = userEvent.setup();
 
@@ -2662,136 +4073,162 @@ describe('RenderTable keyboard descriptions', () => {
         expect(button.querySelector('[aria-describedby]')).toBeNull();
       }
     }
-    expect(screen.getByRole('button', { name: RENDERS_SORT_NAME })).toBeDefined();
-    expect(screen.getByRole('button', { name: TOTAL_SORT_NAME })).toBeDefined();
+    const rendersSort = screen.getByRole('button', { name: RENDERS_SORT_NAME });
+    const totalSort = screen.getByRole('button', { name: TOTAL_SORT_NAME });
 
     const triggers = DESCRIBED_COLUMNS.map((label) => {
       const trigger = triggerIn(headerFor(label));
 
-      // The header text itself is the trigger, and a tab stop of its own.
+      // The header text itself is the trigger: focusable, out of the Tab
+      // order while the grid has rows, like the grid's own sort buttons.
       expect(trigger.textContent).toBe(label);
-      expect(trigger.tabIndex).toBe(0);
+      expect(trigger.getAttribute('tabindex')).toBe('-1');
       expect(trigger.closest('button')).toBeNull();
-      expect(isOpen(bubbleOf(trigger))).toBe(false);
+      expect(isOpen(trigger)).toBe(false);
 
       return trigger;
     });
+    expect(rendersSort.getAttribute('tabindex')).toBe('-1');
+    expect(totalSort.getAttribute('tabindex')).toBe('-1');
 
-    // From the last sort control, Tab walks the five definitions in display
-    // order, and each one opens as focus arrives and closes as it leaves.
+    // ArrowUp from the first row reaches the header's first control; from
+    // there ArrowRight walks the sort buttons and then the five definitions in
+    // display order, each opening as focus arrives and closing as it leaves.
+    // What each open bubble says is kept, because that is what the reader heard.
+    const [firstRow] = dataRows();
+    if (firstRow === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
     act(() => {
-      screen.getByRole('button', { name: TOTAL_SORT_NAME }).focus();
+      firstRow.focus();
     });
 
-    let previous: HTMLElement | undefined;
+    await user.keyboard('{ArrowUp}');
+    expect(document.activeElement).toBe(rendersSort);
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(totalSort);
 
-    for (const trigger of triggers) {
-      await user.tab();
+    let previous: HTMLElement | undefined;
+    const heard = new Map<ColumnLabel, string>();
+
+    for (const [index, trigger] of triggers.entries()) {
+      await user.keyboard('{ArrowRight}');
 
       expect(document.activeElement).toBe(trigger);
-      expect(isOpen(bubbleOf(trigger))).toBe(true);
+      expect(isOpen(trigger)).toBe(true);
+
+      const label = DESCRIBED_COLUMNS[index];
+
+      if (label !== undefined) {
+        heard.set(label, bubbleOf(trigger).textContent ?? '');
+      }
 
       if (previous !== undefined) {
-        expect(isOpen(bubbleOf(previous))).toBe(false);
+        expect(isOpen(previous)).toBe(false);
       }
 
       previous = trigger;
     }
 
+    // ArrowDown returns to the row the reader came from.
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(firstRow);
+
     // The two definitions that must never be read as one stay distinct.
-    expect(bubbleOf(triggerIn(headerFor(STABLE_INPUTS_COLUMN))).textContent).toMatch(
-      /evaluated and none of them had changed/i,
-    );
-    expect(bubbleOf(triggerIn(headerFor(UNCLASSIFIED_COLUMN))).textContent).toMatch(
-      /could not be evaluated/i,
-    );
+    expect(heard.get(STABLE_INPUTS_COLUMN)).toMatch(/evaluated and none of them had changed/i);
+    expect(heard.get(UNCLASSIFIED_COLUMN)).toMatch(/could not be evaluated/i);
   });
 
-  it('makes an in-row description a tab stop only in the row the reader is in', async () => {
-    // Two components far above a median of two, so both counts are marked and
-    // both carry an explanation.
-    const quiet = ['ExampleCard', 'ExamplePanel', 'ExampleForm'].map((component) =>
-      makeRenderStat({
-        component,
-        renderCount: 2,
-        totalDurationMs: 24,
-        averageDurationMs: 12,
-        maxDurationMs: 16,
-        triggers: makeTriggers({ props: 1, unchanged: 1 }),
-        phaseCounts: makePhases({ mount: 1, update: 1 }),
-      }),
-    );
-    const loudWidget = makeRenderStat({ renderCount: 40, totalDurationMs: 1_600 });
-    const loudList = makeRenderStat({
-      component: LIST_COMPONENT,
-      renderCount: 50,
-      totalDurationMs: 2_000,
-    });
-    const stub = resolvingProvider([loudWidget, loudList, ...quiet]);
+  it('moves the roving stop to the row of a control a pointer focuses, and answers the keys there', async () => {
+    const stub = resolvingProvider(KEYBOARD_ROWS);
     const user = userEvent.setup();
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const grid = await screen.findByRole('grid', { name: GRID_NAME });
 
-    const figureOf = (component: string, count: number): HTMLElement =>
-      within(cellFor(rowFor(component), 'Renders')).getByText(formatCount(count));
-    const tabbableFigures = (): Element[] => [
-      ...grid.querySelectorAll('.dg-render-table__count-cell[tabindex="0"]'),
-    ];
+    // A marked figure is described and focusable, never a Tab stop; an
+    // unmarked one takes no focus at all.
+    const figure = figureOf(LIST_COMPONENT, 50);
+    expect(figure.getAttribute('tabindex')).toBe('-1');
+    expect(bubbleOf(figure).textContent ?? '').toMatch(/median of the loaded rows/i);
+    expect(figureOf(FIRST_QUIET_COMPONENT, 2).getAttribute('tabindex')).toBeNull();
 
-    // Before focus reaches any row, no figure is in the Tab sequence — yet each
-    // is still described, and the description still resolves.
+    // A linked component's name is the chip that opens its declaration, on the
+    // same terms: focusable but never a Tab stop, and described by its own
+    // tooltip, which leads with the name.
+    const name = nameOf(rowFor(WIDGET_COMPONENT));
+    expect(name.getAttribute('tabindex')).toBe('-1');
+    expect(bubbleOf(name).textContent ?? '').toContain(WIDGET_COMPONENT);
+
+    // A click focuses the figure, opens its explanation and moves the grid's
+    // one Tab stop to the figure's row.
+    await user.click(figure);
+    expect(document.activeElement).toBe(figure);
+    expect(isOpen(figure)).toBe(true);
+    expect(tabStopsIn(grid)).toEqual([rowFor(LIST_COMPONENT)]);
+
+    // The first Escape closes the description and keeps focus; the second
+    // returns to the row.
+    await user.keyboard('{Escape}');
+    expect(isOpen(figure)).toBe(false);
+    expect(document.activeElement).toBe(figure);
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(rowFor(LIST_COMPONENT));
+
+    // A vertical key on a control moves to the adjacent row, counted from the
+    // control's own row.
+    await user.click(figure);
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowFor(FIRST_QUIET_COMPONENT));
+    expect(tabStopsIn(grid)).toEqual([rowFor(FIRST_QUIET_COMPONENT)]);
+  });
+
+  it('shows the explanation of a marked figure while a pointer rests on it, and none at rest', async () => {
+    const stub = resolvingProvider(KEYBOARD_ROWS);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid', { name: GRID_NAME });
+
+    // At rest no description is shown anywhere in the grid: every bubble is
+    // mounted but hidden, so a role query finds none.
+    expect(within(grid).queryAllByRole('tooltip')).toHaveLength(0);
+
+    // No figure is a Tab stop — the grid is one — yet each is still described:
+    // a pointer resting on it shows the explanation its description resolves
+    // to, and leaving hides it again.
     for (const [component, count] of [
       [WIDGET_COMPONENT, 40],
       [LIST_COMPONENT, 50],
     ] as const) {
       const figure = figureOf(component, count);
-      expect(figure.getAttribute('tabindex')).toBeNull();
-      expect(bubbleOf(figure).textContent ?? '').toMatch(/median of the loaded rows/i);
+      expect(figure.getAttribute('tabindex')).toBe('-1');
+      expect(isOpen(figure)).toBe(false);
+
+      await user.hover(figure);
+      await waitFor(
+        () => {
+          expect(isOpen(figureOf(component, count))).toBe(true);
+        },
+        { timeout: HOVER_OPEN_WAIT_MS },
+      );
+      expect(bubbleOf(figureOf(component, count)).textContent ?? '').toMatch(
+        /median of the loaded rows/i,
+      );
+      expect(within(grid).getAllByRole('tooltip')).toEqual([bubbleOf(figureOf(component, count))]);
+
+      await user.unhover(figureOf(component, count));
+      expect(isOpen(figureOf(component, count))).toBe(false);
+      expect(within(grid).queryAllByRole('tooltip')).toHaveLength(0);
     }
-    expect(tabbableFigures()).toHaveLength(0);
 
-    // The reader arrives on the first loud row: its figure joins the Tab
-    // sequence, and no other row's does.
-    act(() => {
-      rowFor(WIDGET_COMPONENT).focus();
-    });
-
-    expect(figureOf(WIDGET_COMPONENT, 40).tabIndex).toBe(0);
-    expect(figureOf(LIST_COMPONENT, 50).getAttribute('tabindex')).toBeNull();
-    expect(tabbableFigures()).toEqual([figureOf(WIDGET_COMPONENT, 40)]);
-
-    // Tab from the row passes its disclosure control and lands on the figure,
-    // whose explanation opens.
-    await user.tab();
-    expect(document.activeElement).toBe(
-      within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }),
-    );
-    await user.tab();
-    expect(document.activeElement).toBe(figureOf(WIDGET_COMPONENT, 40));
-    expect(isOpen(bubbleOf(figureOf(WIDGET_COMPONENT, 40)))).toBe(true);
-
-    // Moving to the other loud row moves the stop with it.
-    act(() => {
-      rowFor(LIST_COMPONENT).focus();
-    });
-
-    expect(figureOf(LIST_COMPONENT, 50).tabIndex).toBe(0);
-    expect(figureOf(WIDGET_COMPONENT, 40).getAttribute('tabindex')).toBeNull();
-    expect(tabbableFigures()).toEqual([figureOf(LIST_COMPONENT, 50)]);
-    expect(isOpen(bubbleOf(figureOf(WIDGET_COMPONENT, 40)))).toBe(false);
-
-    // A pointer click on a figure outside the focused row puts focus on that
-    // figure's ROW, not on the figure, so the grid's arrow keys keep working
-    // from where the reader clicked.
-    await user.click(figureOf(WIDGET_COMPONENT, 40));
-    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
-    await user.keyboard('{ArrowDown}');
-    expect(document.activeElement).toBe(rowFor(LIST_COMPONENT));
+    // A pointer moves no focus: the grid's one Tab stop is still its first row.
+    expect(tabStopsIn(grid)).toEqual([rowFor(WIDGET_COMPONENT)]);
   });
 
-  it('lets Tab reach the trigger description of an individual render in an open row', async () => {
+  it('opens the trigger description of an individual render when an arrow key reaches it', async () => {
     const occurrence = makeOccurrence({
       eventId: 'event-example-0011',
       spanId: spanIdFor(11),
@@ -2815,22 +4252,280 @@ describe('RenderTable keyboard descriptions', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     await screen.findByRole('grid', { name: GRID_NAME });
-    await user.click(within(rowFor(WIDGET_COMPONENT)).getByRole('button', { name: EXPAND_NAME }));
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
 
     const chip = triggerIn(onlyDetailRow());
     expect(chip.getAttribute('data-trigger')).toBe('context');
-    expect(chip.tabIndex).toBe(0);
+    // Focusable, never a Tab stop, and described while closed: the bubble is
+    // mounted and hidden, so its description resolves though none is shown.
+    expect(chip.getAttribute('tabindex')).toBe('-1');
     expect(bubbleOf(chip).textContent).toBe(formatRenderTriggerLabel('context'));
-    expect(isOpen(bubbleOf(chip))).toBe(false);
+    expect(isOpen(chip)).toBe(false);
 
-    // Focus is on the disclosure control the reader just used; Tab moves on
-    // through the open row — its select control, then the chip.
-    await user.tab();
+    // Focus is on the disclosure control the reader just used; ArrowRight
+    // moves on through the row — first the unlinked name, whose full text
+    // opens — and then through the open row: its select control, then the
+    // chip, whose description opens as focus lands.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(nameOf(rowFor(WIDGET_COMPONENT)));
+    expect(isOpen(nameOf(rowFor(WIDGET_COMPONENT)))).toBe(true);
+    await user.keyboard('{ArrowRight}');
     expect(document.activeElement).toBe(
-      within(onlyDetailRow()).getByRole('button', { name: SELECT_OCCURRENCE_NAME }),
+      within(onlyDetailRow()).getByRole('button', {
+        name: selectOccurrencePatternOf(WIDGET_COMPONENT),
+      }),
     );
-    await user.tab();
+    await user.keyboard('{ArrowRight}');
     expect(document.activeElement).toBe(chip);
-    expect(isOpen(bubbleOf(chip))).toBe(true);
+    expect(isOpen(chip)).toBe(true);
+    expect(bubbleOf(chip).textContent).toBe(formatRenderTriggerLabel('context'));
+
+    // Escape closes the description first, then returns to the row.
+    await user.keyboard('{Escape}');
+    expect(isOpen(chip)).toBe(false);
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(rowFor(WIDGET_COMPONENT));
+  });
+});
+
+describe('RenderTable shared selection', () => {
+  /** The earlier of the two renders the cases below expand to. */
+  const FIRST_RENDER = makeOccurrence({
+    eventId: 'event-example-0021',
+    spanId: spanIdFor(21),
+    startTime: BASE_START_MS,
+    durationMs: 8,
+  });
+
+  /** The later one. */
+  const SECOND_RENDER = makeOccurrence({
+    eventId: 'event-example-0022',
+    spanId: spanIdFor(22),
+    startTime: BASE_START_MS + 32,
+    durationMs: 12,
+  });
+
+  /** A component row whose per-render list holds both. */
+  const TWO_RENDERS_ROW = makeRenderStat({
+    renderCount: 2,
+    totalDurationMs: 20,
+    averageDurationMs: 10,
+    maxDurationMs: 12,
+    triggers: makeTriggers({ props: 2 }),
+    phaseCounts: makePhases({ update: 2 }),
+    occurrences: [FIRST_RENDER, SECOND_RENDER],
+    occurrencesTruncated: false,
+  });
+
+  /** The caption of the evidence chip the host case cites the second render with. */
+  const CHIP_LABEL = 'the later render';
+
+  /**
+   * The line of each individual render in the open row, in display order, with
+   * its select control — found by the name every such control carries, which
+   * names the row's component and ends with the offset it shows.
+   *
+   * @returns One entry per render.
+   */
+  function renderLines(): { readonly line: HTMLElement; readonly control: HTMLElement }[] {
+    return within(onlyDetailRow())
+      .getAllByRole('button', { name: selectOccurrencePatternOf(WIDGET_COMPONENT) })
+      .map((control) => {
+        const line = control.closest<HTMLElement>('.dg-render-table__occurrence');
+
+        if (line === null) {
+          throw new Error('a select control sits outside any render line');
+        }
+
+        return { line, control };
+      });
+  }
+
+  /**
+   * The select control of one render line.
+   *
+   * @param index The line's position in display order.
+   * @returns That line's control.
+   */
+  function controlAt(index: number): HTMLElement {
+    const entry = renderLines()[index];
+
+    if (entry === undefined) {
+      throw new Error(`no render line at position ${String(index)}`);
+    }
+
+    return entry.control;
+  }
+
+  /**
+   * Which renders are drawn as the selected event, one flag per line, each
+   * asserted to agree with its control's `aria-pressed`.
+   *
+   * @returns One flag per render line, in display order.
+   */
+  function selectedFlags(): boolean[] {
+    return renderLines().map(({ line, control }) => {
+      const selected = line.classList.contains('dg-is-selected');
+
+      expect(control.getAttribute('aria-pressed')).toBe(String(selected));
+
+      return selected;
+    });
+  }
+
+  /**
+   * Expands the one component row and waits for its per-render list.
+   *
+   * @param user The user-event session.
+   */
+  async function expandWidgetRow(user: ReturnType<typeof userEvent.setup>): Promise<void> {
+    await screen.findByRole('grid', { name: GRID_NAME });
+    await user.click(
+      within(rowFor(WIDGET_COMPONENT)).getByRole('button', {
+        name: expandNameOf(WIDGET_COMPONENT),
+      }),
+    );
+  }
+
+  it('marks the render a reader selects, and only that one, when no host is mounted', async () => {
+    const stub = resolvingProvider([TWO_RENDERS_ROW]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await expandWidgetRow(user);
+
+    // Nothing is selected yet, and every control says so.
+    expect(selectedFlags()).toEqual([false, false]);
+
+    await user.click(controlAt(1));
+
+    // The standalone fallback keeps the view's own last selection, so the
+    // render stays marked by class and by `aria-pressed` alike.
+    expect(selectedFlags()).toEqual([false, true]);
+    expect(spies.onSelectEvent.mock.calls).toEqual([
+      [
+        {
+          eventId: SECOND_RENDER.eventId,
+          spanId: SECOND_RENDER.spanId,
+          traceId: SECOND_RENDER.traceId,
+        },
+      ],
+    ]);
+
+    // A second selection moves the one mark rather than adding another.
+    await user.click(controlAt(0));
+
+    expect(selectedFlags()).toEqual([true, false]);
+  });
+
+  it('follows the panel selection a host provides, and keeps no selection of its own', async () => {
+    const stub = resolvingProvider([TWO_RENDERS_ROW]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    /**
+     * The view, under a host whose shared selection is `selection`.
+     *
+     * @param selection The panel's current selection.
+     * @returns The element tree.
+     */
+    const tree = (selection: PanelSelection | undefined) => (
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={spies.actions}>
+            <PanelSelectionContext.Provider value={{ selection }}>
+              <RenderTable node={makeNode()} />
+            </PanelSelectionContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    // Selected by id alone, as a host surface driving the selection from its
+    // details drawer names it.
+    const { rerender } = render(tree({ eventId: SECOND_RENDER.eventId }));
+    await expandWidgetRow(user);
+
+    expect(selectedFlags()).toEqual([false, true]);
+
+    // Selected by trace and span, as a view that drew the same span under
+    // another record's id reports it: still the same render.
+    rerender(
+      tree({ eventId: 'event-example-other', traceId: TRACE_ID, spanId: FIRST_RENDER.spanId }),
+    );
+
+    expect(selectedFlags()).toEqual([true, false]);
+
+    // Under a host the view reports and the host records: activating a render
+    // raises the report, and the mark stays with what the host provides.
+    await user.click(controlAt(1));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(selectedFlags()).toEqual([true, false]);
+
+    // Another view's selection, or none, leaves no render marked.
+    rerender(tree({ eventId: 'event-example-elsewhere' }));
+    expect(selectedFlags()).toEqual([false, false]);
+
+    rerender(tree(undefined));
+    expect(selectedFlags()).toEqual([false, false]);
+  });
+
+  it('shares one selection with the summary chips when mounted by the panel host', async () => {
+    const stub = resolvingProvider([TWO_RENDERS_ROW]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    const spec: PanelSpec = {
+      version: PANEL_SPEC_VERSION,
+      id: 'panel-example-0001',
+      sessionId: PANEL_SESSION_ID,
+      panelVersion: 1,
+      title: 'Example panel',
+      summary: {
+        observed: [
+          {
+            statement: 'One component rendered twice.',
+            evidence: [{ eventId: SECOND_RENDER.eventId, label: CHIP_LABEL }],
+          },
+        ],
+        likelyCauses: [],
+      },
+      layout: [makeNode()],
+    };
+
+    render(<PanelHost spec={spec} dataProvider={stub.provider} actions={spies.actions} />);
+    await expandWidgetRow(user);
+
+    const chip = screen.getByRole('button', { name: CHIP_LABEL });
+
+    expect(chip.getAttribute('aria-pressed')).toBe('false');
+    expect(selectedFlags()).toEqual([false, false]);
+
+    // An evidence chip selects the event it cites (AAP 0.7.3), and the render
+    // that is that event is marked in the table beneath.
+    await user.click(chip);
+
+    expect(chip.getAttribute('aria-pressed')).toBe('true');
+    expect(chip.classList.contains('dg-is-selected')).toBe(true);
+    expect(selectedFlags()).toEqual([false, true]);
+
+    // A render selected in the table moves the one selection: the chip that
+    // cites another event is released.
+    await user.click(controlAt(0));
+
+    expect(selectedFlags()).toEqual([true, false]);
+    expect(chip.getAttribute('aria-pressed')).toBe('false');
+    expect(chip.classList.contains('dg-is-selected')).toBe(false);
+    expect(spies.onSelectEvent.mock.calls.map(([ref]) => ref.eventId)).toEqual([
+      SECOND_RENDER.eventId,
+      FIRST_RENDER.eventId,
+    ]);
   });
 });

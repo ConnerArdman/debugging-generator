@@ -92,6 +92,7 @@ import {
 import type { FunctionTimingPatch, FunctionTimingRequest } from './function-timing.js';
 import {
   ARGUMENTS_HAZARDS,
+  DEFAULT_REST_PARAMETER_TYPE,
   HELPER_LOCAL_IDENTIFIER,
   HELPER_TYPE_ALIAS_TEXT,
   INNER_FUNCTION_IDENTIFIER,
@@ -101,6 +102,7 @@ import {
   SPAN_HELPER_GLOBAL,
   SPAN_HELPER_TYPE_NAME,
   STRICT_MODE_DIRECTIVE,
+  buildWrapperBody,
   detectArgumentsHazard,
   isStrictModeDirective,
   needsHelperTypeAlias,
@@ -2874,8 +2876,9 @@ describe('function declarations', () => {
       'export function planCycleSegments({\n  kilnId,\n  targetConeValue = 6,\n  segments = [],\n}: PlanCycleSegmentsInput): CyclePlan {',
     );
     // The parameter list moved nowhere: the inner function takes none and reads
-    // the bindings the outer one destructured.
-    expect(innerDeclarationOf(patch)).toBe(`function ${INNER_FUNCTION_IDENTIFIER}() {`);
+    // the bindings the outer one destructured. It restates the declared return
+    // type, so the moved `return` statements keep their contextual type.
+    expect(innerDeclarationOf(patch)).toBe(`function ${INNER_FUNCTION_IDENTIFIER}(): CyclePlan {`);
     expect(patch.patchedText).not.toContain('targetConeValue = 6,\n}: PlanCycleSegmentsInput');
   });
 
@@ -2962,8 +2965,12 @@ describe('an exported route handler', () => {
     // The framework resolves the handler by its exported name, so the export
     // must survive as exactly one declaration of exactly that name.
     expect(patch.patchedText.split('export async function POST(').length - 1).toBe(1);
-    // `async` is on the inner function too, because the moved body awaits.
-    expect(innerDeclarationOf(patch)).toBe(`async function ${INNER_FUNCTION_IDENTIFIER}() {`);
+    // `async` is on the inner function too, because the moved body awaits, and
+    // so is the declared return type the moved `return` statements were typed
+    // against.
+    expect(innerDeclarationOf(patch)).toBe(
+      `async function ${INNER_FUNCTION_IDENTIFIER}(): Promise<Response> {`,
+    );
   });
 
   it('answers the same responses as the unpatched handler', async () => {
@@ -3005,7 +3012,7 @@ describe('arrow functions', () => {
     // syntax error inside it: the wrapper must stay an arrow taking a rest
     // parameter, and the emitted text may not mention `arguments` at all.
     expect(patch.patchedText).toContain(
-      `export const scoreShelfSlot = (...${REST_PARAMETER_IDENTIFIER}: unknown[]): number => {`,
+      `export const scoreShelfSlot = (...${REST_PARAMETER_IDENTIFIER}: [slot: ShelfSlot, index: number]): number => {`,
     );
     expect(patch.patchedText).not.toContain('arguments');
     // The original head — parameters, their types and the return type — moved
@@ -3056,7 +3063,7 @@ describe('arrow functions', () => {
     expect(patch.shape).toBe('arrow-function');
     expect(patch.callStyle).toBe('rest');
     expect(patch.patchedText).toContain(
-      `export const pickGlazeProfile = (...${REST_PARAMETER_IDENTIFIER}: unknown[]): GlazeProfile => {`,
+      `export const pickGlazeProfile = (...${REST_PARAMETER_IDENTIFIER}: [load: ShelfLoad]): GlazeProfile => {`,
     );
     expect(patch.patchedText).toContain(
       `const ${INNER_FUNCTION_IDENTIFIER} = (load: ShelfLoad): GlazeProfile => {`,
@@ -3189,7 +3196,7 @@ describe('class methods', () => {
     // declares the receiver type so a strict target project still compiles.
     expect(patch.receiver).toBe('this');
     expect(innerDeclarationOf(patch)).toBe(
-      `function ${INNER_FUNCTION_IDENTIFIER}(this: KilnController) {`,
+      `function ${INNER_FUNCTION_IDENTIFIER}(this: KilnController): number {`,
     );
 
     const before = evaluateModule(patch.originalText, file);
@@ -3216,7 +3223,7 @@ describe('class methods', () => {
 
     expect(patch.receiver).toBe('this');
     expect(innerDeclarationOf(patch)).toBe(
-      `async function ${INNER_FUNCTION_IDENTIFIER}(this: KilnController) {`,
+      `async function ${INNER_FUNCTION_IDENTIFIER}(this: KilnController): Promise<number> {`,
     );
 
     const before = evaluateModule(patch.originalText, file, { globals: { Promise } });
@@ -3638,7 +3645,9 @@ describe('async and promise-returning functions', () => {
     // in a promise of its own.
     const patch = patchFixture(firingLogFile, 'loadRecentFiringCycles');
 
-    expect(patch.patchedText).toContain(`function ${INNER_FUNCTION_IDENTIFIER}() {`);
+    expect(patch.patchedText).toContain(
+      `function ${INNER_FUNCTION_IDENTIFIER}(): Promise<FiringCycleEntry[]> {`,
+    );
     expect(patch.patchedText).not.toContain(`async function ${INNER_FUNCTION_IDENTIFIER}`);
 
     for (const state of helperStates()) {
@@ -3943,7 +3952,7 @@ describe('the file’s own formatting', () => {
 
     // And this is a real rewrite rather than a no-op: the wrapper is there.
     expect(patch.patchedText).toContain(
-      `export function formatSoakLabel(minutes: number): string {\n  function ${INNER_FUNCTION_IDENTIFIER}() {`,
+      `export function formatSoakLabel(minutes: number): string {\n  function ${INNER_FUNCTION_IDENTIFIER}(): string {`,
     );
   });
 
@@ -4200,6 +4209,501 @@ describe('the recorded source location', () => {
       // And a patch built from the request alone carries none.
       expect(patchFixture(file, 'findRampCeiling').actionId).toBeUndefined();
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The patched file keeps type-checking in its own project (A1-F03, A1-F06)
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The strict options a target project is expected to hold itself to, including
+ * the two that make signature changes visible: `exactOptionalPropertyTypes`
+ * (an optional tuple element without `| undefined` rejects an explicit
+ * `undefined`) and `noUncheckedIndexedAccess`.
+ */
+const TARGET_PROJECT_OPTIONS = Object.freeze({
+  strict: true,
+  exactOptionalPropertyTypes: true,
+  noUncheckedIndexedAccess: true,
+  noEmit: true,
+  lib: ['lib.es2023.d.ts'],
+  target: ts.ScriptTarget.ES2023,
+  module: ts.ModuleKind.ESNext,
+  moduleResolution: ts.ModuleResolutionKind.Bundler,
+});
+
+/**
+ * Type-checks a small multi-file project **with its imports resolved**, the way
+ * the developer's own build does — which is precisely what the transform's
+ * single-file pre-flight cannot do, and why these cases exist.
+ *
+ * @param files Project-relative paths and their contents.
+ * @returns One `path(line): TSnnnn message` string per diagnostic.
+ */
+function projectDiagnostics(files: Readonly<Record<string, string>>): string[] {
+  const project = new Project({
+    useInMemoryFileSystem: true,
+    compilerOptions: { ...TARGET_PROJECT_OPTIONS },
+  });
+
+  for (const [path, text] of Object.entries(files)) {
+    project.createSourceFile(`/project/${path}`, text, { overwrite: true });
+  }
+
+  return project.getPreEmitDiagnostics().map((diagnostic) => {
+    const messageText = diagnostic.getMessageText();
+    const message = typeof messageText === 'string' ? messageText : messageText.getMessageText();
+
+    return `${diagnostic.getSourceFile()?.getBaseName() ?? '?'}(${String(
+      diagnostic.getLineNumber() ?? 0,
+    )}): TS${String(diagnostic.getCode())} ${message}`;
+  });
+}
+
+/** A type module the targets below import their declared types from. */
+const IMPORTED_TYPES = [
+  "export type Outcome = 'placed' | 'held';",
+  'export interface Receipt {',
+  '  readonly id: number;',
+  '  readonly outcome: Outcome;',
+  '}',
+  'export type Settle = (request: { readonly id: number }, attempt: number) => { readonly outcome: Outcome };',
+  '',
+].join('\n');
+
+describe('the patched file keeps type-checking in its own project (A1-F03, A1-F06)', () => {
+  it('restates an imported declared return type on the inner function', () => {
+    // Before the fix the inner function carried no return type, so the literal
+    // `'placed'` widened to `string` and the project failed with TS2322 — while
+    // the single-file pre-flight, which cannot resolve `./types`, saw nothing.
+    const text = [
+      "import type { Receipt } from './types';",
+      '',
+      'export async function settleLater(id: number): Promise<Receipt> {',
+      '  await Promise.resolve();',
+      "  return { id, outcome: 'placed' };",
+      '}',
+      '',
+      'export function settleNow(id: number): Receipt {',
+      "  return { id, outcome: 'held' };",
+      '}',
+      '',
+    ].join('\n');
+
+    expect(projectDiagnostics({ 'src/types.ts': IMPORTED_TYPES, 'src/settle.ts': text })).toEqual(
+      [],
+    );
+
+    for (const [symbol, inner] of [
+      ['settleLater', `async function ${INNER_FUNCTION_IDENTIFIER}(): Promise<Receipt> {`],
+      ['settleNow', `function ${INNER_FUNCTION_IDENTIFIER}(): Receipt {`],
+    ] as const) {
+      const patch = expectPatch({ file: 'src/settle.ts', symbol, text });
+
+      expect(innerDeclarationOf(patch), symbol).toBe(inner);
+      expect(
+        projectDiagnostics({ 'src/types.ts': IMPORTED_TYPES, 'src/settle.ts': patch.patchedText }),
+        symbol,
+      ).toEqual([]);
+    }
+  });
+
+  it('patches a function whose declared return type lives in the same file instead of refusing it', () => {
+    // The same widening with the type declared locally was visible to the
+    // pre-flight, which then refused the patch outright: such a function could
+    // not be timed at all.
+    const text = [
+      "type Grade = 'a' | 'b';",
+      'interface Graded {',
+      '  readonly grade: Grade;',
+      '}',
+      '',
+      'export function grade(): Graded {',
+      "  return { grade: 'a' };",
+      '}',
+      '',
+    ].join('\n');
+    const patch = expectPatch({ file: 'src/grade.ts', symbol: 'grade', text });
+
+    expect(innerDeclarationOf(patch)).toBe(`function ${INNER_FUNCTION_IDENTIFIER}(): Graded {`);
+    expect(projectDiagnostics({ 'src/grade.ts': patch.patchedText })).toEqual([]);
+  });
+
+  it('keeps a never-returning function typed, where an unannotated inner function infers void', () => {
+    const text = 'export function fail(message: string): never {\n  throw new Error(message);\n}\n';
+    const patch = expectPatch({ file: 'src/fail.ts', symbol: 'fail', text });
+
+    expect(innerDeclarationOf(patch)).toBe(`function ${INNER_FUNCTION_IDENTIFIER}(): never {`);
+    expect(projectDiagnostics({ 'src/fail.ts': patch.patchedText })).toEqual([]);
+  });
+
+  it('answers a type predicate with boolean and an assertion signature with void, keeping both on the outer', () => {
+    // Both forms name the outer function's own parameter, which the inner
+    // function does not declare, so they are restated as the value each kind of
+    // function returns. The outer keeps its predicate and its assertion, which
+    // is what the consumer's narrowing below depends on.
+    const text = [
+      'export function isLabel(value: unknown): value is string {',
+      "  return typeof value === 'string';",
+      '}',
+      '',
+      'export function assertLabel(value: unknown): asserts value is string {',
+      "  if (typeof value !== 'string') {",
+      "    throw new TypeError('not a label');",
+      '  }',
+      '}',
+      '',
+    ].join('\n');
+    const consumer = [
+      "import { assertLabel, isLabel } from './labels';",
+      '',
+      'export function shout(value: unknown): string {',
+      '  if (isLabel(value)) {',
+      '    return value.toUpperCase();',
+      '  }',
+      '  assertLabel(value);',
+      '  return value.toLowerCase();',
+      '}',
+      '',
+    ].join('\n');
+
+    for (const [symbol, inner] of [
+      ['isLabel', `function ${INNER_FUNCTION_IDENTIFIER}(): boolean {`],
+      ['assertLabel', `function ${INNER_FUNCTION_IDENTIFIER}(): void {`],
+    ] as const) {
+      const patch = expectPatch({ file: 'src/labels.ts', symbol, text });
+
+      expect(innerDeclarationOf(patch), symbol).toBe(inner);
+      expect(patch.patchedText).toContain('value is string {');
+      expect(
+        projectDiagnostics({ 'src/labels.ts': patch.patchedText, 'src/shout.ts': consumer }),
+        symbol,
+      ).toEqual([]);
+    }
+  });
+
+  it("keeps an exported arrow's parameter list as its public signature", () => {
+    // Before the fix the wrapper was `(...__args: unknown[])`, and a consumer
+    // indexing `Parameters<typeof measure>` failed with TS2571 in its own file.
+    const text =
+      'export const measure = (width: number, label: string): number => width + label.length;\n';
+    const consumer = [
+      "import { measure } from './measure';",
+      '',
+      'type MeasureArgs = Parameters<typeof measure>;',
+      "const args: MeasureArgs = [3, 'abc'];",
+      'export const measured: number = measure(...args);',
+      'export const digits: number = args[0].toFixed(0).length;',
+      '',
+    ].join('\n');
+    const patch = expectPatch({ file: 'src/measure.ts', symbol: 'measure', text });
+
+    expect(patch.patchedText).toContain(
+      `export const measure = (...${REST_PARAMETER_IDENTIFIER}: [width: number, label: string]): number => {`,
+    );
+    expect(
+      projectDiagnostics({ 'src/measure.ts': patch.patchedText, 'src/consumer.ts': consumer }),
+    ).toEqual([]);
+
+    // Argument checking at call sites is back too: a wrong argument is still an
+    // error against the patched signature, as it was against the original.
+    const misuse = "import { measure } from './measure';\nexport const bad = measure('3', 4);\n";
+
+    expect(
+      projectDiagnostics({ 'src/measure.ts': patch.patchedText, 'src/misuse.ts': misuse }),
+    ).toEqual(projectDiagnostics({ 'src/measure.ts': text, 'src/misuse.ts': misuse }));
+    expect(
+      projectDiagnostics({ 'src/measure.ts': text, 'src/misuse.ts': misuse }).length,
+    ).toBeGreaterThan(0);
+  });
+
+  it('restates optional, defaulted, rest and destructured parameters as the compiler does', () => {
+    const text = [
+      'export const scale = (base: number, factor = 2, suffix?: string): string =>',
+      "  `${String(base * factor)}${suffix ?? ''}`;",
+      '',
+      'export const tally = (head: string, ...rest: readonly number[]): number => head.length + rest.length;',
+      '',
+      "export const box = ({ w, h }: { w: number; h: number }, unit = 'px'): string =>",
+      '  `${String(w)}x${String(h)}${unit}`;',
+      '',
+      'export const settleFirst = (first = 1, second: string): string => `${String(first)}${second}`;',
+      '',
+      "export const notify = (value: number, done?: () => void, mode = 'x' as 'x' | 'y'): number => {",
+      '  done?.();',
+      "  return mode === 'x' ? value : -value;",
+      '};',
+      '',
+    ].join('\n');
+    const consumer = [
+      "import { box, notify, scale, settleFirst, tally } from './shapes';",
+      '',
+      'type ScaleArgs = Parameters<typeof scale>;',
+      'export const factor: ScaleArgs[1] = 4;',
+      'export const explicit: ScaleArgs = [1, undefined, undefined];',
+      'export const scaled: string = scale(1) + scale(1, 3) + scale(1, 3, "x") + scale(1, undefined);',
+      'export const tallied: number = tally("a", 1, 2, 3);',
+      'export const boxed: string = box({ w: 1, h: 2 }) + box({ w: 1, h: 2 }, "em");',
+      'export const first: string = settleFirst(undefined, "b");',
+      'type NotifyArgs = Parameters<typeof notify>;',
+      "export const notifyArgs: NotifyArgs = [1, undefined, 'y'];",
+      'export const notified: number = notify(1, () => undefined) + notify(2, undefined, undefined);',
+      '',
+    ].join('\n');
+
+    expect(projectDiagnostics({ 'src/shapes.ts': text, 'src/consumer.ts': consumer })).toEqual([]);
+
+    const expectations = [
+      ['scale', '[base: number, factor?: number | undefined, suffix?: string | undefined]'],
+      ['tally', '[head: string, ...rest: readonly number[]]'],
+      ['box', '[arg1: { w: number; h: number }, unit?: string | undefined]'],
+      ['settleFirst', '[first: number | undefined, second: string]'],
+      ['notify', "[value: number, done?: (() => void) | undefined, mode?: 'x' | 'y' | undefined]"],
+    ] as const;
+
+    for (const [symbol, tuple] of expectations) {
+      const patch = expectPatch({ file: 'src/shapes.ts', symbol, text });
+
+      expect(patch.patchedText, symbol).toContain(`(...${REST_PARAMETER_IDENTIFIER}: ${tuple})`);
+      expect(
+        projectDiagnostics({ 'src/shapes.ts': patch.patchedText, 'src/consumer.ts': consumer }),
+        symbol,
+      ).toEqual([]);
+    }
+  });
+
+  it('types an unannotated parameter as the compiler would, without refusing a caller', () => {
+    // Syntax only: a literal initializer states its widened primitive, and a
+    // parameter with neither annotation nor literal is `any` — what the
+    // compiler gives it without a contextual type, and never a rejection.
+    const text = [
+      "export const pad = (value, width = 4, fill = ' ', loud = false, big = -1n, ...rest) => value;",
+      '',
+    ].join('\n');
+    const patch = expectPatch({ file: 'src/pad.ts', symbol: 'pad', text }, unverifiedPatcher);
+
+    expect(patch.patchedText).toContain(
+      `(...${REST_PARAMETER_IDENTIFIER}: [value: any, width?: number | undefined, fill?: string | undefined, loud?: boolean | undefined, big?: bigint | undefined, ...rest: any[]])`,
+    );
+  });
+
+  it('keeps a generic arrow generic by leaving its type parameters on the outer arrow only', () => {
+    // A second, shadowing type-parameter list on the inner arrow made
+    // `__orig.apply(…)` answer `unknown`, which the pre-flight refused.
+    const text =
+      'export const pick = <T,>(items: readonly T[], index: number): T | undefined => items[index];\n';
+    const consumer =
+      "import { pick } from './pick';\nexport const picked: string | undefined = pick(['a', 'b'], 1);\n";
+    const patch = expectPatch({ file: 'src/pick.ts', symbol: 'pick', text });
+
+    expect(patch.patchedText).toContain(
+      `export const pick = <T,>(...${REST_PARAMETER_IDENTIFIER}: [items: readonly T[], index: number]): T | undefined => {`,
+    );
+    expect(patch.patchedText).toContain(
+      `const ${INNER_FUNCTION_IDENTIFIER} = (items: readonly T[], index: number): T | undefined => {`,
+    );
+    expect(
+      projectDiagnostics({ 'src/pick.ts': patch.patchedText, 'src/consumer.ts': consumer }),
+    ).toEqual([]);
+
+    const pickPatched = exportedFunction(evaluateModule(patch.patchedText, 'src/pick.ts'), 'pick');
+
+    expect(pickPatched(['a', 'b'], 1)).toBe('b');
+  });
+
+  it('restates the contextual type of an arrow bound to an annotated variable or property', () => {
+    // The outer arrow stays typed by `Settle`; the inner arrow that holds the
+    // original head is not, so without `satisfies` its parameters became
+    // implicit `any` and its returned literal widened — a build error that an
+    // imported `Settle` hides from any single-file check.
+    const text = [
+      "import type { Settle } from './types';",
+      '',
+      "export const settle: Settle = (request, attempt) => ({ outcome: request.id + attempt > 3 ? 'held' : 'placed' });",
+      '',
+      'export class Desk {',
+      "  readonly route: Settle = (request) => ({ outcome: request.id > 2 ? 'held' : 'placed' });",
+      '}',
+      '',
+    ].join('\n');
+    const consumer = [
+      "import { Desk, settle } from './desk';",
+      "import type { Outcome } from './types';",
+      '',
+      'export const first: Outcome = settle({ id: 1 }, 1).outcome;',
+      'export const second: Outcome = new Desk().route({ id: 5 }, 0).outcome;',
+      '',
+    ].join('\n');
+    const files = (desk: string): Record<string, string> => ({
+      'src/types.ts': IMPORTED_TYPES,
+      'src/desk.ts': desk,
+      'src/consumer.ts': consumer,
+    });
+
+    expect(projectDiagnostics(files(text))).toEqual([]);
+
+    for (const symbol of ['settle', 'Desk.route']) {
+      const patch = expectPatch({ file: 'src/desk.ts', symbol, text });
+
+      expect(patch.patchedText, symbol).toContain(') satisfies Settle;');
+      expect(projectDiagnostics(files(patch.patchedText)), symbol).toEqual([]);
+    }
+  });
+
+  it('does not refuse a target for restating a global the check project cannot resolve', () => {
+    // `Request` and `Response` come from the DOM library, which the pre-flight
+    // does not load; the restated annotations name them once more, which is an
+    // artefact of the check rather than a diagnostic the patch introduces.
+    const text = [
+      'export const respond = async (request: Request): Promise<Response> => {',
+      '  return new Response(await request.text());',
+      '};',
+      '',
+    ].join('\n');
+    const patch = expectPatch({ file: 'app/respond.ts', symbol: 'respond', text });
+
+    expect(patch.patchedText).toContain(
+      `(...${REST_PARAMETER_IDENTIFIER}: [request: Request]): Promise<Response> => {`,
+    );
+  });
+
+  it('annotates the wrapper body with the rest-parameter type it is given, and refuses one it cannot emit', () => {
+    const meta = { file: 'src/measure.ts', line: 1, column: 14, symbol: 'measure' };
+    const base = { spanName: 'measure', meta, callStyle: 'rest', language: 'typescript' } as const;
+    const typed = buildWrapperBody({ ...base, restParameterType: '[width: number]' });
+    const defaulted = buildWrapperBody(base);
+
+    expect(typed.ok && typed.value.restParameter).toBe(
+      `...${REST_PARAMETER_IDENTIFIER}: [width: number]`,
+    );
+    expect(defaulted.ok && defaulted.value.restParameter).toBe(
+      `...${REST_PARAMETER_IDENTIFIER}: ${DEFAULT_REST_PARAMETER_TYPE}`,
+    );
+
+    for (const options of [
+      { ...base, restParameterType: '   ' },
+      { ...base, callStyle: 'arguments', restParameterType: '[width: number]' },
+      {
+        ...base,
+        language: 'javascript',
+        meta: { ...meta, file: 'src/measure.js' },
+        restParameterType: '[width: number]',
+      },
+    ] as const) {
+      const refused = buildWrapperBody(options);
+
+      expect(refused.ok, JSON.stringify(options)).toBe(false);
+      if (!refused.ok) {
+        expect(refused.error.code).toBe('PATCH_UNSUPPORTED');
+        // Refused for the type itself, not by an earlier check on the options.
+        expect(refused.error.message).toMatch(/rest-parameter type/u);
+        expect(typeof refused.error.hint).toBe('string');
+      }
+    }
+  });
+
+  it('leaves a JavaScript arrow unannotated', () => {
+    const patch = patchFixture('src/legacy/rack-tally.js', 'tallyRackSlots');
+
+    expect(patch.patchedText).toContain(`(...${REST_PARAMETER_IDENTIFIER}) => {`);
+    expect(patch.patchedText).not.toContain(`${REST_PARAMETER_IDENTIFIER}:`);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A position recorded over already-patched text (A1-F01)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('a position recorded over already-patched text (A1-F01)', () => {
+  const file = 'src/server/cone-rules.ts';
+
+  it("records the developer's line for a second symbol patched in the same file", () => {
+    const original = readFixture(file);
+    const first = patchFixture(file, 'assertConeValue');
+    const alone = patchFixture(file, 'findConeProfile');
+    const expected = positionOfDeclaredName(
+      original,
+      'export function findConeProfile(',
+      'findConeProfile',
+    );
+
+    // Layered over the first patch, with the developer's text as the location
+    // text: the position is the one the code graph indexed.
+    const second = expectPatch({
+      file,
+      symbol: 'findConeProfile',
+      text: first.patchedText,
+      locationText: original,
+    });
+
+    expect({ line: second.location.line, column: second.location.column }).toEqual(expected);
+    expect(second.location).toEqual(alone.location);
+    expect(second.meta).toEqual(alone.meta);
+    expect(second.patchedText).toContain(
+      `{ file: ${JSON.stringify(file)}, line: ${String(expected.line)}, column: ${String(expected.column)}, symbol: "findConeProfile" }`,
+    );
+    // And the rewrite itself is still computed against the layered bytes: the
+    // first wrapper is intact, and the alias is not inserted twice.
+    expect(second.originalText).toBe(first.patchedText);
+    expect(second.patchedText).toContain('symbol: "assertConeValue"');
+    expect(second.helperTypeAliasInserted).toBe(false);
+  });
+
+  it('would have drifted by the alias and the earlier wrapper without it', () => {
+    // The failure the location text exists to prevent, made visible: read from
+    // the layered text the line is below the developer's by exactly the lines
+    // the first patch added above the target.
+    const original = readFixture(file);
+    const first = patchFixture(file, 'assertConeValue');
+    const layered = expectPatch({ file, symbol: 'findConeProfile', text: first.patchedText });
+    const expected = positionOfDeclaredName(
+      original,
+      'export function findConeProfile(',
+      'findConeProfile',
+    );
+    const addedAbove = first.patchedText.split('\n').length - original.split('\n').length;
+
+    expect(layered.location.line).toBe(expected.line + addedAbove);
+  });
+
+  it('treats a location text equal to the text being patched as no location text at all', () => {
+    const original = readFixture(file);
+    const plain = patchFixture(file, 'findConeProfile');
+    const same = expectPatch({
+      file,
+      symbol: 'findConeProfile',
+      text: original,
+      locationText: original,
+    });
+
+    expect(same.patchedText).toBe(plain.patchedText);
+    expect(same.location).toEqual(plain.location);
+  });
+
+  it('refuses a target the location text does not declare, writing nothing', () => {
+    const original = readFixture(file);
+    const first = patchFixture(file, 'assertConeValue');
+    const result = patcher.patch({
+      file,
+      symbol: 'findConeProfile',
+      text: first.patchedText,
+      locationText: original.replace(/findConeProfile/gu, 'lookUpConeProfile'),
+    });
+
+    expectRefusal(result, 'location-unresolved', 'PATCH_TARGET_NOT_FOUND');
+  });
+
+  it('refuses a location text that declares the name in a different shape', () => {
+    const text = 'export function grade(value: number): number {\n  return value * 2;\n}\n';
+    const locationText = 'export const grade = (value: number): number => value * 2;\n';
+    const result = patcher.patch({ file: 'src/grade.ts', symbol: 'grade', text, locationText });
+
+    expectRefusal(result, 'location-unresolved', 'PATCH_TARGET_NOT_FOUND');
   });
 });
 

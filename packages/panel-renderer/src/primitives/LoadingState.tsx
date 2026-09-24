@@ -47,21 +47,24 @@
  *
  * ## Live regions: the division of labour across the three states
  *
- * This is the one state component that announces itself. It owns the busy
- * announcement — `role="status"`, `aria-live="polite"`, `aria-busy="true"` — so
- * a screen-reader user is told that a region is working rather than being left
- * with a silent gap. The other two are deliberately different and must stay
- * that way: `EmptyState` carries no live region at all, because "nothing was
- * captured" is a resting state a user navigates to rather than an event worth
- * interrupting for, and `ErrorState` uses `role="alert"`, whose assertive
- * politeness is warranted precisely once — when something failed. Giving all
- * three the same treatment is what produces a surface that talks over itself
- * while eight queries resolve.
+ * This component owns the busy announcement — `role="status"`,
+ * `aria-live="polite"`, `aria-busy="true"` — so a screen-reader user is told
+ * that a region is working rather than being left with a silent gap. The other
+ * two are deliberately different and must stay that way: `EmptyState` is the
+ * settled polite `role="status"` without `aria-busy`, which tells the reader
+ * what the load resolved to ("nothing was captured") without ever interrupting
+ * them, and `ErrorState` announces a failure — assertively with `role="alert"`
+ * for the first failure of a burst and politely with `role="status"` for the
+ * rest, as the query layer decides. Only the busy flag tells a working region
+ * from a settled one, and only the one alert interrupts, which is what keeps a
+ * surface resolving eight queries from talking over itself.
  *
  * The announcement is text-only: the skeleton bars are `aria-hidden` decoration
  * with no accessible name, and the label is rendered into the accessibility
  * tree through the shared `dg-visually-hidden` utility so nothing about it is
- * painted.
+ * painted. Its spelling is normalised here — trimmed, and ending in a single
+ * `…` — so every busy region announces itself the same way whoever wrote its
+ * label (see {@link LoadingStateProps.label}).
  *
  * ## Motion, and why none of it is here
  *
@@ -194,6 +197,47 @@ const SINGLE_SKELETON_COUNT = 1;
 const DEFAULT_LABEL = 'Loading…';
 
 /**
+ * The one character every announced label ends with: U+2026, the horizontal
+ * ellipsis, which a screen reader voices as a single pause rather than as
+ * "dot dot dot".
+ */
+const ELLIPSIS = '…';
+
+/** A run of full stops at the end of a label — `"."`, `"..."` or any other count. */
+const TRAILING_FULL_STOPS = /\.+$/u;
+
+/**
+ * The label as it is announced: trimmed, and ending in exactly one `…`.
+ *
+ * Every busy region in a panel says it is busy the same way, whoever wrote its
+ * label (B2-F14): before this, some components wrote "Loading requests…" and
+ * others "Loading captured database queries", so two regions in the same
+ * state announced themselves as if they were in two different ones. The
+ * convention is applied here rather than asked of each caller, because a
+ * convention every caller has to remember is one that some caller forgets.
+ *
+ * A label already ending in `…` is kept as written; a trailing run of full
+ * stops — the ASCII `"..."` or a lone `"."` — is replaced by the one ellipsis;
+ * any other label has the ellipsis appended. An absent or blank label, or one
+ * that is nothing but full stops or an ellipsis, falls back to
+ * {@link DEFAULT_LABEL}, since a live region announcing a lone ellipsis tells
+ * the reader nothing.
+ *
+ * @param label The caller's label, if any.
+ * @returns The text the region announces.
+ */
+function announcedLabel(label: string | undefined): string {
+  const trimmed = label?.trim() ?? '';
+
+  if (trimmed.endsWith(ELLIPSIS)) {
+    return trimmed.slice(0, -ELLIPSIS.length).trim() === '' ? DEFAULT_LABEL : trimmed;
+  }
+
+  const stem = trimmed.replace(TRAILING_FULL_STOPS, '').trimEnd();
+  return stem === '' ? DEFAULT_LABEL : `${stem}${ELLIPSIS}`;
+}
+
+/**
  * The classes every skeleton element carries: the block's element class for its
  * place in the silhouette, and the shared shimmer treatment. Both are constant,
  * so the value is hoisted rather than rebuilt per bar.
@@ -274,6 +318,13 @@ export interface LoadingStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 
    * the default where the caller knows what is resolving. Keep it short: a
    * polite live region reads it in full, and it is spoken again each time the
    * region re-announces.
+   *
+   * **Convention: the announced text always ends with a single `…`.** Write
+   * the label with or without it — `"Loading captured calls"`,
+   * `"Loading captured calls..."` and `"Loading captured calls…"` all announce
+   * `"Loading captured calls…"` — so every busy region in a panel reads the
+   * same way. The label is trimmed, a trailing `"."` or `"..."` becomes the
+   * ellipsis, and a blank label falls back to the default.
    */
   label?: string | undefined;
 
@@ -317,9 +368,10 @@ export interface LoadingStateProps extends Omit<HTMLAttributes<HTMLDivElement>, 
  * <LoadingState variant="block" />
  */
 export function LoadingState(props: LoadingStateProps): ReactElement {
-  const { variant = DEFAULT_VARIANT, rows, label = DEFAULT_LABEL, className, ...rest } = props;
+  const { variant = DEFAULT_VARIANT, rows, label, className, ...rest } = props;
 
   const skeletonCount = resolveSkeletonCount(variant, rows);
+  const announced = announcedLabel(label);
 
   return (
     <div
@@ -329,7 +381,7 @@ export function LoadingState(props: LoadingStateProps): ReactElement {
       aria-busy="true"
       {...rest}
     >
-      <Text className="dg-visually-hidden">{label}</Text>
+      <Text className="dg-visually-hidden">{announced}</Text>
       {Array.from({ length: skeletonCount }, (_unused, index) => (
         // The bars are interchangeable and their count changes only with the
         // props, so the index is a stable identity; nothing here holds state

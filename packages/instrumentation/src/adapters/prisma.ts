@@ -42,6 +42,23 @@
  * evidence of nothing, while `DbCallNodeData.driver` is the classification that
  * pass already made.
  *
+ * ## Which query sites it anchors on
+ *
+ * Only ones the dev server can actually execute. The mapper's spans are runtime
+ * hooks the preload installs in the **dev-server process** (AAP §0.5.1), and a
+ * seed, migration, script, test or configuration module runs in a process of
+ * its own — the ORM's seed command, a test runner — so a query it issues is
+ * never observed, and an anchor on it promises evidence that never arrives.
+ * Such modules are recognised by `@debuggen/code-analysis`'s
+ * `isToolingModulePath`, which is built from published tool conventions rather
+ * than from any project's vocabulary, and are left out before ranking.
+ *
+ * Among the rest, a question that names a route or a component is answered with
+ * the query sites that route or component actually **reaches**: a bounded
+ * downstream `pathBetween` search from each node the question resolved to, so a
+ * service function two or three calls below a route handler ranks ahead of an
+ * unrelated one, and the shortest path wins.
+ *
  * ## What it reports when it cannot deliver
  *
  * The mapper's spans need the preload loaded in the target project's
@@ -90,11 +107,13 @@
 
 import { newActionId, normalizePosix, nowEpochMs, toPosix } from '@debuggen/shared';
 import type { LogFields, Logger } from '@debuggen/shared';
+import { isToolingModulePath } from '@debuggen/code-analysis';
 import type {
   CodeGraph,
   CodeMatch,
   CodeNodeKind,
   CodeNodeOf,
+  CodePathEndpoint,
   CodeQueries,
   DatabaseAccessStyle,
   DbDriver,
@@ -462,9 +481,11 @@ export const PRISMA_ADAPTER_LIMITS = Object.freeze({
    * How many owner candidates the reachability pass inspects, at most.
    *
    * The pass asks `CodeQueries.whoCalls` per candidate, which is a map lookup
-   * per target — cheap, but a project with hundreds of query owners would turn a
-   * proposal into a scan. Candidates are ordered deterministically *before* the
-   * cap applies, so the same project always yields the same inspected set.
+   * per target, and then at most one bounded `CodeQueries.pathBetween` search
+   * per evidence root — cheap each, but a project with hundreds of query owners
+   * would turn a proposal into a scan. Candidates are ordered deterministically
+   * *before* the cap applies, so the same project always yields the same
+   * inspected set.
    */
   maxOwnersInspected: 64,
 
@@ -892,6 +913,17 @@ interface PrismaQueryOwner {
 
   /** Whether the owner is a `server-function` node — the service-layer case. */
   readonly serviceFunction: boolean;
+
+  /**
+   * The owner's opaque graph node id, when it was resolved through a `queries`
+   * edge.
+   *
+   * The target endpoint of the reachability search. Absent for an owner taken
+   * from a call site's own `symbol` field, which names a declaration without
+   * pointing at its node; that search then describes the owner by file and
+   * symbol instead.
+   */
+  readonly nodeId?: string | undefined;
 }
 
 /**
@@ -929,6 +961,7 @@ function ownerOfCall(graph: CodeGraph, call: CodeNodeOf<'db-call'>): PrismaQuery
       symbol: owner.name,
       line: owner.line,
       serviceFunction: owner.kind === 'server-function',
+      nodeId: owner.id,
     };
 
     if (resolved.serviceFunction) {
@@ -1068,8 +1101,11 @@ function groupByOwner(
  *   the developer named the querying code.
  * - `1` — a seed resolved to *something else in the same file*: the developer
  *   named the module, which is weaker but still their own evidence.
- * - `2` — the declaration is **called from** a file the question points at: the
- *   route or handler the question named reaches this query.
+ * - `2` — the declaration is **reachable** from what the question points at:
+ *   it is called from a file the question names, or a bounded downstream
+ *   `pathBetween` search from a node the question resolved to — the route the
+ *   URL matched, the component it named — arrives at it. Within this tier the
+ *   shorter path ranks first.
  * - `3` — no evidence narrowed it. Reached when the understanding asked for
  *   database evidence without naming anything, which is an ordinary question
  *   ("why is this slow?" with an element selected) and must still produce
@@ -1080,8 +1116,28 @@ type EvidenceTier = 0 | 1 | 2 | 3;
 /** The tier assigned when nothing in the understanding narrowed a candidate. */
 const UNNARROWED_TIER: EvidenceTier = 3;
 
-/** The tier a candidate earns by being called from a file the question names. */
+/** The tier a candidate earns by being reachable from what the question names. */
 const REACHABLE_TIER: EvidenceTier = 2;
+
+/**
+ * The distance recorded for a candidate a direct caller in an evidence file
+ * reaches: one call hop, which no downstream search can beat without the
+ * candidate being the evidence itself (tier `0`).
+ */
+const DIRECT_CALLER_DISTANCE = 1;
+
+/**
+ * How many evidence roots the reachability search starts from, at most.
+ *
+ * Together with {@link PRISMA_ADAPTER_LIMITS.maxOwnersInspected} this bounds
+ * the searches one proposal runs — at most `8 × 64`, each itself bounded by the
+ * query surface's own depth and node budgets — so a question naming many
+ * things costs a bounded wait. Eight covers every entity and hint a validated
+ * understanding carries in practice; roots are kept in the order the
+ * understanding named them, so the same question always searches from the same
+ * roots.
+ */
+const MAX_REACHABILITY_ROOTS = 8;
 
 /**
  * What the understanding's names resolved to in the graph.
@@ -1099,6 +1155,18 @@ interface SeedEvidence {
   /** Files a seed resolved into, or that an entity named outright. */
   readonly files: ReadonlySet<string>;
 
+  /**
+   * The node ids a downstream reachability search starts from: the route node
+   * a URL entity matched and every non-call-site node a seed resolved to, in
+   * the order the understanding named them, at most
+   * {@link MAX_REACHABILITY_ROOTS}.
+   *
+   * A call site is never a root: it is an expression with no downstream, and
+   * one that belongs to this adapter's driver already put its owner in tier
+   * `0`.
+   */
+  readonly roots: readonly string[];
+
   /** Whether the understanding named anything at all that the graph resolved. */
   readonly resolved: boolean;
 }
@@ -1110,7 +1178,8 @@ interface SeedEvidence {
  * runs the bounded, ranked lookup that turns them into declarations. Route and
  * URL entities additionally go through `routeForUrl`, because a request path is
  * not a declaration name and the route map is the only thing that can match one
- * — and the file it yields is what the reachability tier is measured against.
+ * — and the file it yields is what the reachability tier is measured against,
+ * while the route's own graph node is where its downstream search starts.
  *
  * An entity's own `file`, where the producer supplied one, is admitted
  * directly: it is already a project-relative path, and it is the one seed that
@@ -1127,6 +1196,7 @@ function resolveSeedEvidence(
   const declarations = new Set<string>();
   const nodeIds = new Set<string>();
   const files = new Set<string>();
+  const roots = new Set<string>();
   const seeds: string[] = [];
 
   for (const entity of understanding.entities) {
@@ -1141,6 +1211,10 @@ function resolveSeedEvidence(
 
       if (route !== undefined) {
         files.add(route.file);
+
+        if (route.node !== undefined) {
+          roots.add(route.node.nodeId);
+        }
       }
     }
   }
@@ -1153,6 +1227,10 @@ function resolveSeedEvidence(
       limit: queries.limits.maxResults,
     })) {
       admitMatch(match, declarations, nodeIds, files);
+
+      if (match.kind !== 'db-call') {
+        roots.add(match.nodeId);
+      }
     }
   }
 
@@ -1160,7 +1238,8 @@ function resolveSeedEvidence(
     declarations,
     nodeIds,
     files,
-    resolved: declarations.size > 0 || nodeIds.size > 0 || files.size > 0,
+    roots: [...roots].slice(0, MAX_REACHABILITY_ROOTS),
+    resolved: declarations.size > 0 || nodeIds.size > 0 || files.size > 0 || roots.size > 0,
   };
 }
 
@@ -1217,41 +1296,78 @@ function directTierOf(group: PrismaOwnerGroup, evidence: SeedEvidence): Evidence
 }
 
 /**
- * Whether a candidate is called from a file the question points at.
+ * How many hops separate a candidate from what the question points at, or
+ * `undefined` when it is not reachable within the bounds.
  *
- * The third tier, and the one that connects a question about a route to the
- * service function that does the querying: `whoCalls` reads the `calls` and
- * `references` edges an extractor already recorded, so a route handler that
- * delegates to this declaration is one map lookup away.
+ * The third tier, and the one that connects a question about a route or a
+ * component to the service function that does the querying. Two routes,
+ * cheapest first, and the shorter answer wins:
  *
- * Only consulted when the stronger tiers found nothing for this candidate and
- * the understanding resolved to at least one file, because with no files to
- * measure against the answer could only be "no".
+ * 1. **A caller in an evidence file.** `whoCalls` reads the `calls` and
+ *    `references` edges an extractor already recorded, so a route handler that
+ *    delegates to this declaration is one map lookup away, at
+ *    {@link DIRECT_CALLER_DISTANCE}.
+ * 2. **A downstream path from an evidence root.** `pathBetween` from the route
+ *    node a URL matched, or from a node a name resolved to, in the query
+ *    surface's default direction — downstream, so every hop points the way a
+ *    request flows — and within its own depth and node budgets. This is what
+ *    reaches the service function two or three calls below a route handler,
+ *    which a one-hop caller check cannot see. The path's `depth` is the
+ *    distance.
+ *
+ * Only consulted when the stronger tiers found nothing for any candidate. The
+ * root loop stops as soon as a path of {@link DIRECT_CALLER_DISTANCE} is found,
+ * because no root can place the candidate closer without it being the evidence
+ * itself.
  *
  * @param queries The bounded query surface.
  * @param group The candidate.
  * @param evidence What the understanding's names resolved to.
- * @returns `true` when a caller lives in one of the evidence files.
+ * @returns The shortest distance found, or `undefined` when neither route
+ * reaches the candidate.
  */
-function isReachableFromEvidence(
+function reachDistanceFromEvidence(
   queries: CodeQueries,
   group: PrismaOwnerGroup,
   evidence: SeedEvidence,
-): boolean {
-  if (evidence.files.size === 0) {
-    return false;
-  }
-
-  for (const caller of queries.whoCalls({
-    file: group.owner.file,
-    symbol: group.owner.symbol,
-  })) {
-    if (evidence.files.has(caller.caller.file)) {
-      return true;
+): number | undefined {
+  if (evidence.files.size > 0) {
+    for (const caller of queries.whoCalls({
+      file: group.owner.file,
+      symbol: group.owner.symbol,
+    })) {
+      if (evidence.files.has(caller.caller.file)) {
+        return DIRECT_CALLER_DISTANCE;
+      }
     }
   }
 
-  return false;
+  // The owner's own node when the `queries` edge named it; otherwise a
+  // selector for the declaration, which is what an owner taken from a call
+  // site's `symbol` field can offer.
+  const target: CodePathEndpoint = group.owner.nodeId ?? {
+    file: group.owner.file,
+    symbol: group.owner.symbol,
+  };
+  let shortest: number | undefined;
+
+  for (const root of evidence.roots) {
+    const path = queries.pathBetween(root, target);
+
+    if (path === undefined) {
+      continue;
+    }
+
+    if (shortest === undefined || path.depth < shortest) {
+      shortest = path.depth;
+    }
+
+    if (shortest <= DIRECT_CALLER_DISTANCE) {
+      break;
+    }
+  }
+
+  return shortest;
 }
 
 /** A candidate with the tier it earned. */
@@ -1261,17 +1377,25 @@ interface RankedCandidate {
 
   /** How directly the question points at it. */
   readonly tier: EvidenceTier;
+
+  /**
+   * How many hops the reachability pass measured from the evidence, for a
+   * {@link REACHABLE_TIER} candidate; `0` for every other tier, where no
+   * distance was measured and the order falls through to the file.
+   */
+  readonly distance: number;
 }
 
 /**
  * Orders two ranked candidates deterministically.
  *
- * Evidence tier, then project-relative file path, then declaration line, then
- * symbol — and that order is total for this candidate set, because a group is
- * keyed on `(file, symbol)` and two distinct groups therefore differ in the
- * file, the symbol, or both. The result is identical across runs and across
- * machines, which is what makes a proposal reproducible apart from its fresh
- * action ids.
+ * Evidence tier, then reachability distance (the shorter path first, which
+ * only differs inside the reachable tier), then project-relative file path,
+ * then declaration line, then symbol — and that order is total for this
+ * candidate set, because a group is keyed on `(file, symbol)` and two distinct
+ * groups therefore differ in the file, the symbol, or both. The result is
+ * identical across runs and across machines, which is what makes a proposal
+ * reproducible apart from its fresh action ids.
  *
  * @param left First candidate.
  * @param right Second candidate.
@@ -1281,6 +1405,10 @@ interface RankedCandidate {
 function compareCandidates(left: RankedCandidate, right: RankedCandidate): number {
   if (left.tier !== right.tier) {
     return left.tier - right.tier;
+  }
+
+  if (left.distance !== right.distance) {
+    return left.distance - right.distance;
   }
 
   const byFile = compareText(left.group.owner.file, right.group.owner.file);
@@ -1684,9 +1812,15 @@ function rationaleFor(group: PrismaOwnerGroup): string {
  * here, where the reason can be logged, rather than at `../feasibility.ts`,
  * which would reject the whole action as a symbol it could not find.
  *
+ * Query owners in a tooling module (`isToolingModulePath`: seeds, migrations,
+ * scripts, tests, configuration) are left out before anything is ranked,
+ * whatever the question named: they run in a process the preload is not
+ * loaded into, so no span of theirs can reach a capture.
+ *
  * Returns an empty array — never throws — when the project does not query
- * through the mapper, when the question wants no database evidence, or when
- * cancellation arrived between steps.
+ * through the mapper, when every query owner is a tooling module, when the
+ * question wants no database evidence, or when cancellation arrived between
+ * steps.
  *
  * @param context The session's context.
  * @param understanding The validated Stage 1 artifact.
@@ -1716,12 +1850,31 @@ function planActions(
     return [];
   }
 
-  const groups = groupByOwner(context.graph, calls);
+  const owned = groupByOwner(context.graph, calls);
 
-  if (groups.length === 0) {
+  if (owned.length === 0) {
     logger.debug('call sites belong to no addressable declaration; proposing nothing', {
       ...sessionFields(context),
       callSites: calls.length,
+    });
+
+    return [];
+  }
+
+  const groups = owned.filter((group) => !isToolingModulePath(group.owner.file));
+  const toolingOwners = owned.length - groups.length;
+
+  if (toolingOwners > 0) {
+    logger.debug('query owners in tooling modules left out; they never run in the dev server', {
+      ...sessionFields(context),
+      toolingOwners,
+    });
+  }
+
+  if (groups.length === 0) {
+    logger.debug('every query owner is a tooling module; proposing nothing', {
+      ...sessionFields(context),
+      toolingOwners,
     });
 
     return [];
@@ -1784,6 +1937,7 @@ function planActions(
     ...sessionFields(context),
     actions: actions.length,
     candidates: ranked.length,
+    toolingOwners,
     tier: bestTier,
     kinds: PRISMA_TELEMETRY_KINDS.join(','),
   });
@@ -1795,15 +1949,18 @@ function planActions(
  * Ranks the candidates: direct evidence first, then the bounded reachability
  * pass, then the deterministic order.
  *
- * The reachability pass runs only over candidates nothing stronger claimed, and
- * only when the understanding resolved to at least one file. Candidates are
- * ordered **before** the inspection cap applies, so the same project always
+ * The reachability pass runs only when nothing stronger claimed any candidate
+ * and the understanding resolved to at least one file or root. A candidate it
+ * reaches joins {@link REACHABLE_TIER} with the distance measured, so the
+ * query sites closest to the named route or component come first. Candidates
+ * are ordered **before** the inspection cap applies, so the same project always
  * inspects the same subset and two runs produce the same ranking.
  *
  * The inspection cap is {@link PRISMA_ADAPTER_LIMITS.maxOwnersInspected} and
  * is deliberately not an option: it bounds a query pass rather than describing
  * a preference, and a caller that wanted a different proposal size states
- * {@link PrismaAdapterOptions.maxTargets} instead.
+ * {@link PrismaAdapterOptions.maxTargets} instead. With
+ * {@link MAX_REACHABILITY_ROOTS} it bounds the number of path searches.
  *
  * @param context The session's context.
  * @param groups The candidates.
@@ -1816,7 +1973,7 @@ function rankCandidates(
   evidence: SeedEvidence,
 ): readonly RankedCandidate[] {
   const direct = groups
-    .map((group) => ({ group, tier: directTierOf(group, evidence) }))
+    .map((group): RankedCandidate => ({ group, tier: directTierOf(group, evidence), distance: 0 }))
     .sort(compareCandidates);
 
   if (!evidence.resolved || direct.some((candidate) => candidate.tier < UNNARROWED_TIER)) {
@@ -1825,15 +1982,17 @@ function rankCandidates(
 
   let inspected = 0;
   const reachable = direct.map((candidate): RankedCandidate => {
-    if (inspected >= PRISMA_ADAPTER_LIMITS.maxOwnersInspected) {
+    if (inspected >= PRISMA_ADAPTER_LIMITS.maxOwnersInspected || isAborted(context)) {
       return candidate;
     }
 
     inspected += 1;
 
-    return isReachableFromEvidence(context.queries, candidate.group, evidence)
-      ? { group: candidate.group, tier: REACHABLE_TIER }
-      : candidate;
+    const distance = reachDistanceFromEvidence(context.queries, candidate.group, evidence);
+
+    return distance === undefined
+      ? candidate
+      : { group: candidate.group, tier: REACHABLE_TIER, distance };
   });
 
   return reachable.sort(compareCandidates);

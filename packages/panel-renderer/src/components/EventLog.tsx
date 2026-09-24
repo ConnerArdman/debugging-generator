@@ -11,6 +11,13 @@
  * reports the record's identifiers and nothing else: the drawer reads the whole
  * record from the capture, this list never has to render it.
  *
+ * The selected record is the panel's one shared selection, not a state of this
+ * list: under the panel host a record selected anywhere — a table row, a chart
+ * bar, an evidence chip — marks its line here (`aria-selected` plus the grid's
+ * own `dg-is-selected`, and the grid scrolls it into its viewport), and a line
+ * activated here marks the same record in every other view (AAP 0.7.3). Outside
+ * a host the list falls back to marking the line last activated in it.
+ *
  * ## THE FIELDS IT READS ARE THE CATALOG'S, NOT THIS FILE'S
  *
  * The catalog entry `catalogEntryFor('eventLog')` (in `@debuggen/panel-schema`)
@@ -57,7 +64,19 @@
  *     active — plus an explicit note that the text filter reaches the loaded
  *     records only, because `DataQueryFilter` has no free-text field and this
  *     is the one view where a reader might reasonably expect "search
- *     everything". The counts are the feature, not decoration.
+ *     everything". The counts are the feature, not decoration, so the same
+ *     statements are also held by a polite live region and announced as the
+ *     reader types.
+ *
+ * Both ratios are announced politely as they change, because a reader who
+ * cannot see them would otherwise type into the filter or press "load more"
+ * and hear nothing. The footer's text is itself a polite live region. The
+ * toolbar draws its statements as pills that are not live — `layout/Toolbar`
+ * takes no live-region option, and its status row only mounts once there is a
+ * statement, which is too late to announce the first one — so this component
+ * mirrors those statements into one visually hidden, always-mounted, polite
+ * and atomic region: what is heard is exactly what is shown, and it is heard
+ * once.
  *
  * The kind filter is the opposite case: `kinds` IS a field of the query's
  * filter, so choosing a kind narrows the request and re-queries. The picker's
@@ -86,11 +105,20 @@
  * `gridcell` roles, the roving tab stop and the arrow/Home/End/Enter handling.
  * This file therefore imports no virtualizer of its own — a second one would
  * put two windows over one list and break that shared contract — and writes no
- * key handler, no `tabIndex` and no `role`. What it owns is the grid's
- * accessible name, the toolbar's control labels, and the fact that a click on a
- * row's source chip is the chip's alone: the table excludes clicks that
- * originated in an interactive descendant from row activation, so opening a
- * file never also selects a row.
+ * key handler and no `role`. What it owns is the grid's accessible name, the
+ * toolbar's control labels, and the fact that a click on a row's source chip
+ * is the chip's alone: the table excludes clicks that originated in an
+ * interactive descendant from row activation, so opening a file never also
+ * selects a row.
+ *
+ * The grid is ONE Tab stop — its active row — however many records are loaded.
+ * The table's keyboard model reaches the controls inside a row: ArrowRight (or
+ * F2) moves onto a row's source chip, ArrowLeft or Escape returns to the row,
+ * and the vertical keys move between rows from either. The single `tabIndex`
+ * this file writes is the one obligation that model places on a caller: the
+ * only focusable control a cell renders, the source chip, is `tabIndex={-1}`,
+ * so it stays reachable by those keys and by the pointer and never adds a Tab
+ * stop per row.
  *
  * ## THREE STATES, IN ONE FIXED ORDER
  *
@@ -100,8 +128,11 @@
  * `useQuery`'s `"success"` with no rows reads as an empty state, while a
  * rejection carries the failure, its code and the serialised query into an
  * error state with a working retry (AAP 0.5.5 — a failure is never presented as
- * a result). An empty page is not always an empty capture, and the empty state
- * says which one it is, from the counters the same response carried:
+ * a result), worded by the host's one error-state contract
+ * (`queryFailureProps` in `../host/useQuery`) so it reads like every other
+ * failed node in the panel. An empty page is not always an empty capture, and
+ * the empty state says which one it is, from the counters the same response
+ * carried:
  *
  *   - a count-only query (`limit: 0`) asked for a total and no rows, and states
  *     that total — or that none was reported;
@@ -116,7 +147,8 @@
  * paging footer, so the next page stays reachable. A further absence is
  * distinguished from all of these: a text filter that matches none of the
  * loaded records is the filter's doing, not the capture's, and says so in the
- * table's own empty slot.
+ * table's own empty slot — beside a control that clears the filter and returns
+ * focus to its field.
  *
  * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
  *
@@ -136,13 +168,25 @@
  *   `dg-event-log__time`      the offset cell, secondary and tabular
  *   `dg-event-log__name`      the record's own label, truncating
  *   `dg-event-log__attrs`     the compact attribute strip, truncating
+ *   `dg-event-log__attr`      one attribute chip of that strip: it shrinks
+ *                             toward nothing and grows toward its own text,
+ *                             so short pairs show whole and only the longest
+ *                             share what is left, ellipsized
+ *   `dg-event-log__more`      the strip's "+N more" count, which never
+ *                             shrinks and so stays visible after the chips
  *   `dg-data-table__footer`   the paging counts below the grid — the
  *                             stylesheet's own class for exactly this, since
  *                             the table renders no footer itself
  *
  * The caller's `className` is composed last. `dg-icon` is the global utility of
  * `../styles/base.css` that gives every glyph its font-relative square and its
- * `currentColor`, and is never redefined here.
+ * `currentColor`, and `dg-visually-hidden` the one that keeps the live match
+ * count in the accessibility tree without painting it or taking a place in the
+ * column; neither is redefined here.
+ *
+ * The strip is laid out by those two rules alone, never by measuring: no chip
+ * count is computed from a width, so the component renders — and is driven by
+ * its suite — without a layout engine, and a resize never re-renders a row.
  *
  * @see ../host/useQuery for the loading/error/success state machine.
  * @see ../host/DataProvider for what resolves a query, and its paging counters.
@@ -164,13 +208,13 @@ import {
 } from '@debuggen/panel-schema';
 import type { TelemetryEvent, TelemetryKind } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ListX, ScrollText, TriangleAlert } from 'lucide-react';
-import { useCallback, useMemo, useState } from 'react';
+import { ChevronDown, ListX, ScrollText, X } from 'lucide-react';
+import { useCallback, useMemo, useState, useRef } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
-import type { PanelEventRef } from '../host/PanelActions';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import { queryFailureProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarSelect, ToolbarStatus } from '../layout/Toolbar';
@@ -288,6 +332,9 @@ const LOADING_LABEL = 'Loading captured records…';
 const EMPTY_MESSAGE =
   'No records were captured for this query. Start a capture, reproduce the behaviour, then look again.';
 
+/** The heading above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No records';
+
 /** The heading of the state a count-only (`limit: 0`) query resolves to. */
 const COUNT_ONLY_TITLE = 'Count only';
 
@@ -307,12 +354,33 @@ const EVENT_NOUN_SINGULAR = 'event';
 /** The record noun of the empty-page copy, for any other count. */
 const EVENT_NOUN_PLURAL = 'events';
 
-/** What a text filter that matches none of the loaded records says. */
+/**
+ * What a text filter that matches none of the loaded records says. It names
+ * the one control the state offers, {@link CLEAR_SEARCH_LABEL}, in that
+ * control's own words.
+ */
 const FILTERED_EMPTY_MESSAGE =
-  'No loaded records match this text filter. Clear the filter to see the whole loaded page.';
+  'No loaded records match this text filter. Clear the text filter to see the whole loaded page.';
 
-/** What a failed query says when the provider rejected without a message. */
-const ERROR_MESSAGE_FALLBACK = 'The captured records for this view could not be loaded.';
+/**
+ * The label of the control a no-match state offers: it empties the text field
+ * and returns focus to it, so the reader can type again where they left off.
+ */
+const CLEAR_SEARCH_LABEL = 'Clear text filter';
+
+/**
+ * What joins the toolbar's status statements into the one sentence the live
+ * region announces. One text run rather than one element per statement: the
+ * announcement is atomic, and each statement stays the only element on the
+ * page whose own text is exactly that statement.
+ */
+const LIVE_STATUS_SEPARATOR = '. ';
+
+/**
+ * Where the clear control finds the text field it returns focus to: the text
+ * entry of this view's own filter row, looked up inside this view's block.
+ */
+const SEARCH_FIELD_SELECTOR = '.dg-event-log__toolbar input';
 
 /** The paging control's label. */
 const LOAD_MORE_LABEL = 'Load more';
@@ -412,6 +480,17 @@ interface EventLogPageState {
 
   /** Every record loaded by the earlier pages of that same request. */
   readonly carried: readonly TelemetryEvent[];
+
+  /**
+   * The total the service last reported for this sequence, already vetted by
+   * {@link reportedTotal}, carried across the request for the next page.
+   *
+   * `useQuery` reports no total while that page is in flight, and the footer is
+   * a polite live region: without this, "3 of 40 records loaded" would read
+   * "3 records loaded" for the length of the request and announce a count that
+   * claims no total was ever reported. `undefined` when none was.
+   */
+  readonly total: number | undefined;
 }
 
 /**
@@ -420,12 +499,13 @@ interface EventLogPageState {
  * Its identity matches no derived query — a serialised query always begins with
  * its source — so the first render reads the node's authored starting offset
  * through the same path every reset does, and there is no separate
- * initialisation branch. Its own `offset` is therefore never read.
+ * initialisation branch. Its own `offset` and `total` are therefore never read.
  */
 const INITIAL_PAGE_STATE: EventLogPageState = Object.freeze({
   identity: '',
   offset: DATA_QUERY_DEFAULT_OFFSET,
   carried: EMPTY_EVENTS,
+  total: undefined,
 });
 
 /*
@@ -623,12 +703,25 @@ function coverageLabel(loadedCount: number, total: number | undefined, baseOffse
 
 /** The copy of the empty state a settled page with no records resolves to. */
 interface EmptyPageCopy {
-  /** The state's heading, or `undefined` for the plain empty-capture message. */
-  readonly title: string | undefined;
+  /** The state's heading: a short label for the absence it explains. */
+  readonly title: string;
 
   /** The state's sentence. */
   readonly message: string;
 }
+
+/**
+ * The copy of the empty capture — the one empty page that says the capture
+ * holds nothing for this query (case 2 of {@link describeEmptyPage}).
+ *
+ * A single frozen value so the component can recognise the case by reference:
+ * it is the only empty state with nothing any toolbar control could reach, so
+ * it is the one drawn without the toolbar (see the component body).
+ */
+const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
 
 /**
  * The record noun for a count: singular for exactly one, plural otherwise.
@@ -695,7 +788,7 @@ function describeEmptyPage(
     total === 0 ||
     (total === undefined && baseOffset === DATA_QUERY_DEFAULT_OFFSET && !hasForwardPage)
   ) {
-    return { title: undefined, message: EMPTY_MESSAGE };
+    return NOTHING_CAPTURED_COPY;
   }
 
   const position = formatCount(offset + 1);
@@ -716,21 +809,6 @@ function describeEmptyPage(
         ? `This page starts at position ${position}, past the end of the ${matched} that matched this query.`
         : `${matched} matched this query, but none are shown on this page.`,
   };
-}
-
-/**
- * The failed query, serialised for the error state.
- *
- * Pretty-printed JSON is the form that state documents: a developer has to be
- * able to read what was asked for, not only that asking failed. The query holds
- * no captured data — a source, a narrowing filter and paging numbers — so
- * nothing redacted passes through here.
- *
- * @param query The request that failed.
- * @returns The request as indented JSON.
- */
-function serialiseQuery(query: DataQuery): string {
-  return JSON.stringify(query, null, 2);
 }
 
 /**
@@ -1003,28 +1081,34 @@ function toEventRef(event: TelemetryEvent): PanelEventRef {
   return { eventId: event.id, spanId: event.spanId, traceId: event.traceId };
 }
 
-/**
- * The failure sentence the error state shows.
- *
- * The provider's own message where it has one — it is the failure as the layer
- * that observed it understands it — followed by its hint when one was supplied,
- * because a hint is the only actionable part of most transport failures. Never
- * an inference about a cause: that belongs to a validated analysis, not to an
- * error box (AAP 0.5.5).
- *
- * @param message The rejected query's message, when the provider gave one.
- * @param hint The rejection's hint, when it carried one.
- * @returns One sentence, or the generic fallback.
- */
-function errorSentence(message: string | undefined, hint: string | undefined): string {
-  const parts = [message, hint].filter((part): part is string => part !== undefined && part !== '');
-
-  return parts.length === 0 ? ERROR_MESSAGE_FALLBACK : parts.join(' ');
-}
-
 /** The React key, selection identity and measurement key of a row. */
 function eventLogRowKey(row: EventLogRow): string {
   return row.event.id;
+}
+
+/**
+ * The key of the drawn row that stands for the panel's selected event.
+ *
+ * Read against the rows the grid is handed — the loaded page after the text
+ * filter — because only a drawn row can carry the mark: a selected record the
+ * text filter hides, or one this log has not loaded, marks nothing rather than
+ * a neighbour, and is marked again once it is drawn.
+ *
+ * @param rows The rows the grid draws, in display order.
+ * @param selection The panel's selection, or `undefined` for none.
+ * @returns The matching row's key, or `null` when no drawn row stands for it.
+ */
+function selectedEventLogRowKey(
+  rows: readonly EventLogRow[],
+  selection: PanelSelection | undefined,
+): string | null {
+  if (selection === undefined) {
+    return null;
+  }
+
+  const match = rows.find((row) => matchesPanelSelection(selection, toEventRef(row.event)));
+
+  return match === undefined ? null : eventLogRowKey(match);
 }
 
 /*
@@ -1040,6 +1124,17 @@ function eventLogRowKey(row: EventLogRow): string {
  * an intrinsic track would size itself from one row's own content and stop
  * sitting under its own header (see `../primitives/DataTable`). No track is a
  * literal length (AAP 0.6.4).
+ *
+ * Every track also has a non-zero floor. The three bounded columns are fixed
+ * `ch` measures sized for their widest value and header: a sequence number up
+ * to six digits, an offset up to five integer digits in seconds, the longest
+ * kind label ("Performance entry"). The two free-text columns are
+ * `minmax(<floor>, <share>)`: the floor keeps a readable excerpt of a name
+ * beside its source chip, and at least one attribute pair, and the share hands
+ * spare width to the attributes two parts to one. `DataTable` sums the floors
+ * into the grid's own minimum width, so a surface narrower than their sum
+ * scrolls the log horizontally instead of squeezing a column to its padding
+ * and letting its content paint over the next one.
  * ---------------------------------------------------------------------------
  */
 
@@ -1084,6 +1179,8 @@ function renderKindCell(row: EventLogRow): ReactNode {
  * A record that resolved to a project location carries the dense source chip,
  * whose click is its own: the table excludes clicks from interactive
  * descendants from row activation, so opening a file never also selects a row.
+ * The chip is `tabIndex={-1}`: the grid's arrow keys move focus onto it, and a
+ * chip left in the Tab order would add one Tab stop per loaded record.
  *
  * The cell is itself a flex row with the design system's own gap, so the runs
  * below need no spacing of their own.
@@ -1099,7 +1196,9 @@ function renderNameCell(row: EventLogRow): ReactNode {
       <Text size="sm" truncate title={event.name} className="dg-event-log__name">
         {event.name}
       </Text>
-      {event.source === undefined ? null : <SourceLink location={event.source} compact />}
+      {event.source === undefined ? null : (
+        <SourceLink location={event.source} compact tabIndex={-1} />
+      )}
     </>
   );
 }
@@ -1111,6 +1210,15 @@ function renderNameCell(row: EventLogRow): ReactNode {
  * — and nothing here expands, re-parses or reconstructs one (AAP 0.5.2). What
  * is not shown is counted rather than dropped, so the strip never implies that
  * a record carries less than it does.
+ *
+ * The strip is one line inside a cell that is often narrower than its chips,
+ * so what fits is decided by the stylesheet, never by a measured width: every
+ * chip (`dg-event-log__attr`) may shrink to nothing and grow only toward its
+ * own text, which leaves short pairs whole and ellipsizes only the longest,
+ * while the count (`dg-event-log__more`) never shrinks and therefore always
+ * stays in view right after the last chip. A chip that the cell cut short
+ * carries its rendered text as its `title` — exactly the bounded preview it
+ * shows, never anything fuller — so the whole pair is still one hover away.
  */
 function renderAttributesCell(row: EventLogRow): ReactNode {
   if (row.pairs.length === 0 && row.hiddenAttributeCount === 0) {
@@ -1123,13 +1231,17 @@ function renderAttributesCell(row: EventLogRow): ReactNode {
 
   return (
     <Stack direction="horizontal" gap={1} align="center" className="dg-event-log__attrs">
-      {row.pairs.map((pair) => (
-        <Code key={pair.key} size="sm">
-          {`${pair.key}${ATTRIBUTE_PAIR_SEPARATOR}${pair.text}`}
-        </Code>
-      ))}
+      {row.pairs.map((pair) => {
+        const text = `${pair.key}${ATTRIBUTE_PAIR_SEPARATOR}${pair.text}`;
+
+        return (
+          <Code key={pair.key} size="sm" title={text} className="dg-event-log__attr">
+            {text}
+          </Code>
+        );
+      })}
       {row.hiddenAttributeCount > 0 ? (
-        <Text size="xs" tone="muted">
+        <Text size="xs" tone="muted" className="dg-event-log__more">
           {`+${formatCount(row.hiddenAttributeCount)} ${MORE_ATTRIBUTES_SUFFIX}`}
         </Text>
       ) : null}
@@ -1158,14 +1270,14 @@ const EVENT_LOG_COLUMNS: readonly DataTableColumn<EventLogRow>[] = Object.freeze
   {
     key: 'name',
     header: COLUMN_HEADER_NAME,
-    width: 'minmax(0, 1fr)',
+    width: 'minmax(28ch, 1fr)',
     rowHeader: true,
     cell: renderNameCell,
   },
   {
     key: 'attributes',
     header: COLUMN_HEADER_ATTRIBUTES,
-    width: 'minmax(0, 2fr)',
+    width: 'minmax(28ch, 2fr)',
     cell: renderAttributesCell,
   },
 ]);
@@ -1218,6 +1330,10 @@ export function EventLog(props: EventLogProps): ReactElement {
   // reading the context is unconditional, as a hook must be, and safe outside a
   // provider by that module's documented contract.
   const actions = usePanelActions();
+  // The panel's one selection, shared with every other view under the host, and
+  // the recorder a row activation calls: a no-op under a host, which records
+  // the report itself, and this log's own fallback outside one.
+  const { selection, shared, markSelected } = useViewSelection();
 
   const [selectedKind, setSelectedKind] = useState<TelemetryKind | typeof ALL_KINDS_VALUE>(
     ALL_KINDS_VALUE,
@@ -1254,7 +1370,7 @@ export function EventLog(props: EventLogProps): ReactElement {
     offset,
   };
 
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   // Earlier pages first, then the page that just resolved. While a further page
   // is in flight `data` is absent and the carried records stand alone, so the
@@ -1281,6 +1397,22 @@ export function EventLog(props: EventLogProps): ReactElement {
     setSearchValue(next);
   }, []);
 
+  // The block's own element, read only from the clear handler below — never
+  // during a render — to find the text field it returns focus to.
+  const rootRef = useRef<HTMLDivElement>(null);
+
+  // The no-match state's one control. It empties the text field and moves
+  // focus into it BEFORE the re-render that removes the control: the rows come
+  // back in that render and the empty state with its button goes, so without
+  // this the focused element would vanish and focus would fall to the document
+  // body. The field is found inside this block's own toolbar because the text
+  // primitive exposes no `ref` and the toolbar forwards no `id`; it is the
+  // view's only text field, so the lookup is exact and never leaves this view.
+  const handleClearSearch = useCallback((): void => {
+    setSearchValue('');
+    rootRef.current?.querySelector<HTMLElement>(SEARCH_FIELD_SELECTOR)?.focus();
+  }, []);
+
   // Choosing a kind is a RE-QUERY, not a local filter: the kind goes into the
   // request's `filter.kinds`, the accumulator resets with the new request
   // identity, and the host is told which narrowing the reader asked for. The
@@ -1305,7 +1437,10 @@ export function EventLog(props: EventLogProps): ReactElement {
   // helper call after that callback would read to it as a later mutation of a
   // memoized dependency and make it skip this component.
   const loadedCount = rows.length;
-  const knownTotal = reportedTotal(total);
+  // The total of the page that resolved, or — when `useQuery` reports none, as
+  // it does while the next page is in flight — the total this sequence last
+  // reported, so the polite footer never announces a count that lost its total.
+  const knownTotal = reportedTotal(total) ?? paging?.total;
 
   // The next offset is the response's own, copied rather than derived from the
   // length of a page or from the total, which would drift the moment the
@@ -1336,15 +1471,37 @@ export function EventLog(props: EventLogProps): ReactElement {
       return;
     }
 
-    setPage({ identity, offset: loadMoreOffset, carried: carried.concat(data) });
-  }, [carried, data, identity, loadMoreOffset]);
+    setPage({
+      identity,
+      offset: loadMoreOffset,
+      carried: carried.concat(data),
+      total: knownTotal,
+    });
+  }, [carried, data, identity, knownTotal, loadMoreOffset]);
 
   const selectEvent = actions?.onSelectEvent;
   const handleRowActivate = useCallback(
     (row: EventLogRow): void => {
-      selectEvent?.(toEventRef(row.event));
+      const ref = toEventRef(row.event);
+
+      // Recorded first, reported second: under the panel host the report is
+      // what moves the shared selection, and outside one the recorder is what
+      // marks the row.
+      markSelected(ref);
+      selectEvent?.(ref);
     },
-    [selectEvent],
+    [markSelected, selectEvent],
+  );
+
+  // Whether this log's rows have a selected state at all. Under a host they
+  // always do, because any view or evidence chip may select one of its records;
+  // outside one, only while a row can be activated — a grid whose rows all
+  // report `aria-selected="false"` and can never become selected would claim a
+  // selection model that does not exist.
+  const selectable = shared || selectEvent !== undefined;
+  const selectedRowKey = useMemo(
+    () => (selectable ? selectedEventLogRowKey(visibleRows, selection) : undefined),
+    [selectable, selection, visibleRows],
   );
 
   const visibleCount = visibleRows.length;
@@ -1370,6 +1527,11 @@ export function EventLog(props: EventLogProps): ReactElement {
       : []),
   ];
 
+  // The same statements as one sentence, for the live region below: empty
+  // while no text filter is active, so the region stays silent until the
+  // reader types and falls silent again when the filter is cleared.
+  const liveStatus = toolbarStatus.map((entry) => entry.label).join(LIVE_STATUS_SEPARATOR);
+
   // Offered only when there is something to choose: a picker holding nothing
   // but "all kinds" is a control that cannot act.
   const kindSelects: readonly ToolbarSelect[] =
@@ -1385,6 +1547,21 @@ export function EventLog(props: EventLogProps): ReactElement {
         ]
       : EMPTY_SELECTS;
 
+  // The toolbar is omitted over one state only: a settled empty capture — the
+  // query succeeded, nothing loaded, no forward page — reached with none of the
+  // reader's own narrowing in force. There is then nothing any of its controls
+  // could reach: the text filter searches loaded records and there are none,
+  // and every kind the picker offers narrows a result that is already empty.
+  // Everywhere else it stays: while a query is in flight or failed, so a
+  // re-query raised from the bar never removes the bar, and over a result the
+  // reader narrowed to nothing, so the narrowing can be undone where it was made.
+  const toolbarShown = !(
+    emptyPage === NOTHING_CAPTURED_COPY &&
+    !hasMore &&
+    searchValue === '' &&
+    selectedKind === ALL_KINDS_VALUE
+  );
+
   // The four bodies, in the order AAP 0.6.2 fixes: busy, failed, absent, then
   // the grid. An empty page and a failed request are different answers and are
   // never merged - `"success"` with no rows is an absence phrased from the
@@ -1399,14 +1576,15 @@ export function EventLog(props: EventLogProps): ReactElement {
       </div>
     );
   } else if (status === 'error') {
+    // The shared failure contract, with the query exactly as it was asked: the
+    // generic lead and the provider's own cause, its hint on a line of its own,
+    // its code and a retry. Scoped to the whole view even for a later page,
+    // because this body replaces the rows carried from the earlier pages rather
+    // than keeping them above the failure.
     body = (
       <div className="dg-event-log__error">
         <ErrorState
-          message={errorSentence(error?.message, error?.hint)}
-          code={error?.code}
-          query={serialiseQuery(query)}
-          onRetry={retry}
-          icon={<TriangleAlert className="dg-icon" />}
+          {...queryFailureProps({ error, announcement, retry }, query, { scope: 'view' })}
         />
       </div>
     );
@@ -1427,29 +1605,62 @@ export function EventLog(props: EventLogProps): ReactElement {
         columns={EVENT_LOG_COLUMNS}
         rowKey={eventLogRowKey}
         caption={node.title ?? EVENT_LOG_CATALOG_ENTRY.label}
+        selectedRowKey={selectedRowKey}
         onRowActivate={selectEvent === undefined ? undefined : handleRowActivate}
-        empty={<EmptyState message={FILTERED_EMPTY_MESSAGE} icon={<ListX className="dg-icon" />} />}
+        // Reached only by a text filter that matched nothing: a settled page
+        // with no record at all takes the empty body above, so these rows are
+        // empty exactly when the filter emptied them, and the state's control
+        // undoes that filter in place.
+        empty={
+          <EmptyState
+            message={FILTERED_EMPTY_MESSAGE}
+            icon={<ListX className="dg-icon" />}
+            action={
+              <Button
+                variant="secondary"
+                size="sm"
+                icon={<X className="dg-icon" />}
+                onClick={handleClearSearch}
+              >
+                {CLEAR_SEARCH_LABEL}
+              </Button>
+            }
+          />
+        }
       />
     );
   }
 
   return (
-    <div className={clsx('dg-event-log', className)}>
-      <Toolbar
-        className="dg-event-log__toolbar"
-        label={TOOLBAR_LABEL}
-        search={{
-          value: searchValue,
-          onValueChange: handleSearchChange,
-          label: SEARCH_LABEL,
-          placeholder: SEARCH_PLACEHOLDER,
-          labelHidden: true,
-        }}
-        selects={kindSelects}
-        status={toolbarStatus}
-        compact
-        wrap
-      />
+    <div className={clsx('dg-event-log', className)} ref={rootRef}>
+      {toolbarShown ? (
+        <Toolbar
+          className="dg-event-log__toolbar"
+          label={TOOLBAR_LABEL}
+          search={{
+            value: searchValue,
+            onValueChange: handleSearchChange,
+            label: SEARCH_LABEL,
+            placeholder: SEARCH_PLACEHOLDER,
+            labelHidden: true,
+          }}
+          selects={kindSelects}
+          status={toolbarStatus}
+          compact
+          wrap
+        />
+      ) : null}
+      {/* The match count, announced politely as the reader types. The toolbar
+          draws it as a pill, and a pill's changing text is not announced; this
+          region holds the same statements, so what is heard is what is shown,
+          and it is the only live copy of them. It is always mounted, because a
+          region inserted with its text already in it is not announced either,
+          and it follows the filter row it reports on. The utility takes it out
+          of flow, so it adds no gap to the column. No `role`: the busy state
+          below owns this view's one `status`. */}
+      <div className="dg-visually-hidden" aria-live="polite" aria-atomic="true">
+        {liveStatus}
+      </div>
       {body}
       {/* The footer follows what has loaded, and also an empty page the service
           reports a forward `nextOffset` for: that page ends nothing, and the
@@ -1463,7 +1674,9 @@ export function EventLog(props: EventLogProps): ReactElement {
           wrap
           className="dg-data-table__footer"
         >
-          <Text size="xs" tone="muted">
+          {/* Polite, so a reader who pressed "load more" hears how far the
+              loaded page now reaches instead of nothing at all. */}
+          <Text size="xs" tone="muted" aria-live="polite">
             {footerLabel}
           </Text>
           {hasMore ? (

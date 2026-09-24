@@ -50,12 +50,13 @@
  *
  * One consequence of that emission is worth naming here, because it is a
  * property of *this* module rather than of the emitter: the field schemas below
- * are **shared instances**, not per-node copies — one source enumeration, one
- * filter, one limit — so every repetition across the sixteen node types is the
- * same schema object, and each leaf is the same schema object at every one of
- * the nesting levels described under "The node union, level by level". Rendered
- * with reference reuse, the document is roughly 60 KB of definitions and
- * references (60,046 characters, measured on this schema); inlined, each level
+ * are **shared instances**, not per-node copies — one filter, one limit, one
+ * source enumeration per node type — so every repetition across the sixteen
+ * node types is the same schema object, and each leaf is the same schema object
+ * at every one of the nesting levels described under "The node union, level by
+ * level". Rendered with reference reuse, the document is roughly 87 KB of
+ * definitions and references (86,499 characters for the draft 2020-12
+ * rendering, measured on this schema); inlined, each level
  * would be copied into each of the three containers of the level above, and
  * the rendering outgrows the longest string the runtime can hold. A future edit
  * that rebuilt any of those fields per node, or the leaves per level, would
@@ -69,14 +70,18 @@
  *   Both forms are accepted because both are natural to write; normalisation
  *   resolves them into the single internal form. When a node carries both, the
  *   nested `query` wins for the keys it declares and the flat fields fill the
- *   gaps — stated here, implemented once, in `./normalize.ts`.
+ *   gaps — stated here, implemented once, in `./normalize.ts`. Either spelling
+ *   may carry the node's `source`, and a node type that reads captured data
+ *   must carry it in one of them (see "Which sources a node may read, and when
+ *   it must name one" below).
  * - **A bare string summary.** `summary` is `string | { … }`, and the string
  *   form is the common one. It becomes the panel summary's non-evidentiary
  *   headline; it never becomes an observed fact. Facts come only from the
  *   validated analysis, which is why the object form's purported facts and
  *   citations are not even representable here (see `authoredSummaryProseSchema`).
  * - **A `metricCards` node with no source.** The source of a metric-card row is
- *   implied, and normalisation supplies it from the node catalog.
+ *   implied — its catalog entry's `defaultSource` — and normalisation supplies
+ *   it from the node catalog. A source that *is* written is still checked.
  * - **A trace-id placeholder.** See `dataQueryInputSchema`: a trace identifier
  *   cannot be known while a panel is being authored, so this layer checks no
  *   format for it and semantic validation resolves it against the capture.
@@ -94,15 +99,41 @@
  *   accepting both query forms: an invented dimension is rejected here instead
  *   of surviving into a panel that claims to present it.
  *
- * ## What it deliberately does not decide
+ * ## Which sources a node may read, and when it must name one
  *
- * **Which sources a given node type may read.** That is the node catalog's
- * statement (`./catalog.ts`) and `./validate.ts` applies it after
- * normalisation. Restating it here would put the same rule in two places, and
- * would flatten into the emitted JSON Schema as a per-node source enumeration
- * that has to be regenerated whenever the catalog changes. A node that names a
- * known source its type cannot read is therefore accepted at step 1 and
- * rejected at step 3, with the catalog as the single registry throughout.
+ * The node catalog (`./catalog.ts`) states, per node type, the sources its
+ * renderer component can consume and whether the type implies one
+ * (`defaultSource`). This schema **derives** both rules from that statement —
+ * it restates no source list — and enforces them at step 1, because a node
+ * without a readable source is exactly the repairable authoring omission step 1
+ * exists for, and at step 3 it would be a rejection the model never hears of:
+ *
+ * - **Each query-backed node type's `source` is an enumeration of its catalog
+ *   sources**, flat on the node and inside `query` alike. A node that names a
+ *   source its type cannot read is refused here, with the readable ones listed.
+ * - **A node type whose entry requires a query and implies no source must name
+ *   one**, on the node or inside its `query` object. Each such type is the
+ *   union of its two spellings — `source` required on the node, or a `query`
+ *   object whose `source` is required — discriminated on the flat `source`,
+ *   which the nested spelling leaves out (or sets to `null`). Both spellings
+ *   stay accepted, and so does writing both, under the precedence above.
+ * - **A type with a catalog default** (`metricCards`) takes its source
+ *   optionally, from the same per-type enumeration.
+ *
+ * Every rejection names what is wrong in the catalog's terms. The schema's own
+ * messages — which are what the model provider's repair loop shows the author —
+ * name the node type and list its readable sources, or list the catalogued
+ * node types for a type outside them; `parsePanelSpecInput` reports the
+ * matching `./validate.ts` codes (`panel_node_query_source_missing`,
+ * `panel_node_query_source_not_allowed`, `panel_node_query_source_unknown`,
+ * `panel_node_type_unknown`) with that closed vocabulary as each issue's
+ * `expected`. Neither ever repeats a rejected value. `./validate.ts` applies
+ * the same rules again at step 3, for a document that reached it without
+ * passing through here.
+ *
+ * The price is a per-type source enumeration in the emitted JSON Schema, which
+ * is regenerated from the catalog with every change to it — so the catalog
+ * remains the single registry.
  *
  * Environment-neutral, like every module in this package: no `node:` builtin,
  * no DOM global, no side effect at load. Importing it builds schemas and
@@ -133,6 +164,7 @@ import { DebuggenError, err, ok, sourceLocationSchema } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { METRIC_IDS } from '@debuggen/telemetry';
 
+import { PANEL_NODE_CATALOG } from './catalog.js';
 import {
   isLayoutNodeType,
   LAYOUT_NODE_MAX_CHILDREN,
@@ -145,18 +177,22 @@ import {
   dataQuerySchema,
   dataQuerySortSchema,
   dataQuerySourceSchema,
+  isDataQuerySource,
   panelNodeDescriptionSchema,
   panelNodeTitleSchema,
   type DataQueryFlatFieldKey,
+  type DataQuerySource,
 } from './nodes/query.js';
 import type { QueryBackedNodeType } from './nodes/viz.js';
 import {
+  isPanelNodeType,
   PANEL_CHILDREN_FIELD,
   PANEL_LAYOUT_FIELD,
   PANEL_LAYOUT_MAX_NODES,
   PANEL_NODE_TYPES,
   PANEL_TITLE_MAX_LENGTH,
   PANEL_VIZ_NODE_TYPES,
+  type PanelNodeType,
 } from './spec.js';
 import {
   describeIssues,
@@ -214,23 +250,41 @@ const authoredNodeLabelShape = {
  * ---------------------------------------------------------------------------
  * The authored data query
  *
- * One definition of the five query fields, used twice: spread flat onto every
- * query-backed node, and wrapped into the optional nested `query` object those
- * same nodes accept. Declaring it once is what guarantees the two spellings a
- * normaliser has to reconcile are spellings of the *same* fields.
+ * The five query fields are declared in two halves. The four that narrow,
+ * order and page a source — `filter`, `sort`, `limit`, `offset` — are one set
+ * of shared instances, spread flat onto every query-backed node and into every
+ * nested `query` object, which is what guarantees the two spellings a
+ * normaliser has to reconcile are spellings of the *same* fields. The fifth,
+ * `source`, is the one field whose vocabulary depends on the node carrying it,
+ * so it is built once **per node type** from that type's node catalog entry
+ * (see "Which sources a node may read, and when it must name one" above).
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The five query fields, each optional, as a reusable shape.
+ * The name of the query field that selects what a node reads.
+ *
+ * Typed against the authoritative flat-field list, so renaming the field in
+ * `./nodes/query.ts` fails to compile here rather than leaving the per-type
+ * source schemas, the spelling discriminator and the rejection classifier below
+ * pointing at a key nothing writes.
+ */
+const SOURCE_FIELD = 'source' satisfies DataQueryFlatFieldKey;
+
+/** The nested spelling of a node's data request, as it appears in an issue path. */
+const QUERY_FIELD = 'query';
+
+/** A node's discriminator, as it appears in an issue path. */
+const NODE_TYPE_FIELD = 'type';
+
+/**
+ * The four query fields that narrow, order and page a source, each optional,
+ * as one reusable shape of shared instances.
  *
  * Every field is the definition `./nodes/query.ts` owns, and that reuse is the
  * point rather than a convenience:
  *
- * - `source` and `sort` are the exported enumerations over the closed source
- *   and sort vocabularies. The ten source names are exactly the discriminants
- *   of the result union the panel-data route serves (AAP 0.4.2), so a second
- *   list of them here would break the service the moment either changed.
+ * - `sort` is the exported enumeration over the closed sort vocabulary.
  * - `filter` is the internal filter schema itself, which already draws its
  *   `kinds` and `tier` vocabularies from `@debuggen/telemetry` — the package
  *   that owns them and forbids a second hard-coded copy — and which already
@@ -244,32 +298,19 @@ const authoredNodeLabelShape = {
  *
  * Every field is optional because the flat and the nested form fill each
  * other's gaps: a node may name its source flat and its filter nested, and
- * neither half is complete on its own. A node that ends up with no source at
- * all is the catalog's and `./validate.ts`'s business, not this schema's.
+ * neither half is complete on its own.
  *
- * The `satisfies` clause is a compile-time proof rather than a decoration, and
- * it fails in both directions against the authoritative flat-field list: a
- * field declared here and missing from `DATA_QUERY_FLAT_FIELD_KEYS` leaves the
- * record type unsatisfied, and a key in that tuple with no declaration here
- * leaves a required key unimplemented. The authoring schema and the normaliser
- * that lifts these fields therefore cannot disagree about which fields they
- * are. `metrics` is deliberately not among them — it is an option of the
- * metric-card node, not a query field, and normalisation must not relocate it.
+ * The `satisfies` clause is a compile-time proof rather than a decoration: it
+ * requires exactly the authoritative flat-field list minus `source`, so a field
+ * added to `DATA_QUERY_FLAT_FIELD_KEYS` without a declaration here, or declared
+ * here without being in that tuple, fails to compile. Each place the shape is
+ * completed with a `source` repeats the proof over the whole list, so the
+ * authoring schema and the normaliser that lifts these fields cannot disagree
+ * about which fields they are. `metrics` is deliberately not among them — it is
+ * an option of the metric-card node, not a query field, and normalisation must
+ * not relocate it.
  */
-const authoredQueryFieldShape = {
-  /**
-   * Which prepared view of the capture this node reads.
-   *
-   * Optional in the authored form only: normalisation resolves it from the
-   * nested query, the flat field or the node type's implicit source, in that
-   * order, and the internal form requires it.
-   */
-  source: dataQuerySourceSchema
-    .optional()
-    .describe(
-      'Which prepared view of the captured evidence this node reads, named by one of the closed source values. May also be written inside this node\'s "query" object instead. Omit it only on a node type whose source is implied.',
-    ),
-
+const authoredQueryRefinementShape = {
   /** How to narrow the source before anything is drawn. */
   filter: dataQueryFilterSchema
     .optional()
@@ -290,13 +331,21 @@ const authoredQueryFieldShape = {
 
   /** How many items to skip before the returned page. The internal field. */
   offset: dataQuerySchema.shape.offset,
-} satisfies Record<DataQueryFlatFieldKey, z.ZodType>;
+} satisfies Record<Exclude<DataQueryFlatFieldKey, typeof SOURCE_FIELD>, z.ZodType>;
 
 /**
- * The optional nested `query` object a node may carry instead of, or beside,
- * the flat fields.
+ * The data request of one node written as an object, over the **whole** source
+ * vocabulary: every field optional, `source` any of the closed source values.
  *
- * Strict, like every other object in this module: the five fields above are the
+ * This is the vocabulary-wide statement of the nested spelling, and the type
+ * `./normalize.ts` reads a node's nested request as ({@link DataQueryInput}).
+ * No authored node is parsed with it: each query-backed node type parses its
+ * nested `query` with the same four refinement fields and a `source` narrowed
+ * to the sources that type can read (see {@link authoredSourceSchemasFor}), so
+ * what every node's nested object accepts is a subset of what this one accepts,
+ * and a value parsed by any of them is a `DataQueryInput`.
+ *
+ * Strict, like every other object in this module: the five fields are the
  * whole query vocabulary, and an invented sixth is rejected rather than
  * silently dropped by a resolver that never reads it.
  *
@@ -325,9 +374,12 @@ const authoredQueryFieldShape = {
  * field for the same reason, so nothing tightens behind this module's back.
  */
 export const dataQueryInputSchema = z
-  .strictObject(authoredQueryFieldShape)
+  .strictObject({
+    source: dataQuerySourceSchema.optional(),
+    ...authoredQueryRefinementShape,
+  } satisfies Record<DataQueryFlatFieldKey, z.ZodType>)
   .describe(
-    'The data request for one node, written as an object. Its five fields may equally be written directly on the node; when both spellings appear on one node, this object wins for the fields it names and the fields written on the node fill the rest.',
+    'The data request for one node, written as an object. Its five fields may equally be written directly on the node; when both spellings appear on one node, this object wins for the fields it names and the fields written on the node fill the rest. Each node type narrows "source" to the sources it can read.',
   );
 
 /**
@@ -336,50 +388,240 @@ export const dataQueryInputSchema = z
  *
  * Inferred from {@link dataQueryInputSchema}, so the validator and the type are
  * one statement. `./normalize.ts` consumes this together with a node's flat
- * fields and produces the internal `DataQuery`.
+ * fields and produces the internal `DataQuery`; the nested object of every
+ * authored node type is assignable to it.
  */
 export type DataQueryInput = z.infer<typeof dataQueryInputSchema>;
 
-/**
- * The shape shared by the twelve query-backed nodes in their authored form:
- * the two labels, the five query fields flat, and the nested query object.
- *
- * Both spellings are declared, and both are declared *explicitly*. A
- * passthrough or a catch-all would accept the flat fields too, and would also
- * accept anything else an author cared to attach — including an id, a colour or
- * a height, none of which this package admits (AAP 0.6.2 keeps every visual
- * value in the renderer's design tokens). Explicit fields plus strictness is
- * what makes "accepts both query forms" and "rejects invented dimensions" the
- * same statement.
+/*
+ * ---------------------------------------------------------------------------
+ * The source vocabulary of one node type
+ * ---------------------------------------------------------------------------
  */
-const authoredQueryBackedNodeShape = {
-  ...authoredNodeLabelShape,
-  ...authoredQueryFieldShape,
 
-  /**
-   * The same five query fields written as one object.
-   *
-   * Optional, and never required: a node that writes them flat is complete
-   * without it. When both are present the precedence is the one documented on
-   * {@link dataQueryInputSchema} and implemented in `./normalize.ts`.
-   */
-  query: dataQueryInputSchema
-    .optional()
-    .describe(
-      "This node's data request as an object. Equivalent to writing the same fields directly on the node; use either spelling, not both.",
-    ),
-};
+/**
+ * The sources a query-backed node type may read, as its node catalog entry
+ * states them — imported, never restated.
+ *
+ * @param type The node type.
+ * @returns The catalog's source list for that type, in the catalog's order.
+ * @throws DebuggenError `INTERNAL` at module load if the catalog lists no
+ * source for a query-backed type. Such an entry is a product defect: the
+ * enumeration built from it would accept nothing, and JSON Schema can render
+ * an enumeration of nothing only as a type-less `not` schema, which the
+ * provider's structured-output renderer refuses — so it is reported where it
+ * is introduced rather than as a prompt that cannot be sent.
+ */
+function catalogSourcesOf(type: QueryBackedNodeType): readonly DataQuerySource[] {
+  const { sources } = PANEL_NODE_CATALOG[type];
+
+  if (sources.length === 0) {
+    throw new DebuggenError(
+      'INTERNAL',
+      `The node catalog lists no source for the query-backed node type ${type}, so its authored form could accept no data request.`,
+      {
+        hint: 'Give the catalog entry at least one source its renderer component can consume, or stop classing the node type as query-backed.',
+      },
+    );
+  }
+
+  return sources;
+}
+
+/**
+ * The three model-facing messages one node type's source schemas report.
+ *
+ * Built from the node type and its catalog sources only — a closed vocabulary,
+ * never the rejected value (AAP 0.5.2) — because these are the messages the
+ * model provider's repair loop quotes back to the model, beside the path, for
+ * the ways a data request can be wrong. Each names the whole remedy: the
+ * sources the type can read and, for a missing one, both places it may be
+ * written.
+ */
+interface SourceMessages {
+  /** For a node that names no source in either spelling. */
+  readonly missing: string;
+
+  /** For a source the node type cannot read, or a value that is no source at all. */
+  readonly notAllowed: string;
+
+  /** For a `query` that is present but is not an object of query fields. */
+  readonly queryNotObject: string;
+}
+
+/**
+ * Builds {@link SourceMessages} for one node type.
+ *
+ * @param type The node type.
+ * @param sources Its catalog sources.
+ * @returns The three messages.
+ */
+function sourceMessagesFor(
+  type: QueryBackedNodeType,
+  sources: readonly DataQuerySource[],
+): SourceMessages {
+  const listed = sources.join(', ');
+
+  return {
+    missing: `A ${type} node needs a source (one of: ${listed}), written as "source" on the node or inside its "query" object.`,
+    notAllowed: `Not a source a ${type} node can read; use one of: ${listed}.`,
+    queryNotObject: `The "query" of a ${type} node must be an object of query fields, and its source one of: ${listed}.`,
+  };
+}
+
+/**
+ * The model-facing description of one node type's `source` field.
+ *
+ * Driven by the catalog rather than by the node type's name: a type whose
+ * entry declares a `defaultSource` is told its source is implied, and every
+ * other type is told that it must name one, in either spelling. The sources
+ * themselves are not repeated here: the enumeration the description sits on
+ * lists them, and every repetition is prompt text multiplied by the node
+ * types.
+ *
+ * @param type The node type.
+ * @returns The description.
+ */
+function sourceDescriptionFor(type: QueryBackedNodeType): string {
+  return PANEL_NODE_CATALOG[type].defaultSource === undefined
+    ? `Which prepared view of the captured evidence this ${type} node reads. Required: write it on the node or inside the node's "query" object.`
+    : `Which prepared view of the captured evidence this ${type} node reads. Implied for this node type, so it may be omitted; a source that is written must be one of these.`;
+}
+
+/**
+ * Builds every schema that states one query-backed node type's source
+ * vocabulary: the source enumeration, and the node type's two nested `query`
+ * objects.
+ *
+ * - `source` — an enumeration over exactly the catalog's sources for the type,
+ *   one instance used at every place this type's source is written, so the
+ *   emitted JSON Schema renders it once. Its error function reports the
+ *   `missing` message when there is no value at all (the enumeration's own
+ *   `invalid_value` for an absent required key) and the `notAllowed` message
+ *   for any value outside the list — a source this type cannot read, a string
+ *   that is no source, or a value that is not a string.
+ * - `optionalQuery` — the nested object with `source` optional: for a node
+ *   that names its source on the node itself, or whose source is implied. A
+ *   `query` that is not an object reports the `queryNotObject` message.
+ * - `requiredQuery` — the nested object with `source` required: for a node
+ *   that names no source on the node, so the object is the only place left to
+ *   name one. Its own `invalid_type` reports the `missing` message when the
+ *   `query` is absent and the `queryNotObject` message when it is present but
+ *   not an object.
+ *
+ * Called once per node type at module load, and builds schemas and nothing
+ * else. The returned schemas are shared by every nesting level, like the
+ * leaves they are part of.
+ *
+ * @param type The node type.
+ * @returns The type's source enumeration, its two nested query objects and
+ * the messages they report.
+ * @throws DebuggenError `INTERNAL` when the catalog lists no source for the
+ * type; see {@link catalogSourcesOf}.
+ */
+function authoredSourceSchemasFor(type: QueryBackedNodeType) {
+  const sources = catalogSourcesOf(type);
+  const messages = sourceMessagesFor(type, sources);
+
+  const source = z
+    .enum(sources, {
+      error: (issue) => {
+        if (issue.code !== 'invalid_value') {
+          return undefined;
+        }
+
+        return issue.input === undefined ? messages.missing : messages.notAllowed;
+      },
+    })
+    .describe(sourceDescriptionFor(type));
+
+  const optionalQuery = z.strictObject(
+    {
+      source: source.optional(),
+      ...authoredQueryRefinementShape,
+    } satisfies Record<DataQueryFlatFieldKey, z.ZodType>,
+    { error: (issue) => (issue.code === 'invalid_type' ? messages.queryNotObject : undefined) },
+  );
+
+  const requiredQuery = z.strictObject(
+    {
+      source,
+      ...authoredQueryRefinementShape,
+    } satisfies Record<DataQueryFlatFieldKey, z.ZodType>,
+    {
+      error: (issue) => {
+        if (issue.code !== 'invalid_type') {
+          return undefined;
+        }
+
+        return issue.input === undefined ? messages.missing : messages.queryNotObject;
+      },
+    },
+  );
+
+  return { source, optionalQuery, requiredQuery, messages };
+}
+
+/**
+ * The flat `source` of a node that names its source inside `query` instead:
+ * absent, or `null`, which is read as absent.
+ *
+ * It exists for one reason, and that reason is the spelling discriminator in
+ * {@link sourceRequiredNodeInput}. A node type that must name a source has two
+ * authored spellings — the source on the node, or inside its `query` object —
+ * and the schema tells them apart by the flat `source` value: one of the
+ * type's sources selects the flat spelling, and no value selects the nested
+ * one. The discriminator needs the nested spelling to *claim* that "no value",
+ * and the constructs that claim nothing but absence either cannot be rendered
+ * at all (`undefined`) or render as a type-less `not` schema that the model
+ * provider's structured-output renderer refuses outright. `null` is the one
+ * value that can stand for absence and render with a type, so it is the one
+ * admitted, and it means exactly what leaving the key out means: normalisation
+ * takes the source from the nested object, which this spelling requires.
+ *
+ * One shared instance for every node type, so the emitted schema renders it
+ * once.
+ */
+const NESTED_SPELLING_FLAT_SOURCE = z
+  .null()
+  .optional()
+  .describe(
+    'Leave this out, or null, when the source is written inside this node\'s "query" object instead.',
+  );
+
+/*
+ * The descriptions of the two nested `query` fields a source-requiring node
+ * type's spellings carry. Short on purpose: each is rendered once per such
+ * node type, and the rule they share — the source is required, on the node or
+ * in this object — is already stated on the type's `source` enumeration.
+ */
+
+/** Describes the nested `query` of a node that names its source on the node. */
+const FLAT_SPELLING_QUERY_DESCRIPTION =
+  'The same fields written as an object; it wins for each field it names, so its "source" may be left out here.';
+
+/** Describes the nested `query` of a node that names its source nowhere else. */
+const NESTED_SPELLING_QUERY_DESCRIPTION =
+  "This node's data request as an object, naming the source this node reads.";
+
+/** Describes the nested `query` of a node whose source is implied. */
+const IMPLIED_SOURCE_QUERY_DESCRIPTION =
+  "This node's data request as an object. Equivalent to writing the same fields directly on the node; use either spelling, not both.";
 
 /*
  * ---------------------------------------------------------------------------
  * The twelve query-backed leaves
  *
- * One strict object each, all of them the shared shape above plus their own
- * `type` literal — and, for exactly one of them, one extra option. The literal
- * is what the discriminated union at the bottom of this module keys on, which
- * is what makes a malformed node fail against one schema with one clear issue
- * path instead of against sixteen at once (AAP 0.8.3 requires that an unknown
- * node type fails).
+ * Every one of them pins its own `type` literal, which is what the
+ * discriminated union at the bottom of this module keys on, and that is what
+ * makes a malformed node fail against one schema with one clear issue path
+ * instead of against sixteen at once (AAP 0.8.3 requires that an unknown node
+ * type fails).
+ *
+ * Eleven of them must name a source, and their catalog entries declare no
+ * default one; each is a union of its two spellings, built by
+ * {@link sourceRequiredNodeInput}. The twelfth, the metric-tile row, has an
+ * implied source and one extra option, and is a single strict object.
  *
  * The descriptions here say what a node draws in one line. The longer guidance
  * an author needs in order to *choose* between them is the node catalog's, and
@@ -388,96 +630,150 @@ const authoredQueryBackedNodeShape = {
  */
 
 /**
- * Builds the authored form of one query-backed node: the shared shape plus a
- * `type` literal.
+ * Builds the authored form of one query-backed node type that must name a
+ * source: a discriminated union, over the flat `source` value, of the type's
+ * two spellings.
  *
- * Generic in the node type so the literal survives into the returned schema's
- * internals — a discriminated union cannot be built from options whose
- * discriminator it can no longer see, and would have to fall back to a plain
- * union whose failures report every branch's issues instead of the one that
- * matched. Constrained to `QueryBackedNodeType` so a type name outside that
- * vocabulary cannot be given a query-backed shape, and the return type is
- * deliberately inferred for the same reason the literal is generic.
+ * - **The flat spelling** carries `source` on the node, required and drawn from
+ *   the type's catalog sources, and may also carry a nested `query` whose own
+ *   `source` is optional — the nested object wins for the fields it names, as
+ *   `./normalize.ts` implements.
+ * - **The nested spelling** carries no flat source (absent, or the `null` that
+ *   {@link NESTED_SPELLING_FLAT_SOURCE} reads as absent) and a **required**
+ *   `query` whose `source` is required and drawn from the same list.
  *
- * @typeParam TType The node type this schema's `type` field pins.
+ * Both spellings carry the same labels and the same four flat refinement
+ * fields, so everything but the source is written the same way in either.
+ *
+ * **Why a discriminated union and not a plain one.** A plain union parses a
+ * failing node against both spellings and, when both fail, reports one
+ * `invalid_union` at the node's path in place of the field that was wrong: a
+ * node with a valid source and a misspelt sort would be told only that it
+ * matched neither spelling. Discriminating on the flat `source` routes each
+ * node to exactly one spelling first — a catalogued source to the flat one, no
+ * value to the nested one — so every other field fails at its own path, word
+ * for word as it would on a single object. What the discriminator itself
+ * reports is the one failure it can see: a flat value that is not a source
+ * this type can read, at the node's `source` path, with the type's
+ * `notAllowed` message.
+ *
+ * Every construct is one JSON Schema renders: the result is a `oneOf` of two
+ * strict objects, the flat one requiring `source`, the nested one requiring
+ * `query` and its `source`.
+ *
+ * Generic in the node type so the literal survives into both spellings'
+ * internals, which the discriminated union over node types above it needs to
+ * see; the return type is deliberately inferred for the same reason.
+ *
+ * @typeParam TType The node type both spellings pin.
  * @param type The node type literal.
  * @param description Model-facing description of what this node draws.
- * @returns A strict object schema for one authored node of that type.
+ * @returns The union of the two authored spellings of that node type.
+ * @throws DebuggenError `INTERNAL` at module load when the catalog lists no
+ * source for the type; see {@link catalogSourcesOf}.
  */
-function queryBackedNodeInput<TType extends QueryBackedNodeType>(type: TType, description: string) {
+function sourceRequiredNodeInput<TType extends QueryBackedNodeType>(
+  type: TType,
+  description: string,
+) {
+  const vocabulary = authoredSourceSchemasFor(type);
+
+  const flatSpelling = z.strictObject({
+    type: z.literal(type),
+    ...authoredNodeLabelShape,
+    ...({
+      source: vocabulary.source,
+      ...authoredQueryRefinementShape,
+    } satisfies Record<DataQueryFlatFieldKey, z.ZodType>),
+    query: vocabulary.optionalQuery.optional().describe(FLAT_SPELLING_QUERY_DESCRIPTION),
+  });
+
+  const nestedSpelling = z.strictObject({
+    type: z.literal(type),
+    ...authoredNodeLabelShape,
+    ...({
+      source: NESTED_SPELLING_FLAT_SOURCE,
+      ...authoredQueryRefinementShape,
+    } satisfies Record<DataQueryFlatFieldKey, z.ZodType>),
+    query: vocabulary.requiredQuery.describe(NESTED_SPELLING_QUERY_DESCRIPTION),
+  });
+
   return z
-    .strictObject({
-      type: z.literal(type),
-      ...authoredQueryBackedNodeShape,
+    .discriminatedUnion(SOURCE_FIELD, [flatSpelling, nestedSpelling], {
+      error: (issue) =>
+        issue.code === 'invalid_union' ? vocabulary.messages.notAllowed : undefined,
     })
     .describe(description);
 }
 
 /** One interaction on a shared time axis, in lanes by tier. */
-const timelineNodeInputSchema = queryBackedNodeInput(
+const timelineNodeInputSchema = sourceRequiredNodeInput(
   'timeline',
   'A correlated timeline of one interaction: every span on a shared time axis, in lanes by the tier that produced it, so the time each tier held and the gaps between them are visible. Narrow it to a single interaction, since a capture holds many.',
 );
 
 /** Calls as offset bars with their nested work. */
-const waterfallNodeInputSchema = queryBackedNodeInput(
+const waterfallNodeInputSchema = sourceRequiredNodeInput(
   'waterfall',
   'A waterfall of the calls in one interaction, each a bar positioned by its offset from the first: work that ran one after another when it could have run together reads as a staircase. Narrow it to a single interaction.',
 );
 
 /** Captured records in chronological order. */
-const eventLogNodeInputSchema = queryBackedNodeInput(
+const eventLogNodeInputSchema = sourceRequiredNodeInput(
   'eventLog',
   'A chronological log of captured records, unaggregated and filterable. Narrow it by kind to keep it readable.',
 );
 
 /** Nested timing drawn as a hierarchy. */
-const flameNodeInputSchema = queryBackedNodeInput(
+const flameNodeInputSchema = sourceRequiredNodeInput(
   'flame',
   'Nested timing drawn as a hierarchy, which distinguishes a call that was slow itself from one that was merely waiting on the work inside it. Narrow it to a single interaction.',
 );
 
 /** A sortable ranking of spans. */
-const tableNodeInputSchema = queryBackedNodeInput(
+const tableNodeInputSchema = sourceRequiredNodeInput(
   'table',
   'A sortable table of spans showing what each one was, which tier produced it and how long it took. Suits a ranking; order it and bound the rows to the few that matter.',
 );
 
 /** Per-component render statistics. */
-const renderTableNodeInputSchema = queryBackedNodeInput(
+const renderTableNodeInputSchema = sourceRequiredNodeInput(
   'renderTable',
   'Render statistics per component: how often each rendered, how long that took, what triggered those renders and which of its inputs changed.',
 );
 
 /** The component tree with per-node render counts. */
-const componentTreeNodeInputSchema = queryBackedNodeInput(
+const componentTreeNodeInputSchema = sourceRequiredNodeInput(
   'componentTree',
   'The component hierarchy captured at the end of the interaction, with the render count of each node, so a count can be read against where the component sits.',
 );
 
 /** Network requests grouped, with duplicates counted. */
-const requestTableNodeInputSchema = queryBackedNodeInput(
+const requestTableNodeInputSchema = sourceRequiredNodeInput(
   'requestTable',
   'Network requests grouped so that identical ones collapse into one row with a count, each expandable to its occurrences and their initiators.',
 );
 
 /** Database statements grouped, with execution counts. */
-const queryTableNodeInputSchema = queryBackedNodeInput(
+const queryTableNodeInputSchema = sourceRequiredNodeInput(
   'queryTable',
   'Database statements grouped by their parameterized text, with execution counts, durations and the call site of each. Statements are shown parameterized; no row contents are captured.',
 );
 
 /** Hook state transitions. */
-const stateTransitionsNodeInputSchema = queryBackedNodeInput(
+const stateTransitionsNodeInputSchema = sourceRequiredNodeInput(
   'stateTransitions',
   'State transitions in order: a summary of the previous value, what triggered the change, and a summary of the next one. Values are summarised rather than captured in full.',
 );
 
 /** The correlated flow as a graph. */
-const dependencyGraphNodeInputSchema = queryBackedNodeInput(
+const dependencyGraphNodeInputSchema = sourceRequiredNodeInput(
   'dependencyGraph',
   'The correlated flow as a graph, from the interaction through the functions and calls it reached to the datastore and external services at the end of it.',
 );
+
+/** The metric-tile row's catalog-derived source schemas; see {@link authoredSourceSchemasFor}. */
+const metricCardsSources = authoredSourceSchemasFor('metricCards');
 
 /**
  * The capture's computed values as a row of tiles.
@@ -498,11 +794,24 @@ const dependencyGraphNodeInputSchema = queryBackedNodeInput(
  * instead of a repair prompt. Requiring it keeps the failure where the author
  * can fix it, at a named path, with the whole vocabulary listed in the emitted
  * schema.
+ *
+ * **Its source is optional, and still checked.** The catalog entry declares a
+ * `defaultSource`, which `./normalize.ts` supplies when the node names none,
+ * so omission produces a node the internal schema accepts and is not an
+ * authoring error. A source that *is* written — on the node or inside its
+ * `query` — must be one of the entry's sources, from the same per-type
+ * enumeration the other eleven use, so a tile row pointed at a source it
+ * cannot draw is repaired at step 1 rather than rejected at step 3.
  */
 const metricCardsNodeInputSchema = z
   .strictObject({
     type: z.literal('metricCards'),
-    ...authoredQueryBackedNodeShape,
+    ...authoredNodeLabelShape,
+    ...({
+      source: metricCardsSources.source.optional(),
+      ...authoredQueryRefinementShape,
+    } satisfies Record<DataQueryFlatFieldKey, z.ZodType>),
+    query: metricCardsSources.optionalQuery.optional().describe(IMPLIED_SOURCE_QUERY_DESCRIPTION),
 
     /**
      * Which computed values to show, in display order.
@@ -949,23 +1258,100 @@ const MIN_NODE_DEPTH_LEVELS = 2;
 const DEEPEST_LEVEL_NODE_MESSAGE = `Only a visualization node is accepted here: this position is at the deepest nesting level a panel allows (${String(PANEL_MAX_NODE_DEPTH)}), so no section, split or stack may be placed at it.`;
 
 /**
+ * How the node-type messages below join the vocabulary they list: compactly,
+ * because of the line budget described on {@link UNKNOWN_NODE_TYPE_MESSAGE}.
+ */
+const NODE_TYPE_MESSAGE_SEPARATOR = '|';
+
+/**
+ * The schema-level message of every level's union above the deepest, for a
+ * node whose `type` is absent or names no node type: the fact, then the node
+ * vocabulary.
+ *
+ * Built from the vocabulary tuple — a closed, product-owned list and never the
+ * rejected value (AAP 0.5.2) — because this is the line the model provider's
+ * repair loop quotes back to the model for the failure, and "invalid input"
+ * leaves the model to guess which types exist.
+ *
+ * **Worded to fit the repair loop's line budget.** The loop renders each issue
+ * as `path: message` and cuts a line longer than 200 characters
+ * (`MAX_ISSUE_LINE_LENGTH` in `packages/model-provider/src/structured.ts`).
+ * The sixteen type names alone take 150 of those, so the list is joined
+ * without spaces and the sentence around it is as short as it can be: at a
+ * top-level node, where an unknown type is usually written, the whole line
+ * fits. Below a container the path is longer and the tail of the list may be
+ * cut; the fact comes first so that what survives still says what is wrong.
+ */
+const UNKNOWN_NODE_TYPE_MESSAGE = `Unknown node type: ${PANEL_NODE_TYPES.join(NODE_TYPE_MESSAGE_SEPARATOR)}`;
+
+/**
+ * The deepest level's message for a node whose `type` is absent or names no
+ * node type at all, as opposed to a container placed too deep: the fact, why
+ * the position is special, then the visualization node types — the only ones
+ * it accepts — in the same compact form as {@link UNKNOWN_NODE_TYPE_MESSAGE}.
+ */
+const UNKNOWN_DEEPEST_NODE_TYPE_MESSAGE = `Unknown node type; at the deepest nesting level (${String(PANEL_MAX_NODE_DEPTH)}) use a visualization node: ${PANEL_VIZ_NODE_TYPES.join(NODE_TYPE_MESSAGE_SEPARATOR)}`;
+
+/**
+ * The `type` an unmatched node declared, read for choosing a message and never
+ * for repeating it.
+ *
+ * The node reached the error function because the union already read its
+ * `type` once, so this read normally repeats a plain property access. A value
+ * hostile enough to throw on the second read yields `undefined`, which selects
+ * the unknown-type message, rather than turning the message lookup into a
+ * crash of the parse it is describing.
+ *
+ * @param input The node the union could not match.
+ * @returns Its declared `type`, or `undefined`.
+ */
+function unmatchedNodeTypeOf(input: unknown): unknown {
+  try {
+    return readProperty(input, NODE_TYPE_FIELD);
+  } catch {
+    // Deliberately unbound: the exception is caller-controlled data and must
+    // not reach a message in any form.
+    return undefined;
+  }
+}
+
+/**
+ * The error function of every level's union above the deepest: the
+ * vocabulary for the union's own no-matching-discriminator issue, and the
+ * library's message for everything else — a value that is not an object at
+ * all is not a node-type fault.
+ */
+const unknownNodeTypeError = (issue: z.core.$ZodRawIssue): string | undefined =>
+  issue.code === 'invalid_union' ? UNKNOWN_NODE_TYPE_MESSAGE : undefined;
+
+/**
  * The union parsing a node at the deepest level, {@link PANEL_MAX_NODE_DEPTH}:
  * the thirteen leaves, and no container.
  *
  * The end of the chain, and the reason the chain is finite: no option here has
  * a child position, so nothing below this level is ever parsed.
  *
- * The custom message is attached through an error *function* scoped to the
- * union's own no-matching-discriminator issue (`invalid_union`). The union
- * raises one other issue of its own — `invalid_type`, for a value that is not an
- * object at all — and that keeps the library's message, because "no container
- * here" would misdescribe it. Issues raised inside a matched leaf belong to that
- * leaf's field schemas, so a leaf at this level with a malformed field reports
- * exactly what it would report at level 1.
+ * The custom messages are attached through an error *function* scoped to the
+ * union's own no-matching-discriminator issue (`invalid_union`): a container
+ * type placed here gets {@link DEEPEST_LEVEL_NODE_MESSAGE}, and any other
+ * unmatched `type` the visualization vocabulary. The union raises one other
+ * issue of its own — `invalid_type`, for a value that is not an object at all —
+ * and that keeps the library's message, because neither would describe it.
+ * Issues raised inside a matched leaf belong to that leaf's field schemas, so a
+ * leaf at this level with a malformed field reports exactly what it would
+ * report at level 1.
  */
 const deepestNodeInputSchema: z.ZodType<PanelNodeInput> = z
   .discriminatedUnion('type', [...LEAF_NODE_INPUT_SCHEMAS], {
-    error: (issue) => (issue.code === 'invalid_union' ? DEEPEST_LEVEL_NODE_MESSAGE : undefined),
+    error: (issue) => {
+      if (issue.code !== 'invalid_union') {
+        return undefined;
+      }
+
+      return isLayoutNodeType(unmatchedNodeTypeOf(issue.input))
+        ? DEEPEST_LEVEL_NODE_MESSAGE
+        : UNKNOWN_DEEPEST_NODE_TYPE_MESSAGE;
+    },
   })
   .describe(
     `A node at the deepest nesting level a panel allows (${String(PANEL_MAX_NODE_DEPTH)}, counting a node written directly in the layout as level 1). Only visualization nodes are accepted at this level; a section, split or stack placed here has nowhere to put its children.`,
@@ -1004,10 +1390,11 @@ function buildSecondLevelNodeInputSchema(): z.ZodType<PanelNodeInput> {
   let level: z.ZodType<PanelNodeInput> = deepestNodeInputSchema;
 
   for (let depth = PANEL_MAX_NODE_DEPTH - 1; depth >= MIN_NODE_DEPTH_LEVELS; depth -= 1) {
-    level = z.discriminatedUnion('type', [
-      ...containerNodeInputSchemasFor(level),
-      ...LEAF_NODE_INPUT_SCHEMAS,
-    ]);
+    level = z.discriminatedUnion(
+      'type',
+      [...containerNodeInputSchemasFor(level), ...LEAF_NODE_INPUT_SCHEMAS],
+      { error: unknownNodeTypeError },
+    );
   }
 
   return level;
@@ -1040,7 +1427,9 @@ const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
  *
  * A discriminated union over `type` rather than a plain union, and that is the
  * difference between a usable rejection and an unreadable one: an unrecognised
- * node type fails with a single issue on the node's own `type` path, and a
+ * node type fails with a single issue on the node's own `type` path — its
+ * message listing the node types, {@link UNKNOWN_NODE_TYPE_MESSAGE}, and
+ * `parsePanelSpecInput` reporting it as `panel_node_type_unknown` — and a
  * *recognised* type with a malformed body fails against that type's schema
  * alone instead of reporting sixteen branches' worth of issues at once. Both
  * matter more here than anywhere else in the package, because this failure is
@@ -1062,9 +1451,11 @@ const PANEL_NODE_INPUT_SCHEMAS = Object.freeze([
  * rather than a `z.ZodDiscriminatedUnion`, which no consumer of the authored
  * form needs.
  */
-export const panelNodeInputSchema: z.ZodType<PanelNodeInput> = z.discriminatedUnion('type', [
-  ...PANEL_NODE_INPUT_SCHEMAS,
-]);
+export const panelNodeInputSchema: z.ZodType<PanelNodeInput> = z.discriminatedUnion(
+  'type',
+  [...PANEL_NODE_INPUT_SCHEMAS],
+  { error: unknownNodeTypeError },
+);
 
 /*
  * ---------------------------------------------------------------------------
@@ -1234,11 +1625,10 @@ export type PanelSummaryInput = z.infer<typeof panelSummaryInputSchema>;
  *
  * What a document that passes this schema has proved is that it is *well
  * formed*: its node types exist, its sources and sorts are in the closed
- * vocabularies, its metric ids exist, its bounds hold. What it has not proved
- * is that the views it asks for can read the sources it names — the node
- * catalog's statement, applied by `./validate.ts` after normalisation — or that
- * the evidence it points at exists in the capture, which `./semantic.ts` is the
- * only layer able to tell.
+ * vocabularies, its metric ids exist, its bounds hold, and every node that
+ * reads captured data names a source its type can read. What it has not proved
+ * is that the evidence it points at exists in the capture, which
+ * `./semantic.ts` is the only layer able to tell.
  */
 export const panelSpecInputSchema = z
   .strictObject({
@@ -1391,7 +1781,7 @@ const PREFLIGHT_TRUNCATED_CLAUSE = 'the document was not examined further';
  * figures are the constants the schema and the preflight enforce, so the
  * sentence cannot drift from either bound.
  */
-const PANEL_SPEC_INPUT_HINT = `An authored panel needs a non-empty title, a summary written as a sentence or as an object of prose, and a layout of nodes whose types, sources, sorts and metric ids come from the closed vocabularies; containers nest at most ${String(PANEL_MAX_NODE_DEPTH)} levels deep, counting a top-level node as level 1, and the deepest level holds visualization nodes only; a panel holds at most ${String(PANEL_INPUT_MAX_NODE_COUNT)} nodes in all; no other field is accepted, and node ids are assigned rather than authored.`;
+const PANEL_SPEC_INPUT_HINT = `An authored panel needs a non-empty title, a summary written as a sentence or as an object of prose, and a layout of nodes whose types, sources, sorts and metric ids come from the closed vocabularies; every node that reads captured data names a source its type can read, on the node or inside its "query" object, unless its type's source is implied; containers nest at most ${String(PANEL_MAX_NODE_DEPTH)} levels deep, counting a top-level node as level 1, and the deepest level holds visualization nodes only; a panel holds at most ${String(PANEL_INPUT_MAX_NODE_COUNT)} nodes in all; no other field is accepted, and node ids are assigned rather than authored.`;
 
 /**
  * The issue code reported when a too-deeply nested node is found before the
@@ -1883,6 +2273,316 @@ function preflightNodePositions(value: unknown): NodePreflightOutcome {
 
 /*
  * ---------------------------------------------------------------------------
+ * The node vocabulary of a rejection
+ *
+ * The schema reports the three node-vocabulary failures in the schema
+ * library's own terms: an unknown node type as an `invalid_union` on the
+ * node's `type`, a source the type cannot read as an `invalid_union` or an
+ * `invalid_value` on a `source`, and a node that names no source as a missing
+ * `query` or `query.source`. Those codes are right for the library and say
+ * nothing about the rule broken, so the rejection `parsePanelSpecInput`
+ * returns reports them with the syntactic validator's own catalog codes —
+ * `panel_node_type_unknown`, `panel_node_query_source_not_allowed`,
+ * `panel_node_query_source_unknown` and `panel_node_query_source_missing` —
+ * and with the closed vocabulary that would have been accepted as the issue's
+ * `expected`. The schema's own issue messages, which the model provider's
+ * repair loop reads, already say the same in prose; this is the same
+ * diagnosis in the structured form a log, a user interface and a test read.
+ *
+ * Classifying needs the value the schema rejected — whether a type is a known
+ * one misplaced or no type at all, whether a source is absent or wrong — so it
+ * reads the raw input at the issue's path, with ordinary property access, as
+ * the schema library read it. It never *reports* a value: every field it
+ * writes is a path, a code or a member of a closed vocabulary (AAP 0.5.2).
+ * ---------------------------------------------------------------------------
+ */
+
+/** How a closed vocabulary is written as the `expected` of a reported issue. */
+const VOCABULARY_SEPARATOR = ' | ';
+
+/** The validator's code for a node whose type is not a node type. */
+const NODE_TYPE_UNKNOWN_CODE: PanelValidationIssueCode = 'panel_node_type_unknown';
+
+/** The validator's code for a query-backed node that names no source. */
+const SOURCE_MISSING_CODE: PanelValidationIssueCode = 'panel_node_query_source_missing';
+
+/** The validator's code for a known source its node type cannot read. */
+const SOURCE_NOT_ALLOWED_CODE: PanelValidationIssueCode = 'panel_node_query_source_not_allowed';
+
+/** The validator's code for a value that is no source at all. */
+const SOURCE_UNKNOWN_CODE: PanelValidationIssueCode = 'panel_node_query_source_unknown';
+
+/**
+ * The node-level field a classifiable issue is about: the node's own `type`,
+ * its flat `source`, its nested `query`, or that object's `source`.
+ */
+type NodeVocabularyField = 'type' | 'source' | 'query' | 'query.source';
+
+/** An issue path split into the node it is about and the field of that node. */
+interface LocatedNodeIssue {
+  /** The path of the node: `layout`, an index, then `children` and an index per level. */
+  readonly nodePath: readonly PropertyKey[];
+
+  /** The node's nesting level, a node written directly in `layout` being 1. */
+  readonly level: number;
+
+  /** Which of the node's vocabulary fields the issue is about. */
+  readonly field: NodeVocabularyField;
+}
+
+/**
+ * Splits an issue path into a node path and one of the node's vocabulary
+ * fields, or answers `undefined` for any other path.
+ *
+ * A node path is `layout` and an index, followed by a `children` segment and
+ * an index for every container below it — the only way the authoring schema
+ * nests nodes — so anything after the longest such prefix is a field of the
+ * node the prefix reaches. Only the four fields of {@link NodeVocabularyField}
+ * are classified; every other path is left as the schema reported it.
+ *
+ * @param path An issue path, as the schema library reports it.
+ * @returns The located node and field, or `undefined`.
+ */
+function locateNodeIssue(path: readonly PropertyKey[]): LocatedNodeIssue | undefined {
+  if (path[0] !== PANEL_LAYOUT_FIELD || typeof path[1] !== 'number') {
+    return undefined;
+  }
+
+  let end = 2;
+  let level = 1;
+
+  while (path[end] === PANEL_CHILDREN_FIELD && typeof path[end + 1] === 'number') {
+    end += 2;
+    level += 1;
+  }
+
+  const [first, second, ...beyond] = path.slice(end);
+  const nodePath = path.slice(0, end);
+
+  if (beyond.length > 0 || first === undefined) {
+    return undefined;
+  }
+
+  if (second === undefined) {
+    return first === NODE_TYPE_FIELD || first === SOURCE_FIELD || first === QUERY_FIELD
+      ? { nodePath, level, field: first }
+      : undefined;
+  }
+
+  return first === QUERY_FIELD && second === SOURCE_FIELD
+    ? { nodePath, level, field: 'query.source' }
+    : undefined;
+}
+
+/**
+ * Reads one property of a value the way the schema library read it, or
+ * answers `undefined` for a value that has no properties.
+ *
+ * Ordinary property access, deliberately: the classification must describe the
+ * value the schema judged, and the schema read it this way. It may throw on a
+ * hostile value — a throwing getter, a revoked proxy — which is why
+ * {@link parsePanelSpecInput} classifies inside its `try`.
+ *
+ * @param value Any value.
+ * @param key The property to read.
+ * @returns The property's value, or `undefined`.
+ */
+function readProperty(value: unknown, key: PropertyKey): unknown {
+  return typeof value === 'object' && value !== null
+    ? (value as Readonly<Record<PropertyKey, unknown>>)[key]
+    : undefined;
+}
+
+/**
+ * Reads the value at a path of property keys, one {@link readProperty} per
+ * segment.
+ *
+ * @param root The value the path starts from.
+ * @param path The keys to follow.
+ * @returns The value at the path, or `undefined` where the path leaves the
+ * value.
+ */
+function readPath(root: unknown, path: readonly PropertyKey[]): unknown {
+  let current = root;
+
+  for (const segment of path) {
+    current = readProperty(current, segment);
+  }
+
+  return current;
+}
+
+/**
+ * Renders a path of property keys in the dotted form `describeIssues`
+ * reports, so a classified issue and an unclassified one read alike.
+ *
+ * @param path The keys.
+ * @returns The dotted path.
+ */
+function dottedPath(path: readonly PropertyKey[]): string {
+  return path.map((segment) => String(segment)).join('.');
+}
+
+/**
+ * The node types a node position at one nesting level accepts: every type
+ * above the deepest level, the visualization types alone at it.
+ *
+ * @param level The position's nesting level.
+ * @returns The accepted node types, in the vocabulary's order.
+ */
+function nodeTypesAcceptedAt(level: number): readonly string[] {
+  return level >= PANEL_MAX_NODE_DEPTH ? PANEL_VIZ_NODE_TYPES : PANEL_NODE_TYPES;
+}
+
+/**
+ * Classifies a node's `type` failure: `panel_node_type_unknown`, unless the
+ * type is a known one the position does not accept.
+ *
+ * The one known-type case is a container at the deepest level, which is a
+ * placement mistake rather than an unknown type, so it keeps the schema's own
+ * issue — whose message says exactly that.
+ *
+ * @param issue The schema's issue on the node's `type`.
+ * @param declaredType The node's raw `type`.
+ * @param located Where the issue is.
+ * @returns The catalog issue, or `undefined` to keep the schema's.
+ */
+function nodeTypeIssueFor(
+  issue: z.core.$ZodIssue,
+  declaredType: unknown,
+  located: LocatedNodeIssue,
+): SchemaIssueSummary | undefined {
+  if (issue.code !== 'invalid_union' || isPanelNodeType(declaredType)) {
+    return undefined;
+  }
+
+  return {
+    path: dottedPath(issue.path),
+    code: NODE_TYPE_UNKNOWN_CODE,
+    expected: nodeTypesAcceptedAt(located.level).join(VOCABULARY_SEPARATOR),
+  };
+}
+
+/**
+ * Classifies a failure of a query-backed node's source, in either spelling.
+ *
+ * - **No source at all** — the nested spelling's required `query` absent, or
+ *   its `source` absent — is `panel_node_query_source_missing`, reported at
+ *   the node's flat `source` path whichever spelling the author was using, so
+ *   one condition has one path.
+ * - **A written source** that fails is `panel_node_query_source_not_allowed`
+ *   when it is a member of the closed source vocabulary, and
+ *   `panel_node_query_source_unknown` when it is not, at the path it was
+ *   written at.
+ *
+ * Any other failure of these fields — a `query` that is present but not an
+ * object, say — keeps the schema's own issue.
+ *
+ * @param issue The schema's issue.
+ * @param node The raw node.
+ * @param type The node's catalogued, query-backed type.
+ * @param located Where the issue is.
+ * @returns The catalog issue, or `undefined` to keep the schema's.
+ */
+function sourceIssueFor(
+  issue: z.core.$ZodIssue,
+  node: unknown,
+  type: PanelNodeType,
+  located: LocatedNodeIssue,
+): SchemaIssueSummary | undefined {
+  const expected = PANEL_NODE_CATALOG[type].sources.join(VOCABULARY_SEPARATOR);
+  const missing: SchemaIssueSummary = {
+    path: dottedPath([...located.nodePath, SOURCE_FIELD]),
+    code: SOURCE_MISSING_CODE,
+    expected,
+  };
+  const written = (source: unknown): SchemaIssueSummary =>
+    source === undefined
+      ? missing
+      : {
+          path: dottedPath(issue.path),
+          code: isDataQuerySource(source) ? SOURCE_NOT_ALLOWED_CODE : SOURCE_UNKNOWN_CODE,
+          expected,
+        };
+
+  switch (located.field) {
+    case SOURCE_FIELD:
+      return issue.code === 'invalid_union' || issue.code === 'invalid_value'
+        ? written(readProperty(node, SOURCE_FIELD))
+        : undefined;
+    case QUERY_FIELD:
+      return issue.code === 'invalid_type' && readProperty(node, QUERY_FIELD) === undefined
+        ? missing
+        : undefined;
+    case 'query.source':
+      return issue.code === 'invalid_value'
+        ? written(readProperty(readProperty(node, QUERY_FIELD), SOURCE_FIELD))
+        : undefined;
+    case NODE_TYPE_FIELD:
+      return undefined;
+  }
+}
+
+/**
+ * The catalog issue one schema issue is reported as, or `undefined` when it is
+ * not a node-vocabulary failure.
+ *
+ * @param root The raw value handed to the parser.
+ * @param issue One issue of its failed parse.
+ * @returns The classified issue, or `undefined`.
+ */
+function nodeVocabularyIssueFor(
+  root: unknown,
+  issue: z.core.$ZodIssue,
+): SchemaIssueSummary | undefined {
+  const located = locateNodeIssue(issue.path);
+
+  if (located === undefined) {
+    return undefined;
+  }
+
+  const node = readPath(root, located.nodePath);
+  const declaredType = readProperty(node, NODE_TYPE_FIELD);
+
+  if (located.field === NODE_TYPE_FIELD) {
+    return nodeTypeIssueFor(issue, declaredType, located);
+  }
+
+  return isPanelNodeType(declaredType) && PANEL_NODE_CATALOG[declaredType].requiresQuery
+    ? sourceIssueFor(issue, node, declaredType, located)
+    : undefined;
+}
+
+/**
+ * Reduces the issues of a failed parse to what a rejection reports: every
+ * issue as `describeIssues` reduces it, except the node-vocabulary failures,
+ * which are reported with their catalog codes (see this section's heading).
+ *
+ * One entry per schema issue, in the schema's order, so the count and the
+ * order of a rejection's issues are the schema's.
+ *
+ * May throw when reading the value throws, like the preflight, which is why
+ * {@link parsePanelSpecInput} calls it inside its `try`.
+ *
+ * @param root The raw value handed to the parser.
+ * @param issues The issues of its failed parse.
+ * @returns The issues to report.
+ */
+function describeInputIssues(
+  root: unknown,
+  issues: readonly z.core.$ZodIssue[],
+): SchemaIssueSummary[] {
+  const described = describeIssues(issues);
+
+  return described.map((summary, index) => {
+    const issue = issues[index];
+
+    return (issue === undefined ? undefined : nodeVocabularyIssueFor(root, issue)) ?? summary;
+  });
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * The parser
  * ---------------------------------------------------------------------------
  */
@@ -1952,10 +2652,15 @@ function preflightNodePositions(value: unknown): NodePreflightOutcome {
 export function parsePanelSpecInput(value: unknown): Result<PanelSpecInput, DebuggenError> {
   let preflight: NodePreflightOutcome;
   let parsed: z.ZodSafeParseResult<PanelSpecInput> | undefined;
+  let rejected: readonly SchemaIssueSummary[] | undefined;
 
   try {
     preflight = preflightNodePositions(value);
     parsed = preflight.issues.length === 0 ? panelSpecInputSchema.safeParse(value) : undefined;
+    rejected =
+      parsed === undefined || parsed.success
+        ? undefined
+        : describeInputIssues(value, parsed.error.issues);
   } catch {
     // Deliberately unbound: the exception is caller-controlled data and must
     // not reach the rejection in any form (see step 3 above).
@@ -1970,5 +2675,5 @@ export function parsePanelSpecInput(value: unknown): Result<PanelSpecInput, Debu
     return ok(parsed.data);
   }
 
-  return err(panelSpecInputRejection(describeIssues(parsed.error.issues)));
+  return err(panelSpecInputRejection(rejected ?? describeIssues(parsed.error.issues)));
 }

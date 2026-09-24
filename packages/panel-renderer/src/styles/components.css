@@ -31,12 +31,14 @@
  *   `base.css`, which has to beat the animations declared below.
  * - `.dg-visually-hidden` is a single class in `base.css`, so a single-class
  *   rule here would OVERRIDE it. The primitives compose that utility onto
- *   `dg-data-table__caption`, `dg-field__label`, `dg-heading`, `dg-text` and
- *   `dg-tooltip__bubble`, so none of those base rules may set `position`,
- *   `inline-size`, `block-size`, `overflow`, `white-space` or `clip-path` —
- *   the properties the utility relies on. Where a component genuinely needs
- *   them (the tooltip bubble) they are declared on a two-class state selector
- *   (`.dg-tooltip__bubble.dg-is-open`) instead.
+ *   `dg-data-table__caption`, `dg-field__label`, `dg-heading` and `dg-text`,
+ *   so none of those base rules may set `position`, `inline-size`,
+ *   `block-size`, `overflow`, `white-space` or `clip-path` — the properties
+ *   the utility relies on. The tooltip bubble composes it too, while closed
+ *   (alongside the `hidden` attribute), which is why its single-class rule is
+ *   paint-only: its positioning is declared on the two-class open-state
+ *   selector (`.dg-tooltip__bubble.dg-is-open`), which never carries the
+ *   utility.
  *
  * ## Zero hardcoded values, and the structural-value policy
  *
@@ -45,10 +47,12 @@
  * 0.6.4). The only literals permitted are `0`, `none`, `auto`, `inherit`,
  * `currentColor` and `transparent`. There is no hexadecimal or functional
  * colour notation, no length literal of any unit — absolute, root-relative or
- * font-relative — and no bare line-height anywhere below. A glyph box, a
- * spinner and an icon-only control's box are the font-relative size tokens
- * (`--dg-icon-size`, `--dg-spinner-size`, `--dg-icon-button-size`), and
- * `src/tokens/tokens.test.ts` fails on any length written as a literal.
+ * font-relative — and no bare line-height anywhere below. A glyph box and a
+ * spinner are the font-relative size tokens (`--dg-icon-size`,
+ * `--dg-spinner-size`); every interactive control's box is floored at the
+ * WCAG 2.2 SC 2.5.8 target size, which is the largest space token
+ * (`--dg-space-7`, 24 px). `src/tokens/tokens.test.ts` fails on any length
+ * written as a literal.
  *
  * `base.css` records the structural forms that encode no design decision and
  * are therefore permitted, and this file uses exactly those: percentages
@@ -62,8 +66,11 @@
  *
  * - `calc(<space token> * n)` for the few silhouette and container sizes the
  *   token table has no value for (a loading placeholder's height, a scroll
- *   container's cap, a tooltip's maximum width). The token remains the unit of
- *   the design scale; the multiplier is the only thing this file adds.
+ *   container's cap, a tooltip's maximum width, a split pane's basis). The
+ *   token remains the unit of the design scale; the multiplier is the only
+ *   thing this file adds. A size composed from two tokens is written as their
+ *   sum (`calc(<token> + <token>)`) for the same reason — the `md` icon-only
+ *   control's side and the dropdown's chevron room are each one such sum.
  * - `calc(var(--dgc-…, 0) * 1px)` where a component hands CSS a UNITLESS
  *   number (a virtualizer offset). The number is the value; `1px` is only the
  *   unit it is given, and this consumption form is fixed by the contract
@@ -73,18 +80,33 @@
  * package (`prefers-reduced-motion`), and responsiveness is intrinsic —
  * `flex-wrap`, `min-inline-size: 0`, `flex: 1 1 auto` and auto-fitting grid
  * tracks — because the token table declares no breakpoint. Hover states are
- * plain `:hover` for the same reason; each one changes colour only, so a
- * sticky hover on a touch surface changes nothing a user can act on.
+ * plain `:hover` for the same reason; each one changes paint only — a colour,
+ * an underline or an SVG stroke width, never geometry — so a sticky hover on a
+ * touch surface changes nothing a user can act on.
  *
  * ## Theming is pure cascade
  *
  * A theme is one `data-theme` attribute on the panel root, written by
- * `src/layout/PanelShell.tsx` from `src/tokens/theme.ts`. Not one selector
- * below is theme-specific: the token blocks carry every difference, including
- * the high-contrast theme's thicker focus ring, its opaque borders and its
- * absent shadows — which is why every elevated surface here pairs
- * `--dg-shadow-*` with a `thin` or `medium` border, so a surface stays
- * delineated in a theme where the shadow resolves to `none`.
+ * `src/layout/PanelShell.tsx` from `src/tokens/theme.ts`. The token blocks
+ * carry every difference, including the high-contrast theme's thicker focus
+ * ring, its opaque borders and its absent shadows — which is why every
+ * elevated surface here pairs `--dg-shadow-*` with a `thin` or `medium`
+ * border, so a surface stays delineated in a theme where the shadow resolves
+ * to `none`.
+ *
+ * There is one deliberate exception, and only one. The high-contrast theme
+ * raises both border tones to the same colour, so a hover that only moves an
+ * edge from `--dg-border-subtle` to `--dg-border-strong` — a field, a
+ * secondary button — changes nothing there, a ghost button's hover surface is
+ * the tone of the card it sits on, and a timeline bar that rests with a
+ * `transparent` stroke is unoutlined. A token cannot express that difference
+ * without breaking the theme's documented deltas, so a handful of rules
+ * re-establish the hover edge and the bar outline under
+ * `:where([data-theme='high-contrast'])`, using existing tokens only.
+ * `:where()` gives the theme scope zero specificity, so each such rule ties
+ * with the rule it refines and wins only by its position after it, and the
+ * colour of every state — invalid, disabled, pressed, focused, selected,
+ * orphan — still comes from that state's own rule.
  *
  * ## Naming contract
  *
@@ -99,8 +121,8 @@
  *                           never styled on its own. The set the components
  *                           emit and this file styles: selected, active,
  *                           disabled, expanded, open, hovered, highlighted,
- *                           duplicate, outlier, ambiguous, orphan (and its
- *                           alias orphaned), error, invalid, truncated,
+ *                           duplicate, outlier, inferred, ambiguous, orphan
+ *                           (and its alias orphaned), error, invalid, truncated,
  *                           unavailable, static, changed and unchanged.
  *                           Two states deliberately have NO class: a column's
  *                           sort direction and a node's expansion are carried
@@ -114,12 +136,17 @@
  *                           set, and the module that supplies each:
  *                             --dgc-badge-color     primitives/Badge
  *                             --dgc-columns         primitives/DataTable
+ *                             --dgc-min-inline      primitives/DataTable
+ *                             --dgc-column-count    primitives/DataTable
  *                             --dgc-align           primitives/DataTable
+ *                             --dgc-tooltip-block   primitives/Tooltip
+ *                             --dgc-tooltip-inline  primitives/Tooltip
  *                             --dgc-virtual-total   DataTable, components/EventLog
  *                             --dgc-virtual-start   DataTable, components/EventLog
  *                             --dgc-bar-color       components/Timeline, Waterfall
  *                             --dgc-lane-color      components/Timeline
  *                             --dgc-frame-color     components/FlameChart
+ *                             --dgc-frame-ink       components/FlameChart
  *                             --dgc-node-color      components/DependencyGraph
  *                             --dgc-severity-color  DurationCell, MetricCards
  *                             --dgc-depth           components/ComponentTree,
@@ -168,16 +195,22 @@
  *
  * ## Accessibility outranks appearance
  *
- * The focus indicator comes from `base.css`'s global `:focus-visible` rule and
- * is never removed or suppressed. A rule here only ever adjusts
- * `outline-offset`, and only inward (`calc(var(--dg-space-0) * -1)`) where a
- * scroll container or a sticky header would otherwise clip the ring. Every
- * interactive class carries hover, focus and disabled treatment; de-emphasis
- * is `--dg-text-muted`, `--dg-border-subtle` and `cursor: not-allowed`, never
- * `opacity`, which would silently invalidate the contrast ratios
- * `src/tokens/tokens.test.ts` pins. Colour is never the sole carrier of
- * meaning: every status colour below sits beside a label, a glyph, a border
- * style or an ARIA attribute that says the same thing.
+ * Keyboard focus is always indicated, and always by `--dg-focus-ring`: the
+ * global `:focus-visible` rule of `base.css` draws it on the focused element,
+ * and no rule here removes it. Two adjustments are made, neither of which
+ * changes the ring itself. A scroll container or a sticky header that would
+ * otherwise clip it pulls `outline-offset` inward
+ * (`calc(var(--dg-space-0) * -1)`). A text field or picker draws it on its
+ * field box, the visible edge, instead of on the borderless native control
+ * inside that box — same token, same offset — so a field shows one ring
+ * rather than two crossing ones.
+ *
+ * Every interactive class carries hover, focus and disabled treatment;
+ * de-emphasis is `--dg-text-muted`, `--dg-border-subtle` and
+ * `cursor: not-allowed`, never `opacity`, which would silently invalidate the
+ * contrast ratios `src/tokens/tokens.test.ts` pins. Colour is never the sole
+ * carrier of meaning: every status colour below sits beside a label, a glyph,
+ * a border style or an ARIA attribute that says the same thing.
  *
  * The kind scale (`--dg-kind-*`) is held to 3:1 because it is used as a FILL
  * behind or beside a text label. Consequently a kind colour is spent on a
@@ -215,7 +248,22 @@
 
 /* The chip: the shared pill behind badges, source links, trigger markers and
  * status markers. `white-space: nowrap` is safe on every selector listed —
- * none of them is ever composed with `dg-visually-hidden`. */
+ * none of them is ever composed with `dg-visually-hidden`. The tight block
+ * padding is the label's, not the target's: a chip that is a control (the
+ * interactive source link, an evidence chip) is a `dg-button` as well and
+ * takes that block's 24 px target floor, and a chip that is only a label (a
+ * badge, a status marker) needs no target size at all.
+ *
+ * A chip is never wider than the box it sits in (`max-inline-size`), and what
+ * does not fit is CLIPPED at the chip's own edge rather than painted over the
+ * neighbouring cell: a chip squeezed by a narrow column used to keep drawing
+ * its label across the column boundary, so a "Request key" chip read as
+ * "Requ200key" over the status beside it. `clip`, not `hidden`: it clips
+ * without making the chip a scroll container, so the chip keeps its content
+ * baseline inside a line of text and keeps its automatic minimum inside a flex
+ * row. The columns that hold chips are sized to fit them (see the track notes
+ * in primitives/DataTable.tsx); the clip is the guarantee that a value wider
+ * than its column still cannot collide with another. */
 .dg-badge,
 .dg-source-link,
 .dg-render-table__trigger,
@@ -225,12 +273,14 @@
   align-items: center;
   gap: var(--dg-space-1);
   max-inline-size: 100%;
+  overflow: clip;
   padding-block: var(--dg-space-0);
   padding-inline: var(--dg-space-2);
   border: thin solid transparent;
   border-radius: var(--dg-radius-sm);
   font: var(--dg-text-xs);
   white-space: nowrap;
+  text-overflow: ellipsis;
   text-decoration: none;
 }
 
@@ -272,9 +322,9 @@
 /* ==========================================================================
  * Virtualization
  *
- * `@tanstack/react-virtual` drives `primitives/DataTable` and
- * `components/EventLog`. The contract, declared by DataTable.tsx and honoured
- * on both sides:
+ * `@tanstack/react-virtual` drives `primitives/DataTable` (and through it
+ * `components/EventLog`) and the frame tree of `components/FlameChart`. The
+ * contract, declared by DataTable.tsx and honoured on both sides:
  *
  *   - the component supplies the total canvas size as the UNITLESS
  *     `--dgc-virtual-total` and each row's offset as the unitless
@@ -282,7 +332,7 @@
  *   - CSS supplies positioning and the unit, and nothing else.
  *
  * The canvas takes `min-block-size` rather than `block-size` deliberately.
- * Both DataTable and EventLog fall back to rendering every row unvirtualized
+ * Every consumer falls back to rendering rows unvirtualized, in normal flow,
  * when the virtualizer can measure no viewport — the first paint of a real
  * browser, and every happy-dom test run, where `getBoundingClientRect()`
  * answers zeroes. In that state no component sets `--dgc-virtual-total`, the
@@ -303,12 +353,16 @@
   min-block-size: calc(var(--dgc-virtual-total, 0) * 1px);
 }
 
+/* The row is placed by its block-start INSET rather than by a transform. A
+ * transformed box is the containing block of every fixed-position descendant,
+ * so a translated row would trap the fixed-position bubble of each
+ * primitives/Tooltip inside it — and, with it, inside the scroll container the
+ * bubble exists to escape. */
 .dg-virtual-row {
   position: absolute;
-  inset-block-start: 0;
+  inset-block-start: calc(var(--dgc-virtual-start, 0) * 1px);
   inset-inline-start: 0;
   inline-size: 100%;
-  transform: translateY(calc(var(--dgc-virtual-start, 0) * 1px));
 }
 
 /* ==========================================================================
@@ -319,6 +373,19 @@
  * `layout/Stack` and `layout/Split`. The focus ring needs no rule — base.css
  * applies `--dg-focus-ring` to every `:focus-visible` element, so the
  * high-contrast theme's thicker ring is inherited by construction.
+ *
+ * ## The target-size floor
+ *
+ * Every control is at least `--dg-space-7` (24 px) on both axes, the minimum
+ * target size of WCAG 2.2 SC 2.5.8 — accessibility outranks density (AAP
+ * 0.6.4). The floor lives on the block, so it covers every variant, both
+ * densities and every class a caller composes onto a button: the dense `sm`
+ * chip (a 16 px line, two `--dg-space-0` paddings and two hairlines, 22 px on
+ * its own), the row expand toggles, the evidence and source chips and the
+ * sortable column header all inherit it rather than restating it. It is a
+ * MINIMUM rather than a size, so content taller or wider than the floor —
+ * every `md` label, every labelled chip — is never clipped or squeezed, and
+ * the `md` density's own 28 px height is untouched.
  * ========================================================================== */
 
 .dg-button {
@@ -326,6 +393,8 @@
   align-items: center;
   justify-content: center;
   gap: var(--dg-space-1);
+  min-inline-size: var(--dg-space-7);
+  min-block-size: var(--dg-space-7);
   padding-block: var(--dg-space-1);
   padding-inline: var(--dg-space-3);
   background: var(--dg-surface-elevated);
@@ -343,7 +412,10 @@
 }
 
 /* Sizes carry density and the type role only, so they never fight a variant's
- * colours. The `font` shorthand resets `font-variant`, which no button needs. */
+ * colours. The `font` shorthand resets `font-variant`, which no button needs.
+ * The dense `sm` chip keeps its tight padding and reaches the 24 px target
+ * height through the block's floor above, its label centred in the extra room
+ * by the block's flex alignment. */
 .dg-button--sm {
   gap: var(--dg-space-0);
   padding-block: var(--dg-space-0);
@@ -358,11 +430,27 @@
   font: var(--dg-text-md);
 }
 
-/* A square chip with no label box. `aspect-ratio: 1` is relational, so the
- * control stays square at either density without a length. */
+/* A square chip with no label box, whose side is set by the minimum sizes
+ * rather than by its glyph. `aspect-ratio` cannot do this job: with both axes
+ * automatic the block size is the content's (a glyph's line box) and the inline
+ * size the glyph's advance, so a narrow glyph drew a tall, thin control. The
+ * inline padding is dropped instead, so the side is exactly the floor and the
+ * glyph is centred in it by the block's own flex alignment.
+ *
+ * `sm` needs nothing further: the block's `--dg-space-7` floor makes it a 24 px
+ * square. `md` takes the height of a labelled `md` control — its 18 px
+ * `--dg-text-md` line, two `--dg-space-1` paddings and two hairlines, 28 px —
+ * on both axes, so an icon chip beside a labelled button of the same density
+ * is the same height and still square. That side is written as the target
+ * floor plus one step of the scale; the token table has no size for it, and
+ * the sum names exactly the two design-scale values it is built from. */
 .dg-button--icon-only {
-  padding-inline: var(--dg-space-1);
-  aspect-ratio: 1;
+  padding-inline: 0;
+}
+
+.dg-button--icon-only.dg-button--md {
+  min-inline-size: calc(var(--dg-space-7) + var(--dg-space-1));
+  min-block-size: calc(var(--dg-space-7) + var(--dg-space-1));
 }
 
 .dg-button--full {
@@ -421,7 +509,15 @@
 }
 
 /* Chrome-free until hover: a toolbar row, a table's sort control, a row's
- * expand toggle. */
+ * expand toggle.
+ *
+ * A ghost button almost always sits ON the elevated surface — the toolbar, a
+ * table's sticky header, a hovered, expanded or roving row — so its hover can
+ * never be that surface: it would draw nothing. Hover therefore raises one
+ * step further, to the overlay surface, and gains the strong hairline, the same
+ * two steps the secondary variant takes, so the fill reads on the elevated
+ * surface and on the base alike. Press adds the accent edge, so pressing is
+ * distinct from hovering. */
 .dg-button--ghost {
   background: transparent;
   border-color: transparent;
@@ -429,12 +525,14 @@
 }
 
 .dg-button--ghost:hover {
-  background: var(--dg-surface-elevated);
+  background: var(--dg-surface-overlay);
+  border-color: var(--dg-border-strong);
   color: var(--dg-text-primary);
 }
 
 .dg-button--ghost:active {
   background: var(--dg-surface-overlay);
+  border-color: var(--dg-accent);
   color: var(--dg-text-primary);
 }
 
@@ -457,6 +555,18 @@
   color: var(--dg-surface-base);
 }
 
+/* High contrast collapses the two border tones into one, so the secondary
+ * hover edge (subtle to strong) does not change there, and the ghost hover
+ * surface is the elevated tone the card behind it already has. The accent
+ * edge restores a visible hover for both — and for the icon-only controls,
+ * which take one of these two variants. Declared after every variant and
+ * before the states below, at the states' specificity, so a pressed toggle
+ * and a disabled control still win by order. */
+:where([data-theme='high-contrast']) .dg-button--secondary:hover,
+:where([data-theme='high-contrast']) .dg-button--ghost:hover {
+  border-color: var(--dg-accent);
+}
+
 /* --- states: two classes, so they beat every variant above ---------------- */
 
 /* A pressed toggle — the element picker, a filter that is on. `aria-pressed`
@@ -468,14 +578,42 @@
   color: var(--dg-text-primary);
 }
 
-/* Disabled: muted text and a subtle border, never `opacity`, which would
- * change the effective contrast of everything inside the control. */
+/* Disabled: the design system's one disabled treatment, shared with the text
+ * field and picker (`.dg-field.dg-is-disabled` below) — the elevated surface,
+ * a subtle border, muted text and `cursor: not-allowed`. The surface is not
+ * dimmed because no surface token is dimmer than the elevated one in both the
+ * dark and the light theme (the base surface is darker in one and lighter in
+ * the other), so the muted text carries the state. Never `opacity`, which
+ * would change the effective contrast of everything inside the control. */
 .dg-button[disabled],
 .dg-button.dg-is-disabled {
   background: var(--dg-surface-elevated);
   border-color: var(--dg-border-subtle);
   color: var(--dg-text-muted);
   cursor: not-allowed;
+}
+
+/* A disabled ghost button stays chrome-free. The shared treatment above gives
+ * it a surface and a hairline its enabled state never had, which drew the
+ * unavailable control HEAVIER than the available one — a toolbar toggle that
+ * cannot be used looking like the most emphatic thing in the row. Only the text
+ * steps down, to the muted tone. Declared last and at the same specificity as
+ * the hover and press rules, so a pointer over a disabled ghost changes
+ * nothing either. */
+.dg-button--ghost[disabled],
+.dg-button--ghost.dg-is-disabled {
+  background: transparent;
+  border-color: transparent;
+  color: var(--dg-text-muted);
+}
+
+/* A pressed toggle that is also unavailable — a filter left on while no data is
+ * loaded — keeps a trace of being on: the muted accent edge, lighter than the
+ * enabled pressed state's full accent edge and fill, so it is neither lost nor
+ * drawn as the row's strongest control. `aria-pressed` carries the same fact. */
+.dg-button--ghost.dg-is-active[disabled],
+.dg-button--ghost.dg-is-active.dg-is-disabled {
+  border-color: var(--dg-accent-muted);
 }
 
 /* ==========================================================================
@@ -490,8 +628,10 @@
  * The control ROW carries the box — surface, hairline and radius — and the
  * control itself is transparent and borderless inside it. That is what lets a
  * leading glyph and a trailing chevron sit inside the same box as the control,
- * and what makes `:focus-within` able to raise the whole box while base.css's
- * `:focus-visible` ring still lands on the control a keyboard user is in.
+ * and it is why keyboard focus is indicated on the box: the ring is still
+ * `--dg-focus-ring` at the global offset, drawn on the field's visible edge
+ * instead of on the borderless native control, so exactly one rectangle marks
+ * the field a keyboard user is in.
  * ========================================================================== */
 
 .dg-field {
@@ -531,10 +671,32 @@
   border-color: var(--dg-border-strong);
 }
 
-/* The box follows the control into focus. This adds to the global
- * `:focus-visible` ring and never replaces it. */
-.dg-field__control:focus-within {
+/* The high-contrast theme resolves both border tones to one colour, so the
+ * subtle-to-strong move above is invisible there; the hover edge is carried by
+ * the accent instead. `:where()` keeps the theme scope at zero specificity, so
+ * this ties with the rule above and wins only by order, and the invalid and
+ * disabled field states, one class more specific, still win over it. */
+:where([data-theme='high-contrast']) .dg-field__control:hover {
   border-color: var(--dg-accent);
+}
+
+/* Keyboard focus, drawn once, on the box. The native control is borderless
+ * and inset by the row's padding, so base.css's global ring landing on it
+ * would be a second rectangle crossing the box's own edge. The ring therefore
+ * moves to the box — the field's visible edge — with the same token and the
+ * same offset every button uses, and the control's own copy is withdrawn. The
+ * ring is relocated, never removed: whenever a control matches
+ * `:focus-visible`, the box that contains it matches `:has(:focus-visible)`,
+ * because Input.tsx and Select.tsx render the control only inside it. That
+ * covers the multi-line and read-only forms with no rule of their own. */
+.dg-field__control:has(:focus-visible) {
+  outline: var(--dg-focus-ring);
+  outline-offset: var(--dg-space-0);
+}
+
+.dg-input:focus-visible,
+.dg-select__native:focus-visible {
+  outline: none;
 }
 
 .dg-field__hint {
@@ -555,12 +717,20 @@
   font: var(--dg-text-xs);
 }
 
+/* The dense field's box takes the same 24 px floor as the button block
+ * (`--dg-space-7`), for the same reason — it is a pointer target — and so that
+ * a dense field and a dense button in one row (a toolbar, always) are boxes of
+ * one height whose edges line up. The native control stretches to fill the
+ * row, so the whole box, not only the 20 px of text inside it, focuses the
+ * control when clicked; the text stays vertically centred in it. */
 .dg-field--sm .dg-field__control {
+  min-block-size: var(--dg-space-7);
   padding-inline: var(--dg-space-1);
 }
 
 .dg-field--sm .dg-input,
 .dg-field--sm .dg-select__native {
+  align-self: stretch;
   padding-block: var(--dg-space-0);
   font: var(--dg-text-sm);
 }
@@ -577,9 +747,17 @@
   border-color: var(--dg-danger);
 }
 
+/* Disabled: exactly the `.dg-button[disabled]` treatment, so a disabled field
+ * and a disabled button in one toolbar row read as one state. The box keeps
+ * the enabled field's elevated surface — no surface token is dimmer than it in
+ * both the dark and the light theme, so disabled dims the text, never the
+ * surface — and the muted control, label, hint and chevron rules carry the
+ * state. Declared after the invalid rule at the same specificity, so a field
+ * that is both shows the disabled edge. */
 .dg-field.dg-is-disabled .dg-field__control {
-  background: var(--dg-surface-base);
+  background: var(--dg-surface-elevated);
   border-color: var(--dg-border-subtle);
+  cursor: not-allowed;
 }
 
 .dg-field.dg-is-disabled .dg-field__label,
@@ -657,9 +835,16 @@
   cursor: pointer;
 }
 
+/* `opacity: inherit` cancels the user agent's own translucency for a disabled
+ * `<select>` (Chromium ships `select:disabled { opacity: 0.7 }`), which the
+ * form-control reset in base.css does not cover. Disabled is then signalled by
+ * the muted-token treatment alone, as it is on the text control and the
+ * button; nothing in this design system sets `opacity`, so the value inherited
+ * from the field box is fully opaque. */
 .dg-select__native:disabled {
   color: var(--dg-text-muted);
   cursor: not-allowed;
+  opacity: inherit;
 }
 
 /* The dropdown list is painted by the platform, which takes its colours from
@@ -877,9 +1062,26 @@
   max-block-size: calc(var(--dg-space-7) * 18);
 }
 
+/* The grid's floor, and the reason a narrow table scrolls instead of
+ * squeezing. primitives/DataTable.tsx publishes the sum of its columns'
+ * minimum tracks as `--dgc-min-inline` and their number as
+ * `--dgc-column-count`; the floor adds the gaps between the tracks and the
+ * row's inline-start edge (the `medium` border below, which `--dg-space-1`
+ * covers). Wider than its viewport, the grid overflows it and the viewport —
+ * `overflow: auto` — scrolls horizontally with every column still at its
+ * readable minimum. The floor is a sum of MINIMUMS rather than `max-content`:
+ * each row is its own grid container, so a content-sized grid would change
+ * width with whichever rows the window currently renders. With no stated
+ * minimum the fallback leaves the grid exactly as wide as its viewport. */
 .dg-data-table [role='grid'] {
   display: block;
-  min-inline-size: 100%;
+  min-inline-size: max(
+    100%,
+    calc(
+      var(--dgc-min-inline, 0%) + (var(--dgc-column-count, 1) - 1) * var(--dg-space-2) +
+        var(--dg-space-1)
+    )
+  );
 }
 
 /* The header stays visible while the body scrolls. `--dg-z-overlay` is the
@@ -905,6 +1107,15 @@
   gap: var(--dg-space-2);
 }
 
+/* The header row carries the same transparent inline-start edge as every data
+ * row (see the rows section below). The two are separate grid containers, so
+ * an edge on one and not the other gave them different content boxes: the
+ * header's tracks started one border-width earlier and each flexible track
+ * resolved wider than the column beneath it. */
+.dg-data-table__head [role='row'] {
+  border-inline-start: medium solid transparent;
+}
+
 /* `--dgc-align` arrives as a CSS alignment keyword, never a physical
  * direction, so a right-to-left surface stays correct. It drives both text
  * alignment and the flex justification, because a cell whose content is a chip
@@ -923,11 +1134,19 @@
 }
 
 /* The sort control fills its cell and inherits the cell's type and
- * justification, so a sortable column and a static one are the same shape. */
+ * justification, so a sortable column and a static one are the same shape.
+ *
+ * Its hover is the ghost button's — a fill and a strong hairline one step above
+ * the header's elevated surface. So that the hairline does not sit flush
+ * against the label, the control takes one space step of inline padding and
+ * gives it back as a negative margin into the cell's own padding: the label
+ * stays exactly where a static header's label is, and the box grows outward
+ * rather than pushing the text. */
 .dg-data-table__sort-button {
-  inline-size: 100%;
+  inline-size: calc(100% + var(--dg-space-1) * 2);
+  margin-inline: calc(var(--dg-space-1) * -1);
   justify-content: inherit;
-  padding-inline: 0;
+  padding-inline: var(--dg-space-1);
   color: inherit;
   font: inherit;
 }
@@ -939,21 +1158,37 @@
 /* The visible ordering indicator, rendered from the attribute that carries the
  * state to assistive technology. A glyph rather than a colour, so the
  * direction survives a monochrome surface, and pointer-inert so it can never
- * take a click away from the control beside it. */
-.dg-data-table__header-cell[aria-sort='ascending']::after,
-.dg-data-table__header-cell[aria-sort='descending']::after {
+ * take a click away from a control.
+ *
+ * It is drawn inside the sort control, directly after the label, because the
+ * control fills its cell: drawn after the control instead, the glyph would sit
+ * at the cell's far edge on a start-aligned column, a whole track away from
+ * the name it qualifies. A sorted column without a control (sortable, but no
+ * handler) keeps the glyph on the cell. The empty alternative text keeps the
+ * glyph out of the control's and the cell's accessible names: `aria-sort`
+ * already states the direction. */
+.dg-data-table__header-cell[aria-sort='ascending'] > .dg-data-table__sort-button::after,
+.dg-data-table__header-cell[aria-sort='descending'] > .dg-data-table__sort-button::after,
+.dg-data-table__header-cell[aria-sort='ascending']:not(:has(> .dg-data-table__sort-button))::after,
+.dg-data-table__header-cell[aria-sort='descending']:not(
+    :has(> .dg-data-table__sort-button)
+  )::after {
   flex: none;
   color: var(--dg-accent);
   font: var(--dg-mono-sm);
   pointer-events: none;
 }
 
-.dg-data-table__header-cell[aria-sort='ascending']::after {
-  content: '↑';
+.dg-data-table__header-cell[aria-sort='ascending'] > .dg-data-table__sort-button::after,
+.dg-data-table__header-cell[aria-sort='ascending']:not(:has(> .dg-data-table__sort-button))::after {
+  content: '↑' / '';
 }
 
-.dg-data-table__header-cell[aria-sort='descending']::after {
-  content: '↓';
+.dg-data-table__header-cell[aria-sort='descending'] > .dg-data-table__sort-button::after,
+.dg-data-table__header-cell[aria-sort='descending']:not(
+    :has(> .dg-data-table__sort-button)
+  )::after {
+  content: '↓' / '';
 }
 
 /* --- rows ----------------------------------------------------------------- */
@@ -974,6 +1209,14 @@
   background: var(--dg-surface-elevated);
 }
 
+/* A row a click selects says so under the pointer. `DataTable` writes
+ * `aria-selected` on its rows exactly when the table is used for selection, so
+ * the attribute's presence — either value — is what marks a row as selectable;
+ * a table that only expands or only reads keeps the default cursor. */
+.dg-data-table__row[aria-selected] {
+  cursor: pointer;
+}
+
 /* Inward offset: the ring of the roving tab stop would otherwise be clipped by
  * the scroll container's edge or hidden under the sticky header. */
 .dg-data-table__row:focus-visible {
@@ -981,8 +1224,12 @@
 }
 
 /* The roving tab stop. Kept quiet — it says where the keyboard is, not what is
- * selected — and declared before the louder states so they win. */
-.dg-data-table__row.dg-is-active {
+ * selected — and declared before the louder states so they win. It is drawn
+ * only while focus is inside the table: once the reader has left, the row is no
+ * longer where the keyboard is, and a tint that stayed would read as a second,
+ * unexplained selection. `:where()` adds no specificity, so the rule still
+ * ranks with, and yields to, the two-class states below. */
+:where(.dg-data-table:focus-within) .dg-data-table__row.dg-is-active {
   background: var(--dg-surface-elevated);
 }
 
@@ -1018,6 +1265,31 @@
   color: var(--dg-text-primary);
   font: var(--dg-text-sm);
   text-align: var(--dgc-align, start);
+}
+
+/* A cell owns its box. Content wider than its column — a chip stack, a long
+ * label, a value in a panel narrower than any sizing anticipated — is clipped
+ * at the cell's edge instead of painting over the neighbouring column, in
+ * either inline direction (an end-aligned cell overflows toward its START).
+ * The columns are sized so that their content fits (see the track notes in
+ * primitives/DataTable.tsx); this is the guarantee for everything else.
+ * `clip` rather than `hidden`: the cell does not become a scroll container, so
+ * it keeps its flex minimum and a wheel over it still scrolls the table. The
+ * clip margin reaches into the padding-free edge a compact cell has, so the
+ * focus ring of a control inside a cell is never shaved off; it stays inside
+ * the gap between columns and never reaches the next cell. A tooltip bubble is
+ * `position: fixed` and is not clipped by any of this.
+ *
+ * The justification is SAFE: content that fits sits where `--dgc-align` puts
+ * it, and content that does not fit falls back to the start edge, so what the
+ * clip removes is always the END of a value. An end-aligned figure that
+ * overflowed toward its start would otherwise lose its leading digits and
+ * read as a different, smaller number ("940.50" as "40.50"). */
+.dg-data-table__cell,
+.dg-data-table__header-cell {
+  justify-content: safe var(--dgc-align, start);
+  overflow: clip;
+  overflow-clip-margin: var(--dg-space-1);
 }
 
 /* The expand toggle a column's cell renderer places in the identity column. */
@@ -1170,9 +1442,11 @@
   color: var(--dg-info);
 }
 
-/* Inline code, an identifier, a path, a redacted statement. The base layer
- * already gives `code`, `pre`, `kbd` and `samp` the mono role and tabular
- * figures; these rules add the chip around them. */
+/* Inline code, an identifier, a path, a redacted statement: the chip around
+ * the mono role. The base layer gives `code`, `pre`, `kbd` and `samp` the mono
+ * role and tabular figures at zero specificity, but the `font` shorthands
+ * below reset those figures, so the post-role group at the end of this section
+ * restores them for every Code. */
 .dg-code {
   padding-block: 0;
   padding-inline: var(--dg-space-0);
@@ -1238,18 +1512,26 @@
 /* --- after every role rule: weight and figures ---------------------------- */
 
 /* The type roles are complete `font` shorthands and the shorthand RESETS
- * weight, so a rule that wants a role's size and line-height with a heavier
- * face restates the weight — through `--dg-font-weight-medium`, the token that
- * holds it, never as a numeral. Only classes whose own `font` shorthand is
- * declared ABOVE may join this group: a component that sets a role later in the
- * file declares its raised weight inside its own rule, after the shorthand. */
+ * weight and figures alike, so a rule that wants a role's size and line-height
+ * with a heavier face restates the weight — through `--dg-font-weight-medium`,
+ * the token that holds it, never as a numeral — and a rule that wants tabular
+ * figures restates `font-variant-numeric`. Only classes whose own `font`
+ * shorthand is declared ABOVE may join these two groups: a component that sets
+ * a role later in the file declares its raised weight or its tabular figures
+ * inside its own rule, after the shorthand. */
 .dg-text--medium,
 .dg-heading--md,
 .dg-heading--sm {
   font-weight: var(--dg-font-weight-medium);
 }
 
+/* Tabular figures. `dg-code` is here because AAP 0.6.3 pairs the mono family
+ * with `tabular-nums` for code, SQL, paths and numeric columns, so every Code
+ * renders them by default; `dg-code--numeric` still marks numeric content and
+ * no longer changes the rendering. `dg-text--numeric` is the opt-in for
+ * interface text, whose default figures are proportional. */
 .dg-text--numeric,
+.dg-code,
 .dg-code--numeric {
   font-variant-numeric: tabular-nums;
 }
@@ -1258,17 +1540,29 @@
  * primitives/Tooltip.tsx
  *
  * The bubble renders inside the panel's own DOM — no portal, no positioning
- * library — so it inherits the active theme by cascade. Placement is one
- * variant class per side, written on the wrapper for the component's whole
- * life and echoed on the bubble while it is open.
+ * library — so it inherits the active theme by cascade. An OPEN bubble is
+ * `position: fixed`, placed at the viewport coordinates Tooltip.tsx measures
+ * from its trigger and publishes as the unitless `--dgc-tooltip-block` and
+ * `--dgc-tooltip-inline`: a fixed box is laid out against the viewport, so no
+ * `overflow` of a table cell, a scroll container or the panel shell can clip
+ * it. Nothing in this stylesheet may transform, filter or contain an ancestor
+ * of a trigger — any of those would become the bubble's containing block
+ * again (see `.dg-virtual-row`). Placement is one variant class per side,
+ * written on the wrapper for the component's whole life and echoed on the
+ * bubble while it is open; the variant states the GAP to the trigger as a
+ * signed start margin, which the component reads back to place the bubble's
+ * border box, so the gap stays a token in this file.
  *
- * The bubble is mounted for the component's whole life with a fixed `id` and
- * `role="tooltip"`, and only its class list changes: `dg-visually-hidden`
- * while closed, `dg-is-open` plus the placement variant while open.
- * `dg-visually-hidden` is a single class in base.css, so every LAYOUT property
- * of the bubble lives on the two-class `.dg-tooltip__bubble.dg-is-open`
- * selector — if they sat on the block rule they would override the utility and
- * a closed bubble would be visible.
+ * The bubble is mounted for the component's whole life, so the trigger's
+ * `aria-describedby` always resolves. Closed, it carries the `hidden`
+ * attribute and `dg-visually-hidden` — out of rendering and out of the
+ * accessibility tree; open, it drops both and takes `dg-is-open` plus the
+ * placement variant, whether hover, focus or the view that owns it (the
+ * component's controlled `open`) opened it. Every LAYOUT property of the
+ * bubble lives on the two-class `.dg-tooltip__bubble.dg-is-open` selector, so
+ * the block rule stays paint-only, never touches a property the
+ * visually-hidden utility relies on, and a bubble can never be laid out in a
+ * state the component does not write.
  *
  * There is no arrow: an arrow needs a length for its size and the token table
  * has none, and a border-triangle would also have to invent a colour blend.
@@ -1298,7 +1592,8 @@
   max-inline-size: 100%;
 }
 
-/* Paint only — see the note above about `dg-visually-hidden`. */
+/* Paint only — layout lives on the open-state selector, as the section note
+ * above explains. */
 .dg-tooltip__bubble {
   background: var(--dg-surface-overlay);
   border-radius: var(--dg-radius-md);
@@ -1314,7 +1609,9 @@
  * space token is about a short sentence at the `--dg-text-sm` role, which is
  * what a tooltip carries. */
 .dg-tooltip__bubble.dg-is-open {
-  position: absolute;
+  position: fixed;
+  inset-block-start: calc(var(--dgc-tooltip-block, 0) * 1px);
+  inset-inline-start: calc(var(--dgc-tooltip-inline, 0) * 1px);
   inline-size: max-content;
   max-inline-size: calc(var(--dg-space-7) * 10);
   padding-block: var(--dg-space-1);
@@ -1323,29 +1620,29 @@
    * where every shadow token resolves to `none`. */
   border: thin solid var(--dg-border-strong);
   white-space: normal;
+  /* A long unbroken value — a URL, a SQL identifier — wraps inside the
+   * maximum width instead of running out of the bubble. */
+  overflow-wrap: anywhere;
 }
 
+/* The gap between trigger and bubble, per side, as a signed START margin on
+ * the axis the bubble sits on: negative when the bubble lies before the
+ * trigger (above it, or at its inline start), positive after it. Tooltip.tsx
+ * reads its magnitude as the gap and cancels the margin when it places the
+ * border box, so a bubble flipped to the other side keeps the same gap. */
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--top {
-  inset-block-end: 100%;
-  inset-inline-start: 0;
-  margin-block-end: var(--dg-space-1);
+  margin-block-start: calc(var(--dg-space-1) * -1);
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--bottom {
-  inset-block-start: 100%;
-  inset-inline-start: 0;
   margin-block-start: var(--dg-space-1);
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--start {
-  inset-block-start: 0;
-  inset-inline-end: 100%;
-  margin-inline-end: var(--dg-space-1);
+  margin-inline-start: calc(var(--dg-space-1) * -1);
 }
 
 .dg-tooltip__bubble.dg-is-open.dg-tooltip--end {
-  inset-block-start: 0;
-  inset-inline-start: 100%;
   margin-inline-start: var(--dg-space-1);
 }
 
@@ -1761,7 +2058,7 @@
  * same basis and grows by the same factor, which makes their widths equal
  * whatever they contain, and keeps shrinking so a narrow surface squeezes the
  * panes evenly instead of overflowing. No size token exists for a basis, so it
- * is ten units of the largest space token.
+ * is twenty units of the largest space token — 480 px.
  *
  * That basis is also the collapse threshold. `--collapse` — which the component
  * emits for a horizontal division unless the caller opts out — is the whole of
@@ -1770,6 +2067,19 @@
  * lines, which IS the single column a docked DevTools panel needs at around
  * four hundred pixels. Without it the panes stay on one line and shrink
  * together. Neither case needs a width in a rule.
+ *
+ * The basis is therefore the narrowest width a pane is allowed to be while it
+ * shares a line, and it is sized for what a pane holds: a multi-column table,
+ * a correlated timeline, a request waterfall. A basis of ten units put two
+ * panes side by side from a 492 px division, so at a 768 px surface each pane
+ * got 366 px — narrower than the single column the same views are given on a
+ * 480 px surface, which crushed their columns and overprinted their cells
+ * (measured in the browser). At twenty units two equal panes share a line only
+ * from a 972 px division, where each is at least 480 px, and below that the
+ * division is one column of full-width panes. The threshold still follows the
+ * container, never the viewport, so a division nested in a pane collapses on
+ * its own share of the space; and a container query could not state it
+ * without a length literal, because a query condition cannot read a token.
  *
  * A caller that needs a weighting sets `--dgc-split-weight` inline on the pane;
  * the declaration order inside the rule is what lets that override the `flex`
@@ -1894,14 +2204,14 @@
  * exactly at one basis unit at the moment the line stops fitting, so the panes
  * fall into a column BEFORE any of them is squeezed below that unit. A weighted
  * division therefore collapses at a wider container than an equal one — a 3:1:1
- * split needs roughly `5 × 240px` plus its gaps to stay on one line (measured,
- * not estimated) — which is the right trade for a surface as narrow as a docked
- * DevTools panel: a readable column beats three unreadable strips. The lever for
- * anyone who wants the panes to hold on longer is the basis unit below, never
- * the weight multiplication, which is what makes the proportions exact. */
+ * split needs `5 × 480px` plus its gaps to stay on one line — which is the
+ * right trade for a surface as narrow as a docked DevTools panel: a readable
+ * column beats three unreadable strips. The lever for anyone who wants the
+ * panes to hold on longer is the basis unit below, never the weight
+ * multiplication, which is what makes the proportions exact. */
 .dg-split__pane {
-  flex: 1 1 calc(var(--dg-space-7) * 10);
-  flex-basis: calc(var(--dg-space-7) * 10 * var(--dgc-split-weight, 1));
+  flex: 1 1 calc(var(--dg-space-7) * 20);
+  flex-basis: calc(var(--dg-space-7) * 20 * var(--dgc-split-weight, 1));
   flex-grow: var(--dgc-split-weight, 1);
   min-inline-size: 0;
   min-block-size: 0;
@@ -2056,6 +2366,22 @@
  * The filter, sort and search row above a visualization. Sticky, so it stays
  * reachable while a long result scrolls, and at the overlay stacking level for
  * the same reason as the table header.
+ *
+ * ## One line for every control box
+ *
+ * A field whose label is shown is a COLUMN — the label above, the control box
+ * below — while a button, a field whose label is visually hidden and a badge
+ * are the box alone. Centring those items against each other centres the
+ * column, which drops the labelled control box half a label below its
+ * neighbours. The bar and its control sections therefore align their items to
+ * the END of the line instead: every control box — the dense field box and
+ * the dense button, both floored at `--dg-space-7` — ends on the same edge
+ * and, being one height, starts on the same edge too, and a visible label
+ * sits above its own control without moving anything else. The two sections
+ * that hold statements rather than controls (the result badges and the
+ * shortcut hint) are shorter than a control, so each is given a control's
+ * height with its content centred in it: a badge reads level with the
+ * controls beside it rather than sitting on their bottom edge.
  * ========================================================================== */
 
 .dg-toolbar {
@@ -2064,7 +2390,7 @@
   z-index: var(--dg-z-overlay);
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: end;
   gap: var(--dg-space-2);
   min-inline-size: 0;
   padding-block: var(--dg-space-1);
@@ -2079,7 +2405,7 @@
 .dg-toolbar__group {
   display: flex;
   flex-wrap: wrap;
-  align-items: center;
+  align-items: end;
   gap: var(--dg-space-1);
   min-inline-size: 0;
 }
@@ -2108,27 +2434,39 @@
  * relaxes that for the narrowest surfaces. None of them grows: the search
  * section above is the one that takes the free space, so up to its maximum
  * inline size these sit at the inline end without a spacer, and past it they
- * pack toward the start with the slack trailing them. */
+ * pack toward the start with the slack trailing them. Items align to the end
+ * of the section for the reason the section note gives: two pickers, one with
+ * its label shown and one without, keep their boxes on one line. */
 .dg-toolbar__controls,
 .dg-toolbar__actions,
 .dg-toolbar__status {
   display: flex;
   flex: none;
   flex-wrap: nowrap;
-  align-items: center;
+  align-items: end;
   gap: var(--dg-space-1);
   min-inline-size: 0;
 }
 
+/* The result indicators are statements, shorter than a control: a control's
+ * height, with the badges centred in it, puts them level with the controls
+ * beside them. Declared after the grouped rule so its alignment wins. */
+.dg-toolbar__status {
+  align-items: center;
+  min-block-size: var(--dg-space-7);
+}
+
 /* The keyboard-shortcut hint, last in the bar. Its type role and muted colour
  * come from the `Text` primitive the component renders it as, so this rule
- * contributes alignment only. */
+ * contributes alignment only — including a control's height with the keys
+ * centred in it, for the same reason as the result indicators above. */
 .dg-toolbar__hint {
   display: flex;
   flex: none;
   align-items: center;
   gap: var(--dg-space-1);
   min-inline-size: 0;
+  min-block-size: var(--dg-space-7);
 }
 
 /* Denser bar for a narrow host: one step down the spacing scale for the gap
@@ -2240,6 +2578,18 @@
   border-inline-start: medium solid var(--dg-border-strong);
 }
 
+/* The observed register with nothing in it: one muted sentence where the list
+ * would be, inset and edged exactly like that list, so the answer sits in the
+ * register's own place. Muted and in the body role, never a fact's primary
+ * colour, so it cannot be read as a measured statement. */
+.dg-summary-header__none {
+  min-inline-size: 0;
+  padding-inline-start: var(--dg-space-3);
+  border-inline-start: medium solid var(--dg-border-strong);
+  color: var(--dg-text-muted);
+  font: var(--dg-text-md);
+}
+
 /* Inference: a warning-toned edge, and every item carries a confidence badge
  * whose text names the level, so the distinction is never colour alone. */
 .dg-summary-header__region--causes .dg-summary-header__facts {
@@ -2273,8 +2623,24 @@
 
 /* An evidence chip selects the events that substantiate the statement beside
  * it, so it is rendered as a control and styled as one: the muted accent
- * surface over the ghost button's chrome, and the hover feedback of something
- * clickable. The focus ring comes from base.css. */
+ * surface over the ghost button's chrome. The focus ring comes from base.css.
+ *
+ * Its states form one ladder of rising emphasis, each a step above the last:
+ *
+ *   rest      muted accent fill, accent edge
+ *   hover     the same fill, the primary-text edge and an underline — it only
+ *             ever GAINS emphasis under the pointer, never drops to a neutral
+ *             surface that reads as "less clickable"
+ *   press     the full accent fill, with the label on the base surface colour
+ *             (the pairing the primary button uses)
+ *   selected  the full accent fill with the primary-text edge — the chip whose
+ *             event the panel has selected, persisting after the pointer leaves.
+ *             `SummaryHeader` writes `dg-is-selected` and `aria-pressed="true"`
+ *             together, so a reader gets the same fact the fill shows
+ *
+ * The hover, press and selected rules are two-class selectors declared after
+ * the ghost variant's own, so they win over it; selected is declared last, so a
+ * hovered or pressed selected chip stays drawn as selected. */
 .dg-summary-header__chip {
   background: var(--dg-accent-muted);
   border-color: var(--dg-accent);
@@ -2283,8 +2649,22 @@
 }
 
 .dg-summary-header__chip:hover {
-  background: var(--dg-surface-overlay);
-  border-color: var(--dg-border-strong);
+  background: var(--dg-accent-muted);
+  border-color: var(--dg-text-primary);
+  color: var(--dg-text-primary);
+  text-decoration: underline;
+}
+
+.dg-summary-header__chip:active {
+  background: var(--dg-accent);
+  border-color: var(--dg-accent);
+  color: var(--dg-surface-base);
+}
+
+.dg-summary-header__chip.dg-is-selected {
+  background: var(--dg-accent);
+  border-color: var(--dg-text-primary);
+  color: var(--dg-surface-base);
 }
 
 /* ==========================================================================
@@ -2304,11 +2684,13 @@
  *
  * ## Colour arrives as a token reference
  *
- * `src/utils/color.ts` folds the seventeen telemetry kinds onto seven kind
- * tokens, the three tiers onto lane tokens, the six dependency-graph
- * participant classes onto kind tokens, the five render triggers onto status
- * tokens and the four duration buckets onto duration tokens — and answers with
- * `var(--dg-*)` strings. A component hands one in through the `--dgc-*`
+ * `src/utils/color.ts` folds the seventeen telemetry kinds onto nine kind
+ * tokens (the seven AAP 0.6.3 values plus the supplementary service and
+ * external members), pairs each kind fill with the label ink that clears
+ * 4.5:1 on it, maps the three tiers onto lane tokens, the six dependency-graph
+ * participant classes onto six distinct kind tokens, the five render triggers
+ * onto status tokens and the four duration buckets onto duration tokens — and
+ * answers with `var(--dg-*)` strings. A component hands one in through the `--dgc-*`
  * property its section documents, and every rule here consumes it with a token
  * fallback, so an unconfigured element still resolves to a token.
  *
@@ -2319,6 +2701,14 @@
  * below give all thirteen the same behaviour: fill the node, and hold a
  * minimum height so an unresolved or empty node is visibly a state rather than
  * a gap.
+ *
+ * Each box is a COLUMN, so the state inside it stretches across the node's
+ * full inline size and its copy is centred in the node — the same placement
+ * whether a component puts the `__empty` class on a wrapper around the
+ * `EmptyState` (the chart views, the event log, the metric tiles and the
+ * component tree) or on the `EmptyState` itself (the tables). A row box would
+ * shrink-wrap the state at the inline start instead, so two empty nodes side
+ * by side would disagree about where "nothing here" is written.
  * ========================================================================== */
 
 .dg-timeline__empty,
@@ -2335,8 +2725,22 @@
 .dg-dependency-graph__empty {
   display: flex;
   flex: 1 1 auto;
+  flex-direction: column;
   min-inline-size: 0;
   min-block-size: calc(var(--dg-space-7) * 4);
+}
+
+/* Where the box is a wrapper, the state inside it also grows along the column,
+ * so it takes the box's whole minimum height and `.dg-empty-state`'s own
+ * centring places the copy in the middle of the node rather than at its top. */
+.dg-timeline__empty > .dg-empty-state,
+.dg-waterfall__empty > .dg-empty-state,
+.dg-event-log__empty > .dg-empty-state,
+.dg-metric-cards__empty > .dg-empty-state,
+.dg-flame__empty > .dg-empty-state,
+.dg-component-tree__empty > .dg-empty-state,
+.dg-dependency-graph__empty > .dg-empty-state {
+  flex: 1 1 auto;
 }
 
 .dg-timeline__loading,
@@ -2409,6 +2813,16 @@
   min-inline-size: 0;
 }
 
+/* A virtualized row is positioned and transformed, so it is its own stacking
+ * context and the rows after it paint over it. The timeline row that is hovered
+ * or holds focus is raised to the tooltip layer, so the description its
+ * Operation cell reveals overlays the rows beneath instead of hiding under
+ * them — the flame chart's tree does the same for its rows. */
+.dg-timeline__equivalent .dg-virtual-row:hover,
+.dg-timeline__equivalent .dg-virtual-row:focus-within {
+  z-index: var(--dg-z-tooltip);
+}
+
 /* The block of every visualization: a column that may shrink below its content
  * so a wide chart or a long identifier never widens the panel. */
 .dg-timeline,
@@ -2428,12 +2842,34 @@
 }
 
 /* Every SVG canvas in the package. `display: block` removes the inline
- * baseline gap under it; the `width`/`height` attributes are the component's. */
+ * baseline gap under it; the `width`/`height` attributes are the component's.
+ *
+ * A measured canvas is drawn in CSS pixels — one user unit per pixel, so its
+ * text renders at the typography token's size at every panel width — and is
+ * never narrower than the chart's minimum, so on a narrow panel it is wider
+ * than its viewport and the viewport scrolls. `max-inline-size: none` is what
+ * lets it: base.css caps every `svg` at its container's width, which would
+ * scale a wide canvas down, shrinking its labels below legibility and leaving
+ * its declared height standing as a blank band beneath the drawing. An
+ * unmeasured canvas (no layout, see `utils/measure.ts`) declares a width of
+ * `100%` itself, so it still fits its container. */
 .dg-timeline__canvas,
 .dg-flame__canvas,
 .dg-dependency-graph__canvas {
   display: block;
   min-inline-size: 0;
+  max-inline-size: none;
+}
+
+/* The scroll viewport each canvas is measured from. Inline-size containment
+ * makes the viewport's width its container's alone: without it, a canvas drawn
+ * at the measured width would become the viewport's min-content width, hold a
+ * shrink-to-fit ancestor (a flex pane, a grid track sized by its content) at
+ * that width, and the chart could never narrow when the panel does. */
+.dg-timeline__viewport,
+.dg-flame__viewport,
+.dg-dependency-graph__viewport {
+  contain: inline-size;
 }
 
 /* Axis furniture, shared by the two time-based views. Unitless SVG geometry,
@@ -2463,8 +2899,7 @@
  * stacking come from the primitive. */
 .dg-timeline__tooltip,
 .dg-waterfall__tooltip,
-.dg-flame__tooltip,
-.dg-dependency-graph__tooltip {
+.dg-flame__tooltip {
   position: relative;
   display: inline-flex;
   min-inline-size: 0;
@@ -2477,14 +2912,20 @@
  * edge from a parent span to each child.
  *
  * `--dgc-bar-color` carries the span's kind colour, `--dgc-lane-color` the
- * lane's tier accent. A bar's LABEL is drawn beside the bar rather than on it,
- * in a text tone — the kind scale is a fill scale, held to the non-text ratio.
+ * lane's tier accent. A bar's LABEL is measured by the component and drawn
+ * where it fits: beside the bar (after it, else before it) in a text tone on
+ * the lane surface, and only where neither side has room, inside a bar wide
+ * enough to hold it, in the base surface on the kind fill (`__bar-label--inside`).
  *
  * An async continuation whose lineage is ambiguous (more than one settled
  * request had an open continuation window when a commit landed) is drawn with
- * `__edge--dashed`, and an orphan attached to the trace root carries
- * `dg-is-orphan`. Both are visually distinct from a resolved parent edge,
- * because a guessed relationship must not read as a measured one (AAP 0.4.2).
+ * `__edge--dashed` and `dg-is-ambiguous` — a dashed warning connector — and its
+ * bar carries `dg-is-ambiguous` too, a dashed warning outline. One attributed
+ * with a single candidate carries `dg-is-inferred`, a solid connector in the
+ * info tone. An orphan attached to the trace root carries `dg-is-orphan`. All
+ * are visually distinct from a resolved parent edge and from each other,
+ * because a guessed relationship must not read as a measured one (AAP 0.4.2);
+ * the dependency graph draws the same two lineage states the same way.
  *
  * SVG paints in document order and `z-index` does not apply to it, so paint
  * order is the component's to get right: the edge group belongs BEFORE the bar
@@ -2503,6 +2944,49 @@
   /* Gap: no size token exists for a chart's scroll cap. Sixteen units of the
    * largest space token holds a deep trace without taking the whole panel. */
   max-block-size: calc(var(--dg-space-7) * 16);
+}
+
+/* The detail strip between the canvas and the table: the selected span, or a
+ * hovered or focused span previewed in its place. It is ALWAYS in the layout,
+ * one reserved line tall whether it shows a span or its resting line, and it
+ * never wraps — a strip that appeared on hover, or grew a second line for a
+ * longer row, would push the table down under the pointer reading it. The line
+ * is two runs. The lead run (lead word, kind and tier, name) identifies the
+ * span and is laid out first; on a narrow panel only the name gives way, by
+ * truncating. The trailing run (`__detail-rest`: duration, offset, status,
+ * source chip, lineage note) takes what width is left and is clipped at the
+ * strip's inline end instead of taking a second line — every value in it is
+ * also in that row's own cells below. Only the trailing run clips, and only on
+ * the inline axis (`overflow-x: clip`, which unlike `hidden` creates no scroll
+ * container and leaves the block axis visible), so the description bubble the
+ * name opens from the lead run is never cut off by the strip. The reserved line
+ * is the largest space token: the tallest control in the line, the source
+ * chip, fits within it. */
+.dg-timeline__detail {
+  display: flex;
+  align-items: center;
+  gap: var(--dg-space-2);
+  min-inline-size: 0;
+  min-block-size: var(--dg-space-7);
+  white-space: nowrap;
+}
+
+.dg-timeline__detail > .dg-stack {
+  flex: 0 1 auto;
+  min-inline-size: 0;
+}
+
+.dg-timeline__detail-rest {
+  display: flex;
+  align-items: center;
+  flex: 1 1 0;
+  min-inline-size: 0;
+  overflow-x: clip;
+  overflow-y: visible;
+}
+
+.dg-timeline__detail-rest > .dg-stack {
+  flex: none;
 }
 
 .dg-timeline__lanes {
@@ -2537,26 +3021,72 @@
   cursor: pointer;
 }
 
+/* An ambiguous async continuation's own bar: a dashed warning outline, so the
+ * span whose parent was a choice among candidates reads as uncertain on the
+ * bar as well as on its connector, and never like an orphan's SOLID warning
+ * outline. The row's "Ambiguous parent" flag and its description say the same
+ * in words. Declared before the hover and selected rules, which share its
+ * specificity and so win on colour and width (the bars are not focusable, so
+ * there is no focus rule to order against); the dash stays under them, so a
+ * selected ambiguous bar still reads as ambiguous. */
+.dg-timeline__bar.dg-is-ambiguous {
+  stroke: var(--dg-warning);
+  stroke-dasharray: 4 3;
+}
+
 .dg-timeline__bar:hover {
   stroke: var(--dg-text-primary);
 }
 
-.dg-timeline__bar:focus-visible {
-  stroke: var(--dg-accent);
-  stroke-width: 2;
-}
-
+/* No focus rule: the canvas is `role="img"` and its bars are not focusable, so
+ * the keyboard reads them in the table beneath it, whose rows carry the ring. */
 .dg-timeline__bar.dg-is-selected {
   stroke: var(--dg-accent);
   stroke-width: 2;
 }
 
-/* Beside the bar, on the panel surface — never on top of a kind fill. */
+/* A label beside its bar — after the bar's end or before its start — on the
+ * lane surface. The halo — a stroke in the lane's own surface colour painted
+ * beneath the fill (`paint-order: stroke`) — keeps the label legible where a
+ * connector or a gridline runs behind it, without a box that would read as a
+ * control. Unitless SVG stroke width, like every stroke in this section. */
 .dg-timeline__bar-label {
   fill: var(--dg-text-secondary);
   font: var(--dg-mono-sm);
   dominant-baseline: middle;
   pointer-events: none;
+  paint-order: stroke;
+  stroke: var(--dg-surface-elevated);
+  stroke-width: 3;
+  stroke-linejoin: round;
+}
+
+/* The backdrop under a label beside its bar: the lane's own surface colour, so
+ * it is invisible against the lane and reads as no box at all, but a connector
+ * or gridline passing under the label stops at its edges rather than showing
+ * through the spaces between words, which the halo cannot cover. The component
+ * sizes it to the label plus an inset and keeps it clear of every bar. */
+.dg-timeline__bar-label-backdrop {
+  fill: var(--dg-surface-elevated);
+  stroke: none;
+  pointer-events: none;
+}
+
+/* A label inside its bar, drawn only where the bar is wider than the label and
+ * its inset on both sides and neither side of the bar had room. The base
+ * surface on the kind fill is the treatment of a flame frame's label; there is
+ * no halo, because the fill behind the text is the bar itself and a halo in the
+ * lane's colour would outline every glyph against it.
+ *
+ * Vertical fit, measured in a browser in the product's monospace face: the bar
+ * is 12 units tall (an 18-unit row less a 3-unit inset above and below), and an
+ * 11 px label centred on it by `dominant-baseline: middle` puts its ink —
+ * capitals, ascenders and descenders — within it, from its top edge to about
+ * one unit above its bottom edge. Nothing paints outside the bar, so the rule
+ * needs no clip. */
+.dg-timeline__bar-label--inside {
+  fill: var(--dg-surface-base);
+  stroke: none;
 }
 
 /* A connector is an essential non-text graphic, so it strokes with the
@@ -2571,11 +3101,23 @@
   pointer-events: none;
 }
 
-/* An ambiguous async continuation: dashed, and the component states the
- * ambiguity in the event detail as well, so the dash is not the only signal. */
+/* An async continuation attributed with a single candidate: inferred rather
+ * than measured, so it is told apart in the info tone — and solid, because its
+ * parent was not in doubt. The row's description names the mechanism. */
+.dg-timeline__edge.dg-is-inferred {
+  stroke: var(--dg-info);
+}
+
+/* An ambiguous async continuation: dashed, in the warning tone its bar's
+ * outline carries, and the component states the ambiguity in the event detail
+ * as well, so neither the dash nor the tone is the only signal. */
 .dg-timeline__edge--dashed,
 .dg-timeline__edge.dg-is-ambiguous {
   stroke-dasharray: 4 3;
+}
+
+.dg-timeline__edge.dg-is-ambiguous {
+  stroke: var(--dg-warning);
 }
 
 /* A span whose parent never arrived, attached to the trace root and flagged
@@ -2592,6 +3134,20 @@
 .dg-timeline__bar.dg-is-orphaned {
   stroke: var(--dg-warning);
   stroke-width: 1;
+}
+
+/* High contrast outlines every filled shape, so a bar at rest strokes with the
+ * strong border instead of `transparent`. The theme scope is `:where()`, zero
+ * specificity, so this ties with the base bar rule and wins only by order,
+ * and the hover, focus, selected and orphan colours above still win. Hover
+ * already strokes with the primary text tone, which equals the strong border
+ * in this theme, so the hover change is the heavier stroke. */
+:where([data-theme='high-contrast']) .dg-timeline__bar {
+  stroke: var(--dg-border-strong);
+}
+
+:where([data-theme='high-contrast']) .dg-timeline__bar:hover {
+  stroke-width: 2;
 }
 
 /* ==========================================================================
@@ -2776,6 +3332,31 @@
   color: var(--dg-text-muted);
 }
 
+/* One attribute chip of the strip. The strip is a single nowrap line that
+ * clips at the cell, and a chip keeping the flex default `min-inline-size:
+ * auto` could not shrink below its whole text: one long pair pushed the rest,
+ * and the "+N more" count after them, past the clip and cut them mid-glyph.
+ * Here every chip starts from nothing and grows toward its own text — the
+ * `max-content` ceiling — so free space is shared out like water: pairs short
+ * enough to fit are shown whole, and only the longest divide what remains and
+ * ellipsize, each at its own border. The component sets the chip's text as its
+ * title, so a shortened pair is still readable on hover. */
+.dg-event-log__attr {
+  flex: 1 1 0;
+  min-inline-size: 0;
+  max-inline-size: max-content;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* The count of attributes the strip does not show. It never shrinks, so it is
+ * always drawn in full right after the last chip — the chips give way first,
+ * and the strip never claims a record carries less than it does. */
+.dg-event-log__more {
+  flex: none;
+}
+
 /* ==========================================================================
  * components/MetricCards.tsx
  *
@@ -2784,8 +3365,10 @@
  * wide DevTools panel are the same rule.
  *
  * A metric that could not be observed — the transferred-bytes gap of AAP
- * 0.6.6 — renders the not-available label under `dg-is-unavailable`, muted, so
- * an unobservable value can never be read as a measured zero.
+ * 0.6.6 — renders the not-available label under `dg-is-unavailable`: muted,
+ * and on a dashed tile with an italic figure. The shape change is what keeps an
+ * unobservable value from reading as a measured zero, because a measured fast
+ * duration is muted as well (`--dg-duration-fast` aliases `--dg-text-muted`).
  * ========================================================================== */
 
 .dg-metric-cards {
@@ -2798,14 +3381,29 @@
   min-inline-size: 0;
 }
 
+/* The three state boxes are items of the tile grid above, because the block
+ * keeps its class in every state. Each spans every track, first grid line to
+ * last, so a state reads across the whole node like every other component's
+ * instead of occupying the width of one tile. */
+.dg-metric-cards__empty,
+.dg-metric-cards__loading,
+.dg-metric-cards__error {
+  grid-column: 1 / -1;
+}
+
 /* MetricCards.tsx writes each tile part under two names — the tile's own
  * `dg-metric-card*` block and the `dg-metric-cards__*` element names its
  * component contract states — on the same element, so every rule below groups
- * the pair and either name alone selects the whole treatment. */
+ * the pair and either name alone selects the whole treatment.
+ *
+ * The tiles of one grid row stretch to the row's height, and the heading and
+ * the figure are pushed to the tile's two ends, so a heading that wraps onto a
+ * second line never lowers its own figure below the figures beside it. */
 .dg-metric-card,
 .dg-metric-cards__card {
   display: flex;
   flex-direction: column;
+  justify-content: space-between;
   gap: var(--dg-space-0);
   min-inline-size: 0;
   padding: var(--dg-space-3);
@@ -2842,9 +3440,17 @@
 }
 
 /* Declared last, and at two classes, so an unobservable metric is muted
- * whatever severity the value would otherwise carry. */
+ * whatever severity the value would otherwise carry — and, since muted is also
+ * the colour of a measured fast duration, drawn in a different shape: a dashed
+ * tile edge and an italic figure. The italic is restated after the value's
+ * `font` shorthand, which resets the style, at the higher specificity. */
+.dg-metric-card.dg-is-unavailable {
+  border-style: dashed;
+}
+
 .dg-metric-card.dg-is-unavailable .dg-metric-card__value {
   color: var(--dg-text-muted);
+  font-style: italic;
 }
 
 /* ==========================================================================
@@ -2854,10 +3460,14 @@
  * 0.6.6. It is not a sampling profile, so there is no sample-count chrome, no
  * self-time colouring and no inverted view.
  *
- * A frame's label is drawn INSIDE the frame, so it is painted in
- * `--dg-surface-base`: the kind colours a frame is filled with are light in
- * the dark and high-contrast themes and dark in the light theme, and the base
- * surface colour is the one label colour that reads against all of them.
+ * A frame's label is drawn INSIDE the frame, so it is text on a kind fill and
+ * owes the 4.5:1 text bar to that fill. No single colour reaches it on every
+ * fill — the light scale holds fills that need a light ink and one (fetch)
+ * that needs a dark one — so the component hands each label the ink paired
+ * with its frame's fill through `--dgc-frame-ink` (`kindInkColorVar` in
+ * `src/utils/color.ts`, backed by the `--dg-kind-*-ink` tokens, whose values
+ * the token test measures against their fills in every theme). The fallback
+ * is the ink of the frame's own fallback fill.
  * ========================================================================== */
 
 .dg-flame {
@@ -2871,8 +3481,9 @@
   max-block-size: calc(var(--dg-space-7) * 14);
 }
 
-/* One depth row of the icicle. Crisp edges on the group, so the hairline
- * separation between adjacent frames lands on a device pixel. */
+/* One drawn row of the icicle — a depth, or one sub-row of a depth whose
+ * siblings overlap. Crisp edges on the group, so the hairline separation
+ * between adjacent frames lands on a device pixel. */
 .dg-flame__row {
   shape-rendering: crispEdges;
 }
@@ -2890,18 +3501,16 @@
   stroke: var(--dg-text-primary);
 }
 
-.dg-flame__frame:focus-visible {
-  stroke: var(--dg-accent);
-  stroke-width: 2;
-}
-
+/* No focus rule: the canvas is `role="img"` and its frames are not focusable,
+ * so the keyboard reads them in the tree beneath it, whose rows carry the
+ * ring. */
 .dg-flame__frame.dg-is-selected {
   stroke: var(--dg-accent);
   stroke-width: 2;
 }
 
 .dg-flame__frame-label {
-  fill: var(--dg-surface-base);
+  fill: var(--dgc-frame-ink, var(--dg-kind-function-ink));
   font: var(--dg-mono-sm);
   dominant-baseline: middle;
   pointer-events: none;
@@ -2911,14 +3520,27 @@
  * chart is not showing — is the grouped note rule of the shared section. */
 
 /* The chart's text equivalent. The canvas is `role="img"` and cannot be entered
- * with a keyboard, so the same frames are listed beneath it, one row each, in
- * the order the icicle draws them. Markers are dropped here rather than in
- * base.css, which keeps them for the lists that want them. */
+ * with a keyboard, so the same frames are listed beneath it as a tree, one row
+ * each, in the order the icicle draws them. The tree is virtualized through the
+ * shared `dg-virtual-*` helpers, so its viewport is capped: the cap is what
+ * gives the virtualizer a window to render into, and without it every row
+ * would be laid out at once. */
 .dg-flame__equivalent {
-  display: flex;
-  flex-direction: column;
   min-inline-size: 0;
-  list-style: none;
+}
+
+.dg-flame__equivalent .dg-virtual-viewport {
+  /* Gap: no size token exists for a list's scroll cap. */
+  max-block-size: calc(var(--dg-space-7) * 14);
+}
+
+/* A positioned row is its own stacking context, and the rows after it paint
+ * over it, so the row being hovered or read is raised to the tooltip layer:
+ * its detail bubble then overlays the rows beneath instead of hiding under
+ * them. */
+.dg-flame__equivalent .dg-virtual-row:hover,
+.dg-flame__equivalent .dg-virtual-row:focus-within {
+  z-index: var(--dg-z-tooltip);
 }
 
 /* One frame's row. `--dgc-depth` is the frame's depth as a unitless integer and
@@ -2938,9 +3560,41 @@
   border-inline-start: medium solid transparent;
 }
 
+/* The row whose frame the pointer rests on in the icicle above: the author's
+ * own hover feedback for the frame, in the list a keyboard reader uses, so the
+ * frame's detail is not left to the canvas's user-agent title alone. Written
+ * before the selected rule, so a selected row keeps its accent while hovered;
+ * Escape clears it. */
+.dg-flame__equivalent-row.dg-is-hovered {
+  background: var(--dg-surface-elevated);
+}
+
+/* The treeitem is the tree's one tab stop and takes the global focus ring;
+ * drawing it inside the row keeps the ring clear of the viewport's clipping
+ * edge and of the rows above and below. */
+.dg-flame__equivalent-row:focus-visible {
+  outline-offset: calc(var(--dg-space-0) * -1);
+}
+
 .dg-flame__equivalent-row.dg-is-selected {
   background: var(--dg-accent-muted);
   border-inline-start-color: var(--dg-accent);
+}
+
+.dg-flame__toggle {
+  flex: none;
+}
+
+/* A leaf's placeholder: the empty box in the disclosure control's place, so a
+ * leaf's name lines up with the foldable rows at its depth. The same box as
+ * `.dg-component-tree__toggle:empty` — the icon-only toggle's size through
+ * `--dg-icon-button-size`, resolved in the small type role the `sm` button
+ * sets, and kept square by `aspect-ratio` — so it tracks the control through a
+ * token change. */
+.dg-flame__toggle:empty {
+  font: var(--dg-text-sm);
+  inline-size: var(--dg-icon-button-size);
+  aspect-ratio: 1;
 }
 
 /* A record the correlator re-attached to the trace root: the structure around
@@ -3000,9 +3654,15 @@
   font: var(--dg-mono-md);
 }
 
+/* The figure and its outlier glyph are one unbroken unit: the glyph sits beside
+ * the count it qualifies instead of wrapping onto a line of its own below it. */
 .dg-render-table__count-cell {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--dg-space-1);
   font: var(--dg-mono-md);
   font-variant-numeric: tabular-nums;
+  white-space: nowrap;
 }
 
 .dg-render-table__count-cell.dg-is-outlier {
@@ -3050,6 +3710,26 @@
   font: var(--dg-mono-sm);
 }
 
+/* One render in that list — the only item in the view that is one captured
+ * event, and so the only one that can be the panel's selection. The edge is
+ * transparent on every render so that marking one selected only RECOLOURS it,
+ * as on a grid row, and the transition is the grid row's. */
+.dg-render-table__occurrence {
+  min-inline-size: 0;
+  border-inline-start: medium solid transparent;
+  transition-property: background-color, border-color;
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
+}
+
+/* The panel's selected event, drawn as every selected row in the product is;
+ * its select control also reports `aria-pressed`, so colour is not the only
+ * signal. */
+.dg-render-table__occurrence.dg-is-selected {
+  background: var(--dg-accent-muted);
+  border-inline-start-color: var(--dg-accent);
+}
+
 /* ==========================================================================
  * components/ComponentTree.tsx
  *
@@ -3060,10 +3740,15 @@
  * `--dgc-depth` is a unitless integer the component sets per node; the
  * indentation is that integer times one space token, which keeps the whole
  * tree on the design scale with no per-level class.
+ *
+ * A row wraps rather than squeezing: its counts, trigger, threshold marks and
+ * source chip move to a further line when the tree is narrow, so the display
+ * name keeps its own width instead of shrinking to nothing beside them.
  * ========================================================================== */
 
 .dg-component-tree__node {
   display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: var(--dg-space-1);
   min-inline-size: 0;
@@ -3072,6 +3757,12 @@
   padding-inline-start: calc(var(--dgc-depth, 0) * var(--dg-space-4));
   border-inline-start: medium solid transparent;
   cursor: pointer;
+  /* The same easing a grid row's hover and selection take, so a tree beside a
+   * table answers the pointer at the same pace. base.css's reduced-motion
+   * block removes it with every other transition. */
+  transition-property: background-color, border-color;
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
 }
 
 .dg-component-tree__node:hover {
@@ -3101,16 +3792,14 @@
 /* The leaf's placeholder — the empty box the note above describes. `:empty`
  * addresses exactly the case that needs a rule: a span with no toggle inside
  * it, which would otherwise collapse to nothing and pull a leaf's label out of
- * line with its siblings'. It reserves the icon-only toggle's box through the
- * `--dg-icon-button-size` token — that control's glyph square, its inline
- * padding and its hairlines, stated once in the token table — resolved in the
- * small type role (`--dg-text-sm`, which is also what `.dg-button--sm` sets,
- * so the token's font-relative glyph term is the glyph the toggle draws). The
- * box therefore tracks the toggle through a token change instead of drifting
- * from it, and `aspect-ratio` keeps it square without a second length. */
+ * line with its siblings'. It reserves the box of the toggle a parent node
+ * draws — a `sm` icon-only button, which is the 24 px square the button
+ * block's target floor makes it — through that same `--dg-space-7` token, so
+ * the placeholder tracks the toggle through a token change instead of
+ * drifting from it, and `aspect-ratio` keeps it square without a second
+ * length. */
 .dg-component-tree__toggle:empty {
-  font: var(--dg-text-sm);
-  inline-size: var(--dg-icon-button-size);
+  inline-size: var(--dg-space-7);
   aspect-ratio: 1;
 }
 
@@ -3157,9 +3846,12 @@
   font: var(--dg-mono-sm);
 }
 
+/* A Code chip restyled after the post-role group, so its tabular figures are
+ * restated after the shorthand that resets them. */
 .dg-request-table__url {
   color: var(--dg-text-primary);
   font: var(--dg-mono-md);
+  font-variant-numeric: tabular-nums;
 }
 
 /* The status class always accompanies the status code itself, so the colour
@@ -3194,22 +3886,75 @@
   min-inline-size: 0;
 }
 
+/* The grouping chip ("Request key") is the identity row's last slot and keeps
+ * its width: when the Request column is tight it is the URL before it that
+ * ellipsizes — its full value is one hover or focus away in its tooltip —
+ * so the chip always names how the group was keyed. */
+.dg-request-table__group-row > .dg-stack__items > :last-child {
+  flex: none;
+}
+
 .dg-request-table__group-row.dg-is-duplicate {
   border-inline-start-color: var(--dg-warning);
 }
 
-/* One occurrence of a group, on the elevated surface so the nesting is legible
- * without a second grid. */
-.dg-request-table__occurrence-row {
-  display: flex;
-  flex-wrap: wrap;
+/* One occurrence of a group, on the elevated surface so the nesting is legible.
+ *
+ * The occurrences line up as COLUMNS — offset, duration, status, initiator —
+ * so a cluster of identical requests reads down the page, not as a ragged run
+ * of chips. The list is one grid of four tracks: three sized to the widest
+ * value of their kind in this list (`max-content`) and the initiator taking
+ * the rest, where its chip truncates. Each occurrence is a `layout/Stack`
+ * (outer box and its items box), and both boxes span the grid and adopt its
+ * tracks as a SUBGRID, so every occurrence's four slots share one set of
+ * column edges. RequestTable.tsx renders exactly those four slots per
+ * occurrence, in that order; a note above the list (truncation, no
+ * occurrences) spans every track. */
+.dg-request-table__occurrences > .dg-stack__items {
+  display: grid;
+  grid-template-columns: max-content max-content max-content minmax(0, 1fr);
   align-items: center;
-  gap: var(--dg-space-2);
+  column-gap: var(--dg-space-3);
+}
+
+.dg-request-table__occurrences > .dg-stack__items > * {
+  grid-column: 1 / -1;
+}
+
+.dg-request-table__occurrence-row,
+.dg-request-table__occurrence-row > .dg-stack__items {
+  display: grid;
+  grid-template-columns: subgrid;
+  grid-column: 1 / -1;
+  align-items: center;
   min-inline-size: 0;
+}
+
+/* The transparent edge is what keeps a selected occurrence aligned with the
+ * others, and the transition is the grid row's. */
+.dg-request-table__occurrence-row {
   padding-block: var(--dg-space-0);
   padding-inline-start: var(--dg-space-4);
   background: var(--dg-surface-elevated);
+  border-inline-start: medium solid transparent;
   font: var(--dg-mono-sm);
+  transition-property: background-color, border-color;
+  transition-duration: var(--dg-motion-duration);
+  transition-timing-function: var(--dg-motion-easing);
+}
+
+/* The occurrence that is the panel's selected event, drawn as every selected
+ * row in the product is; its select control reports `aria-pressed` beside it. */
+.dg-request-table__occurrence-row.dg-is-selected {
+  background: var(--dg-accent-muted);
+  border-inline-start-color: var(--dg-accent);
+}
+
+/* Each slot keeps to its track: a status badge or an initiator chip wider than
+ * its column truncates rather than overlapping the next slot. */
+.dg-request-table__occurrence-row > .dg-stack__items > * {
+  min-inline-size: 0;
+  max-inline-size: 100%;
 }
 
 /* The slot the initiating component's source chip sits in. */
@@ -3229,6 +3974,14 @@
   min-inline-size: 0;
 }
 
+/* The "+N" count beside the first initiating component keeps its width, so the
+ * number of further initiators is always whole; the first chip is what
+ * truncates. Only when there is a second slot at all — a lone chip is both the
+ * first and the last child and must still be free to shrink. */
+.dg-request-table__initiators > .dg-stack__items > :last-child:not(:first-child) {
+  flex: none;
+}
+
 /* ==========================================================================
  * components/QueryTable.tsx
  *
@@ -3240,10 +3993,13 @@
  * the shape of a statement is the finding, so it is never clipped to a line.
  * ========================================================================== */
 
+/* A Code chip restyled after the post-role group, so its tabular figures are
+ * restated after the shorthand that resets them. */
 .dg-query-table__statement {
   min-inline-size: 0;
   color: var(--dg-text-primary);
   font: var(--dg-mono-sm);
+  font-variant-numeric: tabular-nums;
   white-space: pre-wrap;
   overflow-wrap: anywhere;
 }
@@ -3258,19 +4014,40 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* One calling site: its source chip and its execution count. Never wider than
+ * the cell, so the chip truncates (its own file label ellipsizes) instead of
+ * the pair spilling across the column boundary.
+ *
+ * The caller is a `layout/Stack`, so this box is the stack's OUTER column and
+ * its one child is the row of chip and count. `stretch`, never `center`: a
+ * centred row wider than the box overflowed it on BOTH sides, so the chip
+ * started before the cell's own start edge and was cut at its first letters;
+ * stretched, the row takes the box's width and its chip shrinks inside it.
+ * The row's own cross-axis alignment is the Stack's `align` prop. */
 .dg-query-table__caller {
   display: inline-flex;
-  align-items: center;
+  align-items: stretch;
   min-inline-size: 0;
+  max-inline-size: 100%;
+}
+
+/* The execution count never gives up width: when the chip and its count are
+ * tight it is the source chip before it that truncates, so the count a reader
+ * compares across callers is always whole. Selected by its own class, because
+ * the caller's span name can follow it in the same row. */
+.dg-query-table__caller-count {
+  flex: none;
 }
 
 /* The list of caller chips inside one cell, and the list of executions inside an
  * expanded row. Both are `Stack`s, so their spacing is the stack's; these rules
- * only let them shrink below their content, which is what keeps a long caller
- * name or a wide execution row from widening the grid. */
+ * only let them shrink below their content and never grow past their column,
+ * which is what keeps a long caller name or a wide execution row from widening
+ * the grid. */
 .dg-query-table__callers,
 .dg-query-table__occurrences {
   min-inline-size: 0;
+  max-inline-size: 100%;
 }
 
 /* One execution of a grouped statement, on the elevated surface so the nesting
@@ -3281,6 +4058,14 @@
   padding-inline: var(--dg-space-1);
   border-radius: var(--dg-radius-sm);
   background: var(--dg-surface-elevated);
+  border-inline-start: medium solid transparent;
+}
+
+/* The execution that is the panel's selected event, drawn as every selected
+ * row in the product is; its select control reports `aria-pressed` beside it. */
+.dg-query-table__occurrence-row.dg-is-selected {
+  background: var(--dg-accent-muted);
+  border-inline-start-color: var(--dg-accent);
 }
 
 /* The paging footer, below the grid rather than inside it: it composes the
@@ -3291,7 +4076,10 @@
 }
 
 /* A wrapping statement needs the row to align its cells to the top rather than
- * to the middle, or a one-line neighbour floats in the middle of a tall row. */
+ * to the middle, or a one-line neighbour floats in the middle of a tall row.
+ * Both levels: the row places each cell box at its top, and each cell places
+ * its content at its own top. */
+.dg-query-table .dg-data-table__row,
 .dg-query-table .dg-data-table__cell {
   align-items: start;
 }
@@ -3317,15 +4105,25 @@
 
 /* The value-before and value-after cells. The component writes each under its
  * contract name (`__previous`, `__next`) and its stylesheet name (`__from`,
- * `__to`) on the same element, so the rule groups all four. */
+ * `__to`) on the same element, so the rule groups all four.
+ *
+ * Each cell is a `layout/Stack`: a column-direction `dg-stack` whose single
+ * child, `dg-stack__items`, is the row that holds the direction glyph and the
+ * summary — spaced and centred by the Stack's own gap and alignment classes.
+ * This rule therefore sets no display, gap or alignment of its own. Cross-axis
+ * alignment on the OUTER column is exactly what must stay at the default
+ * stretch: any other value (a `baseline` here once) lets the items row size
+ * itself from its content instead of from the cell, the summary's
+ * `max-inline-size: 100%` then resolves against that oversized row, the
+ * ellipsis never triggers, and a long summary paints across the next column.
+ * The two declarations below bound the cell to its grid track, so the
+ * stretched row — and the summary inside it — are bounded too. */
 .dg-state-transitions__from,
 .dg-state-transitions__to,
 .dg-state-transitions__previous,
 .dg-state-transitions__next {
-  display: inline-flex;
-  align-items: baseline;
-  gap: var(--dg-space-1);
   min-inline-size: 0;
+  max-inline-size: 100%;
 }
 
 /* The reported-state cell, and whether the producer reported values at all.
@@ -3346,6 +4144,19 @@
   border-style: dashed;
 }
 
+/* Every chip a row's cells hold — the trigger's kind, the hook's changed
+ * dimension, the reported state — stays inside its own cell. The shared chip
+ * keeps `min-inline-size: auto` everywhere else, which is right for a chip in
+ * running text, but in a grid track narrower than the chip it made the chip
+ * overflow its cell and paint across the next column. Here it may shrink with
+ * the cell and clips at its own border; its word and glyph still name the
+ * state, and the cell's Stack wraps it onto its own line first where there is
+ * room below. */
+.dg-state-transitions .dg-data-table__cell .dg-badge {
+  min-inline-size: 0;
+  overflow: hidden;
+}
+
 /* One expanded row's detail: its fields sit in `layout/Stack`s of their own,
  * and the detail row of `primitives/DataTable` supplies the inset, so this
  * only lets the block shrink with the table. */
@@ -3358,23 +4169,32 @@
   color: var(--dg-text-muted);
 }
 
+/* A Code chip restyled after the post-role group, so its tabular figures are
+ * restated after the shorthand that resets them. */
 .dg-state-transitions__value {
   color: var(--dg-text-primary);
   font: var(--dg-mono-sm);
+  font-variant-numeric: tabular-nums;
 }
 
-/* A preview the capture bounded: a dotted underline says there is more, and the
- * component supplies the full value as the element's own title. */
+/* A preview the display bound shortened: a dotted underline says so, and the
+ * component's tooltip explains the bound. There is no fuller value to offer —
+ * the summary it received is the most the capture was permitted to hold. */
 .dg-state-transitions__value.dg-is-truncated {
   border-block-end: thin dotted var(--dg-border-strong);
   cursor: help;
 }
 
-/* Links to the event that caused the transition. */
+/* Links to the event that caused the transition. The control may shrink below
+ * its label inside a narrow Trigger track — the button primitive's own label
+ * then ellipsizes — so a long record name is clipped inside its cell instead
+ * of painting across the value-after and reported cells beside it. */
 .dg-state-transitions__trigger {
   display: inline-flex;
   align-items: center;
   gap: var(--dg-space-1);
+  min-inline-size: 0;
+  max-inline-size: 100%;
   color: var(--dg-accent);
   font: var(--dg-text-xs);
   cursor: pointer;
@@ -3430,16 +4250,21 @@
   cursor: pointer;
 }
 
-/* The six participant classes of `src/utils/color.ts`, for a component that
- * prefers a class to an inline property. Both routes resolve to the same
- * token. */
+/* The six participant classes of `src/utils/color.ts`, in six distinct kind
+ * tokens, for a component that prefers a class to an inline property. The
+ * inline `--dgc-node-color` wins when set: it is the participant's own
+ * span-kind colour where its kinds settle one, and its class colour
+ * otherwise. */
 .dg-dependency-graph__node--ui-event {
   stroke: var(--dgc-node-color, var(--dg-kind-interaction));
 }
 
-.dg-dependency-graph__node--function,
-.dg-dependency-graph__node--service {
+.dg-dependency-graph__node--function {
   stroke: var(--dgc-node-color, var(--dg-kind-function));
+}
+
+.dg-dependency-graph__node--service {
+  stroke: var(--dgc-node-color, var(--dg-kind-service));
 }
 
 .dg-dependency-graph__node--api {
@@ -3451,17 +4276,16 @@
 }
 
 .dg-dependency-graph__node--external {
-  stroke: var(--dgc-node-color, var(--dg-kind-http));
+  stroke: var(--dgc-node-color, var(--dg-kind-external));
 }
 
 .dg-dependency-graph__node.dg-is-hovered {
   fill: var(--dg-surface-overlay);
 }
 
-.dg-dependency-graph__node:focus-visible {
-  stroke: var(--dg-accent);
-}
-
+/* No focus rule: the canvas is `role="img"` and its boxes are not focusable,
+ * so the keyboard reads them in the participants grid, whose rows carry the
+ * ring. */
 .dg-dependency-graph__node.dg-is-selected {
   fill: var(--dg-accent-muted);
   stroke: var(--dg-accent);
@@ -3481,6 +4305,15 @@
   pointer-events: none;
 }
 
+/* A selected box is filled with the selection fill, which the muted metrics
+ * tone does not clear 4.5:1 on in the dark themes; the text drawn over it (the
+ * box's following siblings in its group) takes the primary text colour, as
+ * every selected surface does. */
+.dg-dependency-graph__node.dg-is-selected ~ .dg-dependency-graph__node-label,
+.dg-dependency-graph__node.dg-is-selected ~ .dg-dependency-graph__node-meta {
+  fill: var(--dg-text-primary);
+}
+
 /* The relationship-edge token, for the timeline edge's reason: a connector is
  * an essential non-text graphic held to the 3:1 non-text bar on every surface
  * of every theme, which the border colours do not reach in the dark or light
@@ -3493,9 +4326,20 @@
   pointer-events: none;
 }
 
-/* The same ambiguous-lineage treatment as the timeline's edge, for the same
- * reason: an inferred relationship must not be drawn like a measured one. */
+/* The two lineage states of a relationship, told apart from a measured one and
+ * from each other. INFERRED — its records joined their caller through an async
+ * continuation with a single candidate — is solid in the info tone: not
+ * measured, but not in doubt. AMBIGUOUS — at least one of those attributions
+ * chose among several candidates — is dashed in the warning tone, the
+ * timeline's treatment of the same condition (AAP 0.4.2), so the two views
+ * agree. Both tones clear the non-text bar on every surface (they are held to
+ * the text ratio), and the chip in the grid names either state in words. */
+.dg-dependency-graph__edge.dg-is-inferred {
+  stroke: var(--dg-info);
+}
+
 .dg-dependency-graph__edge.dg-is-ambiguous {
+  stroke: var(--dg-warning);
   stroke-dasharray: 4 3;
 }
 
@@ -3509,6 +4353,36 @@
   font: var(--dg-mono-sm);
   text-anchor: middle;
   pointer-events: none;
+}
+
+/* A participant's full label in the grid. It wraps — anywhere, since a label
+ * is often one unbroken module path or route — instead of truncating, so the
+ * cell holds the whole identity in every state and never grows or shrinks
+ * when focus, the pointer or the selection reaches its row. That invariance is
+ * what keeps the row's source chip under the pointer between the press and
+ * the release of a click. Declared after `.dg-text`, whose `break-word` it
+ * replaces; it sets none of the properties `dg-visually-hidden` relies on. */
+.dg-dependency-graph__participant-label {
+  min-inline-size: 0;
+  overflow-wrap: anywhere;
+}
+
+/* A relationship's chip in the grid. The shared chip rule keeps a pill on one
+ * line, and a relationship's text — the called participant, how often, how it
+ * was known — can outgrow its column; left on one line it runs past the cell's
+ * border and takes the lineage words with it. So this chip wraps, anywhere if
+ * it must, and shrinks with its column. Declared after the shared chip rule,
+ * whose `white-space` it replaces; no chip here is visually hidden. */
+.dg-dependency-graph__relationship {
+  min-inline-size: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* An ambiguous relationship's chip carries its curve's dash on its outline, so
+ * the grid and the picture mark it the same way. */
+.dg-dependency-graph__relationship.dg-is-ambiguous {
+  border-style: dashed;
 }
 
 /* Names the participant colours in text, which is what keeps the layered
@@ -3535,10 +4409,19 @@
  * muted and non-interactive — a chip that cannot open anything must not
  * invite a click. A coordinate that did not resolve is omitted from the chip
  * by the component rather than styled here.
+ *
+ * The interactive chip is the button primitive and takes that block's 24 px
+ * target floor (WCAG 2.2 SC 2.5.8). The inert chip is a plain span, so the
+ * block below repeats the same minimum height: the two forms are the same pill
+ * minus the control, and a row must not change height according to whether a
+ * host could resolve a handler for it. The inline minimum stays at zero,
+ * because a chip always carries a glyph and a path wider than the floor and
+ * has to be free to truncate inside a narrow cell.
  * ========================================================================== */
 
 .dg-source-link {
   min-inline-size: 0;
+  min-block-size: var(--dg-space-7);
   background: var(--dg-surface-elevated);
   border-color: var(--dg-border-subtle);
   color: var(--dg-accent);
@@ -3728,4 +4611,116 @@
 
 .dg-panel__banner--fallback .dg-icon {
   color: var(--dg-warning);
+}
+
+/* ==========================================================================
+ * Selected surfaces — primitives/DataTable, components/Waterfall,
+ * components/FlameChart, components/ComponentTree, and the selected execution
+ * inside an expanded RenderTable, RequestTable or QueryTable row
+ *
+ * A selected row, tree node or execution is filled with `--dg-accent-muted`, and the
+ * colours its content otherwise carries were chosen for the three panel
+ * surfaces, not for that fill: in the dark and high-contrast themes the link
+ * accent (4.02:1), the secondary text tone (4.31:1), the muted tone (3.12:1)
+ * and the danger tone behind a critical duration (3.50:1) all fall under the
+ * 4.5:1 text bar on it (AAP 0.6.3). So every text-bearing element painted
+ * directly on a selected surface takes the primary text colour, which the
+ * token test measures on the selection fill in every theme.
+ *
+ * Excluded, with everything inside them, are the elements that paint a fill of
+ * their own — soft and solid badges and the primary and destructive buttons.
+ * Their text is measured against that fill, not the row's, and already clears
+ * the bar there; overriding it would put the primary text colour on an accent
+ * or status fill it was never measured against.
+ *
+ * Declared last in the file, at three classes, so it follows every
+ * component's own colour rule for the same element whatever that rule's
+ * position.
+ * ========================================================================== */
+
+.dg-data-table__row.dg-is-selected,
+.dg-data-table__row.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-waterfall__row.dg-is-selected,
+.dg-waterfall__row.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-flame__equivalent-row.dg-is-selected,
+.dg-flame__equivalent-row.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-component-tree__node.dg-is-selected,
+.dg-component-tree__node.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-render-table__occurrence.dg-is-selected,
+.dg-render-table__occurrence.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-request-table__occurrence-row.dg-is-selected,
+.dg-request-table__occurrence-row.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ),
+.dg-query-table__occurrence-row.dg-is-selected,
+.dg-query-table__occurrence-row.dg-is-selected
+  :not(
+    .dg-badge--soft,
+    .dg-badge--soft *,
+    .dg-badge--solid,
+    .dg-badge--solid *,
+    .dg-button--primary,
+    .dg-button--primary *,
+    .dg-button--danger,
+    .dg-button--danger *
+  ) {
+  color: var(--dg-text-primary);
 }

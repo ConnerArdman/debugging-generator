@@ -33,6 +33,13 @@
  *    migration writes into it. Those two windows cannot be provoked with a real
  *    race in a unit test, so the `node:sqlite` constructor is wrapped for them
  *    alone and every other call is the real binding.
+ * 5. **The state directory is judged, never repaired, and never left.** A
+ *    configuration whose database is not inside its own state root, or whose
+ *    state root is blank, is `CONFIG_INVALID` before any filesystem call — no
+ *    file created, no directory created, no mode changed. An existing state
+ *    directory that grants group or other access is `FS_UNSAFE_PATH`
+ *    (`group-or-other-permissions`) on either route, naming that directory and
+ *    the `chmod` that fixes it, with its mode and contents exactly as found.
  *
  * Every case works inside its own `mkdtemp` sandbox, resolved through `realpath`
  * so a temp directory reached through a link (as on macOS) cannot fail a chain
@@ -1010,6 +1017,199 @@ describe('an unsafe entry at the database path', () => {
       expect(error.details?.canonicalPath).toBe(join(outsideDir, 'sessions.sqlite'));
       expect(error.hint).toContain(linkedDir);
       expect(entriesIn(outsideDir)).toEqual([]);
+    },
+  );
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The state directory a store is opened in
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The state root a configuration-route case declares, inside {@link sandbox} and never pre-created. */
+function unusedStateRoot(): string {
+  return join(sandbox, 'home');
+}
+
+/**
+ * Asserts an open was refused as `CONFIG_INVALID` for `reason`.
+ *
+ * The configuration is wrong rather than the filesystem, so the code is the
+ * configuration one, and `databasePath` in the details is the resolved path the
+ * developer passed.
+ */
+function expectConfigRefusal(
+  opened: Result<Store, DebuggenError>,
+  reason: string,
+  requestedPath: string,
+): DebuggenError {
+  const error = refusalFrom(opened);
+  expect(error.code).toBe('CONFIG_INVALID');
+  expect(error.details?.reason).toBe(reason);
+  expect(error.details?.subsystem).toBe('store');
+  expect(error.details?.databasePath).toBe(requestedPath);
+  expect(error.hint).toContain('databasePath');
+  return error;
+}
+
+/**
+ * Asserts an open was refused because `directory` already existed with group
+ * or other access, and that the refusal names that directory and the `chmod`
+ * that fixes it, with the policy error it wraps kept as the cause.
+ */
+function expectLooseDirectoryRefusal(
+  opened: Result<Store, DebuggenError>,
+  directory: string,
+  mode: number,
+): DebuggenError {
+  const error = refusalFrom(opened);
+  expect(error.code).toBe('FS_UNSAFE_PATH');
+  expect(error.details?.reason).toBe(MODE_REFUSAL_REASON);
+  expect(error.details?.path).toBe(directory);
+  expect(error.details?.subsystem).toBe('store');
+  expect(error.hint).toContain(`chmod 700 ${directory}`);
+  expect(error.hint).toContain('DEBUGGEN_HOME');
+
+  const cause: unknown = error.cause;
+  expect(cause).toMatchObject({
+    code: 'FS_UNSAFE_PATH',
+    details: {
+      reason: MODE_REFUSAL_REASON,
+      path: directory,
+      mode: (mode & PERMISSION_BITS).toString(8),
+    },
+  });
+  return error;
+}
+
+describe('the state directory a store is opened in', () => {
+  it('refuses a configuration whose database lies outside its state root, before creating anything', () => {
+    const stateRoot = unusedStateRoot();
+    const outsideDatabase = join(outsideDir, 'outside.sqlite');
+
+    // Both with and without the directory walk: the containment is a property
+    // of the configuration, so it is decided before either could run.
+    for (const ensureDirectory of [undefined, false]) {
+      const error = expectConfigRefusal(
+        openStore({
+          config: { debuggenHome: stateRoot, databasePath: outsideDatabase },
+          ...(ensureDirectory === undefined ? {} : { ensureDirectory }),
+        }),
+        'outside-state-root',
+        outsideDatabase,
+      );
+
+      expect(error.details?.debuggenHome).toBe(stateRoot);
+      expect(error.hint).toContain(stateRoot);
+      expect(entriesIn(outsideDir)).toEqual([]);
+      expect(existsSync(stateRoot)).toBe(false);
+    }
+  });
+
+  it('refuses a database in a sibling whose name merely begins with the state root', () => {
+    // The lexical gate compares whole components: `<root>-other` is not inside
+    // `<root>`, however the two strings begin.
+    const stateRoot = unusedStateRoot();
+    const sibling = `${stateRoot}-other`;
+    const siblingDatabase = join(sibling, 'sessions.sqlite');
+
+    expectConfigRefusal(
+      openStore({ config: { debuggenHome: stateRoot, databasePath: siblingDatabase } }),
+      'outside-state-root',
+      siblingDatabase,
+    );
+
+    expect(existsSync(sibling)).toBe(false);
+    expect(existsSync(stateRoot)).toBe(false);
+  });
+
+  it.skipIf(NO_POSIX_IDS)(
+    'leaves the mode of the directory outside the state root untouched when it refuses the configuration (POSIX permission bits)',
+    () => {
+      expectConfigRefusal(
+        openStore({
+          config: {
+            debuggenHome: unusedStateRoot(),
+            databasePath: join(outsideDir, 'outside.sqlite'),
+          },
+        }),
+        'outside-state-root',
+        join(outsideDir, 'outside.sqlite'),
+      );
+
+      expect(modeOf(outsideDir)).toBe(ORDINARY_DIR_MODE);
+    },
+  );
+
+  it.each(['', '   '])('refuses a configuration whose state root is blank (%j)', (blank) => {
+    expectConfigRefusal(
+      openStore({ config: { debuggenHome: blank, databasePath } }),
+      'empty-state-root',
+      databasePath,
+    );
+
+    expect(existsSync(stateDir)).toBe(false);
+  });
+
+  it.skipIf(NO_POSIX_IDS)(
+    'refuses a state root that already exists at 0755 on the configuration route, changing nothing (POSIX permission bits)',
+    () => {
+      mkdirSync(stateDir);
+      chmodSync(stateDir, ORDINARY_DIR_MODE);
+
+      expectLooseDirectoryRefusal(
+        openStore({ config: { debuggenHome: stateDir, databasePath } }),
+        stateDir,
+        ORDINARY_DIR_MODE,
+      );
+
+      expect(modeOf(stateDir)).toBe(ORDINARY_DIR_MODE);
+      expect(entriesIn(stateDir)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'names the state root rather than the database directory when the root is the loose one (POSIX permission bits)',
+    () => {
+      // The outermost failing directory is the one to fix first, so the
+      // refusal names it even though the database lives one level below.
+      mkdirSync(stateDir);
+      chmodSync(stateDir, ORDINARY_DIR_MODE);
+      const nestedDatabase = join(stateDir, 'nested', 'sessions.sqlite');
+
+      expectLooseDirectoryRefusal(
+        openStore({ config: { debuggenHome: stateDir, databasePath: nestedDatabase } }),
+        stateDir,
+        ORDINARY_DIR_MODE,
+      );
+
+      expect(modeOf(stateDir)).toBe(ORDINARY_DIR_MODE);
+      expect(entriesIn(stateDir)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'refuses a database directory that already exists at 0755 on the databasePath route, changing nothing (POSIX permission bits)',
+    () => {
+      mkdirSync(stateDir);
+      chmodSync(stateDir, ORDINARY_DIR_MODE);
+
+      expectLooseDirectoryRefusal(openStore({ databasePath }), stateDir, ORDINARY_DIR_MODE);
+
+      expect(modeOf(stateDir)).toBe(ORDINARY_DIR_MODE);
+      expect(entriesIn(stateDir)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'opens a store in a state root that already exists and is private, leaving its mode as it was (POSIX permission bits)',
+    () => {
+      makeStateDir();
+
+      const store = openedStore({ config: { debuggenHome: stateDir, databasePath } });
+
+      expect(store.path).toBe(databasePath);
+      expect(modeOf(stateDir)).toBe(OWNER_ONLY_DIR_MODE);
+      expect(modeOf(databasePath)).toBe(OWNER_ONLY_FILE_MODE);
     },
   );
 });

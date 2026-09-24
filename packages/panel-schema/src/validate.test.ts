@@ -118,6 +118,7 @@ import {
   PANEL_NODE_TYPES,
   PANEL_SPEC_VERSION,
   panelNodeSchema,
+  parsePanelSpec,
   type PanelNode,
   type PanelNodeType,
   type PanelSpec,
@@ -1060,6 +1061,246 @@ describe('validatePanelSpec rejects a data query a node type may not read', () =
     expect(describedIssues(asSpec(document))).toStrictEqual([
       { path: `${PANEL_LAYOUT_FIELD}.0.query`, code: 'panel_node_query_forbidden' },
     ]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * A node-vocabulary fault the schema catches first keeps its catalog code
+ *
+ * `panelSpecSchema` rejects an uncatalogued node type, a query-backed node
+ * without a query and a query without a valid source before the invariant half
+ * runs, and in the schema library's own terms. `validatePanelSpec` reports each
+ * such issue with the catalog code the invariant half has for it, and with the
+ * closed vocabulary that would have been accepted, so a reader of the rejection
+ * learns the rule broken rather than `invalid_union` or `invalid_type`.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The catalogued node types as a rejection lists them. */
+const CATALOGUED_TYPE_LIST = PANEL_NODE_TYPES.join(' | ');
+
+/** The node type named in the QA reproduction of an uncatalogued node. */
+const QA_UNKNOWN_NODE_TYPE = 'gauge';
+
+/** The message a hostile getter throws, which must never reach a rejection. */
+const LEAK_SENTINEL_FOR_READS = 'hostile-getter-message';
+
+/** The sources a node type can read, as a rejection lists them. */
+function sourceListOf(type: PanelNodeType): string {
+  return catalogEntryFor(type).sources.join(' | ');
+}
+
+/** One reported issue with every field a node-vocabulary rejection may carry. */
+const vocabularyIssueSchema = z.strictObject({
+  path: z.string(),
+  code: z.string(),
+  expected: z.string().optional(),
+  nodeType: z.string().optional(),
+});
+
+/**
+ * The issues of a rejection, read strictly, so an unexpected field fails here.
+ *
+ * @param error The rejection.
+ * @returns Every issue, in report order.
+ */
+function vocabularyIssues(error: DebuggenError): readonly z.infer<typeof vocabularyIssueSchema>[] {
+  return z.array(vocabularyIssueSchema).parse(error.details?.['issues']);
+}
+
+describe('validatePanelSpec reports a node-vocabulary fault with its catalog code', () => {
+  it('is a QA reproduction type the vocabulary genuinely does not contain', () => {
+    expect(NODE_TYPE_NAMES).not.toContain(QA_UNKNOWN_NODE_TYPE);
+  });
+
+  it.each([UNCATALOGUED_NODE_TYPE, QA_UNKNOWN_NODE_TYPE])(
+    'reports the uncatalogued type %s as panel_node_type_unknown with the catalogued types',
+    (type) => {
+      const document = specRecord({
+        layout: [nodeRecord(type, { id: `${PANEL_LAYOUT_FIELD}.0` })],
+      });
+      const error = errorOf(validatePanelSpec(document));
+
+      expect(error.code).toBe(REJECTION_CODE);
+      expect(vocabularyIssues(error)).toStrictEqual([
+        {
+          path: `${PANEL_LAYOUT_FIELD}.0.type`,
+          code: 'panel_node_type_unknown',
+          expected: CATALOGUED_TYPE_LIST,
+        },
+      ]);
+      expect(reportedCodes(error)).not.toContain('invalid_union');
+      expect(error.message).toContain(`${PANEL_LAYOUT_FIELD}.0.type (panel_node_type_unknown)`);
+      expect(error.message).not.toContain(type);
+      expect(JSON.stringify(error.details)).not.toContain(type);
+
+      for (const catalogued of PANEL_NODE_TYPES) {
+        expect(error.hint).toContain(catalogued);
+      }
+    },
+  );
+
+  it('classifies an uncatalogued type inside a container at its own path', () => {
+    const document = specRecord({
+      layout: [
+        nodeRecord('section', {
+          id: `${PANEL_LAYOUT_FIELD}.0`,
+          [PANEL_CHILDREN_FIELD]: [
+            nodeRecord(QA_UNKNOWN_NODE_TYPE, { id: `${PANEL_LAYOUT_FIELD}.0.children.0` }),
+          ],
+        }),
+      ],
+    });
+
+    expect(vocabularyIssues(errorOf(validatePanelSpec(document)))).toStrictEqual([
+      {
+        path: `${PANEL_LAYOUT_FIELD}.0.${PANEL_CHILDREN_FIELD}.0.type`,
+        code: 'panel_node_type_unknown',
+        expected: CATALOGUED_TYPE_LIST,
+      },
+    ]);
+  });
+
+  it('reports a query-backed node without a query as panel_node_query_missing', () => {
+    const document = specRecord({
+      layout: [withoutField(nodeRecord('timeline', { id: `${PANEL_LAYOUT_FIELD}.0` }), 'query')],
+    });
+
+    expect(vocabularyIssues(errorOf(validatePanelSpec(document)))).toStrictEqual([
+      {
+        path: `${PANEL_LAYOUT_FIELD}.0.query`,
+        code: 'panel_node_query_missing',
+        expected: sourceListOf('timeline'),
+        nodeType: 'timeline',
+      },
+    ]);
+  });
+
+  it('reports a query that is not an object as panel_node_query_missing', () => {
+    const document = specRecord({
+      layout: [nodeRecord('requestTable', { id: `${PANEL_LAYOUT_FIELD}.0`, query: 'requests' })],
+    });
+
+    expect(vocabularyIssues(errorOf(validatePanelSpec(document)))).toStrictEqual([
+      {
+        path: `${PANEL_LAYOUT_FIELD}.0.query`,
+        code: 'panel_node_query_missing',
+        expected: sourceListOf('requestTable'),
+        nodeType: 'requestTable',
+      },
+    ]);
+  });
+
+  it('reports a query without a source as panel_node_query_source_missing', () => {
+    const document = specRecord({
+      layout: [nodeRecord('table', { id: `${PANEL_LAYOUT_FIELD}.0`, query: {} })],
+    });
+
+    expect(vocabularyIssues(errorOf(validatePanelSpec(document)))).toStrictEqual([
+      {
+        path: `${PANEL_LAYOUT_FIELD}.0.query.source`,
+        code: 'panel_node_query_source_missing',
+        expected: sourceListOf('table'),
+        nodeType: 'table',
+      },
+    ]);
+  });
+
+  it('reports a source outside the vocabulary as panel_node_query_source_unknown', () => {
+    const document = specRecord({
+      layout: [
+        nodeRecord('timeline', {
+          id: `${PANEL_LAYOUT_FIELD}.0`,
+          query: { source: UNCATALOGUED_SOURCE },
+        }),
+      ],
+    });
+    const error = errorOf(validatePanelSpec(document));
+
+    expect(vocabularyIssues(error)).toStrictEqual([
+      {
+        path: `${PANEL_LAYOUT_FIELD}.0.query.source`,
+        code: 'panel_node_query_source_unknown',
+        expected: sourceListOf('timeline'),
+        nodeType: 'timeline',
+      },
+    ]);
+    expect(JSON.stringify(error.details)).not.toContain(UNCATALOGUED_SOURCE);
+    expect(error.message).not.toContain(UNCATALOGUED_SOURCE);
+  });
+
+  it('reports only codes from the closed vocabulary for the node faults it classifies', () => {
+    const document = specRecord({
+      layout: [
+        nodeRecord(QA_UNKNOWN_NODE_TYPE, { id: `${PANEL_LAYOUT_FIELD}.0` }),
+        withoutField(nodeRecord('flame', { id: `${PANEL_LAYOUT_FIELD}.1` }), 'query'),
+        nodeRecord('eventLog', { id: `${PANEL_LAYOUT_FIELD}.2`, query: {} }),
+      ],
+    });
+
+    expect(reportedCodes(errorOf(validatePanelSpec(document)))).toStrictEqual([
+      'panel_node_type_unknown',
+      'panel_node_query_missing',
+      'panel_node_query_source_missing',
+    ]);
+  });
+
+  it('keeps every other schema issue as the schema reported it, in order', () => {
+    const document = specRecord({
+      version: PANEL_SPEC_VERSION + 1,
+      layout: [nodeRecord(QA_UNKNOWN_NODE_TYPE, { id: `${PANEL_LAYOUT_FIELD}.0` })],
+    });
+    const error = errorOf(validatePanelSpec(document));
+
+    expect(reportedIssues(error)).toStrictEqual([
+      { path: 'version', code: 'invalid_value' },
+      { path: `${PANEL_LAYOUT_FIELD}.0.type`, code: 'panel_node_type_unknown' },
+    ]);
+    expect(error.details?.['schema']).toBe('panelSpec');
+  });
+
+  it('returns the schema rejection unchanged when there is nothing to classify', () => {
+    const document = specRecord({ version: PANEL_SPEC_VERSION + 1 });
+    const validated = errorOf(validatePanelSpec(document));
+    const parsed = parsePanelSpec(document);
+
+    expect(isErr(parsed)).toBe(true);
+
+    if (isErr(parsed)) {
+      expect(validated.message).toBe(parsed.error.message);
+      expect(validated.hint).toBe(parsed.error.hint);
+      expect(validated.details).toStrictEqual(parsed.error.details);
+    }
+  });
+
+  it('keeps the schema rejection when the document throws while it is classified', () => {
+    // The schema reads `layout` once; the classifier's second read throws. The
+    // rejection must survive that as the schema's own, never as a crash.
+    let reads = 0;
+    const document: Record<string, unknown> = { ...makeSpec() };
+
+    Object.defineProperty(document, PANEL_LAYOUT_FIELD, {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+
+        if (reads > 1) {
+          throw new Error(LEAK_SENTINEL_FOR_READS);
+        }
+
+        return [nodeRecord(QA_UNKNOWN_NODE_TYPE, { id: `${PANEL_LAYOUT_FIELD}.0` })];
+      },
+    });
+
+    const error = errorOf(validatePanelSpec(document));
+
+    expect(reads).toBe(2);
+    expect(reportedIssues(error)).toStrictEqual([
+      { path: `${PANEL_LAYOUT_FIELD}.0.type`, code: 'invalid_union' },
+    ]);
+    expect(JSON.stringify(error.details)).not.toContain(LEAK_SENTINEL_FOR_READS);
+    expect(error.message).not.toContain(LEAK_SENTINEL_FOR_READS);
   });
 });
 

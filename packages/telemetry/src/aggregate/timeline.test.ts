@@ -456,6 +456,87 @@ describe('dependency-graph event coordinates and lineage', () => {
   });
 });
 
+describe('dependency-graph participant span kinds', () => {
+  /** The participant of the given class and label, failing when absent. */
+  function participant(
+    graph: DependencyGraphData,
+    kind: DependencyGraphNode['kind'],
+    label: string,
+  ): DependencyGraphNode {
+    const node = graph.nodes.find(
+      (candidate) => candidate.kind === kind && candidate.label === label,
+    );
+    if (node === undefined) {
+      throw new Error(`the graph carries no ${kind} participant labelled "${label}"`);
+    }
+    return node;
+  }
+
+  it('keeps the one kind of a participant collapsed from a single kind of record', () => {
+    const graph = buildDependencyGraph([
+      event({ kind: 'render', name: 'render Example' }),
+      event({ kind: 'render', name: 'render Example' }),
+    ]);
+
+    // Two records, one kind: the kind is listed once, not once per record.
+    const node = participant(graph, 'ui-event', 'render Example');
+    expect(node.count).toBe(2);
+    expect(node.spanKinds).toEqual(['render']);
+  });
+
+  it('lists every distinct kind a participant collapsed, in the canonical kind order', () => {
+    // Arrival order is commit before render; the published order is the
+    // vocabulary's, so two reads of one capture always agree.
+    const graph = buildDependencyGraph([
+      event({ kind: 'commit', name: 'example.shared' }),
+      event({ kind: 'render', name: 'example.shared' }),
+      event({ kind: 'commit', name: 'example.shared' }),
+    ]);
+
+    expect(participant(graph, 'ui-event', 'example.shared').spanKinds).toEqual([
+      'render',
+      'commit',
+    ]);
+  });
+
+  it('tells the two ends of one request apart by kind, though they share a class', () => {
+    const request = event({
+      kind: 'fetch',
+      tier: 'browser',
+      name: 'GET /resource',
+      attributes: { 'http.method': 'GET' },
+    });
+    const served = event({
+      kind: 'http.server',
+      tier: 'server',
+      name: 'GET /resource',
+      parentSpanId: request.spanId,
+      attributes: { 'http.route': '/resource' },
+    });
+
+    const graph = buildDependencyGraph([request, served]);
+    const apiNodes = graph.nodes.filter((node) => node.kind === 'api');
+
+    // Both are `api` participants; only their kinds say which end each is.
+    expect(apiNodes).toHaveLength(2);
+    expect(apiNodes.find((node) => node.tier === 'browser')?.spanKinds).toEqual(['fetch']);
+    expect(apiNodes.find((node) => node.tier === 'server')?.spanKinds).toEqual(['http.server']);
+  });
+
+  it('sets the list on every participant it builds', () => {
+    const graph = buildDependencyGraph([
+      event({ kind: 'interaction', name: 'click' }),
+      event({ kind: 'db.query', tier: 'db', name: 'SELECT 1' }),
+      event({ kind: 'server.error', tier: 'server', name: 'Error' }),
+    ]);
+
+    expect(graph.nodes.length).toBeGreaterThan(0);
+    for (const node of graph.nodes) {
+      expect(node.spanKinds?.length, node.id).toBeGreaterThan(0);
+    }
+  });
+});
+
 describe('participant source locations', () => {
   /** Two locations a resolution route could plausibly report with one confidence. */
   const first: SourceLocation = {

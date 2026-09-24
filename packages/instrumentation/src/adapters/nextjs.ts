@@ -90,7 +90,12 @@ import type {
   InstrumentationActionType,
   InstrumentationMode,
 } from '../schema/plan.js';
-import { buildReadiness, deriveServerAgentSignals } from '../schema/readiness.js';
+import {
+  READINESS_HINT_MAX_LENGTH,
+  READINESS_REASON_MAX_LENGTH,
+  buildReadiness,
+  deriveServerAgentSignals,
+} from '../schema/readiness.js';
 import type {
   CaptureSignal,
   Readiness,
@@ -538,14 +543,16 @@ interface PreloadVerdict {
 }
 
 /**
- * The bound the readiness schema puts on a `reason` or a `hint`.
+ * The bound `../schema/plan.ts` puts on an action's `rationale`.
  *
- * Restated rather than imported because `../schema/readiness.js` keeps it
- * private: what is public there is the refusal of a blank, multi-line or
- * over-long string, and this is the number that keeps a composed hint on the
- * right side of it.
+ * Restated rather than imported because that module keeps its
+ * `MAX_RATIONALE_LENGTH` private. The two cannot drift unnoticed: the suite
+ * parses every action this adapter emits against `instrumentationActionSchema`,
+ * which applies the real number. A `reason` and a `hint` are measured against
+ * `READINESS_REASON_MAX_LENGTH` and `READINESS_HINT_MAX_LENGTH`, which the
+ * readiness schema exports for exactly that purpose.
  */
-const MAX_MESSAGE_CHARS = 500;
+const MAX_RATIONALE_CHARS = 500;
 
 /** The conventional script name a dev server is started by. */
 const DEV_SCRIPT_NAME = 'dev';
@@ -666,25 +673,72 @@ function clockFor(context: InstrumentationContext, options: ResolvedOptions): ()
 }
 
 /**
- * Collapses whitespace and enforces the single-line, bounded shape a `reason`
- * or a `hint` has to have.
- *
- * A patcher's message is written for a developer and is already a single
- * sentence, but it travels through this function anyway: the readiness schema
- * refuses a multi-line or over-long string at the boundary, and a refusal there
- * would drop the one sentence that told the developer what to do.
+ * Collapses every run of whitespace to a single space and trims both ends.
  *
  * @param text The composed text.
- * @returns The same text as one bounded line.
+ * @returns The same words on one line.
  */
-function singleLine(text: string): string {
-  const collapsed = text.replace(/\s+/gu, ' ').trim();
+function collapseWhitespace(text: string): string {
+  return text.replace(/\s+/gu, ' ').trim();
+}
 
-  if (collapsed.length <= MAX_MESSAGE_CHARS) {
+/**
+ * Collapses whitespace and enforces the single-line, bounded shape a
+ * developer-facing field has to have.
+ *
+ * The bound is the one of the field being shaped, passed by the caller rather
+ * than assumed: {@link READINESS_REASON_MAX_LENGTH} for a `reason` and for a
+ * failure message, {@link READINESS_HINT_MAX_LENGTH} for a `hint`, and
+ * {@link MAX_RATIONALE_CHARS} for a rationale. The receiving schema refuses a
+ * multi-line or over-long string at the boundary, and a refusal there would
+ * drop the one sentence that told the developer what happened.
+ *
+ * Truncation is a guard for prose composed from this module's own fixed words,
+ * which is far inside every bound. It is never how a hint that carries a
+ * command is fitted: {@link firstFitting} chooses a shorter complete spelling
+ * instead, because a command with its tail cut off still runs.
+ *
+ * @param text The composed text.
+ * @param bound The longest string the receiving field accepts, in characters.
+ * @returns The same text as one line of at most `bound` characters.
+ */
+function singleLine(text: string, bound: number): string {
+  const collapsed = collapseWhitespace(text);
+
+  if (collapsed.length <= bound) {
     return collapsed;
   }
 
-  return `${collapsed.slice(0, MAX_MESSAGE_CHARS - 1)}…`;
+  return `${collapsed.slice(0, bound - 1)}…`;
+}
+
+/**
+ * The first candidate that fits `bound` as one line, returned whole.
+ *
+ * How a hint carrying injected, unbounded material — a project root, a preload
+ * specifier, a dev command, environment variable names — is fitted to its
+ * field: the caller spells the same instruction from most to least prose, each
+ * spelling complete in itself, and nothing is ever cut out of the middle of a
+ * command. A developer who copies a sliced command runs it.
+ *
+ * @param candidates The instruction, from the most to the least complete
+ * spelling.
+ * @param fallback The spelling built only from this module's own fixed words,
+ * for when no candidate fits. It is far inside every bound; it passes through
+ * {@link singleLine} anyway, so the result is bounded whatever a caller passes.
+ * @param bound The longest string the receiving field accepts, in characters.
+ * @returns The first candidate that fits, or the bounded fallback.
+ */
+function firstFitting(candidates: readonly string[], fallback: string, bound: number): string {
+  for (const candidate of candidates) {
+    const line = collapseWhitespace(candidate);
+
+    if (line.length <= bound) {
+      return line;
+    }
+  }
+
+  return singleLine(fallback, bound);
 }
 
 /**
@@ -699,33 +753,81 @@ function singleLine(text: string): string {
  * the environment, and the editor command is always named as the alternative
  * that needs no shell.
  *
+ * The project root is named **once**, inside the hand-typed command
+ * (`cd ‹root› && NODE_OPTIONS="--import ‹specifier›" ‹command›`), because that is
+ * the one place it is actionable. Everything in the line except this module's
+ * own words is injected and unbounded, so the hint is fitted to
+ * {@link READINESS_HINT_MAX_LENGTH} by {@link firstFitting}, never by cutting.
+ * The spellings, most complete first, drop what matters least first:
+ *
+ * 1. The full sentences: the editor command and what it does, the hand-typed
+ *    command, and the environment variable names the editor command sets.
+ * 2. The compact form: the editor command's label, the variable names and the
+ *    exact command, with the explanatory prose gone.
+ * 3. The compact form without the root, telling the developer to run the
+ *    command from the project root. Only a root too long for the second form to
+ *    fit — a deeply nested checkout — reaches it.
+ * 4. The second and third forms without the variable names, for a variable
+ *    list so long that it alone would push the command out.
+ * 5. The editor command with the variable names and no command at all, for a
+ *    specifier or dev command so long that no spelling of the command fits.
+ *    A missing command sends the developer to the editor command, which needs
+ *    none; a truncated one would run.
+ * 6. The editor command alone, built only from this module's own words.
+ *
  * @param context The session's context, for the project root and the summary.
  * @param options The resolved options, for the injected descriptor.
- * @returns A single bounded line naming the project root.
+ * @returns A single line within the hint bound, carrying the exact command
+ * whenever any spelling of it fits and naming the project root whenever the
+ * command still fits with it.
  */
 function relaunchHint(context: InstrumentationContext, options: ResolvedOptions): string {
+  const root = context.projectRoot;
   const specifier = options.relaunch.preloadSpecifier ?? DEBUGGEN_NODE_PRELOAD_SPECIFIER;
   const prefix = RUN_SCRIPT_PREFIXES[context.projectSummary.packageManager];
   const devCommand =
     options.relaunch.devCommand ??
     (prefix === undefined ? undefined : `${prefix} ${DEV_SCRIPT_NAME}`);
-  const variables = options.relaunch.envVarNames ?? [];
-  const variableClause =
-    variables.length === 0
-      ? ''
-      : ` The editor command also sets ${[...variables].sort().join(', ')} for you.`;
+  const variables = [...(options.relaunch.envVarNames ?? [])].sort().join(', ');
+  const preload = `NODE_OPTIONS="--import ${specifier}"`;
+  const editor = `Run "${LAUNCH_COMMAND_LABEL}"`;
 
   // The editor command first, because it is the recovery path that needs no
   // shell and no credentials of its own, and the hand-typed form second — in
   // full where the project's own dev command is known, and otherwise as the one
   // fragment that has to be added to whatever command the developer uses.
-  const byHand =
+  const full = [
+    `${editor}, which starts this project's dev server with the preload and the ingest credentials already set.`,
     devCommand === undefined
-      ? `To do it by hand, start it from ${context.projectRoot} with NODE_OPTIONS="--import ${specifier}".`
-      : `To do it by hand: cd ${context.projectRoot} && NODE_OPTIONS="--import ${specifier}" ${devCommand}.`;
+      ? `To do it by hand, start it from ${root} with ${preload}.`
+      : `To do it by hand: cd ${root} && ${preload} ${devCommand}.`,
+    variables === '' ? '' : `The editor command also sets ${variables} for you.`,
+  ].join(' ');
 
-  return singleLine(
-    `Run "${LAUNCH_COMMAND_LABEL}" for ${context.projectRoot}, which starts the dev server with the preload and the ingest credentials already set. ${byHand}${variableClause}`,
+  // The hand-typed tail of a compact spelling, with the root or without it.
+  const rooted =
+    devCommand === undefined
+      ? `, start the dev server from ${root} with ${preload}`
+      : `: cd ${root} && ${preload} ${devCommand}`;
+  const rootless =
+    devCommand === undefined
+      ? `, start the dev server from the project root with ${preload}`
+      : `, from the project root: ${preload} ${devCommand}`;
+  const sets = variables === '' ? '' : ` (it sets ${variables} for you)`;
+  const compact = (variableClause: string, byHand: string): string =>
+    `${editor}${variableClause} or, by hand${byHand}.`;
+
+  return firstFitting(
+    [
+      full,
+      compact(sets, rooted),
+      compact(sets, rootless),
+      compact('', rooted),
+      compact('', rootless),
+      ...(variables === '' ? [] : [`${editor} for this project; it sets ${variables} for you.`]),
+    ],
+    `${editor} for this project.`,
+    READINESS_HINT_MAX_LENGTH,
   );
 }
 
@@ -745,6 +847,7 @@ function reasonFor(signal: CaptureSignal, verdict: PreloadVerdict): string {
       patched
         ? 'no Debug Generator preload is attached to the dev server for this project, so nothing would receive a function span and no file was modified'
         : 'no Debug Generator preload is attached to the dev server for this project, so the framework produces no spans to collect',
+      READINESS_REASON_MAX_LENGTH,
     );
   }
 
@@ -754,16 +857,23 @@ function reasonFor(signal: CaptureSignal, verdict: PreloadVerdict): string {
     patched
       ? `the dev-server preload for this project has not reported for ${seconds}s, so a function span may never arrive`
       : `the dev-server preload for this project has not reported for ${seconds}s, so its spans may never arrive`,
+    READINESS_REASON_MAX_LENGTH,
   );
 }
 
 /**
  * What the developer can do about a missing or silent preload.
  *
+ * A missing preload gets {@link relaunchHint}. A silent one gets the restart
+ * instruction, which names the project root when it fits the hint bound and
+ * otherwise says "this project" — the sentence degrades by losing the root,
+ * never by being cut.
+ *
  * @param context The session's context.
  * @param options The resolved options.
  * @param verdict The preload verdict.
- * @returns The hint, which always names the project root.
+ * @returns The hint, within {@link READINESS_HINT_MAX_LENGTH} and never
+ * truncated.
  */
 function hintFor(
   context: InstrumentationContext,
@@ -774,8 +884,12 @@ function hintFor(
     return relaunchHint(context, options);
   }
 
-  return singleLine(
-    `Restart the dev server for ${context.projectRoot} with "${LAUNCH_COMMAND_LABEL}" so its preload reconnects.`,
+  return firstFitting(
+    [
+      `Restart the dev server for ${context.projectRoot} with "${LAUNCH_COMMAND_LABEL}" so its preload reconnects.`,
+    ],
+    `Restart this project's dev server with "${LAUNCH_COMMAND_LABEL}" so its preload reconnects.`,
+    READINESS_HINT_MAX_LENGTH,
   );
 }
 
@@ -1395,7 +1509,7 @@ function buildAction(
     type,
     adapter: NEXTJS_ADAPTER_ID,
     mode: PATCH_MODE,
-    rationale: singleLine(rationale),
+    rationale: singleLine(rationale, MAX_RATIONALE_CHARS),
   };
 }
 
@@ -1592,8 +1706,11 @@ function cancelledBeforePatching(pending: number): InstallFailure {
   return {
     error: new DebuggenError(
       'INSTRUMENTATION_INSTALL_FAILED',
+      // An explanation rather than a command, so it is held to the bound a
+      // reason is: the sentence a developer reads about why nothing happened.
       singleLine(
         `The install was cancelled before ${String(pending)} planned target${pending === 1 ? ' was' : 's were'} patched.`,
+        READINESS_REASON_MAX_LENGTH,
       ),
       {
         hint: 'Nothing was written for these targets. Start the capture again to install them.',

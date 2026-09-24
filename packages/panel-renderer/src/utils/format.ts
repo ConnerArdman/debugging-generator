@@ -15,7 +15,8 @@
  * ## What this module owns, and what it does not
  *
  * It owns the *text*: unit selection and fixed precision for durations, byte
- * sizes, counts and percentages; the code-point-safe truncation that keeps a
+ * sizes, counts and percentages; the singular/plural agreement of the words
+ * printed beside a count; the code-point-safe truncation that keeps a
  * preview inside the capture's privacy bound; the one-line collapsing that
  * keeps a multi-line statement out of a table row's height; the compact path
  * and source-chip labels; and the readable labels for the closed telemetry
@@ -63,13 +64,21 @@
  * ## Consumers
  *
  * `../primitives/DurationCell.tsx` (the value/unit split), `MetricCards.tsx`
- * ({@link formatMetric} and {@link NOT_AVAILABLE_LABEL}), `Timeline.tsx`,
+ * ({@link formatMetric}, {@link NOT_AVAILABLE_LABEL} and the duration and byte
+ * value/unit splits), `Timeline.tsx`,
  * `Waterfall.tsx` and `FlameChart.tsx` (compact bar and tooltip labels),
  * `SpanTable.tsx`, `RenderTable.tsx`, `RequestTable.tsx`, `QueryTable.tsx`,
  * `EventLog.tsx`, `StateTransitionViewer.tsx` and `ComponentTree.tsx`
  * (durations, counts, bytes, shares, one-line previews), `SourceLink.tsx` (the
  * chip label and its title) and `../layout/SummaryHeader.tsx` (counts and
- * durations inside observed-fact text).
+ * durations inside observed-fact text). {@link formatCountOf},
+ * {@link pluralize} and {@link countedNoun} are the one count-agreement rule
+ * for every sentence built around a count — today `Waterfall.tsx` (badges,
+ * descriptions, disclosure names, the footer and the empty-page copy),
+ * `FlameChart.tsx` (notes, disclosure names and the list label) and
+ * `DependencyGraph.tsx` (notes and the canvas's text alternative); any other
+ * view that counts something in words uses the same three rather than an
+ * inline `count === 1 ? … : …`.
  */
 
 import {
@@ -518,8 +527,8 @@ export type ByteUnit = 'B' | 'kB' | 'MB' | 'GB' | 'TB' | 'PB';
  * The byte units in ascending order.
  *
  * Typed as a non-empty tuple so the first element is statically known to exist
- * and the defensive fallback in {@link formatBytes} needs no assertion under
- * `noUncheckedIndexedAccess`.
+ * and the defensive fallback in {@link formatBytesParts} needs no assertion
+ * under `noUncheckedIndexedAccess`.
  */
 const BYTE_UNITS: readonly [ByteUnit, ...ByteUnit[]] = Object.freeze([
   'B',
@@ -552,28 +561,66 @@ const PERCENT_DECIMALS = 1;
 const UNITLESS_DECIMALS = 2;
 
 /**
- * Formats a byte count, selecting a decimal (1 000-based) unit.
+ * A formatted byte size, split so a caller can style the unit separately.
+ *
+ * The same discriminated shape as {@link DurationParts}, for the same reason:
+ * the unavailable case has no number and no unit at all, so a caller cannot
+ * print `undefined` beside a value by forgetting to check. A metric tile
+ * renders `value` in its prominent numeric role and `unit` in its own muted
+ * element, exactly as it does for a duration — no string surgery on `text`.
+ */
+export type ByteParts =
+  | {
+      /** The size was measurable and is rendered below. */
+      readonly available: true;
+      /** The numeric text: whole bytes below a kilobyte, one decimal above. */
+      readonly value: string;
+      /** The decimal (SI) unit `value` is expressed in. */
+      readonly unit: ByteUnit;
+      /** `value` and `unit` joined by a single space — the whole label. */
+      readonly text: string;
+    }
+  | {
+      /** The size was not measurable; both fields are the absent label. */
+      readonly available: false;
+      readonly value: typeof NOT_AVAILABLE_LABEL;
+      readonly text: typeof NOT_AVAILABLE_LABEL;
+    };
+
+/**
+ * The one frozen unavailable arm of {@link ByteParts}, so the absent case
+ * allocates nothing and no caller can mutate a shared result.
+ */
+const UNAVAILABLE_BYTES: ByteParts = Object.freeze<ByteParts>({
+  available: false,
+  value: NOT_AVAILABLE_LABEL,
+  text: NOT_AVAILABLE_LABEL,
+});
+
+/**
+ * Formats a byte count, selecting a decimal (1 000-based) unit, split into its
+ * number and its unit.
  *
  * Whole bytes below one kilobyte, then one decimal for every larger unit, which
  * keeps a column of transfer sizes aligned while staying readable. The scale
  * stops at petabytes; a value beyond that keeps the petabyte unit.
  *
  * Degenerate inputs: `0` → `0 B`; a negative value clamps to `0` through the
- * shared `clampNonNegative`; `NaN` and `Infinity` → {@link NOT_AVAILABLE_LABEL},
- * as does a magnitude fixed notation cannot express. An *unmeasured* transfer
- * size must not be passed here as `0`: it is an absent metric value and renders
- * through {@link formatMetric} as `n/a` (AAP 0.6.6).
+ * shared `clampNonNegative`; `NaN` and `Infinity` → the unavailable arm, whose
+ * `text` is {@link NOT_AVAILABLE_LABEL}, as does a magnitude fixed notation
+ * cannot express. An *unmeasured* transfer size must not be passed here as `0`:
+ * it is an absent metric value and renders through {@link formatMetric} as
+ * `n/a` (AAP 0.6.6).
  *
  * @example
  * ```ts
- * formatBytes(512); // '512 B'
- * formatBytes(2048); // '2.0 kB'
- * formatBytes(1_500_000); // '1.5 MB'
+ * formatBytesParts(2048); // { available: true, value: '2.0', unit: 'kB', text: '2.0 kB' }
+ * formatBytesParts(Number.NaN); // { available: false, value: 'n/a', text: 'n/a' }
  * ```
  */
-export function formatBytes(bytes: number): string {
+export function formatBytesParts(bytes: number): ByteParts {
   if (!Number.isFinite(bytes)) {
-    return NOT_AVAILABLE_LABEL;
+    return UNAVAILABLE_BYTES;
   }
 
   let magnitude = clampNonNegative(bytes);
@@ -586,7 +633,29 @@ export function formatBytes(bytes: number): string {
   const unit: ByteUnit = BYTE_UNITS[index] ?? BYTE_UNITS[0];
   const value = groupedFixed(magnitude, index === 0 ? 0 : BYTE_DECIMALS);
 
-  return value === undefined ? NOT_AVAILABLE_LABEL : `${value} ${unit}`;
+  if (value === undefined) {
+    return UNAVAILABLE_BYTES;
+  }
+
+  return { available: true, value, unit, text: `${value} ${unit}` };
+}
+
+/**
+ * Formats a byte count as one string, selecting a decimal (1 000-based) unit.
+ *
+ * Same units, precision and degenerate-input behaviour as
+ * {@link formatBytesParts}, whose `text` it returns, so the joined and the
+ * split forms of one size can never disagree.
+ *
+ * @example
+ * ```ts
+ * formatBytes(512); // '512 B'
+ * formatBytes(2048); // '2.0 kB'
+ * formatBytes(1_500_000); // '1.5 MB'
+ * ```
+ */
+export function formatBytes(bytes: number): string {
+  return formatBytesParts(bytes).text;
 }
 
 /**
@@ -615,6 +684,126 @@ export function formatCount(value: number): string {
   }
 
   return groupedFixed(clampNonNegative(value), 0) ?? NOT_AVAILABLE_LABEL;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Counted words
+ *
+ * Every sentence a panel builds around a count — "1 row touched", "4 calls ·
+ * loaded 9 of 9 spans", "1 operation was re-attached because its parent never
+ * arrived" — has to agree with the number it prints. A component that
+ * hand-rolls `count === 1 ? … : …` beside each figure eventually forgets one,
+ * and the panel reads "1 rows". These helpers are the one agreement rule, and
+ * they decide it from the count *as {@link formatCount} prints it*, so the
+ * word can never disagree with the digits beside it.
+ *
+ * English only, deliberately: the product's copy is English and generic (AAP
+ * 0.5.4), and a locale-aware plural rule would be an `Intl` dependency this
+ * module forbids itself (see the header).
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A word or phrase in the two forms English agrees with a count.
+ *
+ * Usually a noun (`row`/`rows`, `request group`/`request groups`), but any
+ * count-agreeing pair works the same way — a verb (`was`/`were`), a pronoun
+ * (`its`/`their`) — which is how a sentence keeps its verb and pronouns in
+ * step with the noun it counts without a second rule. Build one with
+ * {@link countedNoun}; `one` is the form for a count that prints as `1`, and
+ * `other` the form for every other count, zero included ("0 rows").
+ */
+export interface CountedNoun {
+  /** The singular form, used when the count prints as exactly `1`. */
+  readonly one: string;
+  /** The plural form, used for every other count. */
+  readonly other: string;
+}
+
+/**
+ * Builds a frozen {@link CountedNoun}.
+ *
+ * The plural defaults to the regular English form, the singular with an `s`
+ * appended, which covers the product's own vocabulary (`call`, `row`, `span`,
+ * `operation`, `relationship`); pass `other` for anything irregular or for a
+ * non-noun pair.
+ *
+ * @param one The singular form.
+ * @param other The plural form; defaults to `one` followed by `s`.
+ *
+ * @example
+ * ```ts
+ * countedNoun('nested call'); // { one: 'nested call', other: 'nested calls' }
+ * countedNoun('was', 'were'); // a verb that agrees with the same count
+ * ```
+ */
+export function countedNoun(one: string, other = `${one}s`): CountedNoun {
+  return Object.freeze({ one, other });
+}
+
+/**
+ * Whether a count takes the singular: exactly when {@link formatCount} prints
+ * it as `1`.
+ *
+ * Decided from the printed text rather than from `count === 1`, so a count that
+ * arrived as a floating-point sum (`0.9999999`) prints `1` *and* takes the
+ * singular. Zero, every other count and an unmeasurable count (printed as
+ * {@link NOT_AVAILABLE_LABEL}) take the plural.
+ */
+function takesSingular(count: number): boolean {
+  return formatCount(count) === '1';
+}
+
+/**
+ * The form of `noun` that agrees with `count`, without the number.
+ *
+ * For the words around a count that are not the counted noun itself — the verb
+ * and the pronouns of the same sentence — and for a noun whose number is
+ * printed elsewhere ("loaded 9 of 9 spans" agrees its noun with the total).
+ *
+ * @param count The count the word agrees with.
+ * @param noun A {@link CountedNoun}, or a singular noun with a regular `-s`
+ * plural.
+ *
+ * @example
+ * ```ts
+ * pluralize(1, 'row'); // 'row'
+ * pluralize(0, 'row'); // 'rows'
+ * pluralize(4, countedNoun('was', 'were')); // 'were'
+ * ```
+ */
+export function pluralize(count: number, noun: CountedNoun | string): string {
+  const singular = takesSingular(count);
+
+  if (typeof noun === 'string') {
+    return singular ? noun : `${noun}s`;
+  }
+
+  return singular ? noun.one : noun.other;
+}
+
+/**
+ * A count followed by the form of `noun` that agrees with it: the
+ * {@link formatCount} text, one space, and {@link pluralize}'s word.
+ *
+ * The entry point for "N things": badges, footers, descriptions and notes.
+ * Degenerate counts follow {@link formatCount} — a negative count prints `0`
+ * with the plural, and `NaN` prints {@link NOT_AVAILABLE_LABEL} with the plural.
+ *
+ * @param count The count to print.
+ * @param noun A {@link CountedNoun}, or a singular noun with a regular `-s`
+ * plural.
+ *
+ * @example
+ * ```ts
+ * formatCountOf(1, 'row'); // '1 row'
+ * formatCountOf(1240, 'row'); // '1,240 rows'
+ * formatCountOf(2, countedNoun('nested call')); // '2 nested calls'
+ * ```
+ */
+export function formatCountOf(count: number, noun: CountedNoun | string): string {
+  return `${formatCount(count)} ${pluralize(count, noun)}`;
 }
 
 /**

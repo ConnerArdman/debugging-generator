@@ -63,16 +63,32 @@
  * why none of them appears here; spacing comes from `Stack`, the ordering
  * control from `Toolbar`, colour only ever from `../utils/color`.
  *
- * The only focus stops this file adds of its own sit on the triggers of its
- * tooltips — an abbreviated statement, a row count, a caller's execution count
- * — each carrying `tabIndex={0}`, because a description a pointer reaches by
- * hovering a keyboard reaches by focusing. Such a trigger is described, never
- * operated: it gains no role, no handler and no name of its own (its visible
- * text is what is read, the bubble its description), so the set of controls on
- * screen is unchanged, and its focus ring is the global `:focus-visible` rule
- * of `../styles/base.css`. `DataTable` answers only keys pressed on a row
- * itself, so these stops leave the row navigation intact and let Escape reach
- * the tooltip first.
+ * ## Keyboard: one Tab stop, and the grid's arrow keys for everything inside
+ *
+ * The table is ONE stop in the page's Tab order — `DataTable`'s active row —
+ * and every focusable element this file renders inside a cell or an expanded
+ * row carries `tabIndex={-1}`: the expand toggle, the caller chips, the
+ * execution selectors, the expanded statement blocks, and the triggers of the
+ * tooltips on an abbreviated statement, a row count and a caller's execution
+ * count. `DataTable`'s cell navigation is what reaches them (ArrowRight into the
+ * row and across it and its open detail, ArrowLeft back, Home/End, the vertical
+ * keys to the adjacent row, Escape back to the row), so this file handles no key
+ * itself and keeps no focus bookkeeping of its own.
+ *
+ * A tooltip trigger is described, never operated: it gains no role, no handler
+ * and no name of its own (its visible text is what is read, the bubble its
+ * description), so the set of controls on screen is unchanged, and its focus
+ * ring is the global `:focus-visible` rule of `../styles/base.css`. Focus opens
+ * the bubble however it arrives — an arrow key or a pointer — so a description a
+ * pointer reaches by hovering, a keyboard reaches by moving onto the figure; the
+ * first Escape closes the bubble and only the second returns to the row. An
+ * expanded statement block, once focused, keeps the arrow keys along an axis it
+ * actually scrolls, so a long statement stays scrollable from the keyboard.
+ *
+ * The row's disclosure state lives on its toggle, not on the row: a `grid` row
+ * does not support `aria-expanded`, so the toggle carries `aria-expanded` and
+ * `aria-controls` from the `DataTableCellMeta` its cell receives, and
+ * `aria-controls` names the detail row exactly while that row is rendered.
  *
  * ## States
  *
@@ -95,10 +111,9 @@
 
 import type { DataQuery, DataQuerySort, QueryTableNode } from '@debuggen/panel-schema';
 import { isDataQuerySort } from '@debuggen/panel-schema';
-import type { DebuggenError } from '@debuggen/shared';
 import type { QueryCaller, QueryGroup, QueryOccurrence } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight } from 'lucide-react';
+import { ChevronDown, ChevronRight, Database } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
@@ -107,15 +122,16 @@ import {
   DATA_QUERY_DEFAULT_OFFSET,
   DATA_QUERY_MAX_LIMIT,
 } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import { Badge } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { Code } from '../primitives/Code';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableColumn, DataTableSort } from '../primitives/DataTable';
+import type { DataTableCellMeta, DataTableColumn, DataTableSort } from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
@@ -202,6 +218,9 @@ const DEFAULT_CAPTION = 'Database statements captured during this interaction';
 /** Shown for a capture that genuinely holds no database statements. */
 const EMPTY_MESSAGE = 'No database queries were captured for this interaction.';
 
+/** The first line above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No queries';
+
 /**
  * Title of the empty state for a count-only query (`limit: 0`): the node asked
  * for a total and no rows, so an empty grid is the answer it requested rather
@@ -220,17 +239,11 @@ const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
  */
 const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
-/** The accessible name of the busy region while the first page resolves. */
-const LOADING_LABEL = 'Loading captured database queries';
-
-/** Message of last resort when a rejection carried no readable text. */
-const LOAD_FAILED_MESSAGE = 'The captured database queries could not be loaded.';
-
-/** Title of the error state raised for a node whose query this view cannot read. */
-const WRONG_SOURCE_TITLE = 'This view cannot draw the requested data';
-
-/** Message of that same error state. It names the source it can read, and no more. */
-const WRONG_SOURCE_MESSAGE = `This view draws grouped database statements and can only read the "${QUERIES_SOURCE}" source. The node asked for another one, so nothing was requested.`;
+/**
+ * The accessible name of the busy region while the first page resolves, ending
+ * in the ellipsis every loading label of this package carries (B2-F14).
+ */
+const LOADING_LABEL = 'Loading captured database queries…';
 
 /** The ordering control's own name, and the toolbar's group name. */
 const ORDER_LABEL = 'Order by';
@@ -243,13 +256,6 @@ const LOAD_MORE_LABEL = 'Load more';
 
 /** Label of the control that re-asks for a page whose request failed. */
 const RETRY_PAGE_LABEL = 'Try again';
-
-/**
- * Title of the error state raised when a further page fails beneath rows that
- * are already on screen. It says which request failed — the next page, not the
- * view — because the statements above it are still the ones that loaded.
- */
-const PAGE_ERROR_TITLE = 'Could not load the next page';
 
 /** Shown in the footer while a further page is in flight. */
 const LOADING_MORE_MESSAGE = 'Loading more statements…';
@@ -268,11 +274,21 @@ const GROUPING_BASIS_MESSAGE =
 /** Shown in an expanded row that carries no individual executions. */
 const NO_OCCURRENCES_MESSAGE = 'No individual executions were carried with this group.';
 
-/** The accessible name of the expand affordance while the row is collapsed. */
-const EXPAND_ROW_LABEL = 'Show the executions of this statement';
+/**
+ * Opens the accessible name of the expand affordance while the row is
+ * collapsed; the row's own statement preview completes it (see
+ * {@link disclosureLabel}).
+ */
+const EXPAND_ROW_PREFIX = 'Show the executions of';
 
-/** The accessible name of the same control while the row is open. */
-const COLLAPSE_ROW_LABEL = 'Hide the executions of this statement';
+/** Opens the accessible name of the same control while the row is open. */
+const COLLAPSE_ROW_PREFIX = 'Hide the executions of';
+
+/**
+ * Introduces the name of the span that issued a statement from a caller's
+ * location, shown as plain text beside that location's chip.
+ */
+const CALLER_SPAN_PREFIX = 'via';
 
 /** Names the control that selects one execution, which the offset completes. */
 const SELECT_OCCURRENCE_PREFIX = 'Select the execution at';
@@ -300,6 +316,25 @@ const HEADER = Object.freeze({
  */
 function failureBadgeText(errorCount: number): string {
   return `${formatCount(errorCount)} reported a failure`;
+}
+
+/**
+ * The accessible name of a row's disclosure control, naming the row it opens.
+ *
+ * Every row carries the same icon-only toggle, so a name without the row's
+ * identity would read "Show the executions of this statement" once per row and
+ * tell a screen-reader or voice-control user nothing about which one they are
+ * on. The identity is the statement preview the row header already shows — the
+ * package's own one-line display form of the received text, passed in rather
+ * than re-derived here — so the name repeats what is on screen and transforms
+ * nothing (AAP 0.5.2).
+ *
+ * @param expanded Whether the row's detail is open, which picks the verb.
+ * @param statementPreview The row's statement as its header cell displays it.
+ * @returns The control's accessible name.
+ */
+function disclosureLabel(expanded: boolean, statementPreview: string): string {
+  return `${expanded ? COLLAPSE_ROW_PREFIX : EXPAND_ROW_PREFIX} ${statementPreview}`;
 }
 
 /**
@@ -416,6 +451,13 @@ const DURATION_CLASS = 'dg-query-table__duration';
 /** One caller chip and its count. */
 const CALLER_CLASS = 'dg-query-table__caller';
 
+/**
+ * A caller's execution count: the one slot of a caller that never gives up
+ * width, so the source chip beside it is what ellipsizes. Named by class rather
+ * than by position, because the caller's span name can follow it.
+ */
+const CALLER_COUNT_CLASS = 'dg-query-table__caller-count';
+
 /** The list of caller chips in a cell. */
 const CALLERS_CLASS = 'dg-query-table__callers';
 
@@ -460,6 +502,61 @@ const COLUMN_KEY = Object.freeze({
   maxDuration: 'maxDurationMs',
   rowCount: 'totalRowCount',
   callers: 'callers',
+});
+
+/**
+ * The grid track of each column, keyed like {@link COLUMN_KEY}.
+ *
+ * Every track is `minmax(<floor>, <share>)`. The share is the column's
+ * proportion of spare width. The floor is what makes the grid scroll: `DataTable`
+ * adds up the floors to get the grid's minimum inline size, so a panel narrower
+ * than that scrolls horizontally with every column still readable. With a
+ * `minmax(0, …)` track the grid had no minimum. In a narrow panel each column
+ * shrank to its padding, a chip then covered the next column's value, and the
+ * caller stack spilled outside its cell.
+ *
+ * A floor is written in `ch` of the table's own type: every row, and the grid
+ * summing the floors, resolves `ch` against the same font. A `px` or `rem`
+ * track would be a hardcoded value (AAP 0.6.4). Each floor is sized, in the
+ * browser, to the column's header (plus the sort glyph where the column sorts)
+ * or to its widest ordinary value, whichever is wider, including the cell's
+ * inline padding, plus at least one character to spare:
+ *
+ *   statement  32ch  enough statement to read before it wraps; the text wraps
+ *                    and never clips, so its length does not set the floor
+ *   system     17ch  the aggregate's `(unknown system)` label in its chip,
+ *                    about 16ch with padding and the widest value this column
+ *                    shows; `postgresql` needs 11ch
+ *   executions 12ch  the sorted header with its glyph, about 11ch; a grouped
+ *                    count such as `12,345` is narrower
+ *   durations  13ch  `Average time`, about 11.5ch, and a precise duration such
+ *                    as `940.50 ms` or `12.345 s`, about 10ch
+ *   rows       9ch   a grouped count such as `12,345`, about 8ch; the `Rows`
+ *                    header is 6ch
+ *   callers    30ch  a caller chip showing roughly twenty characters of its
+ *                    name next to its whole execution count. A longer name
+ *                    ellipsizes inside the chip, and its tooltip still carries
+ *                    the full location
+ *
+ * The shares are the ones the columns had before they had floors, so a wide
+ * panel lays out as it did. The floors plus the gaps between columns come to
+ * about 1 050 CSS pixels, measured, which a 1280-pixel window holds without
+ * scrolling.
+ *
+ * The floor is a fixed length, never content-based (`auto`, `min-content`), and
+ * that is deliberate: the header row and each data row are separate grid
+ * containers, so a track sized from one row's content would stop sitting under
+ * its own header.
+ */
+const COLUMN_TRACK = Object.freeze({
+  statement: 'minmax(32ch, 3fr)',
+  system: 'minmax(17ch, 0.9fr)',
+  executions: 'minmax(12ch, 0.7fr)',
+  totalDuration: 'minmax(13ch, 0.8fr)',
+  averageDuration: 'minmax(13ch, 0.8fr)',
+  maxDuration: 'minmax(13ch, 0.8fr)',
+  rowCount: 'minmax(9ch, 0.7fr)',
+  callers: 'minmax(30ch, 2fr)',
 });
 
 /**
@@ -634,6 +731,16 @@ interface EmptyPageCopy {
   readonly message: string;
 }
 
+/**
+ * The copy of the empty capture — the one empty page that says no statements
+ * were captured — as one frozen value, so the empty state recognises it by
+ * reference and gives it the view's glyph.
+ */
+const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
+
 /** The paging facts {@link describeEmptyPage} chooses between. */
 interface EmptyPageFacts {
   /** The resolved page size; `0` is a count-only query. */
@@ -695,7 +802,7 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
   }
 
   if (total === 0 || (total === undefined && baseOffset === 0 && !hasNextPage)) {
-    return { title: undefined, message: EMPTY_MESSAGE };
+    return NOTHING_CAPTURED_COPY;
   }
 
   if (total === undefined) {
@@ -772,42 +879,6 @@ function freshPaging(identity: string, baseOffset: number): PagingState {
 }
 
 /**
- * The query as text, for the error state's diagnostic block.
- *
- * Shown to a developer debugging their own project, and safe to show: a query
- * carries a source, a trace id, kinds, a component name, a tier, a duration
- * threshold and paging numbers — never captured data.
- *
- * @param query The query that failed.
- * @returns Its JSON form.
- */
-function serializeQuery(query: DataQuery): string {
-  return JSON.stringify(query);
-}
-
-/**
- * What the error state says: the rejection's own message and hint when it
- * carried them, and generic copy when it did not.
- *
- * The provider's obligation is to reject with a `DebuggenError`, so the common
- * case has a code (rendered separately by `ErrorState`), a message and often an
- * actionable hint. A rejection that carried nothing readable must still produce
- * a sentence rather than an empty banner.
- *
- * @param error The failure, if the hook reported one.
- * @returns One sentence for the reader.
- */
-function describeError(error: DebuggenError | undefined): string {
-  if (error === undefined) {
-    return LOAD_FAILED_MESSAGE;
-  }
-
-  const parts = [error.message, error.hint ?? ''].map((part) => part.trim()).filter(hasText);
-
-  return parts.length === 0 ? LOAD_FAILED_MESSAGE : parts.join(' ');
-}
-
-/**
  * Whether a string carries something to render.
  *
  * @param value The candidate.
@@ -869,26 +940,35 @@ function occurrenceOffsetText(startTime: number, originEpochMs: number): string 
  * budget that bounds every captured preview — and, whenever that preview is not
  * the whole statement, the untouched statement travels with it as the cell's
  * tooltip, whose bubble is in the document whether it is shown or not and whose
- * trigger — the preview — takes keyboard focus, so the full text opens without
- * a pointer. A preview that already is the whole statement has nothing to
- * disclose, so it carries neither a tooltip nor a focus stop. Nothing
+ * trigger — the preview — is focusable (`tabIndex={-1}`, reached by the grid's
+ * arrow keys), so the full text opens without a pointer. A preview that already
+ * is the whole statement has nothing to disclose, so it carries neither a
+ * tooltip nor a `tabIndex`, and the grid's arrow keys pass over it. Nothing
  * re-formats, re-cases, highlights or completes a placeholder, here or anywhere
  * below.
+ *
+ * The toggle reports the disclosure state itself — `aria-expanded` and the
+ * `aria-controls` that names the open detail row, both from `meta` — because a
+ * `grid` row cannot carry `aria-expanded` (see `../primitives/DataTable`). Its
+ * name carries the same preview the cell shows, so each row's toggle names the
+ * statement it opens (see {@link disclosureLabel}).
  *
  * A group whose statement is the aggregate's "no readable statement" key is the
  * one case rendered as prose rather than as code: it is the data layer's word
  * for an absence, and dressing it as a statement would invent one.
  *
  * @param group The row.
- * @param expanded Whether this row's detail is open.
+ * @param meta The row's expansion state and the id of its detail row, as
+ * `DataTable` hands it to every cell of the row.
  * @param onToggle Called with the row when the affordance is activated.
  * @returns The cell's content.
  */
 function renderStatementCell(
   group: QueryGroup,
-  expanded: boolean,
+  meta: DataTableCellMeta,
   onToggle: (group: QueryGroup) => void,
 ): ReactNode {
+  const { expanded, detailRowId } = meta;
   const unknown = group.statement === UNKNOWN_STATEMENT;
   const preview = oneLinePreview(group.statement);
   const abbreviated = !unknown && preview !== group.statement;
@@ -898,17 +978,18 @@ function renderStatementCell(
   // clones the description onto, and a widened element type does not satisfy
   // that. Both primitives accept the attribute; the element type says so.
   //
-  // An abbreviated preview is a focus stop because its tooltip is the only
-  // place the whole statement appears in a collapsed row, and focus is how a
-  // keyboard reader opens one. It stays a plain `<code>` — no role, no handler,
-  // no name — so the preview is what is read and the bubble describes it. A
-  // preview that is the whole statement has no tooltip, and so no stop.
+  // An abbreviated preview is focusable because its tooltip is the only place
+  // the whole statement appears in a collapsed row, and focus is how a keyboard
+  // reader opens one. `-1`, not `0`: the grid is a single Tab stop, and its
+  // arrow keys move onto the preview. It stays a plain `<code>` — no role, no
+  // handler, no name — so the preview is what is read and the bubble describes
+  // it. A preview that is the whole statement has no tooltip, and so no index.
   const statement = unknown ? (
     <Text size="sm" tone="muted">
       {group.statement}
     </Text>
   ) : (
-    <Code size="sm" wrap className={STATEMENT_CLASS} tabIndex={abbreviated ? 0 : undefined}>
+    <Code size="sm" wrap className={STATEMENT_CLASS} tabIndex={abbreviated ? -1 : undefined}>
       {preview}
     </Code>
   );
@@ -920,8 +1001,10 @@ function renderStatementCell(
         size="sm"
         iconOnly
         className="dg-data-table__expand-button"
+        tabIndex={-1}
         aria-expanded={expanded}
-        aria-label={expanded ? COLLAPSE_ROW_LABEL : EXPAND_ROW_LABEL}
+        aria-controls={detailRowId}
+        aria-label={disclosureLabel(expanded, preview)}
         icon={
           expanded ? (
             <ChevronDown aria-hidden="true" className="dg-icon" />
@@ -984,8 +1067,9 @@ function renderExecutionsCell(group: QueryGroup): ReactNode {
  *
  * A count, never a hint that the rows themselves exist anywhere in this
  * product: nothing about a result is captured beyond its size (AAP 0.5.2),
- * which the cell's tooltip states in as many words. The figure takes keyboard
- * focus so that note is reachable without a pointer.
+ * which the cell's tooltip states in as many words. The figure is focusable —
+ * `tabIndex={-1}`, reached by the grid's arrow keys — so that note is reachable
+ * without a pointer.
  *
  * @param group The row.
  * @returns The cell's content.
@@ -994,9 +1078,10 @@ function renderRowCountCell(group: QueryGroup): ReactNode {
   return (
     <Tooltip content={ROW_COUNT_TOOLTIP}>
       {/* Focusable on purpose: focus is how a keyboard reader opens the
-          tooltip. The figure is read and the bubble describes it, so the
-          `<code>` gains no role, handler or name of its own. */}
-      <Code size="sm" numeric className={ROWS_CLASS} tabIndex={0}>
+          tooltip, and `-1` keeps the grid a single Tab stop whose arrow keys
+          move onto the figure. The figure is read and the bubble describes
+          it, so the `<code>` gains no role, handler or name of its own. */}
+      <Code size="sm" numeric className={ROWS_CLASS} tabIndex={-1}>
         {countOrUnavailable(group.totalRowCount)}
       </Code>
     </Tooltip>
@@ -1015,10 +1100,20 @@ function renderRowCountCell(group: QueryGroup): ReactNode {
  * be attributed to anybody says `n/a` rather than naming a caller it does not
  * have.
  *
- * The chip carries the caller's span name and, beside it, that caller's share of
- * the group's executions; the count's meaning is in its tooltip, because a bare
- * number next to a location is ambiguous, and the count takes keyboard focus so
- * that meaning is reachable without a pointer.
+ * The chip is captioned by the location it opens — its symbol and compacted
+ * `file:line` — with that caller's share of the group's executions beside it
+ * and the caller's span name after both as plain text; see
+ * {@link renderCaller}. The count's meaning is in its tooltip, because a bare
+ * number next to a location is ambiguous, and the count is focusable — reached
+ * by the grid's arrow keys — so that meaning is reachable without a pointer.
+ *
+ * The list is a vertical `Stack` that STRETCHES its callers across the cell,
+ * and this is set explicitly because a centred list would break the cell. A
+ * chip is often wider than its column. Centred, the chip overflowed both edges
+ * of the cell: it started before the cell's start edge, so the start of the
+ * caller's name was cut off, and its end spilled into the Rows column.
+ * Stretched, every caller is exactly as wide as the cell, so the chip starts at
+ * the cell's start edge and ellipsizes when there is not enough room.
  *
  * @param group The row.
  * @returns The cell's content.
@@ -1033,15 +1128,34 @@ function renderCallersCell(group: QueryGroup): ReactNode {
   }
 
   return (
-    <Stack gap={1} className={CALLERS_CLASS}>
+    <Stack gap={1} align="stretch" className={CALLERS_CLASS}>
       {group.callers.map((caller) => renderCaller(caller))}
     </Stack>
   );
 }
 
 /**
- * One caller: its name (as a chip when it resolved to a location), and its share
- * of the executions.
+ * One caller: where it ran the statement from (as a chip when it resolved to a
+ * location), the span that issued it, and its share of the executions.
+ *
+ * `caller.name` is the name of the span the statement ran under — a request, a
+ * route handler — not of the place in the code the chip opens, so it never
+ * captions the chip: a control labelled with one thing that opens another
+ * fails WCAG 2.5.3 and misleads every reader. The chip derives its caption from
+ * the resolved location itself (the symbol and the compacted `file:line`), so
+ * what it says is where it goes, and its accessible name starts with exactly
+ * that visible text. The span name stays on screen as separate plain text
+ * after the chip and its count, outside the button, because which operation
+ * issued the statement is context a reader needs beside the location. A
+ * caller the resolver could not place has no location to caption a chip with,
+ * so its span name alone is shown, as text rather than as a control that leads
+ * nowhere.
+ *
+ * A horizontal `Stack`. Its main axis runs inline and is packed at the START
+ * (`justify="start"`), so the chip always begins at the cell's start edge and
+ * the count follows it. `align="center"` applies only to the cross axis: it
+ * centres the chip and the count VERTICALLY against each other and never
+ * moves either one horizontally.
  *
  * @param caller The caller, exactly as the aggregate produced it.
  * @returns The chip group.
@@ -1049,27 +1163,52 @@ function renderCallersCell(group: QueryGroup): ReactNode {
 function renderCaller(caller: QueryCaller): ReactElement {
   const source = caller.source;
 
+  // Wrapping, so the group never needs more width than its widest part: the
+  // chip and its count share the first line, and the span name moves onto a
+  // line of its own when the cell cannot hold all three side by side, rather
+  // than pushing the group out of its column. On that first line the count
+  // keeps its full width and the chip is what ellipsizes, so the figure a
+  // reader compares across callers is always whole.
   return (
-    <Stack key={caller.id} direction="horizontal" gap={1} align="center" className={CALLER_CLASS}>
+    <Stack
+      key={caller.id}
+      direction="horizontal"
+      gap={1}
+      align="center"
+      justify="start"
+      wrap
+      className={CALLER_CLASS}
+    >
       {source === undefined ? (
         <Text size="xs" tone="secondary" truncate>
           {caller.name}
         </Text>
       ) : (
         // `location` is passed straight through: no rebuilding, no adjusting,
-        // no re-validating. The chip reads the host's `onOpenSource` from the
-        // panel actions context itself.
-        <SourceLink location={source} label={caller.name} />
+        // no re-validating, and no caption of this file's own. The chip reads
+        // the host's `onOpenSource` from the panel actions context itself, and
+        // leaves the Tab order to the grid, whose arrow keys move onto it.
+        <SourceLink location={source} tabIndex={-1} />
       )}
       <Tooltip content={CALLER_COUNT_TOOLTIP}>
-        {/* Focusable on purpose, and still a label rather than a control: no
-            role, handler or name, so the source chip, where there is one,
-            stays the only thing here that acts, and the bubble describes the
-            figure that is read. */}
-        <Badge tone="neutral" variant="soft" tabIndex={0}>
+        {/* Focusable on purpose (`-1`, reached by the grid's arrow keys), and
+            still a label rather than a control: no role, handler or name, so
+            the source chip, where there is one, stays the only thing here that
+            acts, and the bubble describes the figure that is read. */}
+        <Badge tone="neutral" variant="soft" tabIndex={-1} className={CALLER_COUNT_CLASS}>
           {formatCount(caller.executionCount)}
         </Badge>
       </Tooltip>
+      {source !== undefined && hasText(caller.name) ? (
+        // The span the statement ran under, as context after the chip and its
+        // count: plain text, outside every control, never the chip's caption.
+        // It wraps rather than truncates: no tooltip carries it, so an
+        // ellipsis would hide the part of a long name a reader came for, and a
+        // wrapping line asks the cell for no more width than its longest word.
+        <Text size="xs" tone="secondary">
+          {`${CALLER_SPAN_PREFIX} ${caller.name}`}
+        </Text>
+      ) : null}
     </Stack>
   );
 }
@@ -1082,19 +1221,30 @@ function renderCaller(caller: QueryCaller): ReactElement {
  * Activating it selects the underlying event, which is the one place in this
  * view where a single event exists to select. The aggregate row above has none —
  * it stands for many — so it never reports one, and no identifier is invented to
- * fill the gap.
+ * fill the gap. The execution that is the panel's selected event carries the
+ * one selected-state class, `dg-is-selected`, and its select control reports
+ * `aria-pressed`, so the mark every other view draws for that event is drawn
+ * here too, as an attribute as well as a colour.
+ *
+ * It sits in the expanded detail row, inside the grid, so every focusable
+ * element here — the selector, the row-count trigger, the source chip — is
+ * `tabIndex={-1}` and reached by the grid's arrow keys, which continue from the
+ * data row's controls into its detail.
  *
  * @param occurrence The execution.
  * @param originEpochMs The group's first `startTime`, the offsets' origin.
  * @param onSelect Called with the execution when it is activated, when a host
  * offered somewhere to send it.
+ * @param selection The panel's selected event, if any.
  * @returns The occurrence row.
  */
 function renderOccurrenceRow(
   occurrence: QueryOccurrence,
   originEpochMs: number,
   onSelect: ((occurrence: QueryOccurrence) => void) | undefined,
+  selection: PanelSelection | undefined,
 ): ReactElement {
+  const selected = matchesPanelSelection(selection, occurrence);
   const offsetText = occurrenceOffsetText(occurrence.startTime, originEpochMs);
   const offset: ReactElement = (
     <Code size="sm" numeric>
@@ -1109,7 +1259,7 @@ function renderOccurrenceRow(
       gap={2}
       align="center"
       wrap
-      className={OCCURRENCE_ROW_CLASS}
+      className={clsx(OCCURRENCE_ROW_CLASS, selected && 'dg-is-selected')}
     >
       {onSelect === undefined ? (
         offset
@@ -1117,7 +1267,9 @@ function renderOccurrenceRow(
         <Button
           variant="ghost"
           size="sm"
+          tabIndex={-1}
           aria-label={`${SELECT_OCCURRENCE_PREFIX} ${offsetText}`}
+          aria-pressed={selected}
           onClick={() => {
             onSelect(occurrence);
           }}
@@ -1133,15 +1285,18 @@ function renderOccurrenceRow(
       />
       <Tooltip content={ROW_COUNT_TOOLTIP}>
         {/* Focusable on purpose, as in the row-count column: focus is how a
-            keyboard reader opens the privacy note that explains this figure. */}
-        <Code size="sm" numeric className={ROWS_CLASS} tabIndex={0}>
+            keyboard reader opens the privacy note that explains this figure,
+            and the grid's arrow keys are what move it there. */}
+        <Code size="sm" numeric className={ROWS_CLASS} tabIndex={-1}>
           {countOrUnavailable(occurrence.rowCount)}
         </Code>
       </Tooltip>
       <Badge tone="neutral" variant="soft" color={statusColorVar(occurrence.status)}>
         {formatStatusLabel(occurrence.status)}
       </Badge>
-      {occurrence.source === undefined ? null : <SourceLink location={occurrence.source} compact />}
+      {occurrence.source === undefined ? null : (
+        <SourceLink location={occurrence.source} compact tabIndex={-1} />
+      )}
     </Stack>
   );
 }
@@ -1175,19 +1330,28 @@ function renderLabelledDuration(label: string, ms: number): ReactElement {
  * never recomputed: it is what collapsed several executions into one row, and
  * showing it is how the row stays honest about having done so.
  *
+ * Both blocks override `Code`'s scrollable-box default of `tabIndex={0}` with
+ * `-1`: the detail row is inside the grid, whose single Tab stop is the active
+ * row, and the grid's arrow keys move focus onto a block. Once focused, a block
+ * that actually overflows keeps the arrow keys along the axis it scrolls
+ * (`DataTable` leaves those keys to it), so a long statement is still scrolled
+ * from the keyboard.
+ *
  * @param group The expanded row.
  * @param onSelect Called when one of the executions is activated.
+ * @param selection The panel's selected event, if any.
  * @returns The detail content.
  */
 function renderDetail(
   group: QueryGroup,
   onSelect: ((occurrence: QueryOccurrence) => void) | undefined,
+  selection: PanelSelection | undefined,
 ): ReactNode {
   const showsBasis = group.normalizedStatement !== group.statement;
 
   return (
     <Stack gap={2}>
-      <Code block wrap size="sm" className={STATEMENT_CLASS}>
+      <Code block wrap size="sm" className={STATEMENT_CLASS} tabIndex={-1}>
         {group.statement}
       </Code>
 
@@ -1205,7 +1369,7 @@ function renderDetail(
           <Text size="xs" tone="muted">
             {GROUPING_BASIS_MESSAGE}
           </Text>
-          <Code block wrap size="sm" className={STATEMENT_CLASS}>
+          <Code block wrap size="sm" className={STATEMENT_CLASS} tabIndex={-1}>
             {group.normalizedStatement}
           </Code>
         </Stack>
@@ -1218,7 +1382,7 @@ function renderDetail(
       ) : (
         <Stack gap={1} className={OCCURRENCES_CLASS}>
           {group.occurrences.map((occurrence) =>
-            renderOccurrenceRow(occurrence, group.firstStartTime, onSelect),
+            renderOccurrenceRow(occurrence, group.firstStartTime, onSelect, selection),
           )}
         </Stack>
       )}
@@ -1235,41 +1399,44 @@ function renderDetail(
 /**
  * The eight columns, left to right.
  *
- * Tracks are ratios and nothing else: a `px` or `rem` track would be a
- * hardcoded value (AAP 0.6.4), and an intrinsic track would size itself from one
- * row's content and stop sitting under its own header, because the header row
- * and each data row are separate grid containers. Numeric columns align to the
- * end so their last digits line up down the column.
+ * Each track is the column's entry in {@link COLUMN_TRACK}: a share of the
+ * spare width above a `ch` floor. The floor lets a narrow panel scroll
+ * horizontally without squeezing a column below what its header and values
+ * need. Numeric columns align to the end so their last digits line up down the
+ * column.
  *
  * Only the two columns the closed sort vocabulary can actually order are
  * sortable, and each declares the one direction its ordering runs in.
  *
- * @param expandedKeys The keys of the rows whose detail is open.
+ * The statement column reads a row's disclosure state from the `meta`
+ * `DataTable` hands its cells rather than from this view's own key list, so the
+ * toggle's `aria-expanded` and `aria-controls` report exactly the detail row the
+ * table rendered.
+ *
  * @param onToggle Called with a row when its expand affordance is activated.
  * @returns The column definitions.
  */
 function buildColumns(
-  expandedKeys: readonly string[],
   onToggle: (group: QueryGroup) => void,
 ): readonly DataTableColumn<QueryGroup>[] {
   return [
     {
       key: COLUMN_KEY.statement,
       header: HEADER.statement,
-      width: 'minmax(0, 3fr)',
+      width: COLUMN_TRACK.statement,
       rowHeader: true,
-      cell: (group) => renderStatementCell(group, expandedKeys.includes(group.id), onToggle),
+      cell: (group, _rowIndex, meta) => renderStatementCell(group, meta, onToggle),
     },
     {
       key: COLUMN_KEY.system,
       header: HEADER.system,
-      width: 'minmax(0, 0.9fr)',
+      width: COLUMN_TRACK.system,
       cell: (group) => renderSystemCell(group),
     },
     {
       key: COLUMN_KEY.executions,
       header: HEADER.executions,
-      width: 'minmax(0, 0.7fr)',
+      width: COLUMN_TRACK.executions,
       align: 'end',
       sortable: true,
       defaultSortDirection: 'desc',
@@ -1278,7 +1445,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.totalDuration,
       header: HEADER.totalDuration,
-      width: 'minmax(0, 0.8fr)',
+      width: COLUMN_TRACK.totalDuration,
       align: 'end',
       sortable: true,
       defaultSortDirection: 'desc',
@@ -1294,7 +1461,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.averageDuration,
       header: HEADER.averageDuration,
-      width: 'minmax(0, 0.8fr)',
+      width: COLUMN_TRACK.averageDuration,
       align: 'end',
       cell: (group) => (
         <DurationCell
@@ -1308,7 +1475,7 @@ function buildColumns(
     {
       key: COLUMN_KEY.maxDuration,
       header: HEADER.maxDuration,
-      width: 'minmax(0, 0.8fr)',
+      width: COLUMN_TRACK.maxDuration,
       align: 'end',
       cell: (group) => (
         <DurationCell
@@ -1322,14 +1489,14 @@ function buildColumns(
     {
       key: COLUMN_KEY.rowCount,
       header: HEADER.rowCount,
-      width: 'minmax(0, 0.7fr)',
+      width: COLUMN_TRACK.rowCount,
       align: 'end',
       cell: (group) => renderRowCountCell(group),
     },
     {
       key: COLUMN_KEY.callers,
       header: HEADER.callers,
-      width: 'minmax(0, 2fr)',
+      width: COLUMN_TRACK.callers,
       cell: (group) => renderCallersCell(group),
     },
   ];
@@ -1409,7 +1576,7 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     [authoredQuery, pageLimit, position.offset, readableSource, sort],
   );
 
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   /** The page the provider resolved, present only on success. */
   const page = status === 'success' ? data : undefined;
@@ -1446,15 +1613,22 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     [actions, expandedKeys, node.id],
   );
 
+  // The panel's one shared selection: the execution that stands for it is
+  // marked, and a selection made here is recorded for every view (a no-op
+  // under a host, which records the report itself).
+  const { selection, markSelected } = useViewSelection();
+
   const handleSelectOccurrence = useCallback(
     (occurrence: QueryOccurrence): void => {
-      actions?.onSelectEvent({
+      const ref = {
         eventId: occurrence.eventId,
         spanId: occurrence.spanId,
         traceId: occurrence.traceId,
-      });
+      };
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
+    [actions, markSelected],
   );
 
   // Absent a host there is nowhere to send a selection, so the occurrence rows
@@ -1508,13 +1682,13 @@ export function QueryTable(props: QueryTableProps): ReactElement {
   }, [identity, nextOffset, page, pageLimit, position.frozen, position.offset, status]);
 
   const columns = useMemo<readonly DataTableColumn<QueryGroup>[]>(
-    () => buildColumns(expandedKeys, handleToggle),
-    [expandedKeys, handleToggle],
+    () => buildColumns(handleToggle),
+    [handleToggle],
   );
 
   const renderExpandedRow = useCallback(
-    (group: QueryGroup): ReactNode => renderDetail(group, selectOccurrence),
-    [selectOccurrence],
+    (group: QueryGroup): ReactNode => renderDetail(group, selectOccurrence, selection),
+    [selectOccurrence, selection],
   );
 
   const rowKey = useCallback((group: QueryGroup): string => group.id, []);
@@ -1535,14 +1709,14 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     </Button>
   );
 
-  if (!readableSource) {
+  // `query` is `undefined` exactly when the node names a source this view
+  // cannot read (see `readableSource`), so testing it rather than the flag also
+  // narrows it for every state below. The mismatch is a defect in the panel,
+  // worded from the node catalog by the package's one contract for it, with the
+  // node's own query and no retry: asking again cannot change the answer.
+  if (query === undefined) {
     return shell(
-      <ErrorState
-        className={ERROR_CLASS}
-        title={WRONG_SOURCE_TITLE}
-        message={WRONG_SOURCE_MESSAGE}
-        query={serializeQuery(authoredQuery)}
-      />,
+      <ErrorState className={ERROR_CLASS} {...unsupportedQueryProps(node.type, authoredQuery)} />,
     );
   }
 
@@ -1562,13 +1736,12 @@ export function QueryTable(props: QueryTableProps): ReactElement {
     }
 
     if (status === 'error') {
+      // The package's one failure contract, for the view's own data: nothing is
+      // on screen, so the whole view is what failed (B2-F14, B1-F16).
       return shell(
         <ErrorState
           className={ERROR_CLASS}
-          message={describeError(error)}
-          code={error?.code}
-          query={query === undefined ? undefined : serializeQuery(query)}
-          onRetry={retry}
+          {...queryFailureProps({ error, announcement, retry }, query)}
         />,
       );
     }
@@ -1592,6 +1765,7 @@ export function QueryTable(props: QueryTableProps): ReactElement {
         className={EMPTY_CLASS}
         title={emptyCopy.title}
         message={emptyCopy.message}
+        icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Database className="dg-icon" /> : undefined}
         action={hasNextPage ? loadMoreControl : undefined}
       />,
     );
@@ -1634,7 +1808,14 @@ export function QueryTable(props: QueryTableProps): ReactElement {
         wrap
         className={clsx('dg-data-table__footer', FOOTER_CLASS)}
       >
-        <Text size="xs" tone="muted">
+        {/* A polite live region: a further page appending rows, or a re-query
+            under a new ordering, changes this sentence, and a reader who asked
+            for either is told how much of the result is now on screen without
+            moving focus off the control they used. Atomic, so the whole
+            sentence is read rather than only the figure that changed. It is a
+            live region and not `role="status"`, which is reserved for the
+            first page's loading state. */}
+        <Text size="xs" tone="muted" aria-live="polite" aria-atomic="true">
           {loadedText(rows.length, total)}
         </Text>
 
@@ -1649,20 +1830,17 @@ export function QueryTable(props: QueryTableProps): ReactElement {
 
       {/*
        * A further page that failed gets the same error contract as a first page
-       * that did (AAP 0.6.2): the rejection's message and code, the failing
-       * query as it was sent — its `offset` is the page that failed — and a
-       * retry that re-issues exactly that request. It sits below the footer
+       * that did (AAP 0.6.2), in its page scope: the next-page title and lead,
+       * the rejection's cause, hint and code, the failing query as it was sent
+       * — its `offset` is the page that failed — and a retry that re-issues
+       * exactly that request, labelled for the page. It sits below the footer
        * rather than in place of the grid, so the statements already read stay
        * on screen and the reader keeps their place.
        */}
       {status === 'error' ? (
         <ErrorState
           className={ERROR_CLASS}
-          title={PAGE_ERROR_TITLE}
-          message={describeError(error)}
-          code={error?.code}
-          query={query === undefined ? undefined : serializeQuery(query)}
-          onRetry={retry}
+          {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}
           retryLabel={RETRY_PAGE_LABEL}
         />
       ) : null}

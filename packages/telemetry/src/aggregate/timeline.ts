@@ -144,7 +144,7 @@ import type {
   TransitionSource,
 } from '../schema/attributes.js';
 import type { TelemetryEvent } from '../schema/event.js';
-import { STATE_KINDS, TELEMETRY_TIERS } from '../schema/kinds.js';
+import { STATE_KINDS, TELEMETRY_KINDS, TELEMETRY_TIERS } from '../schema/kinds.js';
 import type { TelemetryKind, TelemetryTier } from '../schema/kinds.js';
 
 /*
@@ -2228,6 +2228,22 @@ export interface DependencyGraphNode {
    * participant it resolved statically.
    */
   readonly tier?: TelemetryTier;
+  /**
+   * The distinct telemetry kinds of the collapsed spans, in the canonical order
+   * of `TELEMETRY_KINDS`.
+   *
+   * The participant class above is coarser than the kind vocabulary — a
+   * `ui-event` node may collapse renders, commits or a navigation, and an `api`
+   * node is either the browser's request or the server's — so the class alone
+   * cannot tell a renderer what the node actually is. This list keeps the
+   * kinds on the node, which is what lets a graph colour a participant with
+   * the same span-kind colour the timeline and flame views give its spans.
+   *
+   * Always set by {@link buildDependencyGraph}, never empty there, and never
+   * longer than the kind vocabulary. Optional in the shape for the same reason
+   * as `tier`: a participant contributed without captured records has no kind.
+   */
+  readonly spanKinds?: readonly TelemetryKind[];
   /** A bounded sample of the collapsed span ids; see {@link MAX_SPAN_IDS_PER_DEPENDENCY_NODE}. */
   readonly spanIds: readonly SpanId[];
   /** How many spans collapsed into this node. Never bounded by the sample. */
@@ -2363,6 +2379,8 @@ interface ParticipantAccumulator {
   readonly kind: DependencyNodeKind;
   readonly label: string;
   readonly tier: TelemetryTier;
+  /** Every distinct kind folded in; published sorted, see {@link DependencyGraphNode.spanKinds}. */
+  readonly spanKinds: Set<TelemetryKind>;
   readonly spanIds: SpanId[];
   /**
    * The id of the first record folded in, in canonical order.
@@ -2399,6 +2417,7 @@ interface MutableDependencyGraphNode {
   kind: DependencyNodeKind;
   label: string;
   tier?: TelemetryTier;
+  spanKinds?: readonly TelemetryKind[];
   spanIds: readonly SpanId[];
   count: number;
   totalDurationMs: number;
@@ -2556,6 +2575,7 @@ function accumulateParticipant(
       kind,
       label: identity,
       tier: event.tier,
+      spanKinds: new Set([event.kind]),
       spanIds: [event.spanId],
       firstEventId: event.id,
       firstTraceId: event.traceId,
@@ -2569,6 +2589,7 @@ function accumulateParticipant(
 
   existing.count += 1;
   existing.totalDurationMs += durationMs;
+  existing.spanKinds.add(event.kind);
   if (durationMs > existing.maxDurationMs) {
     existing.maxDurationMs = durationMs;
   }
@@ -2727,6 +2748,20 @@ function assignLayers(
   return layers;
 }
 
+/**
+ * The kinds of `kinds` in the canonical order of `TELEMETRY_KINDS`, so a node's
+ * `spanKinds` is the same list however its records arrived. A kind this build
+ * does not know — a newer producer's, read back from the store — sorts after
+ * every known kind, by its own spelling, rather than being dropped.
+ */
+function canonicalKindOrder(kinds: ReadonlySet<TelemetryKind>): TelemetryKind[] {
+  const rank = (kind: TelemetryKind): number => {
+    const index = TELEMETRY_KINDS.indexOf(kind);
+    return index === -1 ? TELEMETRY_KINDS.length : index;
+  };
+  return [...kinds].sort((left, right) => rank(left) - rank(right) || compareStrings(left, right));
+}
+
 /** Finishes one participant into its output node. */
 function toDependencyNode(accumulator: ParticipantAccumulator, layer: number): DependencyGraphNode {
   const node: MutableDependencyGraphNode = {
@@ -2734,6 +2769,7 @@ function toDependencyNode(accumulator: ParticipantAccumulator, layer: number): D
     kind: accumulator.kind,
     label: accumulator.label,
     tier: accumulator.tier,
+    spanKinds: canonicalKindOrder(accumulator.spanKinds),
     spanIds: [...accumulator.spanIds],
     count: accumulator.count,
     totalDurationMs: roundMs(clampNonNegative(accumulator.totalDurationMs)),

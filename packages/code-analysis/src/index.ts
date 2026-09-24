@@ -340,7 +340,9 @@ export type { BuildIndexOptions, IndexProjectOptions, IndexResult, IndexStats } 
 // database access style, entry points and route inventory, each bounded by
 // `PROJECT_SUMMARY_LIMITS`. The detection helpers and the manifest reader are
 // published beside it so the same answers can be obtained without building a
-// whole summary.
+// whole summary, and so is `isToolingModulePath`, the seed/script/test/config
+// classifier the database adapters use to skip modules that never run inside
+// the dev server.
 // ---------------------------------------------------------------------------
 export {
   PROJECT_SUMMARY_LIMITS,
@@ -349,6 +351,7 @@ export {
   detectFramework,
   detectPackageManager,
   detectRouterStyle,
+  isToolingModulePath,
   parseManifest,
   readTargetManifest,
   summarizeProject,

@@ -53,7 +53,8 @@
  * does not throw. Two `throw`s are reachable from here, both `DebuggenError`
  * with code `INTERNAL`, and both for states a parsed input cannot hold: the
  * exhaustiveness guard on the node switch, which fires for a node type the
- * vocabulary does not contain, and the cycle guard of the layout walk, which
+ * vocabulary does not contain and names the node, what type it declared and
+ * the node types there are, and the cycle guard of the layout walk, which
  * fires for a node found inside its own subtree (a parse always yields a fresh
  * tree). Either is a product bug in whatever assembled the input. Depth is not
  * a third: the layout is walked with an explicit stack rather than by
@@ -64,11 +65,14 @@
  * `Result` here would invite the caller to report a bug of ours as a validation
  * failure of the model's.
  *
- * Normalisation is not a second validator, either. Where the authored value is
- * incomplete in a way the authoring schema chose not to reject — a query-backed
- * node with no source at all — this module emits the node without a query and
- * lets step 3 report it. One validation checkpoint, one error message, at the
- * place the pipeline already looks for one.
+ * Normalisation is not a second validator, either. The authoring schema rejects
+ * a query-backed node that names no source its type can read — flat or inside
+ * its `query` object — unless the type's catalog entry implies one, so every
+ * parsed input resolves a source here. A hand-assembled input that was never
+ * parsed can still lack one; this module then emits the node without a query,
+ * deterministically, and step 3 reports it as `panel_node_query_missing` with
+ * the sources the node type can read. One validation checkpoint per fault, at
+ * the place the pipeline already looks for one.
  *
  * Environment-neutral, like every module in this package: no `node:` builtin,
  * no DOM global, no side effect at load.
@@ -90,7 +94,7 @@
  * ```
  */
 
-import { DebuggenError, assertNever } from '@debuggen/shared';
+import { DebuggenError } from '@debuggen/shared';
 import type { PanelId, SessionId } from '@debuggen/shared';
 
 import { PANEL_NODE_CATALOG } from './catalog.js';
@@ -113,6 +117,7 @@ import {
   PANEL_CHILDREN_FIELD,
   PANEL_LAYOUT_FIELD,
   PANEL_LAYOUT_PATH_ROOT,
+  PANEL_NODE_TYPES,
   PANEL_SPEC_VERSION,
 } from './spec.js';
 import type {
@@ -414,16 +419,25 @@ function mergeFilters(
  * this function carries no branch on `metricCards` — nor on any other node type
  * — and gains none when a second type acquires a default.
  *
+ * The flat `source` of a node that names its source inside `query` may be
+ * written as `null` — the authoring schema's explicit "not here" for that
+ * spelling — and `??` reads it exactly as an absent key, so it never shadows
+ * the catalog default or reaches the output.
+ *
  * Whether the resolved source is one this node type can actually read is not
- * decided here. `./catalog.ts` states each type's readable sources and
- * `./validate.ts` checks them at step 3; a normaliser that also checked would
- * report the same fault twice, in two wordings.
+ * decided here. `./catalog.ts` states each type's readable sources, the
+ * authoring schema admits only those at step 1, and `./validate.ts` checks them
+ * again at step 3 for a document that was never parsed; a normaliser that also
+ * checked would report the same fault a third time, in a third wording.
  *
  * With no source there is nothing to request, so the node is emitted **without
  * a query** and any filter, sort, limit or offset written beside it is dropped
- * with it. The internal schema requires a query of every query-backed node, so
- * step 3 rejects such a node as the syntactic gap it is — which is the reporting
- * this module deliberately does not do itself.
+ * with it. A parsed input cannot reach that branch — the authoring schema
+ * requires a source of every node type without a catalog default — so it is
+ * the hand-assembled input's path, and it stays deterministic: the internal
+ * schema requires a query of every query-backed node, and step 3 rejects such
+ * a node as `panel_node_query_missing`, which is the reporting this module
+ * deliberately does not do itself.
  */
 function liftQuery(input: QueryBackedNodeInput): DataQuery | undefined {
   const declared: DataQueryInput | undefined = input.query;
@@ -567,10 +581,12 @@ function outputArrayFor(authored: readonly PanelNodeInput[]): PanelNode[] {
  * into here — see {@link normalizeLayout} for why.
  *
  * The switch is exhaustive by construction: every branch returns, and the
- * default hands the value to `assertNever`, so a node type added to the
- * vocabulary in `./spec.ts` fails to compile here until it is handled. That is
- * the only reason this function enumerates node types at all — the behaviour
- * within a branch is driven by the catalog, never by the name of the type.
+ * default hands the value — typed `never` — to {@link unknownNodeTypeError}, so
+ * a node type added to the vocabulary in `./spec.ts` fails to compile here
+ * until it is handled, and a hand-assembled node whose type is outside the
+ * vocabulary fails at runtime with an error that says so. That is the only
+ * reason this function enumerates node types at all — the behaviour within a
+ * branch is driven by the catalog, never by the name of the type.
  */
 function normalizeNode(input: PanelNodeInput, id: PanelNodeId): NormalizedNodeShell {
   switch (input.type) {
@@ -651,8 +667,88 @@ function normalizeNode(input: PanelNodeInput, id: PanelNodeId): NormalizedNodeSh
       return { node: normalizeQueryBackedNode(input, id) };
 
     default:
-      return assertNever(input, 'Unhandled authored panel node type');
+      throw unknownNodeTypeError(input, id);
   }
+}
+
+/**
+ * The spelling a declared node type may be named in by
+ * {@link unknownNodeTypeError}: an identifier-shaped token of at most 32
+ * characters, which every node type in the vocabulary is.
+ *
+ * Anything else — prose, a path, a long or oddly spelled string — is described
+ * by what it is rather than quoted, so the error never becomes a carrier for
+ * content: the message names the product's vocabulary and, at most, a token
+ * shaped like a member of it.
+ */
+const NAMEABLE_NODE_TYPE = /^[A-Za-z][A-Za-z0-9_-]{0,31}$/;
+
+/**
+ * Describes the `type` an unhandled authored node declares, for the error
+ * {@link unknownNodeTypeError} raises.
+ *
+ * Reads the field once more, defensively: the switch has already read it, so a
+ * value whose getter throws on the second read is described as unreadable
+ * rather than allowed to replace this error with its own.
+ *
+ * @param input The unhandled node.
+ * @returns A short phrase, for instance `the type "gauge"` or `no type`.
+ */
+function describeDeclaredNodeType(input: unknown): string {
+  let declared: unknown;
+
+  try {
+    declared =
+      typeof input === 'object' && input !== null
+        ? (input as Readonly<Record<string, unknown>>)['type']
+        : undefined;
+  } catch {
+    // Deliberately unbound: the exception is caller-controlled and describes
+    // nothing this error reports.
+    return 'a type that could not be read';
+  }
+
+  if (declared === undefined) {
+    return 'no type';
+  }
+
+  if (typeof declared === 'string') {
+    return NAMEABLE_NODE_TYPE.test(declared)
+      ? `the type "${declared}"`
+      : 'a type string that is not a node type name';
+  }
+
+  return declared === null ? 'a null type' : `a type of the wrong kind (${typeof declared})`;
+}
+
+/**
+ * The failure raised for an authored node whose type the vocabulary does not
+ * contain.
+ *
+ * It cannot come out of `parsePanelSpecInput`, which rejects such a node as
+ * `panel_node_type_unknown` at step 1, so it is a defect in whatever assembled
+ * the value: `INTERNAL`, as the "Totality" contract in this module's
+ * documentation states for every throw here. The message names the node by its
+ * derived id — a path the normaliser minted — says what type it declared (see
+ * {@link describeDeclaredNodeType} for when that is quoted), and the hint lists
+ * the node types, a closed product vocabulary.
+ *
+ * Typed `never` on the node, which is what keeps the switch in
+ * {@link normalizeNode} exhaustive at compile time.
+ *
+ * @param input The unhandled node.
+ * @param id The id derived for its position.
+ * @returns The error to throw.
+ */
+function unknownNodeTypeError(input: never, id: PanelNodeId): DebuggenError {
+  return new DebuggenError(
+    'INTERNAL',
+    `The authored panel node at ${id} declares ${describeDeclaredNodeType(input)}, which is not a panel node type, so it cannot be normalized.`,
+    {
+      hint: `An authored node's type is one of: ${PANEL_NODE_TYPES.join(', ')}. Parse an authored panel with parsePanelSpecInput before normalizing it, or correct whatever assembled this node.`,
+      details: { nodeId: id, nodeTypes: [...PANEL_NODE_TYPES] },
+    },
+  );
 }
 
 /*

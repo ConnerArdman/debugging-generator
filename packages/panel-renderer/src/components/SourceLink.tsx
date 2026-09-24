@@ -57,11 +57,25 @@
  *
  *   - `-1` takes the chip out of the Tab order while keeping it a real,
  *     pointer-activatable, programmatically focusable button. The composite
- *     that asks for it owns the keyboard route to the same intent — a command
- *     on its focused item that calls `onOpenSource` with the same location —
- *     and must advertise that command (for example with `aria-keyshortcuts`).
+ *     that asks for it owns the keyboard route to the same intent: either it
+ *     moves focus onto the chip itself (a grid's cell navigation, below), or
+ *     it offers a command on its focused item that calls `onOpenSource` with
+ *     the same location and advertises it (for example with
+ *     `aria-keyshortcuts`).
  *   - `0`, or omitting the prop, is the browser's own order for a button: the
  *     standalone chip of a summary header or a detail drawer.
+ *
+ * Inside a `DataTable` cell, the caller passes `tabIndex={-1}`: the grid is the
+ * page's single Tab stop, and its own arrow-key cell navigation is what moves
+ * focus onto the chip, after which Enter and Space activate the `<button>`
+ * natively. The index reaches the `<button>` in both interactive shapes — bare,
+ * and wrapped in `Tooltip` when the visible text is abbreviated — because the
+ * tooltip clones its trigger with a merged `aria-describedby` and nothing else.
+ *
+ * There is deliberately no automatic default: the chip never infers `-1` from
+ * an enclosing grid, tree or list, because only the composite knows whether it
+ * owns a keyboard route to the chip, and a chip that silently left the Tab
+ * order inside a composite without one would be unreachable from the keyboard.
  *
  * A positive index is not offered: it reorders the whole page's Tab sequence
  * and is never what a leaf chip means. The inert form ignores the prop
@@ -102,7 +116,11 @@
  * resolves to a `--dg-*` token, so a theme change is a cascade change:
  *
  *   `dg-source-link`             the block: the shared chip pill, monospace,
- *                                accent text on `--dg-surface-elevated`
+ *                                accent text on `--dg-surface-elevated`, at
+ *                                least `--dg-space-7` (24 px) tall in both
+ *                                forms — the interactive chip's pointer target
+ *                                (WCAG 2.2 SC 2.5.8), mirrored by the inert one
+ *                                so a row never changes height with the form
  *   `dg-source-link--compact`    the dense variant a table row embeds
  *   `dg-source-link__icon`       the leading glyph
  *   `dg-source-link__symbol`     the symbol run, in primary text
@@ -117,11 +135,26 @@
  *
  * ## ACCESSIBILITY
  *
- * The interactive form's accessible name is built from the location alone and
- * states the action: `Open <file>:<line>:<column>`. It is deliberately
- * independent of `label`, `showSymbol` and `compact`, so shortening what a
- * sighted reader sees never changes which place the control announces. The
- * glyph is `aria-hidden` and is never the name. Hover is not the only route to
+ * The interactive form's accessible name states the action and always ends
+ * with the full location it opens, and it always contains the text a sighted
+ * reader sees on the chip (WCAG 2.5.3, label in name), so a speech-input user
+ * can activate the chip by saying what is written on it. One rule, computed by
+ * {@link sourceLinkAccessibleName} and nowhere else:
+ *
+ *   - The visible text is what the button renders, in DOM order: the symbol run
+ *     when it is shown, then the chip text, joined by a single space.
+ *   - When `Open <file>:<line>:<column>` already contains that text (compared
+ *     lowercased with whitespace collapsed) — the compact `file:line` chip a row
+ *     embeds — the name is exactly that.
+ *   - Otherwise — a symbol run, a compacted directory, a caller's `label` — the
+ *     name is `<visible text> — open <file>:<line>:<column>`: it starts with
+ *     what is on screen and still ends with the place it opens.
+ *
+ * The DOM carries the same single space between the symbol run and the path
+ * run, so the text an accessibility checker reads off the button is the
+ * visible text this rule compared; the chip's flex layout does not render a
+ * whitespace-only run, so the space changes nothing on screen. The glyph is
+ * `aria-hidden` and is never part of either. Hover is not the only route to
  * the full path: a closed tooltip bubble keeps its text in the accessibility
  * tree, which is what makes the inert form's full location reachable too.
  *
@@ -183,9 +216,10 @@ export interface SourceLinkProps {
    *
    * For the caller that has a better caption than a path — a phrase beside a
    * hypothesis, a column's own wording. A label also suppresses the separate
-   * symbol run, since the caller is stating the whole caption; the accessible
-   * name and the tooltip still name the location in full, so nothing is lost by
-   * shortening what is on screen.
+   * symbol run, since the caller is stating the whole caption. The accessible
+   * name leads with the label and still ends with the location in full, and the
+   * tooltip names it too, so nothing is lost by shortening what is on screen —
+   * which is also why a label should describe the place the chip opens.
    */
   label?: string | undefined;
 
@@ -215,63 +249,62 @@ export interface SourceLinkProps {
 
   /**
    * The interactive chip's place in the Tab order. `-1` for a chip nested in an
-   * item of a composite widget — a tree row, a grid row — whose roving tab stop
-   * is the item itself; `0` or omitted for a standalone chip.
+   * item of a composite widget — a tree row, a grid row, a `DataTable` cell —
+   * whose roving tab stop is the item itself, and whose arrow keys reach the
+   * chip; `0` or omitted for a standalone chip. Never inferred: a caller that
+   * does not pass it gets the browser's own order.
    *
-   * Forwarded to the `<button>` of the interactive form only; the inert form
-   * is never focusable and ignores it. A caller passing `-1` owns the keyboard
-   * route to the same intent (see this module's header).
+   * Forwarded to the `<button>` of the interactive form only, whether or not
+   * that button is wrapped in the abbreviation tooltip; the inert form is never
+   * focusable and ignores it. A caller passing `-1` owns the keyboard route to
+   * the same intent (see this module's header).
    */
   tabIndex?: 0 | -1 | undefined;
 }
 
 /**
- * A pointer into the developer's project, rendered as a chip that opens the
- * file at that line in their editor.
- *
- * @param props The props, as documented on {@link SourceLinkProps}.
- * @returns The chip: interactive when a handler is available, inert when not,
- * wrapped in a tooltip when its visible text is abbreviated.
- *
- * @example A row's location, in the dense form, opening through the host.
- * ```tsx
- * <SourceLink location={item.source} compact />
- * ```
- * @example A standalone chip with an explicit handler and its own caption.
- * ```tsx
- * <SourceLink location={location} label="Open the handler" onOpenSource={open} />
- * ```
- * @example A chip inside a tree row, where the row is the only tab stop.
- * ```tsx
- * <SourceLink location={row.source} compact tabIndex={-1} />
- * ```
+ * The props of {@link SourceLink} that decide what the chip says: its visible
+ * runs, its tooltip and its accessible name. Everything else — the handler,
+ * the Tab index, the class — changes how the chip behaves, never its text.
  */
-export function SourceLink(props: SourceLinkProps): ReactElement {
-  const {
-    location,
-    label,
-    showSymbol = true,
-    compact = false,
-    className,
-    onOpenSource,
-    tabIndex,
-  } = props;
+export type SourceLinkTextInputs = Pick<
+  SourceLinkProps,
+  'location' | 'label' | 'showSymbol' | 'compact'
+>;
 
-  // The prop wins; the host is the fallback; `undefined` is a normal value that
-  // selects the inert form. Reading the context is unconditional, as a hook must
-  // be, and safe outside a provider by that module's documented contract. The
-  // hook answers in the view form, so a host that supplied `openSource` is
-  // reached through `onOpenSource` here with the same location object.
-  const actions = usePanelActions();
-  const openSource = onOpenSource ?? actions?.onOpenSource;
+/** Everything the chip shows and announces, derived from {@link SourceLinkTextInputs}. */
+interface SourceLinkText {
+  /**
+   * The canonical `file:line:column` the chip opens, never shortened: the
+   * accessible name's object and the tooltip's fallback.
+   */
+  readonly target: string;
 
-  // `location` is closed over and passed on by reference - the single guarantee
-  // this component exists to keep. The dependency list is what makes the
-  // identity correct rather than merely current: a row re-keyed to another
-  // location gets a callback bound to that location.
-  const handleClick = useCallback((): void => {
-    openSource?.(location);
-  }, [openSource, location]);
+  /** The tooltip's text. */
+  readonly description: string;
+
+  /** The symbol run, or `undefined` when none is rendered. */
+  readonly symbolText: string | undefined;
+
+  /** The path run: the caller's label, or the visible path and the line. */
+  readonly chipText: string;
+
+  /** Whether the chip hides part of its description and so needs the tooltip. */
+  readonly abbreviated: boolean;
+}
+
+/**
+ * Derives the chip's text from its inputs, applying the component's defaults.
+ *
+ * The one derivation behind both the rendered runs and
+ * {@link sourceLinkAccessibleName}, so what the chip shows and what it
+ * announces are computed from the same strings and cannot drift apart.
+ *
+ * @param inputs The text-bearing props, as the component receives them.
+ * @returns The runs, the target, the description and the abbreviation flag.
+ */
+function deriveSourceLinkText(inputs: SourceLinkTextInputs): SourceLinkText {
+  const { location, label, showSymbol = true, compact = false } = inputs;
 
   const lineResolved = isResolvedCoordinate(location.line);
   const positionResolved = lineResolved && isResolvedCoordinate(location.column);
@@ -306,6 +339,125 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
     !lineResolved ||
     (location.symbol !== undefined && symbolText === undefined);
 
+  return { target, description, symbolText, chipText, abbreviated };
+}
+
+/** Runs of whitespace, collapsed to one space before any name comparison. */
+const WHITESPACE_RUN = /\s+/g;
+
+/**
+ * Text as a reader perceives it: whitespace runs collapsed to one space and
+ * trimmed, the way a rendered line and an accessible name both present it.
+ */
+function collapseWhitespace(text: string): string {
+  return text.replace(WHITESPACE_RUN, ' ').trim();
+}
+
+/**
+ * The accessible name of the interactive chip built from these inputs.
+ *
+ * The chip's single naming rule (WCAG 2.5.3, label in name), exported so a
+ * surface's tests can name the chip exactly as it is named rather than
+ * restating the rule; the component itself calls this function.
+ *
+ *   1. The visible text is what the button renders, in DOM order: the symbol
+ *      run when it is shown, then the chip text, joined by a single space.
+ *   2. The base name is `Open <target>`, the target being the full
+ *      `file:line:column`, an unresolved coordinate spelled
+ *      `NOT_AVAILABLE_LABEL`.
+ *   3. When the base name contains the visible text — both lowercased, with
+ *      whitespace collapsed — the name is the base name.
+ *   4. Otherwise it is `<visible text> — open <target>`: it starts with what is
+ *      on screen, so a speech-input user can say it, and it still ends with the
+ *      full location the chip opens.
+ *
+ * Pure: it reads nothing but its argument, and the inert form, which has no
+ * accessible name of its own, never uses it.
+ *
+ * @param inputs The chip's text-bearing props, with the component's defaults
+ * (`showSymbol` true, `compact` false) applied when omitted.
+ * @returns The accessible name the interactive chip announces.
+ *
+ * @example The compact chip a row embeds keeps the plain form.
+ * ```ts
+ * sourceLinkAccessibleName({ location, compact: true });
+ * // location src/example/Widget.tsx:28:17 → "Open src/example/Widget.tsx:28:17"
+ * ```
+ * @example A chip showing its symbol and a compacted path leads with both.
+ * ```ts
+ * sourceLinkAccessibleName({ location });
+ * // → "renderWidget …/example/Widget.tsx:28 — open src/example/Widget.tsx:28:17"
+ * ```
+ */
+export function sourceLinkAccessibleName(inputs: SourceLinkTextInputs): string {
+  const { target, symbolText, chipText } = deriveSourceLinkText(inputs);
+
+  const visibleText = collapseWhitespace(
+    symbolText === undefined ? chipText : `${symbolText} ${chipText}`,
+  );
+  const baseName = `Open ${target}`;
+
+  return collapseWhitespace(baseName).toLowerCase().includes(visibleText.toLowerCase())
+    ? baseName
+    : `${visibleText} — open ${target}`;
+}
+
+/**
+ * A pointer into the developer's project, rendered as a chip that opens the
+ * file at that line in their editor.
+ *
+ * @param props The props, as documented on {@link SourceLinkProps}.
+ * @returns The chip: interactive when a handler is available, inert when not,
+ * wrapped in a tooltip when its visible text is abbreviated.
+ *
+ * @example A row's location, in the dense form, opening through the host.
+ * ```tsx
+ * <SourceLink location={item.source} compact />
+ * ```
+ * @example A standalone chip with an explicit handler and its own caption.
+ * ```tsx
+ * <SourceLink location={location} label="The widget's click handler" onOpenSource={open} />
+ * ```
+ * @example A chip inside a tree row or a `DataTable` cell, where the composite
+ * is the only tab stop and its arrow keys move focus onto the chip.
+ * ```tsx
+ * <SourceLink location={row.source} compact tabIndex={-1} />
+ * ```
+ */
+export function SourceLink(props: SourceLinkProps): ReactElement {
+  const {
+    location,
+    label,
+    showSymbol = true,
+    compact = false,
+    className,
+    onOpenSource,
+    tabIndex,
+  } = props;
+
+  // The prop wins; the host is the fallback; `undefined` is a normal value that
+  // selects the inert form. Reading the context is unconditional, as a hook must
+  // be, and safe outside a provider by that module's documented contract. The
+  // hook answers in the view form, so a host that supplied `openSource` is
+  // reached through `onOpenSource` here with the same location object.
+  const actions = usePanelActions();
+  const openSource = onOpenSource ?? actions?.onOpenSource;
+
+  // `location` is closed over and passed on by reference - the single guarantee
+  // this component exists to keep. The dependency list is what makes the
+  // identity correct rather than merely current: a row re-keyed to another
+  // location gets a callback bound to that location.
+  const handleClick = useCallback((): void => {
+    openSource?.(location);
+  }, [openSource, location]);
+
+  // What the chip shows, and what it announces, from the same inputs through
+  // the same derivation: the name is the exported rule's own answer, so a test
+  // that names a chip with that helper names it exactly as this render does.
+  const textInputs: SourceLinkTextInputs = { location, label, showSymbol, compact };
+  const { description, symbolText, chipText, abbreviated } = deriveSourceLinkText(textInputs);
+  const accessibleName = sourceLinkAccessibleName(textInputs);
+
   const chipClass = clsx(
     'dg-source-link',
     compact && 'dg-source-link--compact',
@@ -314,14 +466,20 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
   );
 
   // One content node for both forms, so the inert chip is the interactive chip
-  // minus its control - same runs, same classes, same order.
+  // minus its control - same runs, same classes, same order. The single space
+  // after the symbol run is the separator the naming rule joins the runs with:
+  // it puts the words apart in the text an accessibility checker reads off the
+  // button, and the chip's inline-flex layout renders no whitespace-only run,
+  // so the gap on screen stays the token-driven one.
   const content: ReactNode = (
     <>
       <FileCode aria-hidden="true" className="dg-icon dg-source-link__icon" />
       {symbolText === undefined ? null : (
-        <Code size="sm" className="dg-source-link__symbol">
-          {symbolText}
-        </Code>
+        <>
+          <Code size="sm" className="dg-source-link__symbol">
+            {symbolText}
+          </Code>{' '}
+        </>
       )}
       <Code size="sm" className="dg-source-link__file">
         {chipText}
@@ -337,7 +495,7 @@ export function SourceLink(props: SourceLinkProps): ReactElement {
         variant="ghost"
         size="sm"
         className={chipClass}
-        aria-label={`Open ${target}`}
+        aria-label={accessibleName}
         onClick={handleClick}
         // Spread only when given, so an omitted index leaves the button's own
         // Tab order untouched rather than writing an explicit attribute.

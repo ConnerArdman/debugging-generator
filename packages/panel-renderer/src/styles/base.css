@@ -109,11 +109,15 @@
  *
  * ## Accessibility rules that outrank appearance
  *
- * Focus indicators are never removed or suppressed for `:focus-visible`, and
- * the ring comes from `--dg-focus-ring`, so the high-contrast theme's thicker
- * ring is inherited by construction. De-emphasis is expressed with the muted
- * text and subtle border tokens, never with `opacity`, which would silently
- * invalidate the contrast ratios the token test pins.
+ * Keyboard focus is always indicated, and always by `--dg-focus-ring`, so the
+ * high-contrast theme's thicker ring is inherited by construction. The global
+ * `:focus-visible` rule below draws it on the focused element itself. For a
+ * text field or picker, whose native control is borderless inside a visible
+ * box, components.css draws that same ring on the field box — the field's
+ * visible edge — instead of on the control; the ring moves, it is never
+ * removed. De-emphasis is expressed with the muted text and subtle border
+ * tokens, never with `opacity`, which would silently invalidate the contrast
+ * ratios the token test pins.
  *
  * Layout is out of scope here: no page scaffolding, no flex or grid
  * containers, no spacing beyond zeroing user-agent defaults. Spacing and
@@ -267,7 +271,10 @@ body {
 
 /* The ring is the token, so the high-contrast theme's thicker ring needs no
  * rule of its own. `:focus-visible` means a keyboard user sees the ring and a
- * pointer click does not; it is never suppressed. */
+ * pointer click does not. The ring is never removed: the one rule that moves
+ * it is the field rule in components.css, which draws this same token at this
+ * same offset on the field box — the visible edge — rather than on the
+ * borderless native control inside it. */
 :focus-visible {
   outline: var(--dg-focus-ring);
   outline-offset: var(--dg-space-0);

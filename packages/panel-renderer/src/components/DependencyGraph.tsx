@@ -19,11 +19,13 @@
  *   - no force simulation and no layout library of any kind — the layered
  *     geometry is `../utils/scale`'s, which is arithmetic over a column index
  *     and a row index and nothing more;
- *   - no measurement. `getBoundingClientRect`, `ResizeObserver` and
- *     `offsetWidth` appear nowhere: the canvas declares a fixed logical
- *     `viewBox` and the stylesheet sizes it relationally, which is also why the
- *     component renders identically under happy-dom, where every measurement
- *     answers zero.
+ *   - one measurement, and only one: the inner width of the canvas's scroll
+ *     viewport, observed by `useChartCanvas` (`../utils/measure`), which sets
+ *     the space between columns and nothing else. It is responsive sizing, not
+ *     an interaction: no box, label, column or reading order depends on it, and
+ *     where there is no layout to measure (happy-dom, where every measurement
+ *     answers zero) the component draws the unmeasured rhythm, identically on
+ *     every render. See "The canvas is drawn in CSS pixels" below.
  *
  * The limitation is stated on screen rather than left for a reader to discover
  * by trying to drag the picture — see {@link STATIC_LAYOUT_NOTE}.
@@ -65,17 +67,26 @@
  *   - **The canvas.** An SVG carrying `role="img"` and a text alternative that
  *     states how many participants, layers and relationships it holds and where
  *     the equivalent is. It is a picture: pointer hover and click, no tab stop,
- *     and every shape has an SVG `<title>` for the pointer user.
+ *     and every shape has an SVG `<title>` for the pointer user. A click on a
+ *     shape selects its participant and, where the participant resolved to a
+ *     source location, opens that location in the editor (AAP 0.6.2: "node →
+ *     `onOpenSource` where a location exists") — the canvas has no chip of its
+ *     own, so the shape carries both intents, and its title says so. That
+ *     title is the user agent's — never shown on focus, never dismissible — so
+ *     nothing it says is found there alone: the participant's grid row below
+ *     always shows the same detail. Hovering a shape highlights it on the
+ *     canvas, and Escape dismisses that highlight.
  *   - **The participants grid.** The `DataTable` primitive — one row per
  *     participant, ordered by layer and stating it, with the participant's
  *     label, its class, its timing, its outgoing relationships and its source
  *     chip. It is the library's own keyboard-navigable grid (a roving tab stop,
  *     arrow keys, Enter and Space), it is rendered unvirtualized so that it
  *     covers **every** participant rather than a window, and it is what makes
- *     the view operable without a pointer. The row that holds keyboard focus
- *     shows its participant's full label, tier and metrics inline — what a
- *     pointer user reads in the label's tooltip — so nothing is reachable by
- *     hover alone, and no tab stop is added to get there (see
+ *     the view operable without a pointer. Every row shows its participant's
+ *     full label, tier and metrics inline, in one form whatever holds focus,
+ *     the pointer or the selection — so nothing is reachable by hover alone,
+ *     no tab stop is added to get there, and no row changes height under a
+ *     pointer between the press and the release of a click (see
  *     {@link ParticipantCell}). A raw `<ul>` was the alternative and
  *     is not used: AAP 0.6.4 permits no raw `<table>` or bespoke list chrome
  *     above the primitives layer, `../styles/components.css` declares no rule
@@ -93,16 +104,41 @@
  * carries neither, and its `spanIds` sample is never passed off as an event id:
  * that would resolve to nothing in the details drawer, and
  * `../host/PanelActions` is explicit that a fabricated coordinate is worse than
- * an absent one. So activation selects locally (the row and the shape both take
- * `dg-is-selected`) and reports to the host **only** when the participant
- * declares a coordinate that passes validation: a single record, one
- * well-formed span id, an opaque event id and a well-formed trace id (see
+ * an absent one. So activation reports to the host **only** when the
+ * participant declares a coordinate that passes validation: a single record,
+ * one well-formed span id, an opaque event id and a well-formed trace id (see
  * `eventCoordinateOf`). The payload crosses a shallow protocol guard, so a
  * coordinate that breaks those rules — an event id on a multi-record
  * participant, say — is not reported at all, and the view says under the grid
  * how many participants declared one. Nothing is invented. A participant with
  * neither an event coordinate nor a source location still reads fully — label,
  * class, timing, relationships — and offers no control that would do nothing.
+ *
+ * Opening source is a separate intent with separate evidence. A participant's
+ * `source` is the location the aggregate resolved for it, which a collapse of
+ * several records carries as readily as a single one, so a click on its shape
+ * opens that location whenever it exists — with or without an event coordinate
+ * — and hands the host the payload's own object, by reference, exactly as
+ * `./SourceLink` does. In the grid the two intents stay apart: activating a row
+ * (a click, Enter or Space) only selects, and the row's source chip is the
+ * control that opens the editor, so a keyboard user can do either without
+ * doing both.
+ *
+ * ## THE SELECTION IS THE PANEL'S, AND A LOCAL HIGHLIGHT YIELDS TO IT
+ *
+ * The selected participant (the row and the shape both take `dg-is-selected`)
+ * is resolved from the panel host's one shared selection, read through
+ * `useViewSelection`: the participant whose validated coordinate
+ * `matchesPanelSelection` pairs with it is the selected one, so a span selected
+ * in the timeline or the flame chart is marked here too, and one activated here
+ * moves their marks. A participant with no coordinate cannot enter that
+ * selection, yet activating it still has to show where the reader aimed; it is
+ * highlighted locally, and the highlight records the shared selection it was
+ * made under. The moment that selection changes — any view, or this one,
+ * selects an event — the local highlight gives way to it, so this graph never
+ * keeps marking a participant the other charts have moved on from. Re-selecting
+ * the event that is already selected is not a change the host reports, so it
+ * leaves the highlight as it is.
  *
  * The same holds for how a relationship was known. The aggregate counts, per
  * edge, how many of its records joined their caller through a lineage
@@ -119,8 +155,8 @@
  * passed the redaction layer — an interaction and its target, a matched route, a
  * module and a symbol, a database system (AAP 0.5.2). This file renders labels
  * as given: it never parses one, never reassembles a URL or a statement from
- * one, and shortens one only for display (with the full text in the tooltip on
- * hover, and inline in the grid row that holds keyboard focus).
+ * one, and shortens one only to fit a box on the canvas (with the full text in
+ * that shape's title, and in full, wrapped, in its grid row).
  * The only vocabulary this file writes is generic product vocabulary: the six
  * participant classes of the closed telemetry domain and the column headings.
  * A specific component, function or route name here would be exactly the
@@ -136,7 +172,10 @@
  * a page, so there is nothing to load more of — and where the payload says it
  * was bounded, or where a relationship named a participant the payload does not
  * contain, this component says so rather than drawing a graph that looks
- * complete.
+ * complete. A bounded graph is a PARTIAL RESULT, stated beside the canvas in
+ * the shape the timeline and the flame chart share: the "Partial result"
+ * badge, how many of the most significant participants are drawn, and the
+ * route to the rest — narrowing the query to one trace or interaction.
  *
  * ## THE KNOWN BOUNDS OF A STATIC PICTURE, MEASURED IN THE BROWSER
  *
@@ -151,19 +190,40 @@
  *     screen-reader user has. A relationship that runs backwards — what a cyclic
  *     dependency produces — is anchored correctly by the helper and stays
  *     legible in the grid.
- *   - **A wide graph scales to the panel's width rather than scrolling it.**
- *     `../styles/base.css` caps every `svg` at `max-width: 100%`, so the fixed
- *     `viewBox` is fitted uniformly (measured at 0.96 for eight participants)
- *     and a tall graph scrolls in the block axis inside the viewport's own
- *     `max-block-size`. The participants grid is the complete reading of a graph
- *     too large to take in at a glance, which is the other reason it is never
- *     virtualized.
+ *   - **The canvas is drawn in CSS pixels, and a graph too wide to fit scrolls.**
+ *     A fixed logical `viewBox` fitted to the panel was the alternative, and it
+ *     shrank every label with the panel — to about a quarter of its type size
+ *     in a docked DevTools panel — while leaving a blank band beneath the
+ *     drawing. Instead the canvas's `width` and `height` equal its `viewBox`
+ *     size, one user unit to one pixel (`components.css` lifts `base.css`'s
+ *     `max-width` cap from this canvas so nothing rescales it), so text renders
+ *     at its token size at every width and the canvas is exactly as tall as
+ *     its participants. The boxes keep their size — their labels are budgeted
+ *     for it — and the column gap is what follows the viewport: fitted by
+ *     `fitGraphColumnGap` so a graph that fits spreads its columns across the
+ *     viewport (up to `MAX_GRAPH_COLUMN_GAP`, past which it stops short of the
+ *     right edge rather than scattering related participants), and one that
+ *     cannot fit even at the narrowest gap is drawn at that gap and scrolls
+ *     horizontally inside its viewport at full size. The narrowest gap still
+ *     holds every relationship count drawn in it, measured in its own font
+ *     (see {@link fittedColumnGap}). Measured on the eight-participant fixture
+ *     from 375 to 1920 px: one unit per pixel and 11 px text at every width;
+ *     a 1256 px viewport holds all six columns at a 49 unit gap with no
+ *     scrollbar, a 1896 px one stops at the widest gap 86 px short of the
+ *     edge, and a 351 px one scrolls the drawing laid out at the 32 unit gap,
+ *     with no band beneath it in any of them. A tall graph scrolls
+ *     in the block axis inside the viewport's own `max-block-size`. The
+ *     participants grid is the complete reading of a graph too large to take
+ *     in at a glance, which is the other reason it is never virtualized.
  *   - **The relationship curves carry no information of their own.** The
  *     stroke is the design system's edge treatment in
  *     `../styles/components.css`, whose contrast is owned and tested with the
- *     design tokens; this component writes no colour, and every relationship
- *     is also enumerated in text in the grid. See the BLITZY [A11Y] note beside
- *     the edge group below.
+ *     design tokens; a relationship known through an inferred lineage is
+ *     stroked in the info tone and one whose lineage was ambiguous is dashed
+ *     in the warning tone, by state class. This component writes no colour,
+ *     and every relationship — with how it was known — is also enumerated in
+ *     text in the grid. See the BLITZY [A11Y] note beside the edge group
+ *     below.
  *
  * ## WHAT IT READS
  *
@@ -188,7 +248,9 @@
  * are unitless SVG geometry from `../utils/scale`:
  *
  *   dg-dependency-graph              the block
- *   dg-dependency-graph__legend      the participant-class key
+ *   dg-dependency-graph__legend      the colour key: the six participant
+ *                                    classes, then any span-kind colour a
+ *                                    participant is drawn in instead
  *   dg-dependency-graph__viewport    the scroll container around the canvas
  *   dg-dependency-graph__canvas      the SVG
  *   dg-dependency-graph__column      one layer's group of shapes
@@ -196,20 +258,29 @@
  *   dg-dependency-graph__node--*     its participant class
  *   dg-dependency-graph__node-label  the label inside the box
  *   dg-dependency-graph__node-meta   the metrics line inside the box
- *   dg-dependency-graph__edge        a relationship, on the canvas and as a chip
+ *   dg-dependency-graph__edge        a relationship's curve on the canvas
  *   dg-dependency-graph__edge-label  a repeated relationship's count
- *   dg-dependency-graph__tooltip     the slot the tooltip is positioned in
+ *   dg-dependency-graph__relationship
+ *                                    a relationship's chip in the grid, which
+ *                                    wraps inside its cell
+ *   dg-dependency-graph__participant-label
+ *                                    a participant's full label in the grid,
+ *                                    wrapped rather than truncated
  *   dg-dependency-graph__equivalent  the participants grid
  *   dg-dependency-graph__note        the notes under the grid
  *   dg-dependency-graph__empty       the three state boxes, as every
  *   dg-dependency-graph__loading     visualization in this folder declares
  *   dg-dependency-graph__error       them
- *   dg-is-selected / dg-is-hovered / dg-is-ambiguous   the states
+ *   dg-is-selected / dg-is-hovered   a participant's states
+ *   dg-is-inferred / dg-is-ambiguous a relationship's lineage state, on its
+ *                                    curve and on its chip
  *
  * The caller's `className` is composed last.
  *
- * @see ../utils/scale for the layered geometry and the edge paths.
- * @see ../utils/color for the participant-class colour scale.
+ * @see ../utils/scale for the layered geometry, the edge paths and the fitted column gap.
+ * @see ../utils/measure for the viewport width and the label measure.
+ * @see ../utils/color for the participant colour rule: span kinds first, then
+ * the participant-class scale.
  * @see ../host/DataProvider for the data seam and the `graph` result shape.
  * @see ../styles/components.css for the implementation of the classes above.
  */
@@ -224,17 +295,19 @@ import type {
   DependencyGraphData,
   DependencyGraphEdge,
   DependencyGraphNode,
+  TelemetryKind,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
 import { Workflow } from 'lucide-react';
-import { Fragment, createContext, useCallback, useContext, useMemo, useState } from 'react';
-import type { CSSProperties, FocusEvent, ReactElement } from 'react';
+import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { CSSProperties, ReactElement } from 'react';
 
-import { usePanelActions } from '../host/PanelActions';
-import type { PanelEventRef } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Badge } from '../primitives/Badge';
+import type { BadgeTone } from '../primitives/Badge';
 import { DataTable } from '../primitives/DataTable';
 import type { DataTableColumn } from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
@@ -242,22 +315,36 @@ import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
-import { Tooltip } from '../primitives/Tooltip';
-import { dependencyNodeColorVar } from '../utils/color';
+import {
+  dependencyNodeColorVar,
+  dependencyNodeTokenKey,
+  dependencyParticipantColorVar,
+  dependencyParticipantTokenKey,
+} from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  countedNoun,
   formatCount,
+  formatCountOf,
   formatDurationCompact,
+  formatKindLabel,
   formatTierLabel,
+  pluralize,
   truncate,
 } from '../utils/format';
+import { useChartCanvas } from '../utils/measure';
+import type { TextMeasure } from '../utils/measure';
+import type { CountedNoun } from '../utils/format';
 import {
+  MIN_GRAPH_COLUMN_GAP,
   edgePathData,
+  fitGraphColumnGap,
   interpolate,
+  isMeasuredWidth,
   layoutDependencyGraph,
   resolveGraphLayering,
 } from '../utils/scale';
-import type { DependencyGraphLayout, GraphNodeBox } from '../utils/scale';
+import type { DependencyGraphLayout, GraphLayering, GraphNodeBox } from '../utils/scale';
 import { SourceLink } from './SourceLink';
 
 /**
@@ -361,7 +448,11 @@ const KIND_LEGEND_ORDER: readonly DependencyGraphNode['kind'][] = Object.freeze(
  * Geometry
  *
  * Every coordinate below is either a value `../utils/scale` returned or plain
- * arithmetic over one. Nothing here is a CSS length, and nothing is measured.
+ * arithmetic over one, in SVG user units that the canvas draws one to a CSS
+ * pixel. Nothing here is a CSS length. Two inputs are measured, both through
+ * `useChartCanvas`: the viewport's inner width, and the advance of the
+ * relationship count labels in their font. Together they choose the column
+ * gap ({@link fittedColumnGap}); nothing else is derived from a measurement.
  * ---------------------------------------------------------------------------
  */
 
@@ -387,22 +478,34 @@ const BOX_TEXT_BANDS = 3;
  * Approximate SVG user units one label character occupies at the label's type
  * role (`--dg-text-sm`).
  *
- * An estimate, and necessarily one: measuring text would mean reading layout
- * back from the document, which this component does not do. It is used only to
- * choose a truncation budget — the stylesheet, not this number, decides how the
- * text is drawn — so an approximation that errs toward a shorter label is the
- * safe direction.
+ * An estimate: a box is the same width at every panel width — only the gaps
+ * between columns follow the viewport — so its budget is a constant of the
+ * rhythm rather than a measurement. It is used only to choose a truncation
+ * budget — the stylesheet, not this number, decides how the text is drawn — so
+ * an approximation that errs toward a shorter label is the safe direction.
  */
 const LABEL_CHARACTER_WIDTH = 8;
 
 /** The shortest label a box will show before the ellipsis, however narrow it is. */
 const MIN_LABEL_CHARACTERS = 6;
 
-/** Longest relationship-chip label in the participants grid, in code points. */
-const MAX_CHIP_LABEL_CHARACTERS = 28;
-
 /** The fraction along an edge its count label sits at: the midpoint. */
 const EDGE_LABEL_POSITION = 0.5;
+
+/**
+ * The typography token a relationship's count label is set in: `monoSm`, the
+ * `font` `components.css` gives `dg-dependency-graph__edge-label`. The viewport
+ * measure resolves it, so {@link fittedColumnGap} measures those labels in the
+ * face they are drawn in.
+ */
+const EDGE_LABEL_FONT = 'monoSm';
+
+/**
+ * The space kept clear between a count label's ink and the outline of the box
+ * on either side of it, in SVG user units, so a label drawn in a column gap
+ * never touches the participant it sits beside.
+ */
+const EDGE_LABEL_CLEARANCE = 4;
 
 /** Where a participant's label baseline sits inside its box. */
 function labelY(box: GraphNodeBox): number {
@@ -419,7 +522,20 @@ function labelBudget(width: number): number {
   return Math.max(MIN_LABEL_CHARACTERS, Math.floor(width / LABEL_CHARACTER_WIDTH));
 }
 
-/** The canvas box: the layout's own size, inset so no outline is clipped. */
+/** A repeated relationship's count, as the canvas labels its curve: `×3`. */
+function edgeCountText(count: number): string {
+  return `×${formatCount(count)}`;
+}
+
+/**
+ * The canvas box: the layout's own size, inset so no outline is clipped.
+ *
+ * It is also the canvas's size in CSS pixels. The `width` and `height`
+ * attributes and the `viewBox` ({@link canvasViewBox}) are the same two
+ * numbers, so one user unit is one pixel: nothing rescales the drawing, its
+ * text renders at its token size, and the element is exactly as tall as its
+ * content, with no band beneath it.
+ */
 function canvasSize(layout: DependencyGraphLayout): { width: number; height: number } {
   return {
     width: layout.width + OUTLINE_INSET * 2,
@@ -427,15 +543,191 @@ function canvasSize(layout: DependencyGraphLayout): { width: number; height: num
   };
 }
 
-/** The logical `viewBox` of the canvas, with the outline inset applied. */
+/** The `viewBox` of the canvas: its pixel size, with the outline inset applied. */
 function canvasViewBox(layout: DependencyGraphLayout): string {
   const { width, height } = canvasSize(layout);
   return `${String(-OUTLINE_INSET)} ${String(-OUTLINE_INSET)} ${String(width)} ${String(height)}`;
 }
 
-/** The participant colour as the custom property the stylesheet consumes. */
-function nodeColorStyle(kind: DependencyGraphNode['kind']): CssVariableStyle {
-  return { '--dgc-node-color': dependencyNodeColorVar(kind) };
+/**
+ * How many columns a layout built from `layering` uses: one past the highest
+ * column any participant was given, and `0` for an empty graph.
+ *
+ * `layoutDependencyGraph` reports the same count as its `layerCount`, by the
+ * same rule — a column index that is not a whole number of zero or more is
+ * read as `0`. It is read here from the layering because the column gap the
+ * layout is built with depends on it, which keeps the layout to one call per
+ * gap rather than a trial layout followed by the real one.
+ */
+function columnCountOf(layering: GraphLayering): number {
+  let highest = -1;
+  for (const layer of layering.layers.values()) {
+    highest = Math.max(highest, Number.isInteger(layer) && layer >= 0 ? layer : 0);
+  }
+  return highest + 1;
+}
+
+/**
+ * The distinct count labels the canvas draws inside a column gap.
+ *
+ * A repeated relationship's count sits at the midpoint of its anchors
+ * ({@link EDGE_LABEL_POSITION}). For a relationship from one column to the
+ * next, that midpoint is the centre of the gap between the two columns, so
+ * the gap is all the room its label has; those are the labels the narrowest
+ * gap is sized for. A relationship that skips columns, runs backwards or stays
+ * in one column labels a point outside any single gap, and one naming a
+ * participant the graph does not contain is not drawn, so neither constrains
+ * the gap.
+ *
+ * @param edges The payload's relationships.
+ * @param layers The column of every participant, from the resolved layering.
+ */
+function gapCountLabelsOf(
+  edges: readonly DependencyGraphEdge[],
+  layers: ReadonlyMap<string, number>,
+): readonly string[] {
+  const labels = new Set<string>();
+  for (const edge of edges) {
+    if (edge.count <= 1) {
+      continue;
+    }
+    const from = layers.get(edge.from);
+    if (from !== undefined && layers.get(edge.to) === from + 1) {
+      labels.add(edgeCountText(edge.count));
+    }
+  }
+  return [...labels];
+}
+
+/**
+ * The narrowest column gap that holds every label in `labels`: the widest
+ * one's advance in its font, plus {@link EDGE_LABEL_CLEARANCE} and the half
+ * outline ({@link OUTLINE_INSET}) that each neighbouring box's stroke reaches
+ * into the gap, on both sides. Never less than `MIN_GRAPH_COLUMN_GAP`, the
+ * narrowest gap at which a curve still reads as a connector.
+ *
+ * A measure that answers a non-finite advance is ignored rather than trusted.
+ *
+ * @param labels The count labels drawn inside a column gap.
+ * @param measure Measures a string in the labels' font.
+ */
+function minimumColumnGap(labels: readonly string[], measure: TextMeasure): number {
+  let widest = 0;
+  for (const label of labels) {
+    const advance = measure(label);
+    if (Number.isFinite(advance) && advance > widest) {
+      widest = advance;
+    }
+  }
+  if (widest === 0) {
+    return MIN_GRAPH_COLUMN_GAP;
+  }
+  return Math.max(
+    MIN_GRAPH_COLUMN_GAP,
+    Math.ceil(widest) + 2 * (EDGE_LABEL_CLEARANCE + OUTLINE_INSET),
+  );
+}
+
+/**
+ * The column gap to lay the graph out with, given the viewport it is drawn in.
+ *
+ * - **Measured.** `fitGraphColumnGap` over the viewport's inner width less the
+ *   canvas inset, so the whole canvas, outlines included, fits the viewport
+ *   whenever the graph can. Its columns spread to fill the width up to
+ *   `MAX_GRAPH_COLUMN_GAP` and tighten down to {@link minimumColumnGap}; a
+ *   graph that does not fit at that gap is drawn at it, wider than its
+ *   viewport, which then scrolls horizontally with the drawing at full size.
+ * - **Unmeasured** — `width` is `undefined` before the first measurement and
+ *   wherever there is no layout — `fitGraphColumnGap` answers
+ *   `DEFAULT_GRAPH_COLUMN_GAP`, the rhythm the layout-free suites assert.
+ *
+ * A viewport narrower than the inset itself is still a measurement: it asks
+ * for the narrowest gap rather than falling back to the unmeasured rhythm.
+ *
+ * @param columnCount How many columns the layout uses.
+ * @param gapLabels The count labels drawn inside a column gap.
+ * @param width The viewport's inner width in CSS pixels, if measured.
+ * @param measure Measures a string in the count labels' font.
+ * @returns A finite, non-negative gap in SVG user units.
+ */
+function fittedColumnGap(
+  columnCount: number,
+  gapLabels: readonly string[],
+  width: number | undefined,
+  measure: TextMeasure,
+): number {
+  if (!isMeasuredWidth(width)) {
+    return fitGraphColumnGap(undefined, columnCount);
+  }
+  return fitGraphColumnGap(Math.max(1, width - OUTLINE_INSET * 2), columnCount, {
+    minGap: minimumColumnGap(gapLabels, measure),
+  });
+}
+
+/**
+ * The participant colour as the custom property the stylesheet consumes.
+ *
+ * The participant's own span kinds decide it when they agree on one span-kind
+ * colour, so a box is drawn in the colour the same spans have in the timeline,
+ * the flame view and the waterfall; otherwise its class colour does. The rule
+ * is `dependencyParticipantTokenKey` in `../utils/color.ts`.
+ */
+function nodeColorStyle(node: DependencyGraphNode): CssVariableStyle {
+  return { '--dgc-node-color': dependencyParticipantColorVar(node) };
+}
+
+/**
+ * One key entry beyond the six class chips: a span-kind colour some participant
+ * is drawn in that is not its class's own colour, with the kinds it stands for.
+ */
+interface SpanColourKeyEntry {
+  /** The `var(--dg-*)` reference the entry's participants are stroked with. */
+  readonly colorVar: string;
+  /** The kinds drawn in that colour off their class colour, first seen first. */
+  readonly kinds: readonly TelemetryKind[];
+}
+
+/**
+ * The key entries the six class chips do not already explain.
+ *
+ * A participant whose span kinds settle a colour of their own — a render, the
+ * server's end of a request, a failure — is drawn in that colour rather than its
+ * class's, so the class key alone would leave the colour unnamed. Each such
+ * colour gets one entry, labelled with the kinds drawn in it, in the order the
+ * participants are listed, which is deterministic for one graph. A colour that
+ * equals a participant's class colour needs no entry: its class chip names it.
+ *
+ * @param rows - The participants, in the grid's canonical order.
+ * @returns One entry per off-class colour, first seen first; empty when every
+ *   participant is drawn in its class colour.
+ */
+function spanColourKey(rows: readonly ParticipantRow[]): SpanColourKeyEntry[] {
+  const entries = new Map<string, { colorVar: string; kinds: TelemetryKind[] }>();
+
+  for (const { node } of rows) {
+    const token = dependencyParticipantTokenKey(node);
+    if (token === dependencyNodeTokenKey(node.kind)) {
+      continue;
+    }
+
+    const entry = entries.get(token) ?? {
+      colorVar: dependencyParticipantColorVar(node),
+      kinds: [],
+    };
+    for (const kind of node.spanKinds ?? []) {
+      if (!entry.kinds.includes(kind)) {
+        entry.kinds.push(kind);
+      }
+    }
+    entries.set(token, entry);
+  }
+
+  return [...entries.values()];
+}
+
+/** A key entry's text: the readable names of the kinds it stands for. */
+function spanColourKeyLabel(entry: SpanColourKeyEntry): string {
+  return entry.kinds.map(formatKindLabel).join(' · ');
 }
 
 /*
@@ -489,6 +781,36 @@ function canonicalGraph(
   };
 }
 
+/** A payload prepared for layout: everything about it that no viewport width changes. */
+interface GraphArrangement {
+  /** The payload with its participants in canonical order. */
+  readonly graph: DependencyGraphData;
+  /** The layering resolved for it, which both the order and the geometry use. */
+  readonly layering: GraphLayering;
+  /** How many columns its layout uses; see {@link columnCountOf}. */
+  readonly columnCount: number;
+  /** Its count labels that sit inside a column gap; see {@link gapCountLabelsOf}. */
+  readonly gapLabels: readonly string[];
+}
+
+/**
+ * Everything about a payload's layout that the viewport width does not
+ * change: one layering, the canonical order built from that same object, the
+ * column count and the count labels the column gap must hold.
+ *
+ * Computed once per payload. A resize then rebuilds only the geometry, from
+ * this same layering, so the layering never runs twice for one payload.
+ */
+function arrangeGraph(data: DependencyGraphData): GraphArrangement {
+  const layering = resolveGraphLayering(data.nodes, data.edges);
+  return {
+    graph: canonicalGraph(data, layering.layers),
+    layering,
+    columnCount: columnCountOf(layering),
+    gapLabels: gapCountLabelsOf(data.edges, layering.layers),
+  };
+}
+
 /*
  * ---------------------------------------------------------------------------
  * The event coordinate and the lineage the aggregate declares — validated
@@ -529,11 +851,6 @@ const ABSENT: Declaration<never> = Object.freeze({ state: 'absent' });
 
 /** The inconsistent declaration, shared. */
 const INVALID: Declaration<never> = Object.freeze({ state: 'invalid' });
-
-/** The value when it is a string with something in it, and `undefined` otherwise. */
-function nonBlankString(value: unknown): string | undefined {
-  return typeof value === 'string' && value.trim().length > 0 ? value : undefined;
-}
 
 /**
  * Whether a value is an opaque event id: a non-empty string with no surrounding
@@ -622,17 +939,58 @@ function usableLineageOf(edge: DependencyGraphEdge): LineageTally | undefined {
 }
 
 /**
- * Whether any of a relationship's records was inferred rather than measured.
+ * How a relationship was known, as the one state both of its marks — the curve
+ * on the canvas and the chip in the grid — are drawn from.
  *
- * An inferred relationship is drawn dashed and chipped as such, exactly as the
- * timeline marks an async continuation: a guessed relationship must never read
- * as a measured one (AAP 0.4.2). Nothing is inferred *here* — the counts are
- * read and validated, never derived, and an edge that declares none, or
- * declares an inconsistent lineage, is not marked.
+ * - `measured`: every record joined its caller by nesting. So is an edge that
+ *   declares no lineage, or an inconsistent one (which is reported instead).
+ * - `inferred`: some records joined through a lineage attribution (an async
+ *   continuation, AAP 0.4.2), and each of those attributions had exactly one
+ *   candidate. Not measured, so it is told apart — but not in doubt either.
+ * - `ambiguous`: at least one of those attributions chose among several open
+ *   candidates. This, and only this, is the relationship the timeline dashes
+ *   (AAP 0.4.2: the edge is dashed when `lineageAmbiguous` is set), so it is
+ *   the only one dashed here.
  */
-function isInferredRelationship(edge: DependencyGraphEdge): boolean {
-  return (usableLineageOf(edge)?.inferred ?? 0) > 0;
+type LineageState = 'measured' | 'inferred' | 'ambiguous';
+
+/**
+ * The lineage state of a relationship's validated counts.
+ *
+ * Nothing is inferred *here*: the counts are read and validated by
+ * {@link edgeLineageOf}, never derived, and a relationship whose declaration is
+ * absent or inconsistent reads as measured.
+ */
+function lineageStateOf(lineage: LineageTally | undefined): LineageState {
+  if (lineage === undefined || lineage.inferred === 0) {
+    return 'measured';
+  }
+
+  return lineage.ambiguous > 0 ? 'ambiguous' : 'inferred';
 }
+
+/**
+ * The state class each lineage state carries, on the curve and on the chip.
+ * Spelled out, as the class inventory requires; a measured relationship
+ * carries none.
+ */
+const LINEAGE_STATE_CLASS: Readonly<Record<LineageState, string | undefined>> = Object.freeze({
+  measured: undefined,
+  inferred: 'dg-is-inferred',
+  ambiguous: 'dg-is-ambiguous',
+});
+
+/**
+ * The chip tone each lineage state reads in: the info tone for a relationship
+ * inferred from a single candidate, the warning tone for one that was a choice
+ * among several. The chip's text names the state in words either way, so
+ * the tone is never the only signal (AAP 0.6.4).
+ */
+const LINEAGE_TONE: Readonly<Record<LineageState, BadgeTone>> = Object.freeze({
+  measured: 'neutral',
+  inferred: 'info',
+  ambiguous: 'warning',
+});
 
 /** How many declarations of a payload were present but inconsistent. */
 interface InconsistentDeclarations {
@@ -670,8 +1028,8 @@ interface ParticipantRelationship {
    * {@link edgeLineageOf}.
    */
   readonly lineage: LineageTally | undefined;
-  /** Whether any of its records was inferred rather than measured. */
-  readonly inferred: boolean;
+  /** How it was known — measured, inferred or ambiguous; see {@link lineageStateOf}. */
+  readonly state: LineageState;
 }
 
 /** One participant: its datum, its box, what it calls and what it stands for. */
@@ -726,7 +1084,7 @@ function buildRows(layout: DependencyGraphLayout): readonly ParticipantRow[] {
       edge,
       targetLabel: labels.get(edge.to) ?? edge.to,
       lineage,
-      inferred: (lineage?.inferred ?? 0) > 0,
+      state: lineageStateOf(lineage),
     });
     outgoing.set(edge.from, relationships);
   }
@@ -740,6 +1098,52 @@ function buildRows(layout: DependencyGraphLayout): readonly ParticipantRow[] {
       eventRef: coordinate.state === 'valid' ? coordinate.value : undefined,
     };
   });
+}
+
+/**
+ * A participant highlighted locally because it stands for no single event, and
+ * the panel selection that was current when it was activated.
+ *
+ * The highlight holds only while that selection is still the panel's current
+ * one — compared by identity, which the host and the standalone fallback both
+ * keep stable until a different event is selected — so a later selection in
+ * any view ends it without an effect or a subscription.
+ */
+interface LocalHighlight {
+  /** The highlighted participant's id. */
+  readonly participantId: string;
+  /** The panel selection it was made under; `undefined` when nothing was selected. */
+  readonly basis: PanelSelection | undefined;
+}
+
+/**
+ * The id of the participant this graph marks as selected, or `undefined`.
+ *
+ * A local highlight still made under the current selection wins, because it is
+ * the reader's latest gesture in this view and it names no event the other
+ * charts could be marking instead. Otherwise the participant whose validated
+ * coordinate the panel's selection matches is the selected one — the same
+ * event every other chart of the panel marks.
+ *
+ * @param rows The participants, as both representations draw them.
+ * @param selection The panel's selection, as `useViewSelection` returns it.
+ * @param local The local highlight, if one was made.
+ * @returns The selected participant's id, if any participant is selected.
+ */
+function selectedParticipantIdOf(
+  rows: readonly ParticipantRow[],
+  selection: PanelSelection | undefined,
+  local: LocalHighlight | undefined,
+): string | undefined {
+  if (
+    local !== undefined &&
+    local.basis === selection &&
+    rows.some((row) => row.node.id === local.participantId)
+  ) {
+    return local.participantId;
+  }
+
+  return rows.find((row) => matchesPanelSelection(selection, row.eventRef))?.node.id;
 }
 
 /**
@@ -792,73 +1196,6 @@ function buildColumns(rows: readonly ParticipantRow[]): readonly ParticipantColu
 
 /*
  * ---------------------------------------------------------------------------
- * Keyboard focus
- *
- * The grid's focus target is its row — a roving tab stop the `DataTable`
- * primitive owns — so a tooltip on the label, which opens only for focus inside
- * its own wrapper, is never reached from the keyboard. Instead the block
- * listens to focus arriving anywhere inside it, finds the grid row that holds
- * it, and publishes that row's participant id; the one cell that answers to it
- * then shows the label's detail inline. No element gains a tab stop, and
- * neither the primitive nor the tooltip is changed.
- * ---------------------------------------------------------------------------
- */
-
-/**
- * The id of the participant whose grid row holds keyboard focus, or `undefined`
- * when focus is elsewhere.
- *
- * Context rather than a prop: the grid's cells are rendered by `DataTable` from
- * the module-constant column list, which hands a cell its row and nothing
- * else, so a context is how the one cell that answers to focus learns of it
- * without the column list being rebuilt on every focus change.
- */
-const FocusedParticipantContext = createContext<string | undefined>(undefined);
-
-/** A grid row, as the `DataTable` primitive marks every row it renders. */
-const GRID_ROW_SELECTOR = '[role="row"]';
-
-/**
- * The attribute a participant's label carries its participant id in.
- *
- * Written literally on the label in {@link ParticipantCell} so the attribute is
- * visible where it is set; this constant and {@link PARTICIPANT_LABEL_SELECTOR}
- * are the only readers of it.
- */
-const PARTICIPANT_ID_ATTRIBUTE = 'data-participant-id';
-
-/** The label element of a participant, in either of its two forms. */
-const PARTICIPANT_LABEL_SELECTOR = `[${PARTICIPANT_ID_ATTRIBUTE}]`;
-
-/**
- * The participant whose grid row contains `target`, or `undefined` when focus
- * landed outside every participant row.
- *
- * The row is required to lie inside `scope` — the block the listener sits on —
- * so a graph rendered inside some other grid's row can never borrow a
- * participant from a row that is not its own. The header row holds no
- * participant label and so answers `undefined`, as does a label whose id is
- * blank.
- *
- * @param target Where focus arrived.
- * @param scope The block whose rows are considered.
- */
-function focusedParticipantIdOf(target: EventTarget, scope: Element): string | undefined {
-  if (!(target instanceof Element)) {
-    return undefined;
-  }
-
-  const row = target.closest(GRID_ROW_SELECTOR);
-  if (row === null || !scope.contains(row)) {
-    return undefined;
-  }
-
-  const label = row.querySelector(PARTICIPANT_LABEL_SELECTOR);
-  return nonBlankString(label?.getAttribute(PARTICIPANT_ID_ATTRIBUTE));
-}
-
-/*
- * ---------------------------------------------------------------------------
  * Copy
  *
  * Generic product vocabulary only, and every sentence states what the capture
@@ -869,19 +1206,21 @@ function focusedParticipantIdOf(target: EventTarget, scope: Element): string | u
 
 /** The recorded limitation of AAP 0.6.6, stated on screen rather than implied. */
 const STATIC_LAYOUT_NOTE =
-  'This layout is static in this version: hover or focus a participant for its detail and select one to highlight it. Dragging, panning and zooming are not available.';
+  'This layout is static in this version: the table below details every participant, and selecting one there or on the picture highlights it in both. Clicking a participant on the picture also opens its source location in the editor when it has one, as its source chip in the table does. Dragging, panning and zooming are not available.';
 
 /** What an empty graph says. */
 const EMPTY_MESSAGE = 'No dependency relationships were captured for this interaction.';
 
+/** The short label above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No relationships';
+
 /** What the busy announcement says while the graph resolves. */
 const LOADING_LABEL = 'Loading the dependency graph…';
 
-/** What a failed query says when the provider supplied no sentence of its own. */
-const GENERIC_FAILURE_MESSAGE = 'The dependency graph could not be loaded.';
-
-/** The code shown for a node whose query names a source this view cannot draw. */
-const SOURCE_MISMATCH_CODE = 'PANEL_INVALID';
+// No failure copy lives here: both error states take their title, message,
+// hint, code and query block from the one contract in `../host/useQuery`
+// (`queryFailureProps`, `unsupportedQueryProps`), so this view words a failure
+// exactly as every other node does (B1-F16, B2-F14).
 
 /** Marks a relationship chip whose relationship was inferred rather than measured. */
 const INFERRED_LABEL = 'inferred';
@@ -895,39 +1234,66 @@ const RELATIONSHIP_ARROW = '→';
 /** The grid's accessible name. */
 const GRID_CAPTION = `${CATALOG_ENTRY.label}: every participant by layer, with its outgoing relationships and its source location.`;
 
-/** Said when the payload reports that it was bounded. */
-const TRUNCATED_NOTE =
-  'Some participants or relationships were left out because this graph reached its size bound, so the flow shown is partial.';
+/**
+ * The badge a partial result carries — the same words, tone and variant the
+ * timeline's summary strip and the flame chart use, so the three charts mark
+ * a subset identically.
+ */
+const PARTIAL_RESULT_LABEL = 'Partial result';
+
+/**
+ * Said beside the canvas when the payload reports that it was bounded: what is
+ * drawn, what was left out, and the route to the rest.
+ *
+ * The aggregate keeps the costliest participants when it reaches its bound, so
+ * what is drawn is named as the most significant ones. The payload says only
+ * THAT it was bounded — participants, relationships or both — never how much
+ * was left out, so no total is claimed. A `graph` result is one whole object
+ * with nothing more in memory, so the route is a narrower query, never a
+ * control.
+ *
+ * @param drawn How many participants the canvas draws.
+ * @returns The notice's sentences.
+ */
+function truncatedNotice(drawn: number): string {
+  return `Showing the ${formatCount(drawn)} most significant participants: some participants or relationships were left out at this graph's size bound. Narrow the query to one trace or interaction to see more.`;
+}
 
 /** Said when the layering was computed here because the payload carried none. */
 const COMPUTED_LAYERS_NOTE =
   'The columns were computed from the relationships, because the captured participants carried no layer of their own.';
 
+/*
+ * The words the notes and the text alternative count in. Each sentence agrees
+ * its noun, its verb and its pronouns with the count it prints, through the
+ * package's one rule in `../utils/format` — never a "(s)" left for the reader
+ * to resolve.
+ */
+const PARTICIPANT_NOUN: CountedNoun = countedNoun('participant');
+const RELATIONSHIP_NOUN: CountedNoun = countedNoun('relationship');
+const LAYER_NOUN: CountedNoun = countedNoun('layer');
+const IS_VERB: CountedNoun = countedNoun('is', 'are');
+const POSSESSIVE_PRONOUN: CountedNoun = countedNoun('its', 'their');
+const OBJECT_PRONOUN: CountedNoun = countedNoun('it', 'them');
+
 /** Said when a relationship named a participant the payload does not contain. */
 function droppedRelationshipsNote(count: number): string {
-  return `${formatCount(count)} relationship(s) named a participant this graph does not contain and are not drawn.`;
+  return `${formatCountOf(count, RELATIONSHIP_NOUN)} named a participant this graph does not contain and ${pluralize(count, IS_VERB)} not drawn.`;
 }
 
 /** Said when participants declared an event coordinate that contradicts their records. */
 function inconsistentCoordinatesNote(count: number): string {
-  return `${formatCount(count)} participant(s) declared an event that does not match their records, so selecting them opens no event.`;
+  return `${formatCountOf(count, PARTICIPANT_NOUN)} declared an event that does not match ${pluralize(count, POSSESSIVE_PRONOUN)} records, so selecting ${pluralize(count, OBJECT_PRONOUN)} opens no event.`;
 }
 
-/** Said when relationships declared lineage shares that do not add up. */
+/**
+ * Said when relationships declared lineage shares that do not add up. The
+ * relationship itself is still drawn; what is withheld is its declared counts,
+ * so "which are not shown" agrees with those counts and stays plural whatever
+ * the number of relationships.
+ */
 function inconsistentLineagesNote(count: number): string {
-  return `${formatCount(count)} relationship(s) declared inconsistent inferred or ambiguous counts, which are not shown.`;
-}
-
-/** What a node whose query names another source says. */
-function sourceMismatchMessage(source: string): string {
-  return `This view draws the "${CATALOG_ENTRY.sources.join('", "')}" source, but its panel node asks for "${source}".`;
-}
-
-/** The sentence a failed query shows: what failed, plus the provider's hint. */
-function failureMessage(message: string | undefined, hint: string | undefined): string {
-  const stated = nonBlankString(message) ?? GENERIC_FAILURE_MESSAGE;
-  const suffix = nonBlankString(hint);
-  return suffix === undefined ? stated : `${stated} ${suffix}`;
+  return `${formatCountOf(count, RELATIONSHIP_NOUN)} declared inconsistent inferred or ambiguous counts, which are not shown.`;
 }
 
 /**
@@ -935,11 +1301,13 @@ function failureMessage(message: string | undefined, hint: string | undefined): 
  * keyboard-reachable equivalent is.
  */
 function textAlternative(layout: DependencyGraphLayout, truncated: boolean): string {
-  const shape = `${CATALOG_ENTRY.label}: ${formatCount(layout.nodes.length)} participants in ${formatCount(layout.layerCount)} layers, joined by ${formatCount(layout.edges.length)} relationships and drawn left to right from the participant the flow started at.`;
+  const shape = `${CATALOG_ENTRY.label}: ${formatCountOf(layout.nodes.length, PARTICIPANT_NOUN)} in ${formatCountOf(layout.layerCount, LAYER_NOUN)}, joined by ${formatCountOf(layout.edges.length, RELATIONSHIP_NOUN)} and drawn left to right from the participant the flow started at.`;
   const equivalent =
     'The participants table below carries the same participants, their outgoing relationships and their source locations.';
 
-  return truncated ? `${shape} ${TRUNCATED_NOTE} ${equivalent}` : `${shape} ${equivalent}`;
+  return truncated
+    ? `${shape} ${truncatedNotice(layout.nodes.length)} ${equivalent}`
+    : `${shape} ${equivalent}`;
 }
 
 /** A participant's metrics, as one line of text. */
@@ -956,9 +1324,33 @@ function participantMetaText(node: DependencyGraphNode): string {
   return node.count > 1 ? `${total} · ×${formatCount(node.count)}` : total;
 }
 
-/** The pointer title of a participant's shape on the canvas. */
-function participantTitle(node: DependencyGraphNode): string {
-  return `${node.label} · ${KIND_LABEL[node.kind]} · ${participantMetricsText(node)}`;
+/**
+ * What a click on a shape does besides selecting it, for a participant with a
+ * location. The path is the payload's own, project-relative and redacted
+ * upstream (AAP 0.5.2); the sentence around it is product vocabulary.
+ */
+function openSourceHint(file: string): string {
+  return `Click to open ${file} in the editor.`;
+}
+
+/**
+ * The pointer title of a participant's shape on the canvas: what it is, how
+ * long it took and — for a participant with a location, in a surface that can
+ * open one — that a click opens it in the editor.
+ *
+ * @param node The participant.
+ * @param canOpenSource Whether the host supplied the action a click would raise.
+ */
+function participantTitle(node: DependencyGraphNode, canOpenSource: boolean): string {
+  const identity = `${node.label} · ${KIND_LABEL[node.kind]} · ${participantMetricsText(node)}`;
+
+  // The click's second effect is named only where it exists: a participant
+  // with a location, drawn in a surface whose host can open one. Promising a
+  // navigation the click would not perform is the pointer-side form of a
+  // control that does nothing.
+  return canOpenSource && node.source !== undefined
+    ? `${identity}. ${openSourceHint(node.source.file)}`
+    : identity;
 }
 
 /**
@@ -986,22 +1378,30 @@ function lineageSuffix(lineage: LineageTally | undefined): string {
   return ` (${share}${ambiguity})`;
 }
 
-/** A relationship chip's text: what is called, how often, and how it was known. */
+/**
+ * A relationship chip's text: what is called, how often, and how it was known.
+ *
+ * The called participant is named in full. The chip wraps inside its cell
+ * (`dg-dependency-graph__relationship`), so a long module path or route costs
+ * a line rather than its identity — a shortened name here would be the only
+ * place a relationship's target could not be read, since the chip is the
+ * relationship's sole text form in the grid.
+ */
 function relationshipChipText(relationship: ParticipantRelationship): string {
-  const target = truncate(relationship.targetLabel, MAX_CHIP_LABEL_CHARACTERS);
   const repeats = relationship.edge.count > 1 ? ` ×${formatCount(relationship.edge.count)}` : '';
-  return `${RELATIONSHIP_ARROW} ${target}${repeats}${lineageSuffix(relationship.lineage)}`;
+  return `${RELATIONSHIP_ARROW} ${relationship.targetLabel}${repeats}${lineageSuffix(relationship.lineage)}`;
 }
 
 /*
  * ---------------------------------------------------------------------------
  * The grid's cells
  *
- * Each is a function of its row, which is what lets the column list below be a
- * module constant: no cell reads component state, so nothing about the grid is
- * rebuilt when a selection or a hover changes. The participant cell also reads
- * {@link FocusedParticipantContext}, and a context change re-renders that cell
- * alone.
+ * Each is a function of its row and of nothing else, which is what lets the
+ * column list below be a module constant: no cell reads component state or
+ * context, so nothing about the grid is rebuilt — and no cell changes form —
+ * when focus, the pointer or the selection moves. The row's own states
+ * (`dg-is-active`, `dg-is-selected`) belong to the `DataTable` primitive and
+ * change only colour, never the row's content or its size.
  * ---------------------------------------------------------------------------
  */
 
@@ -1016,86 +1416,80 @@ function ClassCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   );
 }
 
-/** The focused participant's second line: its tier, when it has one, and its metrics. */
+/** A participant's second line in the grid: its tier, when it has one, and its metrics. */
 function participantDetailText(node: DependencyGraphNode): string {
   const metrics = participantMetricsText(node);
   return node.tier === undefined ? metrics : `${formatTierLabel(node.tier)} · ${metrics}`;
 }
 
 /**
- * The participant's label, in one of two forms.
+ * The participant's label and detail, in ONE form in every state.
  *
- * - **Its row holds keyboard focus.** The full label, untruncated, with a muted
- *   line under it naming the tier and the metrics — the tooltip's content,
- *   inline. The grid's focus target is the row rather than anything inside this
- *   cell, so a tooltip here would never open for a keyboard user; showing the
- *   detail in the focused row is what makes it reachable without a pointer and
- *   without a second tab stop. The class is not repeated: it is the next
- *   column.
- * - **Otherwise.** The label, truncated by the stylesheet and described in full
- *   by a tooltip that also names its class, its tier and its metrics, for the
- *   pointer user.
+ * The full label — never truncated, wrapped by the stylesheet
+ * (`dg-dependency-graph__participant-label`) wherever it runs past the column —
+ * with a muted line under it naming the tier and the metrics. The class is not
+ * repeated: it is the next column, and it is that column and this text that
+ * make the canvas colour non-essential.
  *
- * Both forms mark the label with the participant id (`data-participant-id`),
- * which is what {@link focusedParticipantIdOf} reads back from a focused row.
- * The tooltip is also the reason a class chip is not drawn inside the SVG box:
- * the canvas carries the colour, and the words that make the colour
- * non-essential live here and in the class column.
+ * The form is the same whether the row holds keyboard focus, sits under the
+ * pointer, is selected or none of these, and both halves of that are
+ * load-bearing:
+ *
+ * - **Nothing is reachable by hover alone.** The grid's focus target is its
+ *   row, so a tooltip on this label would never open for a keyboard user.
+ *   Showing the detail in every row reaches it without a pointer and without a
+ *   second tab stop.
+ * - **A row never changes size on its way to a click.** A mouse press on the
+ *   row's source chip focuses the chip before the button is released. Were this
+ *   cell to answer that focus by growing — a longer label, an extra line — the
+ *   row would grow with it and, because the grid centres a row's cells in the
+ *   block axis, carry the chip out from under the pointer: the release would
+ *   land on the row, and the click would select the participant instead of
+ *   opening its source. Nothing in this view changes a row's content on focus,
+ *   hover or selection, so that cannot happen.
+ *
+ * The label carries the participant's id in `data-participant-id`, as a
+ * relationship chip carries its relationship's in `data-edge-id`, so the
+ * participant a row stands for is legible in the markup without parsing the
+ * label's text.
  */
 function ParticipantCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   const { node } = row;
-  const focusedId = useContext(FocusedParticipantContext);
-
-  if (focusedId === node.id) {
-    return (
-      <Stack gap={1}>
-        <Text size="sm" weight="medium" data-participant-id={node.id}>
-          {node.label}
-        </Text>
-        <Text size="xs" tone="muted">
-          {participantDetailText(node)}
-        </Text>
-      </Stack>
-    );
-  }
-
-  const detail = (
-    <Stack gap={1}>
-      <Text size="sm" weight="medium">
-        {node.label}
-      </Text>
-      <Stack direction="horizontal" gap={2} align="center" wrap>
-        <ClassCell row={row} />
-        {node.tier === undefined ? null : (
-          <Text size="xs" tone="muted">
-            {formatTierLabel(node.tier)}
-          </Text>
-        )}
-      </Stack>
-      <Text size="xs" tone="muted">
-        {participantMetricsText(node)}
-      </Text>
-    </Stack>
-  );
 
   return (
-    <Tooltip className="dg-dependency-graph__tooltip" content={detail}>
-      <Text size="sm" truncate data-participant-id={node.id}>
+    <Stack gap={1}>
+      <Text
+        size="sm"
+        weight="medium"
+        className="dg-dependency-graph__participant-label"
+        data-participant-id={node.id}
+      >
         {node.label}
       </Text>
-    </Tooltip>
+      <Text size="xs" tone="muted">
+        {participantDetailText(node)}
+      </Text>
+    </Stack>
   );
 }
 
 /**
  * Everything the participant calls, one chip each.
  *
- * A relationship with any inferred record carries the state class the
- * stylesheet dashes on the canvas, a warning tone, and the word itself — with
- * the inferred share and the ambiguous part when either applies, see
- * {@link lineageSuffix} — so the distinction survives in text, where a dash
- * pattern cannot reach (AAP 0.6.4: colour and pattern are never the sole
- * indicator).
+ * Each chip carries the lineage state its curve on the canvas carries —
+ * `dg-is-inferred` in the info tone, `dg-is-ambiguous` in the warning tone and
+ * with a dashed outline, nothing for a measured relationship — and the words
+ * themselves: the inferred share and the ambiguous part when either applies,
+ * see {@link lineageSuffix}. So the distinction survives in text, where neither
+ * a tone nor a dash pattern can reach (AAP 0.6.4: colour and pattern are never
+ * the sole indicator).
+ *
+ * The chip is `dg-dependency-graph__relationship`, a class of its own rather
+ * than the canvas curve's: the curve's rule is SVG paint (`fill`, `stroke`,
+ * `pointer-events: none`) that means nothing on an HTML chip, and the chip
+ * needs the one thing the shared chip rule withholds — permission to wrap — so
+ * that a long called participant and its lineage suffix stay inside the cell
+ * instead of running past its border. `data-edge-id` names the relationship.
  */
 function RelationshipsCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   if (row.outgoing.length === 0) {
@@ -1111,9 +1505,12 @@ function RelationshipsCell({ row }: { readonly row: ParticipantRow }): ReactElem
       {row.outgoing.map((relationship) => (
         <Badge
           key={relationship.edge.id}
-          tone={relationship.inferred ? 'warning' : 'neutral'}
+          tone={LINEAGE_TONE[relationship.state]}
           variant="outline"
-          className={clsx('dg-dependency-graph__edge', relationship.inferred && 'dg-is-ambiguous')}
+          className={clsx(
+            'dg-dependency-graph__relationship',
+            LINEAGE_STATE_CLASS[relationship.state],
+          )}
           data-edge-id={relationship.edge.id}
         >
           {relationshipChipText(relationship)}
@@ -1123,7 +1520,16 @@ function RelationshipsCell({ row }: { readonly row: ParticipantRow }): ReactElem
   );
 }
 
-/** Where the participant lives in the project, when a location resolved. */
+/**
+ * Where the participant lives in the project, when a location resolved.
+ *
+ * The chip is `tabIndex={-1}`, as every control inside a `DataTable` cell must
+ * be: the grid's active row is the view's one Tab stop, and the grid's own
+ * cell navigation (ArrowRight or F2 from the row) is the keyboard route onto
+ * the chip, where Enter and Space activate it natively. The pointer still
+ * focuses and activates it in one click, which is what
+ * {@link ParticipantCell}'s one form keeps working.
+ */
 function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
   const { source } = row.node;
 
@@ -1137,15 +1543,27 @@ function SourceCell({ row }: { readonly row: ParticipantRow }): ReactElement {
 
   // The location object is handed over by reference and never rewritten; see
   // `./SourceLink` for why that is the single guarantee of the click path.
-  return <SourceLink location={source} compact />;
+  return <SourceLink location={source} compact tabIndex={-1} />;
 }
 
 /**
  * The columns of the participants grid, in reading order: where a participant
  * sits, what it is, how long it took, what it called, and where it lives.
  *
- * A module constant because every cell is a function of its row (and, for the
- * participant cell, of {@link FocusedParticipantContext}).
+ * A module constant because every cell is a function of its row alone.
+ *
+ * The participant column takes twice the share of the others: it is the one
+ * that carries a full label and a detail line, both wrapped rather than
+ * truncated, so the extra share is spent where the text is. The track is a
+ * ratio, so it resolves identically in the header and in every row, with a
+ * floor in `ch` like every other column (the unsized ones take `DataTable`'s
+ * default `minmax(10ch, 1fr)`): `DataTable` sums the floors into the grid's
+ * minimum width, so a panel narrower than their sum scrolls the table
+ * horizontally instead of squeezing the participant label a few characters
+ * per line. The relationships column gets the same share and a floor of its
+ * own, because its chips name their full target and wrap rather than
+ * truncate: at the default floor a typical `GET /api/… ×4` chip broke into
+ * fragments of a few characters and made its row several hundred pixels tall.
  */
 const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.freeze([
   {
@@ -1162,6 +1580,7 @@ const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.f
     key: 'participant',
     header: 'Participant',
     rowHeader: true,
+    width: 'minmax(24ch, 2fr)',
     cell: (row: ParticipantRow) => <ParticipantCell row={row} />,
   },
   {
@@ -1178,6 +1597,7 @@ const PARTICIPANT_COLUMNS: readonly DataTableColumn<ParticipantRow>[] = Object.f
   {
     key: 'relationships',
     header: 'Relationships',
+    width: 'minmax(22ch, 2fr)',
     cell: (row: ParticipantRow) => <RelationshipsCell row={row} />,
   },
   {
@@ -1225,30 +1645,59 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
   // render in a surface that cannot navigate.
   const actions = usePanelActions();
 
-  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  // The panel's one shared selection under a host, this view's own last
+  // activation outside one; and the local highlight of a participant that
+  // stands for no single event, which yields as soon as that selection changes
+  // (see "THE SELECTION IS THE PANEL'S" above).
+  const { selection, markSelected } = useViewSelection();
+  const [localHighlight, setLocalHighlight] = useState<LocalHighlight | undefined>(undefined);
   const [hoveredId, setHoveredId] = useState<string | undefined>(undefined);
-  const [focusedId, setFocusedId] = useState<string | undefined>(undefined);
 
   // `undefined` when the node names a source this view cannot draw, which stops
   // the query from being issued at all.
   const query = useMemo(() => graphQueryOf(node.query), [node.query]);
-  const serializedQuery = useMemo(() => JSON.stringify(node.query, null, 2), [node.query]);
 
-  const { status, data, error, retry } = useQuery(query);
+  const { status, data, error, announcement, retry } = useQuery(query);
 
-  // The whole layout in one memo: one layering, then the canonical ordering and
-  // the layered geometry, both built from that same layering object so it is
-  // resolved exactly once per payload. All three are pure functions of the
-  // payload, so the same payload always draws the same picture.
-  const layout = useMemo(() => {
-    if (data === undefined) {
-      return undefined;
-    }
+  // The canvas's scroll viewport, observed: its inner width chooses the column
+  // gap, and the measure (in the count labels' font) sizes the narrowest gap.
+  // Without layout the width stays `undefined` and the measure is a
+  // deterministic estimate, so the unmeasured drawing is reproducible.
+  const {
+    ref: viewportRef,
+    width: viewportWidth,
+    measureText,
+  } = useChartCanvas<HTMLDivElement>({ font: EDGE_LABEL_FONT });
 
-    const layering = resolveGraphLayering(data.nodes, data.edges);
-    return layoutDependencyGraph(canonicalGraph(data, layering.layers), undefined, layering);
-  }, [data]);
+  // The layout in three memos, split by what each depends on. The arrangement
+  // (one layering, and the canonical ordering built from that same object) is
+  // a pure function of the payload, so the layering is resolved exactly once
+  // per payload. The column gap follows the viewport. The geometry is rebuilt
+  // from the arrangement only when the gap changes, so a resize that leaves
+  // the gap where it was redraws nothing, and one payload at one width always
+  // draws the same picture.
+  const arrangement = useMemo(() => (data === undefined ? undefined : arrangeGraph(data)), [data]);
+  const columnGap = useMemo(
+    () =>
+      arrangement === undefined
+        ? undefined
+        : fittedColumnGap(
+            arrangement.columnCount,
+            arrangement.gapLabels,
+            viewportWidth,
+            measureText,
+          ),
+    [arrangement, viewportWidth, measureText],
+  );
+  const layout = useMemo(
+    () =>
+      arrangement === undefined
+        ? undefined
+        : layoutDependencyGraph(arrangement.graph, { columnGap }, arrangement.layering),
+    [arrangement, columnGap],
+  );
   const rows = useMemo(() => (layout === undefined ? NO_ROWS : buildRows(layout)), [layout]);
+  const colourKey = useMemo(() => spanColourKey(rows), [rows]);
   const columns = useMemo(() => buildColumns(rows), [rows]);
   const inconsistent = useMemo(
     () =>
@@ -1256,46 +1705,104 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
     [layout],
   );
 
+  const selectedId = selectedParticipantIdOf(rows, selection, localHighlight);
+
+  // Selecting a participant: what a row activation in the grid does (a click on
+  // the row, Enter or Space), and the first half of a click on its shape. It
+  // never opens source — in the grid that is the row's chip's job, and the
+  // table does not treat a click on the chip as a row activation.
   const handleActivate = useCallback(
     (row: ParticipantRow): void => {
-      setSelectedId(row.node.id);
-
       // Reported only when the participant really carries an event coordinate;
       // see this module's header for why nothing is invented when it does not.
+      // Such a participant becomes the panel's selection, and any local
+      // highlight is dropped even when that event was already selected, so the
+      // graph marks what the reader just activated.
       if (row.eventRef !== undefined) {
+        setLocalHighlight(undefined);
+        markSelected(row.eventRef);
         actions?.onSelectEvent(row.eventRef);
+        return;
       }
+
+      setLocalHighlight({ participantId: row.node.id, basis: selection });
     },
-    [actions],
+    [actions, markSelected, selection],
   );
 
-  const handleHover = useCallback((id: string | undefined): void => {
+  // A click on a participant's shape: the selection above, then — where the
+  // participant resolved to a location — that location opened in the editor,
+  // once (AAP 0.6.2). The object is the payload's own, handed over by
+  // reference and never copied or normalised, because every hop after this one
+  // acts on the object it receives (see `./SourceLink`). A collapse of several
+  // records carries no event coordinate but may well carry a location, so the
+  // two are decided independently.
+  const handleNodeClick = useCallback(
+    (row: ParticipantRow): void => {
+      handleActivate(row);
+
+      const { source } = row.node;
+      if (source !== undefined) {
+        actions?.onOpenSource(source);
+      }
+    },
+    [actions, handleActivate],
+  );
+
+  // The hovered shape is highlighted on the canvas only. No grid cell reads it,
+  // so a pointer crossing the picture never changes a row.
+  const handleHover = useCallback((id: string): void => {
     setHoveredId(id);
   }, []);
 
-  // Focus arriving anywhere in the block names the participant of the grid row
-  // that holds it, or nothing. Leaving clears it; focus moving from one row to
-  // another fires this blur first and the next row's focus straight after, so
-  // the name follows the row. See the "Keyboard focus" section above.
-  const handleFocus = useCallback((event: FocusEvent<HTMLDivElement>): void => {
-    setFocusedId(focusedParticipantIdOf(event.target, event.currentTarget));
+  // Only the box that started the hover ends it, so a leave that arrives after
+  // the pointer already entered a neighbouring box changes nothing.
+  const handleHoverEnd = useCallback((id: string): void => {
+    setHoveredId((current) => (current === id ? undefined : current));
   }, []);
 
-  const handleBlur = useCallback((): void => {
-    setFocusedId(undefined);
-  }, []);
+  // The hover highlight is the one preview this view draws, and Escape
+  // dismisses it without moving the pointer, focus or the selection (WCAG
+  // 1.4.13) — until the pointer enters a box again. Nothing here previews on
+  // focus: every grid row already shows its participant's full detail in one
+  // form, so keyboard focus reveals nothing that would need dismissing.
+  //
+  // The pointer does not move focus, so while it rests on a box the key goes to
+  // whatever holds focus — a grid row or the page body alike. The listener
+  // therefore lives on the view's own document, for exactly as long as a box is
+  // hovered; it consumes nothing, and it leaves alone an Escape something else
+  // already handled.
+  const hovering = hoveredId !== undefined;
+  const blockRef = useRef<HTMLDivElement | null>(null);
+
+  useEffect(() => {
+    if (!hovering) {
+      return undefined;
+    }
+
+    const ownerDocument = blockRef.current?.ownerDocument ?? document;
+    const dismiss = (event: globalThis.KeyboardEvent): void => {
+      if (event.key === 'Escape' && !event.defaultPrevented) {
+        setHoveredId(undefined);
+      }
+    };
+
+    ownerDocument.addEventListener('keydown', dismiss);
+    return () => {
+      ownerDocument.removeEventListener('keydown', dismiss);
+    };
+  }, [hovering]);
 
   const blockClass = clsx('dg-dependency-graph', className);
 
+  // A defect in the panel rather than a failed request: the contract names what
+  // this view reads next to what it was asked for, and offers no retry, because
+  // asking again cannot change the answer.
   if (query === undefined) {
     return (
       <div className={blockClass}>
         <div className="dg-dependency-graph__error">
-          <ErrorState
-            message={sourceMismatchMessage(node.query.source)}
-            code={SOURCE_MISMATCH_CODE}
-            query={serializedQuery}
-          />
+          <ErrorState {...unsupportedQueryProps(node.type, node.query)} />
         </div>
       </div>
     );
@@ -1315,12 +1822,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
     return (
       <div className={blockClass}>
         <div className="dg-dependency-graph__error">
-          <ErrorState
-            message={failureMessage(error?.message, error?.hint)}
-            code={error?.code}
-            query={serializedQuery}
-            onRetry={retry}
-          />
+          <ErrorState {...queryFailureProps({ error, announcement, retry }, query)} />
         </div>
       </div>
     );
@@ -1331,6 +1833,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
       <div className={blockClass}>
         <div className="dg-dependency-graph__empty">
           <EmptyState
+            title={EMPTY_TITLE}
             message={EMPTY_MESSAGE}
             icon={<Workflow aria-hidden="true" className="dg-icon" />}
           />
@@ -1342,18 +1845,17 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
   const canvas = canvasSize(layout);
 
   return (
-    <div className={blockClass} onFocus={handleFocus} onBlur={handleBlur}>
+    <div ref={blockRef} className={blockClass}>
       {/*
-       * The key names all six classes even though it shows five colours:
-       * `function` and `service` resolve to the same `--dg-kind-function`
-       * token, a decision recorded and reasoned about in
-       * `../utils/color.ts` (the `service` entry of the participant-class
-       * map). This component consumes that map rather than writing a second
-       * one, so the pairing is honoured here rather than worked around. It
-       * costs nothing legible: each badge carries its class name as text, the
-       * grid below repeats it in the class column, and the layout separates
-       * the two classes by layer - so colour is never the only thing telling
-       * them apart.
+       * The key names all six classes in six distinct colours, each the
+       * participant-class map's entry in `../utils/color.ts`. A participant
+       * whose span kinds settle a colour of their own is drawn in that colour
+       * instead - the colour the same spans have in every other view - so each
+       * such colour follows the class chips as one more entry naming the kinds
+       * drawn in it. Those entries carry no `data-kind`: they name span kinds,
+       * not classes. Colour is never the only carrier either way: each chip
+       * carries its name as text, and the grid below repeats every
+       * participant's class in its class column.
        */}
       <Stack
         direction="horizontal"
@@ -1373,9 +1875,39 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
             {KIND_LABEL[kind]}
           </Badge>
         ))}
+        {colourKey.map((entry) => (
+          <Badge
+            key={entry.colorVar}
+            tone="neutral"
+            variant="soft"
+            color={entry.colorVar}
+            data-span-kinds={entry.kinds.join(' ')}
+          >
+            {spanColourKeyLabel(entry)}
+          </Badge>
+        ))}
       </Stack>
 
-      <div className="dg-dependency-graph__viewport">
+      {data.truncated ? (
+        // Beside the canvas it qualifies rather than under the grid, in the
+        // shape the timeline and the flame chart share: the badge, what is
+        // drawn, and the way to see more.
+        <Stack direction="horizontal" gap={2} align="center" wrap>
+          <Badge tone="warning" variant="outline">
+            {PARTIAL_RESULT_LABEL}
+          </Badge>
+          <Text as="p" size="xs" tone="muted">
+            {truncatedNotice(layout.nodes.length)}
+          </Text>
+        </Stack>
+      ) : null}
+
+      {/*
+       * The measured element: the canvas is drawn at a size derived from this
+       * viewport's inner width, one user unit to a pixel, and scrolls inside it
+       * when the graph cannot fit even at the narrowest column gap.
+       */}
+      <div className="dg-dependency-graph__viewport" ref={viewportRef}>
         <svg
           className="dg-dependency-graph__canvas"
           role="img"
@@ -1397,7 +1929,9 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
            * every theme, rather than decided here. This component writes no
            * colour (AAP 0.6.4), and no information depends on the stroke
            * alone: every relationship is also enumerated in text in the grid
-           * below, and an inferred one is named there as well as dashed here.
+           * below, and an inferred or ambiguous one is named there in words as
+           * well as marked here — solid in the info tone, or dashed in the
+           * warning tone — by the state class the stylesheet implements.
            */}
           <g className="dg-dependency-graph__edges">
             {layout.edges.map((positioned) => (
@@ -1405,7 +1939,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                 <path
                   className={clsx(
                     'dg-dependency-graph__edge',
-                    isInferredRelationship(positioned.edge) && 'dg-is-ambiguous',
+                    LINEAGE_STATE_CLASS[lineageStateOf(usableLineageOf(positioned.edge))],
                   )}
                   d={edgePathData(positioned.curve)}
                 />
@@ -1423,7 +1957,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                       positioned.anchors.target.y,
                     )}
                   >
-                    {`×${formatCount(positioned.edge.count)}`}
+                    {edgeCountText(positioned.edge.count)}
                   </text>
                 ) : null}
               </Fragment>
@@ -1436,21 +1970,25 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                 <g
                   key={row.node.id}
                   onClick={() => {
-                    handleActivate(row);
+                    handleNodeClick(row);
                   }}
                   onPointerEnter={() => {
                     handleHover(row.node.id);
                   }}
                   onPointerLeave={() => {
-                    handleHover(undefined);
+                    handleHoverEnd(row.node.id);
                   }}
                 >
                   {/*
-                   * The pointer user's label. The canvas is `role="img"` with a
-                   * text alternative of its own, so this title is not what
-                   * assistive technology reads - the grid below is.
+                   * The pointer user's label, as the user agent's own tooltip.
+                   * The canvas is `role="img"` with a text alternative of its
+                   * own, so this title is not what assistive technology reads -
+                   * the grid below is - and the same detail is always drawn in
+                   * this participant's grid row, so nothing in it is reachable
+                   * by hover alone. Where a click also opens the participant's
+                   * source, the title says so.
                    */}
-                  <title>{participantTitle(row.node)}</title>
+                  <title>{participantTitle(row.node, actions !== undefined)}</title>
                   <rect
                     className={clsx(
                       'dg-dependency-graph__node',
@@ -1458,7 +1996,7 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
                       row.node.id === selectedId && 'dg-is-selected',
                       row.node.id === hoveredId && 'dg-is-hovered',
                     )}
-                    style={nodeColorStyle(row.node.kind)}
+                    style={nodeColorStyle(row.node)}
                     x={row.box.x}
                     y={row.box.y}
                     width={row.box.width}
@@ -1490,32 +2028,25 @@ export function DependencyGraph(props: DependencyGraphProps): ReactElement {
       {/*
        * The keyboard-reachable equivalent, and deliberately unvirtualized: an
        * equivalent that covered a window of the participants rather than all of
-       * them would not be one. The focused participant is provided around it,
-       * so the row holding focus shows its label's detail inline.
+       * them would not be one. Every row already shows its participant's full
+       * label and detail, so nothing here follows focus or the pointer.
        */}
-      <FocusedParticipantContext.Provider value={focusedId}>
-        <DataTable
-          className="dg-dependency-graph__equivalent"
-          rows={rows}
-          columns={PARTICIPANT_COLUMNS}
-          rowKey={participantRowKey}
-          caption={GRID_CAPTION}
-          selectedRowKey={selectedId ?? null}
-          onRowActivate={handleActivate}
-          virtualize={false}
-          compact
-        />
-      </FocusedParticipantContext.Provider>
+      <DataTable
+        className="dg-dependency-graph__equivalent"
+        rows={rows}
+        columns={PARTICIPANT_COLUMNS}
+        rowKey={participantRowKey}
+        caption={GRID_CAPTION}
+        selectedRowKey={selectedId ?? null}
+        onRowActivate={handleActivate}
+        virtualize={false}
+        compact
+      />
 
       <Stack gap={1} className="dg-dependency-graph__note">
         <Text as="p" size="xs" tone="muted">
           {STATIC_LAYOUT_NOTE}
         </Text>
-        {data.truncated ? (
-          <Text as="p" size="xs" tone="warning">
-            {TRUNCATED_NOTE}
-          </Text>
-        ) : null}
         {layout.droppedEdgeCount > 0 ? (
           <Text as="p" size="xs" tone="warning">
             {droppedRelationshipsNote(layout.droppedEdgeCount)}

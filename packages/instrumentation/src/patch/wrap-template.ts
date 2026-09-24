@@ -428,6 +428,20 @@ export const HELPER_LOCAL_IDENTIFIER = '__dbg' as const;
 export const REST_PARAMETER_IDENTIFIER = '__args' as const;
 
 /**
+ * The annotation a TypeScript `'rest'` wrapper's parameter falls back to when
+ * the caller supplies no {@link WrapperBodyOptions.restParameterType}.
+ *
+ * `unknown[]` accepts every argument, so an arrow patched with it still
+ * compiles at every call site and stays assignable to any signature it was
+ * assigned to. What it cannot do is *state* the arrow's parameters: a consumer
+ * that derives a type from the function — `Parameters<typeof fn>` above all —
+ * sees `unknown` where the developer wrote a type. The patcher therefore
+ * always supplies the arrow's own parameter tuple, and this fallback exists for
+ * a caller of {@link buildWrapperBody} that has no arrow to read one from.
+ */
+export const DEFAULT_REST_PARAMETER_TYPE = 'unknown[]' as const;
+
+/**
  * How the wrapper forwards the caller's arguments to the inner function.
  *
  * - `'arguments'` — the form AAP §0.5.1 states verbatim, for every target that
@@ -1001,6 +1015,29 @@ export interface WrapperBodyOptions {
   readonly restIdentifier?: string | undefined;
 
   /**
+   * The type the `'rest'` style's parameter is annotated with, in a TypeScript
+   * file: the wrapped arrow's own parameter list restated as a tuple, such as
+   * `[width: number, label?: string | undefined]`.
+   *
+   * The wrapper replaces the arrow's parameter list with one rest parameter, and
+   * for an arrow bound to an unannotated variable that parameter list **is** the
+   * exported signature: `Parameters<typeof fn>`, every call site's argument
+   * checking and every consumer that derives a type from the function read it.
+   * Annotating the rest parameter with the original list as a tuple keeps that
+   * signature exactly what it was, where {@link DEFAULT_REST_PARAMETER_TYPE}
+   * would widen it — and a widened signature breaks the developer's build in
+   * files this module never sees (`TS2571` at a consumer indexing
+   * `Parameters<typeof fn>`).
+   *
+   * The caller that examined the arrow supplies it; this module does not parse
+   * types. When it is omitted a TypeScript wrapper falls back to
+   * {@link DEFAULT_REST_PARAMETER_TYPE}. Supplying one for a JavaScript
+   * wrapper, where a parameter annotation is a syntax error, or supplying an
+   * empty one, is refused.
+   */
+  readonly restParameterType?: string | undefined;
+
+  /**
    * Whether the target is a generator or async generator.
    *
    * Declared only so that asking for one **fails loudly**: a wrapper that calls
@@ -1061,15 +1098,16 @@ export interface WrapperBody {
    * The parameter list the wrapper must declare for the `'rest'` call style,
    * or `undefined` for `'arguments'`, which keeps the original parameter list.
    *
-   * For TypeScript this is `...__args: unknown[]`. The annotation is
-   * deliberate: `unknown[]` *widens* the wrapper's parameter types, so every
-   * existing call site and every higher-order use still type-checks — an
-   * arrow patched this way remains assignable to the signature it had — whereas
-   * `never[]` would reject every argument at every call site and a missing
-   * annotation would be an implicit `any` error. Parameter *checking* at those
-   * call sites is looser while the patch is installed, which is the one
-   * type-level cost of instrumenting an arrow and why the annotation is
-   * documented rather than tuned.
+   * For TypeScript this is `...__args: <tuple>`, the tuple being
+   * {@link WrapperBodyOptions.restParameterType} — the wrapped arrow's own
+   * parameter list restated, so the wrapper's signature, `Parameters<typeof
+   * fn>` and argument checking at every call site are what they were before
+   * the patch. Without one it is `...__args: unknown[]`
+   * ({@link DEFAULT_REST_PARAMETER_TYPE}), which keeps call sites compiling
+   * but widens every parameter to `unknown` for anything that derives a type
+   * from the function. A missing annotation would be an implicit `any` error
+   * and `never[]` would reject every argument, so neither is ever emitted. For
+   * JavaScript it is `...__args`, unannotated.
    */
   readonly restParameter: string | undefined;
 
@@ -1214,6 +1252,11 @@ export function buildWrapperBody(options: WrapperBodyOptions): Result<WrapperBod
   const { inner, helper, rest } = identifiers.value;
 
   const isTypeScript = options.language === 'typescript';
+
+  const restParameterType = resolveRestParameterType(options, isTypeScript);
+  if (!restParameterType.ok) {
+    return restParameterType;
+  }
   const receiverExpression = receiver === 'this' ? 'this' : 'undefined';
   const forwarded =
     options.callStyle === 'arguments'
@@ -1257,7 +1300,7 @@ export function buildWrapperBody(options: WrapperBodyOptions): Result<WrapperBod
     restParameter:
       options.callStyle === 'rest'
         ? isTypeScript
-          ? `...${rest}: unknown[]`
+          ? `...${rest}: ${restParameterType.value}`
           : `...${rest}`
         : undefined,
     helperTypeAlias: isTypeScript ? HELPER_TYPE_ALIAS_TEXT : undefined,
@@ -1268,6 +1311,62 @@ export function buildWrapperBody(options: WrapperBodyOptions): Result<WrapperBod
     helperIdentifier: helper,
     restIdentifier: options.callStyle === 'rest' ? rest : undefined,
   });
+}
+
+/**
+ * The annotation a `'rest'` wrapper's parameter carries, or a refusal.
+ *
+ * - A caller-supplied {@link WrapperBodyOptions.restParameterType} is used
+ *   verbatim in a TypeScript file, once it is known to be non-empty: it is the
+ *   developer's own parameter types restated, and the patcher re-parses and
+ *   type-checks the emitted text before anything is written.
+ * - Supplying one for a JavaScript file is refused, because a parameter
+ *   annotation there is a syntax error in the developer's application.
+ * - Supplying one for the `'arguments'` style is refused, because that style
+ *   keeps the original parameter list and has no rest parameter to annotate —
+ *   a type that would be silently dropped is a caller mistake worth naming.
+ * - Omitting it yields {@link DEFAULT_REST_PARAMETER_TYPE} for TypeScript and
+ *   nothing for JavaScript.
+ *
+ * @param options The caller's options, read for the call style and the type.
+ * @param isTypeScript Whether the wrapper is emitted as TypeScript.
+ * @returns The annotation text (empty for JavaScript), or a refusal.
+ */
+function resolveRestParameterType(
+  options: WrapperBodyOptions,
+  isTypeScript: boolean,
+): Result<string> {
+  const supplied = options.restParameterType;
+
+  if (supplied === undefined) {
+    return ok(isTypeScript ? DEFAULT_REST_PARAMETER_TYPE : '');
+  }
+
+  if (options.callStyle !== 'rest') {
+    return refuse(
+      'A rest-parameter type was supplied for a wrapper that forwards arguments and declares no rest parameter.',
+      { callStyle: options.callStyle },
+      'Supply restParameterType only with the rest call style.',
+    );
+  }
+
+  if (!isTypeScript) {
+    return refuse(
+      'A rest-parameter type was supplied for a JavaScript file, where a parameter annotation is a syntax error.',
+      { language: options.language },
+      'Omit restParameterType for a JavaScript target.',
+    );
+  }
+
+  if (supplied.trim().length === 0) {
+    return refuse(
+      'The rest-parameter type is empty.',
+      { restParameterType: supplied },
+      "Supply the wrapped arrow's parameter list as a tuple type, or omit restParameterType.",
+    );
+  }
+
+  return ok(supplied);
 }
 
 /** The three identifiers a wrapper introduces, resolved and validated. */

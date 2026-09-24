@@ -74,8 +74,9 @@
  * Four severities, mapped from the closed reason vocabulary by
  * {@link SEMANTIC_ISSUE_SEVERITY_BY_REASON}:
  *
- * - `fatal` — a citation or filter the capture refutes. The panel must not be
- *   shown as an answer.
+ * - `fatal` — a citation or filter the capture refutes, or a value that is not
+ *   a panel specification at all (below). The panel must not be shown as an
+ *   answer.
  * - `unverifiable` — a reference that could not be checked (above).
  * - `advisory` — the capture holds no evidence of the kind a node draws, or
  *   holds records of that kind none of which carries a field the node cannot
@@ -110,6 +111,49 @@
  * being reported with a crash in the reporter, so every field an issue is about
  * is read at runtime rather than trusted — a specification may have been
  * asserted rather than parsed, and a summary may have arrived over a transport.
+ *
+ * Reading defensively must not become *passing* by default, though. A tolerant
+ * reader that skips what it cannot classify finds no claim in what it skipped,
+ * and no claim reads as `valid`: the false pass the whole checkpoint exists to
+ * prevent. So whatever a claim is reached *through* and cannot be read is
+ * reported as **`malformed-spec`** (`panel_spec_malformed`, fatal under every
+ * option), at the path of the element that could not be read, at two levels:
+ *
+ * - **the roots.** Every claim is reached through three lists — `layout`,
+ *   `summary.observed` and `summary.likelyCauses`. A value that is not an
+ *   object, has no `layout` array, has no `summary` object, or holds a
+ *   statement list that is not an array is rejected up front, one issue per
+ *   unreadable root — `[]` for the document itself, `['layout']`, `['summary']`,
+ *   `['summary', 'observed']`, `['summary', 'likelyCauses']` — and nothing else
+ *   about it is read, and no resolver is asked. A statement list that is absent
+ *   is read as empty, exactly as `panelSummarySchema` defaults it.
+ * - **the elements.** Below readable roots, every list is walked one element
+ *   at a time, each inside its own guard, so one unreadable element costs its
+ *   own claims and nothing else: its siblings, and the nodes after it, are
+ *   checked exactly as they would be without it. A statement or a citation that
+ *   is not an object, a citation that names no event, a node that is not an
+ *   object or whose `type` is not in the node catalog, a container whose
+ *   `children` is not a list, a node that contains itself, and any field whose
+ *   read throws are each reported at the element — `['summary', 'observed',
+ *   0]`, `['summary', 'observed', 0, 'evidence', 1]`, `['layout', 2]` — or, where
+ *   one field decides it, at that field: `['layout', 2, 'type']`, `['layout', 2,
+ *   'children']`, `[…, 'evidence', 1, 'eventId']`. The walk never descends into
+ *   a node whose type the catalog does not know, because nothing says which of
+ *   its fields hold children.
+ *
+ * A malformed field that carries no claim of its own — an `evidence` value that
+ * is not a list, a `query` that is not an object, a filter `traceId` that is
+ * not a string — is still `./validate.ts`'s to report and is read as far as it
+ * can be, exactly as before: it hides nothing this module could check.
+ *
+ * The capture is read **once**, into a plain copy of exactly the fields the
+ * checks consult, and a capture any of whose reads throws is read as one that
+ * publishes nothing at all. Such a capture attests to no citation and refutes
+ * none, so every reference falls to the resolvers or is reported
+ * `unverifiable` — the handling for anything the bounded summary cannot speak
+ * to (above) — and a panel that cites evidence or scopes a view to a trace
+ * never passes on it unverified.
+ *
  * The resolvers are **caller-supplied callbacks**: this module performs no
  * query, no fetch and no file access, and a resolver that throws or answers
  * with the wrong shape is treated as one that declined to answer.
@@ -141,6 +185,7 @@ import type { EventId, Result, SpanId, TraceId } from '@debuggen/shared';
 import {
   METRIC_IDS,
   TELEMETRY_KINDS,
+  TELEMETRY_TIERS,
   attributeKeysFor,
   isMetricId,
   isTelemetryKind,
@@ -167,7 +212,7 @@ import { catalogEntryFor, isKnownPanelNodeType } from './catalog.js';
 import { isDataQuerySource } from './nodes/query.js';
 import type { DataQuery, DataQueryFilter, DataQuerySource } from './nodes/query.js';
 import type { MetricCardsNode, QueryBackedNode } from './nodes/viz.js';
-import { PANEL_LAYOUT_FIELD, walkPanelNodes } from './spec.js';
+import { PANEL_CHILDREN_FIELD, PANEL_LAYOUT_FIELD } from './spec.js';
 import type { PanelNode, PanelNodePath, PanelNodeType, PanelSpec } from './spec.js';
 import type { EventRef, Fact, PanelSummary } from './summary.js';
 import type { PanelValidationIssueCode } from './validate.js';
@@ -278,14 +323,16 @@ const PATH_SEPARATOR = '.';
  */
 
 /**
- * Every way a well-formed panel can still be untrue of its capture, as a closed
+ * Every way a well-formed panel can still be untrue of its capture — and the one
+ * way a value can fail to be a panel this module can read at all — as a closed
  * readonly tuple.
  *
  * Ordered by what each says about the panel: the citations first, then the trace
  * a view is scoped to, then the computed values a tile row asks for, then the
  * evidence a node needs to draw anything — the records of its kinds, then the
  * fields those records must carry — then the two defensive checks on the
- * summary's own lists.
+ * summary's own lists, and last the defensive check on the document's own
+ * shape.
  */
 export const SEMANTIC_ISSUE_REASONS = Object.freeze([
   /** A cited event is not in the capture. Refuted, not merely unproven. */
@@ -337,6 +384,20 @@ export const SEMANTIC_ISSUE_REASONS = Object.freeze([
    * when {@link SemanticValidationOptions.allowEmptyObserved} is `false`.
    */
   'empty-observed',
+  /**
+   * Something claims are reached through could not be read. At a root: the
+   * value is not a non-array object, its `layout` is not an array, its
+   * `summary` is not a non-array object, or a statement list inside that
+   * summary is present but not an array. At an element: a statement or a
+   * citation is not an object, a citation names no event, a node is not an
+   * object, names a type the catalog does not carry or contains itself, a
+   * container's `children` is not a list, or a field's read threw. **Fatal
+   * under every option**, because claims that cannot be read are claims this
+   * module cannot vouch for, and answering `valid` over them would be a false
+   * pass. Defensive: `panelSpecSchema` requires all of these, so this is
+   * unreachable for a specification that passed `./validate.ts`.
+   */
+  'malformed-spec',
 ] as const);
 
 /**
@@ -400,6 +461,7 @@ export const SEMANTIC_ISSUE_SEVERITY_BY_REASON: Readonly<
   'unavailable-field': 'advisory',
   'unevidenced-fact': 'fatal',
   'empty-observed': 'fatal',
+  'malformed-spec': 'fatal',
 });
 
 /**
@@ -433,6 +495,7 @@ export const SEMANTIC_ISSUE_CODE_BY_REASON: Readonly<Record<SemanticIssueReason,
     'unavailable-field': 'panel_node_field_unavailable',
     'unevidenced-fact': EVIDENCE_EMPTY_CODE,
     'empty-observed': 'panel_summary_observed_empty',
+    'malformed-spec': 'panel_spec_malformed',
   });
 
 /**
@@ -471,7 +534,12 @@ export interface SemanticIssue {
    * `['summary', 'observed', 0, 'evidence', 1, 'eventId']`,
    * `['layout', 0, 'query', 'filter', 'traceId']`, `['layout', 2, 'metrics',
    * 0]`. Joined with `.` it is the dotted path the schema library's own issues
-   * use, which is what lets both kinds share one `issues` array.
+   * use, which is what lets both kinds share one `issues` array. Empty for an
+   * issue about the document itself — a `malformed-spec` value that is not an
+   * object at all. A `malformed-spec` issue about an element points at that
+   * element — `['summary', 'observed', 0, 'evidence', 1]`, `['layout', 2]` —
+   * or, where one field decides it, at that field: a node's `type` or
+   * `children`, a citation's `eventId`, `['meta', 'fallback']`.
    */
   readonly path: PanelNodePath;
 
@@ -500,9 +568,10 @@ export interface SemanticIssue {
    * The catalogued type of the node the issue is about, where it is about a
    * node.
    *
-   * Absent for an issue about the summary, and absent for a node whose type is
-   * not in the catalog at all — an unrecognised type string is a rejected
-   * *value*, and `./validate.ts` is the checkpoint that rejects it. Present
+   * Absent for an issue about the summary or about the document's own shape,
+   * and absent for a node whose type is not in the catalog at all — an
+   * unrecognised type string is a rejected *value*, so the `malformed-spec`
+   * issue about it carries its path and never the type it named. Present
    * values are members of the closed node-type vocabulary, which is why this
    * field is safe to log and to show.
    */
@@ -1105,6 +1174,233 @@ const GROUP_OCCURRENCES_FIELD: keyof RenderStat & keyof RequestGroup & keyof Que
 /** `traceIds` on a query group: the traces the statement ran in. */
 const GROUP_TRACE_IDS_FIELD: keyof QueryGroup = 'traceIds';
 
+/**
+ * The capture as the checks below read it: a plain, frozen copy of exactly the
+ * summary fields they consult, made once per validation by
+ * {@link snapshotCapture}.
+ *
+ * Every function after this point takes one of these rather than the
+ * {@link CaptureSummary} it was copied from, so the only code that ever touches
+ * a caller's summary is the copy itself — one guarded pass. That is what lets
+ * the checks read the capture freely without each read needing its own guard,
+ * and what makes each field read once: a getter that answers differently on a
+ * second read cannot make two checks disagree about one capture.
+ *
+ * Typed as an untyped record on purpose. The checks already read every field
+ * as `unknown` through {@link fieldOf} and classify it at runtime, and the copy
+ * holds whatever the summary held at each position — well-formed or not — so
+ * declaring it as a `CaptureSummary` would be an assertion this module could
+ * not back.
+ */
+type CaptureSnapshot = Readonly<Record<string, unknown>>;
+
+/**
+ * The capture that publishes nothing: what a summary is read as when it is not
+ * an object, or when any of its reads throws.
+ *
+ * Every check reads an absent field as "the summary does not say", so this
+ * attests to no event and no trace, refutes no citation, trace or metric, and
+ * reports no node as lacking evidence: every reference is left to the resolvers
+ * or reported unverifiable, which is the honest answer about a capture that
+ * could not be read.
+ */
+const OPAQUE_CAPTURE: CaptureSnapshot = Object.freeze({});
+
+/**
+ * The fields of a summarised span, a failure or a group occurrence that
+ * {@link absorbRecords} reads.
+ */
+const SNAPSHOT_RECORD_FIELDS: readonly string[] = Object.freeze([
+  RECORD_EVENT_ID_FIELD,
+  RECORD_ID_FIELD,
+  RECORD_TRACE_ID_FIELD,
+  RECORD_SPAN_ID_FIELD,
+  RECORD_TRANSFER_EVENT_ID_FIELD,
+]);
+
+/** The fields of a published metric value that the metric checks read. */
+const SNAPSHOT_METRIC_VALUE_FIELDS: readonly string[] = Object.freeze([
+  METRIC_VALUE_ID_FIELD,
+  METRIC_VALUE_AVAILABLE_FIELD,
+  METRIC_VALUE_VALUE_FIELD,
+]);
+
+/** Widened view of the kind vocabulary, the keys of a per-kind tally. */
+const SNAPSHOT_KIND_KEYS: readonly string[] = TELEMETRY_KINDS;
+
+/** Widened view of the tier vocabulary, the keys of a per-tier tally. */
+const SNAPSHOT_TIER_KEYS: readonly string[] = TELEMETRY_TIERS;
+
+/**
+ * Copies a value the checks only ever compare: a primitive as itself, anything
+ * else as `null`.
+ *
+ * Exact for every position it is used at, because each is read only through
+ * `typeof` or a strict comparison — {@link stringFieldOf},
+ * {@link numberFieldOf}, `=== true`, `=== false` — none of which an object
+ * passes and none of which reads into one. Replacing an object by `null` is
+ * what keeps the copy free of the caller's objects, so nothing of the summary
+ * can be reached, or throw, after the copy is made.
+ */
+function copyScalar(value: unknown): unknown {
+  return typeof value === 'object' || typeof value === 'function' ? null : value;
+}
+
+/**
+ * Copies one record: the listed own fields, each through `copyField`, into a
+ * frozen plain object; a value that is not an object is copied as a scalar.
+ *
+ * Exact for the checks, which read a record only through {@link fieldOf} — an
+ * own field, `undefined` when not declared — so a field the record does not
+ * declare reads the same from the copy as from the original, and a value that
+ * is not an object reads as having no fields in both.
+ */
+function copyRecord(
+  value: unknown,
+  keys: readonly string[],
+  copyField: (field: unknown) => unknown,
+): unknown {
+  if (!isObjectLike(value)) {
+    return copyScalar(value);
+  }
+
+  const copy: Record<string, unknown> = {};
+
+  for (const key of keys) {
+    copy[key] = copyField(ownField(value, key));
+  }
+
+  return Object.freeze(copy);
+}
+
+/**
+ * Copies one list, element by element through `copyElement`, into a frozen
+ * array; a value that is not an array is copied as `undefined`.
+ *
+ * Exact for the checks, which read every list position only through
+ * {@link isUnknownArray}, iteration and `length`: anything that is not an array
+ * reads as "not a list" there whatever it is, exactly as `undefined` does, and
+ * a copied list keeps every element in order — so a section's length, which
+ * the field-availability check reads, is preserved.
+ */
+function copyList(value: unknown, copyElement: (element: unknown) => unknown): unknown {
+  if (!isUnknownArray(value)) {
+    return undefined;
+  }
+
+  const copy: unknown[] = [];
+
+  for (let position = 0; position < value.length; position += 1) {
+    copy.push(copyElement(value[position]));
+  }
+
+  return Object.freeze(copy);
+}
+
+/** Copies a summarised span, failure or occurrence; see {@link SNAPSHOT_RECORD_FIELDS}. */
+function copySummarisedRecord(value: unknown): unknown {
+  return copyRecord(value, SNAPSHOT_RECORD_FIELDS, copyScalar);
+}
+
+/**
+ * Copies a render, request or query group through the two fields
+ * {@link absorbGroups} reads: its sampled occurrences and its trace list.
+ */
+function copyGroup(value: unknown): unknown {
+  if (!isObjectLike(value)) {
+    return copyScalar(value);
+  }
+
+  return Object.freeze({
+    [GROUP_OCCURRENCES_FIELD]: copyList(
+      ownField(value, GROUP_OCCURRENCES_FIELD),
+      copySummarisedRecord,
+    ),
+    [GROUP_TRACE_IDS_FIELD]: copyList(ownField(value, GROUP_TRACE_IDS_FIELD), copyScalar),
+  });
+}
+
+/** Copies a published metric value; see {@link SNAPSHOT_METRIC_VALUE_FIELDS}. */
+function copyMetricValue(value: unknown): unknown {
+  return copyRecord(value, SNAPSHOT_METRIC_VALUE_FIELDS, copyScalar);
+}
+
+/**
+ * The body of {@link snapshotCapture}, over a summary known to be an object.
+ * Throws whatever a read of the summary throws; its one caller catches it.
+ *
+ * One entry per summary field a check consults, and no other: a field added to
+ * a check without an entry here reads as absent — "the summary does not say" —
+ * which leaves a question open rather than answering it wrongly.
+ */
+function copyCapture(summary: object): CaptureSnapshot {
+  return Object.freeze({
+    [SUMMARY_TRACE_IDS_FIELD]: copyList(ownField(summary, SUMMARY_TRACE_IDS_FIELD), copyScalar),
+    [SUMMARY_PRIMARY_TRACE_ID_FIELD]: copyScalar(ownField(summary, SUMMARY_PRIMARY_TRACE_ID_FIELD)),
+    [SUMMARY_TRACE_COUNT_FIELD]: copyScalar(ownField(summary, SUMMARY_TRACE_COUNT_FIELD)),
+    [SUMMARY_EVENT_COUNT_FIELD]: copyScalar(ownField(summary, SUMMARY_EVENT_COUNT_FIELD)),
+    [SUMMARY_TRUNCATED_FIELD]: copyScalar(ownField(summary, SUMMARY_TRUNCATED_FIELD)),
+    [SUMMARY_KIND_COUNTS_FIELD]: copyRecord(
+      ownField(summary, SUMMARY_KIND_COUNTS_FIELD),
+      SNAPSHOT_KIND_KEYS,
+      copyScalar,
+    ),
+    [SUMMARY_TIER_COUNTS_FIELD]: copyRecord(
+      ownField(summary, SUMMARY_TIER_COUNTS_FIELD),
+      SNAPSHOT_TIER_KEYS,
+      copyScalar,
+    ),
+    [SUMMARY_METRICS_FIELD]: copyList(ownField(summary, SUMMARY_METRICS_FIELD), copyMetricValue),
+    [SUMMARY_TOP_SPANS_FIELD]: copyList(
+      ownField(summary, SUMMARY_TOP_SPANS_FIELD),
+      copySummarisedRecord,
+    ),
+    [SUMMARY_ERRORS_FIELD]: copyList(ownField(summary, SUMMARY_ERRORS_FIELD), copySummarisedRecord),
+    [SUMMARY_TOP_RENDERS_FIELD]: copyList(ownField(summary, SUMMARY_TOP_RENDERS_FIELD), copyGroup),
+    [SUMMARY_TOP_REQUESTS_FIELD]: copyList(
+      ownField(summary, SUMMARY_TOP_REQUESTS_FIELD),
+      copyGroup,
+    ),
+    [SUMMARY_TOP_QUERIES_FIELD]: copyList(ownField(summary, SUMMARY_TOP_QUERIES_FIELD), copyGroup),
+  });
+}
+
+/**
+ * Reads a summary once into the {@link CaptureSnapshot} every check consults.
+ * **Never throws.**
+ *
+ * All or nothing, deliberately. A summary one of whose reads throws — a
+ * revoked proxy, a trap, a getter that throws, anywhere in the fields the
+ * checks consult — is read as {@link OPAQUE_CAPTURE}, rather than as whatever
+ * was copied before the throw: a partial copy could lose the record that named
+ * a trace and so make a clipped trace list look complete, or drop a metric and
+ * so refute a tile, turning a broken capture into false refutations. A capture
+ * that could not be read in full is one this module cannot partly vouch for,
+ * so it vouches for none of it and refutes nothing: citations and trace
+ * filters are decided by the resolvers where supplied and reported
+ * unverifiable otherwise, so a panel that cites evidence or scopes a view to a
+ * trace never reads as `valid` on it unverified. A metric tile is still held
+ * to the fixed metric vocabulary, which needs no capture; its values' presence
+ * and availability go unchecked, as they do for a summary that publishes no
+ * metric list.
+ *
+ * @param summary The capture as the caller handed it in.
+ * @returns A plain frozen copy of the fields the checks read.
+ */
+function snapshotCapture(summary: CaptureSummary): CaptureSnapshot {
+  const candidate: unknown = summary;
+
+  if (!isObjectLike(candidate)) {
+    return OPAQUE_CAPTURE;
+  }
+
+  try {
+    return copyCapture(candidate);
+  } catch {
+    return OPAQUE_CAPTURE;
+  }
+}
+
 /** Where the capture places an event, as far as the summary records it. */
 interface EventCoordinates {
   /** The trace the event belongs to, when the summary recorded it. */
@@ -1241,8 +1537,12 @@ function absorbGroups(
   }
 }
 
-/** Builds the {@link CaptureIndex} for one summary. Never throws. */
-function indexCapture(summary: CaptureSummary): CaptureIndex {
+/**
+ * Builds the {@link CaptureIndex} for one summary, from its
+ * {@link CaptureSnapshot}. Never throws: the snapshot is plain data this module
+ * made, so nothing read here can run a caller's code.
+ */
+function indexCapture(summary: CaptureSnapshot): CaptureIndex {
   const events = new Map<string, EventCoordinates>();
   const traceIds = new Set<string>();
   const published = new Set<string>();
@@ -1344,8 +1644,11 @@ function copyIdSet(value: unknown): Set<string> | undefined {
  *
  * A resolver that throws, returns a non-object, or returns neither half in a
  * readable shape is treated as one that declined: the ids stay unresolved and
- * are reported as unverifiable. This module is on a reporting path and must not
- * turn a caller's bug into a crash inside the reporter.
+ * are reported as unverifiable. So is one whose answer throws while it is being
+ * read — a half whose getter or iterator throws — because an answer that cannot
+ * be read in full is not one whose other half can be trusted. This module is on
+ * a reporting path and must not turn a caller's bug into a crash inside the
+ * reporter.
  */
 function resolveIds(
   resolver: ((ids: readonly string[]) => IdResolution) | undefined,
@@ -1355,14 +1658,19 @@ function resolveIds(
     return EMPTY_RESOLUTION;
   }
 
-  let answer: unknown;
-
   try {
-    answer = resolver(ids);
+    return readResolution(resolver(ids));
   } catch {
     return EMPTY_RESOLUTION;
   }
+}
 
+/**
+ * The body of {@link resolveIds} once the resolver has answered: copies both
+ * halves of the answer. Throws whatever reading the answer throws; its one
+ * caller catches it.
+ */
+function readResolution(answer: unknown): IdResolution {
   const known = copyIdSet(fieldOf(answer, RESOLUTION_KNOWN_FIELD));
   const resolvedUnknown = copyIdSet(fieldOf(answer, RESOLUTION_UNKNOWN_FIELD));
 
@@ -1400,6 +1708,288 @@ function verdictFor(resolution: IdResolution, id: string): ResolvedVerdict {
 
 /*
  * ---------------------------------------------------------------------------
+ * The document's own shape
+ *
+ * Read before anything is gathered, and read **once**: every list a claim is
+ * reached through — the layout, the two statement lists, and below them each
+ * statement's citations and each container's children — is read here into
+ * elements, each element inside its own guard, so the gathering below works
+ * over values that were already read rather than re-reading a field whose
+ * getter may answer differently the second time.
+ *
+ * Skipping is answering. A tolerant reader that passes over what it cannot
+ * classify finds no claim in it, and no claims reads as `valid`, so whatever a
+ * claim is reached through and cannot be read is reported as `malformed-spec`
+ * where it stands — the roots up front, the elements as the walk meets them
+ * (see this module's documentation).
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The path of an issue about the document itself, rendered as
+ * {@link ROOT_PATH_LABEL} in a message. Frozen, like `./spec.ts`'s
+ * `PANEL_LAYOUT_PATH_ROOT`, because every such issue shares it.
+ */
+const DOCUMENT_PATH: PanelNodePath = Object.freeze([]);
+
+/**
+ * How a value classifies, read without trusting it.
+ *
+ * `unreadable` is an answer of its own: a revoked proxy, a trap or a getter
+ * that throws is a value the walk could not read either, and it is classified
+ * inside a `try` so that the check reporting it never throws itself.
+ */
+type ValueShape = 'absent' | 'list' | 'record' | 'scalar' | 'unreadable';
+
+/**
+ * Classifies a value without trusting it. Never throws.
+ *
+ * `Array.isArray` throws for a revoked proxy, which is why even this
+ * classification sits inside the `try`. `null`, a string, a number, a boolean
+ * and a function are all `scalar`: none of them is a container claims can be
+ * read out of.
+ */
+function shapeOf(value: unknown): ValueShape {
+  try {
+    if (value === undefined) {
+      return 'absent';
+    }
+
+    if (isUnknownArray(value)) {
+      return 'list';
+    }
+
+    return isObjectLike(value) ? 'record' : 'scalar';
+  } catch {
+    return 'unreadable';
+  }
+}
+
+/** One own field, read once, with how it classifies. */
+interface FieldRead {
+  /** How the value classifies; see {@link ValueShape}. */
+  readonly shape: ValueShape;
+  /** The value itself, or `undefined` when reading it threw. */
+  readonly value: unknown;
+}
+
+/**
+ * Reads one own field and classifies it. Never throws: a read that throws is
+ * `unreadable`, and nothing of it is carried.
+ */
+function readField(container: object, key: string): FieldRead {
+  let value: unknown;
+
+  try {
+    value = ownField(container, key);
+  } catch {
+    return { shape: 'unreadable', value: undefined };
+  }
+
+  return { shape: shapeOf(value), value };
+}
+
+/**
+ * Narrows a value to a non-array object: the shape a statement, a citation, a
+ * node and the summary must each have. Never throws.
+ */
+function isRecord(value: unknown): value is object {
+  return isObjectLike(value) && shapeOf(value) === 'record';
+}
+
+/**
+ * One element of a list, as read: its value, or the fact that reading it
+ * threw — in which case nothing of it is carried.
+ */
+type ElementRead =
+  { readonly readable: true; readonly value: unknown } | { readonly readable: false };
+
+/** The read of an element whose read threw. Shared, because it carries nothing. */
+const UNREADABLE_ELEMENT: ElementRead = Object.freeze({ readable: false });
+
+/**
+ * A list field, as read.
+ *
+ * - `list` — an array whose length could be read, with every element read;
+ * - `absent` — the field is not declared, which a statement list reads as empty;
+ * - `not-list` — the field holds something that is not an array;
+ * - `unreadable` — reading the field, classifying it or reading its length
+ *   threw.
+ *
+ * `not-list` and `unreadable` are kept apart because the one list whose wrong
+ * shape carries no hidden claim — a statement's `evidence`, which then cites
+ * nothing and is reported as such — must tell a value it can see is wrong from
+ * one it could not read at all.
+ */
+type ListRead =
+  | { readonly status: 'list'; readonly elements: readonly ElementRead[] }
+  | { readonly status: 'absent' | 'not-list' | 'unreadable' };
+
+/** The shared reads of a list field that yields no elements. */
+const ABSENT_LIST: ListRead = Object.freeze({ status: 'absent' });
+
+/** See {@link ABSENT_LIST}. */
+const NOT_A_LIST: ListRead = Object.freeze({ status: 'not-list' });
+
+/** See {@link ABSENT_LIST}. */
+const UNREADABLE_LIST: ListRead = Object.freeze({ status: 'unreadable' });
+
+/**
+ * Reads every element of an array once, each inside its own guard. Throws only
+ * where its one caller, {@link readList}, catches: reading the length.
+ *
+ * An element is read as an **own** index, like every other field this module
+ * reads, so a hole in a sparse array is an absent element rather than whatever
+ * a prototype supplies. A length that is not a non-negative safe integer — a
+ * proxy may report anything — makes the list unreadable rather than looping on
+ * it.
+ */
+function readElements(list: readonly unknown[]): readonly ElementRead[] | undefined {
+  const length: unknown = list.length;
+
+  if (typeof length !== 'number' || !Number.isSafeInteger(length) || length < 0) {
+    return undefined;
+  }
+
+  const elements: ElementRead[] = [];
+
+  for (let position = 0; position < length; position += 1) {
+    try {
+      elements.push({ readable: true, value: ownField(list, String(position)) });
+    } catch {
+      elements.push(UNREADABLE_ELEMENT);
+    }
+  }
+
+  return elements;
+}
+
+/**
+ * Reads one own list field into its elements. Never throws: a field, a
+ * classification or a length that throws while being read is `unreadable`.
+ */
+function readList(container: object, key: string): ListRead {
+  try {
+    const value = ownField(container, key);
+
+    if (value === undefined) {
+      return ABSENT_LIST;
+    }
+
+    if (!isUnknownArray(value)) {
+      return NOT_A_LIST;
+    }
+
+    const elements = readElements(value);
+
+    return elements === undefined ? UNREADABLE_LIST : { status: 'list', elements };
+  } catch {
+    return UNREADABLE_LIST;
+  }
+}
+
+/** The elements a list read yields: none, unless it read as a list. */
+function elementsOf(read: ListRead): readonly ElementRead[] {
+  return read.status === 'list' ? read.elements : [];
+}
+
+/** A specification whose roots all read: its three claim lists, element by element. */
+interface ReadableDocument {
+  /** The document itself, for the one field read only on demand: `meta`. */
+  readonly spec: object;
+  /** The top-level nodes. */
+  readonly layout: readonly ElementRead[];
+  /** The observed facts; empty when the list was omitted. */
+  readonly observed: readonly ElementRead[];
+  /** The likely causes; empty when the list was omitted. */
+  readonly likelyCauses: readonly ElementRead[];
+}
+
+/**
+ * What reading a specification's roots found: the document's claim lists, or
+ * the paths of every root that could not be read.
+ */
+type DocumentRead =
+  | { readonly readable: true; readonly document: ReadableDocument }
+  | { readonly readable: false; readonly faults: readonly PanelNodePath[] };
+
+/**
+ * Reads a specification's roots once. Never throws.
+ *
+ * One rule per root, matching what `panelSpecSchema` requires of each:
+ *
+ * - the document must be a non-array object — otherwise `[]`, and nothing
+ *   further is read;
+ * - `layout` must be an array, which may be empty — otherwise `['layout']`;
+ * - `summary` must be a non-array object — otherwise `['summary']`, and its
+ *   lists are not read;
+ * - `summary.observed` and `summary.likelyCauses` must each be an array or
+ *   absent — otherwise `['summary', <field>]`. Absent is read as empty, which
+ *   is what `panelSummarySchema`'s defaults make of an omitted list.
+ *
+ * "An array" means one whose length and elements could be read: a list whose
+ * length read throws is a root that cannot be read, while an element whose read
+ * throws is the walk's to report, at that element, with its siblings still
+ * checked.
+ *
+ * Own fields only, through the same reader the claim walk uses, so a document
+ * passes this check exactly when the walk can read its lists: a `layout`
+ * inherited from a prototype is one the walk would never see, and is reported
+ * as missing. Every fault is reported rather than the first, for the reason
+ * {@link collectSemanticIssues} reports every issue.
+ *
+ * @param spec Any value handed in as a specification.
+ * @returns The document's claim lists, or the offending paths in root order.
+ */
+function readDocument(spec: unknown): DocumentRead {
+  if (!isRecord(spec)) {
+    return { readable: false, faults: [DOCUMENT_PATH] };
+  }
+
+  const faults: PanelNodePath[] = [];
+  const layout = readList(spec, PANEL_LAYOUT_FIELD);
+
+  if (layout.status !== 'list') {
+    faults.push([PANEL_LAYOUT_FIELD]);
+  }
+
+  const summary = readField(spec, SUMMARY_FIELD);
+
+  if (!isRecord(summary.value)) {
+    faults.push([SUMMARY_FIELD]);
+
+    return { readable: false, faults };
+  }
+
+  const observed = readList(summary.value, OBSERVED_FIELD);
+  const likelyCauses = readList(summary.value, LIKELY_CAUSES_FIELD);
+
+  for (const [field, statements] of [
+    [OBSERVED_FIELD, observed],
+    [LIKELY_CAUSES_FIELD, likelyCauses],
+  ] as const) {
+    if (statements.status !== 'list' && statements.status !== 'absent') {
+      faults.push([SUMMARY_FIELD, field]);
+    }
+  }
+
+  if (faults.length > 0 || layout.status !== 'list') {
+    return { readable: false, faults };
+  }
+
+  return {
+    readable: true,
+    document: {
+      spec,
+      layout: layout.elements,
+      observed: elementsOf(observed),
+      likelyCauses: elementsOf(likelyCauses),
+    },
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * Gathering: what the specification claims
  *
  * Two passes, and the split is not incidental. The resolvers are called **once**
@@ -1413,8 +2003,12 @@ function verdictFor(resolution: IdResolution, id: string): ResolvedVerdict {
 interface Citation {
   /** Path of the reference object itself, without a field appended. */
   readonly path: PanelNodePath;
-  /** The cited event's id. Absent when the reference carried none readable. */
-  readonly eventId?: string;
+  /**
+   * The cited event's id. Always present: a reference that names no readable
+   * event is reported as `malformed-spec` while gathering and never becomes a
+   * citation, since a citation of nothing is a claim nobody could check.
+   */
+  readonly eventId: string;
   /** The trace coordinate the reference recorded, when it did. */
   readonly traceId?: string;
   /** The span coordinate the reference recorded, when it did. */
@@ -1433,8 +2027,8 @@ interface TraceFilterUse {
 
 /**
  * The issues decidable without a resolver: the summary's own two defensive
- * checks, the metric ids a tile row asks for, and per-node evidence
- * availability.
+ * checks, every element that could not be read, the metric ids a tile row asks
+ * for, and per-node evidence availability.
  */
 interface DecidedWhileGathering {
   /** Refutations found without consulting a resolver. */
@@ -1455,56 +2049,114 @@ interface GatheredClaims {
   readonly decided: DecidedWhileGathering;
 }
 
+/** Where one statement list's gathering puts what it finds. */
+interface CitationSink {
+  /** Every readable citation, in document order. */
+  readonly citations: Citation[];
+  /** The evidence paths of statements that cite nothing. */
+  readonly unevidenced: PanelNodePath[];
+  /** The paths of statements and citations that could not be read. */
+  readonly malformed: PanelNodePath[];
+}
+
 /**
- * Gathers the citations of one statement list, and the statements that have
- * none.
+ * Gathers the citations of one statement list, the statements that have none,
+ * and the elements that could not be read.
  *
- * Read entirely through the untyped helpers, for the reason this module's helper
- * section records: a statement that is not an object at all, or an `evidence`
- * that is not an array, is a *shape* failure `./spec.ts`'s schema owns, and
- * reporting a semantic verdict about it would describe the wrong problem. Such a
- * statement is skipped rather than rejected — except for the one case that *is*
- * this module's business, an evidence list that is absent or empty.
+ * One element at a time, so an element that cannot be read costs its own claims
+ * and nothing else:
+ *
+ * - a statement that is not a non-array object, or whose read threw, is
+ *   `malformed-spec` at the statement — `['summary', 'observed', 0]` — because
+ *   whatever it cites is out of reach;
+ * - an `evidence` whose read threw is `malformed-spec` at the evidence list;
+ * - an `evidence` that is absent, empty or not a list is the one case that
+ *   *is* this module's business as stated, a statement citing nothing:
+ *   `unevidenced-fact`, as before;
+ * - each citation is read by {@link readCitation}.
  */
 function gatherCitations(
-  statements: unknown,
+  statements: readonly ElementRead[],
   basePath: PanelNodePath,
-  citations: Citation[],
-  unevidenced: PanelNodePath[],
+  sink: CitationSink,
 ): void {
-  if (!isUnknownArray(statements)) {
-    return;
+  for (const [statementIndex, statement] of statements.entries()) {
+    const statementPath: PanelNodePath = [...basePath, statementIndex];
+
+    if (!statement.readable || !isRecord(statement.value)) {
+      sink.malformed.push(statementPath);
+      continue;
+    }
+
+    const evidencePath: PanelNodePath = [...statementPath, EVIDENCE_FIELD];
+    const evidence = readList(statement.value, EVIDENCE_FIELD);
+
+    if (evidence.status === 'unreadable') {
+      sink.malformed.push(evidencePath);
+      continue;
+    }
+
+    if (evidence.status !== 'list' || evidence.elements.length === 0) {
+      sink.unevidenced.push(evidencePath);
+      continue;
+    }
+
+    for (const [refIndex, ref] of evidence.elements.entries()) {
+      const read = readCitation(ref, [...evidencePath, refIndex]);
+
+      if (read.readable) {
+        sink.citations.push(read.citation);
+      } else {
+        sink.malformed.push(read.path);
+      }
+    }
+  }
+}
+
+/** One citation as read: the citation, or where it could not be read. */
+type CitationRead =
+  | { readonly readable: true; readonly citation: Citation }
+  | { readonly readable: false; readonly path: PanelNodePath };
+
+/**
+ * Reads one citation. Never throws.
+ *
+ * A reference that is not a non-array object, or one whose fields throw while
+ * being read, is `malformed-spec` at the reference. A readable reference that
+ * names no event — its `eventId` absent, not a string or blank, all of which
+ * `eventRefSchema` refuses — is `malformed-spec` at its `eventId`: it is a
+ * citation of nothing, and letting it pass would let a fact look evidenced by
+ * a reference nobody could check. The two optional coordinates are carried
+ * when they are readable strings and ignored otherwise, as before: a malformed
+ * coordinate hides no claim, and is `./validate.ts`'s to report.
+ */
+function readCitation(ref: ElementRead, path: PanelNodePath): CitationRead {
+  if (!ref.readable || !isRecord(ref.value)) {
+    return { readable: false, path };
   }
 
-  for (const [statementIndex, statement] of statements.entries()) {
-    if (!isObjectLike(statement)) {
-      continue;
+  const { value } = ref;
+
+  try {
+    const eventId = stringFieldOf(value, EVENT_ID_FIELD);
+    const traceId = stringFieldOf(value, EVENT_REF_TRACE_ID_FIELD);
+    const spanId = stringFieldOf(value, EVENT_REF_SPAN_ID_FIELD);
+
+    if (eventId === undefined) {
+      return { readable: false, path: [...path, EVENT_ID_FIELD] };
     }
 
-    const evidencePath: PanelNodePath = [...basePath, statementIndex, EVIDENCE_FIELD];
-    const evidence = ownField(statement, EVIDENCE_FIELD);
-
-    if (!isUnknownArray(evidence) || evidence.length === 0) {
-      unevidenced.push(evidencePath);
-      continue;
-    }
-
-    for (const [refIndex, ref] of evidence.entries()) {
-      if (!isObjectLike(ref)) {
-        continue;
-      }
-
-      const eventId = stringFieldOf(ref, EVENT_ID_FIELD);
-      const traceId = stringFieldOf(ref, EVENT_REF_TRACE_ID_FIELD);
-      const spanId = stringFieldOf(ref, EVENT_REF_SPAN_ID_FIELD);
-
-      citations.push({
-        path: [...evidencePath, refIndex],
-        ...(eventId !== undefined ? { eventId } : {}),
+    return {
+      readable: true,
+      citation: {
+        path,
+        eventId,
         ...(traceId !== undefined ? { traceId } : {}),
         ...(spanId !== undefined ? { spanId } : {}),
-      });
-    }
+      },
+    };
+  } catch {
+    return { readable: false, path };
   }
 }
 
@@ -1515,12 +2167,12 @@ function gatherCitations(
  */
 
 /** Reads one per-kind tally, or `undefined` when the summary has none. */
-function kindCountOf(summary: CaptureSummary, kind: TelemetryKind): number | undefined {
+function kindCountOf(summary: CaptureSnapshot, kind: TelemetryKind): number | undefined {
   return numberFieldOf(fieldOf(summary, SUMMARY_KIND_COUNTS_FIELD), kind);
 }
 
 /** Reads one per-tier tally, or `undefined` when the summary has none. */
-function tierCountOf(summary: CaptureSummary, tier: TelemetryTier): number | undefined {
+function tierCountOf(summary: CaptureSnapshot, tier: TelemetryTier): number | undefined {
   return numberFieldOf(fieldOf(summary, SUMMARY_TIER_COUNTS_FIELD), tier);
 }
 
@@ -1532,7 +2184,7 @@ function tierCountOf(summary: CaptureSummary, tier: TelemetryTier): number | und
  * simply did not publish.
  */
 function holdsAnyKind(
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
   kinds: readonly TelemetryKind[],
 ): boolean | undefined {
   let total = 0;
@@ -1589,10 +2241,10 @@ function holdsAnyKind(
  * replace a whole panel with a fallback. Only `requireVerifiable` escalates it.
  */
 function collectAvailabilityIssues(
-  node: PanelNode,
+  node: object,
   path: PanelNodePath,
   type: PanelNodeType,
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
   index: CaptureIndex,
   fieldPresence: unknown,
 ): readonly SemanticIssue[] {
@@ -1675,7 +2327,7 @@ function requiredFieldsMissing(
   telemetryKinds: readonly TelemetryKind[],
   requiredReads: readonly string[],
   source: DataQuerySource,
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
   fieldPresence: unknown,
 ): boolean {
   for (const { key, kinds } of requiredAttributeKeysByKind(telemetryKinds, requiredReads)) {
@@ -1780,7 +2432,7 @@ function readPresenceVerdict(
  * does not say", never a zero: reading a zero into a metric that was not
  * measured would manufacture the very refutation this module refuses to guess.
  */
-function availableMetricCountOf(summary: CaptureSummary, metricId: MetricId): number | undefined {
+function availableMetricCountOf(summary: CaptureSnapshot, metricId: MetricId): number | undefined {
   const published = fieldOf(summary, SUMMARY_METRICS_FIELD);
 
   if (!isUnknownArray(published)) {
@@ -1822,7 +2474,7 @@ function availableMetricCountOf(summary: CaptureSummary, metricId: MetricId): nu
  * publish something is not evidence that it is absent.
  */
 function requiredKeyMissingFromSummary(
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
   source: DataQuerySource,
   kinds: readonly TelemetryKind[],
 ): boolean | undefined {
@@ -1867,7 +2519,7 @@ function requiredKeyMissingFromSummary(
 function sourceEvidenceMissing(
   telemetryKinds: readonly TelemetryKind[],
   source: DataQuerySource,
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
   index: CaptureIndex,
 ): boolean {
   if (source === METRICS_SOURCE) {
@@ -1898,7 +2550,7 @@ function collectFilterAvailabilityIssues(
   query: object,
   path: PanelNodePath,
   type: PanelNodeType,
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
 ): readonly SemanticIssue[] {
   const filter = ownField(query, QUERY_FILTER_FIELD);
 
@@ -1949,10 +2601,10 @@ function collectFilterAvailabilityIssues(
  * refutations out of missing input.
  */
 function collectMetricIssues(
-  node: PanelNode,
+  node: object,
   path: PanelNodePath,
   type: PanelNodeType,
-  summary: CaptureSummary,
+  summary: CaptureSnapshot,
 ): { readonly fatal: readonly SemanticIssue[]; readonly informational: readonly SemanticIssue[] } {
   const requested = ownField(node, METRICS_FIELD);
 
@@ -1992,57 +2644,274 @@ function collectMetricIssues(
   return { fatal, informational };
 }
 
+/** Everything one node contributes, returned whole so it can be committed whole. */
+interface NodeClaims {
+  /** The trace the node's filter scopes it to, when it names one. */
+  readonly traceFilter?: TraceFilterUse;
+  /** Refutations decided on the spot: metric ids the capture cannot serve. */
+  readonly fatal: readonly SemanticIssue[];
+  /** Evidence the capture does not hold for the node. */
+  readonly advisory: readonly SemanticIssue[];
+  /** Metrics the capture could not measure. */
+  readonly informational: readonly SemanticIssue[];
+}
+
 /**
  * Gathers one node's claims and decides the checks that need no resolver.
  *
- * A node whose type the catalog does not know ends here: an unrecognised type is
- * `./validate.ts`'s rejection, and asking the catalog about it would reach a
- * lookup that has no entry.
+ * Reached only for a non-array object whose `type` the catalog carries, which
+ * {@link gatherFromLayout} establishes first. **Throws** whatever reading the
+ * node's own fields throws — its `query`, its filter, its `metrics` — and
+ * returns rather than records what it found, so that its one caller can commit
+ * a node's claims only once all of them were read and report the node instead
+ * when they were not. Nothing it reads of the capture can throw: it reads the
+ * {@link CaptureSnapshot}.
  */
 function gatherFromNode(
-  node: PanelNode,
+  node: object,
   path: PanelNodePath,
-  summary: CaptureSummary,
+  type: PanelNodeType,
+  summary: CaptureSnapshot,
   index: CaptureIndex,
   fieldPresence: unknown,
-  traceFilters: TraceFilterUse[],
-  fatal: SemanticIssue[],
-  advisory: SemanticIssue[],
-  informational: SemanticIssue[],
-): void {
-  const type: unknown = ownField(node, NODE_TYPE_FIELD);
+): NodeClaims {
+  const query = ownField(node, NODE_QUERY_FIELD);
+  const traceId = stringFieldOf(fieldOf(query, QUERY_FILTER_FIELD), FILTER_TRACE_ID_FIELD);
+  const metrics = collectMetricIssues(node, path, type, summary);
+  const advisory = collectAvailabilityIssues(node, path, type, summary, index, fieldPresence);
 
-  if (!isKnownPanelNodeType(type)) {
+  return {
+    ...(traceId === undefined
+      ? {}
+      : {
+          traceFilter: {
+            path: [...path, NODE_QUERY_FIELD, QUERY_FILTER_FIELD, FILTER_TRACE_ID_FIELD],
+            nodeType: type,
+            traceId,
+          },
+        }),
+    fatal: metrics.fatal,
+    advisory,
+    informational: metrics.informational,
+  };
+}
+
+/** Where the layout walk puts what it finds, shared by every node it reaches. */
+interface LayoutSink {
+  /** Every trace id a node's filter scopes to, in walk order. */
+  readonly traceFilters: TraceFilterUse[];
+  /** Refutations, and every node that could not be read. */
+  readonly fatal: SemanticIssue[];
+  /** Evidence the capture does not hold. */
+  readonly advisory: SemanticIssue[];
+  /** Metrics the capture could not measure. */
+  readonly informational: SemanticIssue[];
+}
+
+/** A node the layout walk has reached but not yet visited. */
+interface NodeFrame {
+  /** The node, as read out of its list. */
+  readonly element: ElementRead;
+  /** Where it sits: see {@link PanelNodePath}. */
+  readonly path: PanelNodePath;
+  /**
+   * The containers the walk descended through to reach it, outermost first —
+   * what tells a node that contains itself from one merely placed twice.
+   */
+  readonly ancestors: readonly object[];
+}
+
+/** Pairs each element of a child list with its path, for {@link gatherFromLayout}'s stack. */
+function framesOf(
+  elements: readonly ElementRead[],
+  basePath: PanelNodePath,
+  ancestors: readonly object[],
+): NodeFrame[] {
+  return elements.map((element, position) => ({
+    element,
+    path: [...basePath, position],
+    ancestors,
+  }));
+}
+
+/**
+ * Walks a layout, gathering every node's claims. **Never throws**, and never
+ * stops early: a node that cannot be read is reported where it stands and the
+ * walk goes on with the nodes after it.
+ *
+ * The traversal is `./spec.ts`'s `walkPanelNodes`, reproduced rather than
+ * called, because that one trusts what it walks: it reads `type` and
+ * `children` directly and ends in `assertNever`, so one unknown node type
+ * throws out of it and every node after that one goes unchecked — which is how
+ * a fabricated trace filter placed after an unrecognised node used to pass.
+ * The order and the paths are the same: pre-order, siblings in document order,
+ * an explicit stack rather than recursion, top-level nodes at `['layout', n]`
+ * and children at `[…, 'children', n]`. So a well-formed layout is gathered
+ * exactly as before, and a resolver is asked about the same ids in the same
+ * order.
+ *
+ * Per node, in this order:
+ *
+ * 1. a node that is not a non-array object, or whose read threw, is
+ *    `malformed-spec` at the node — `['layout', 2]`;
+ * 2. a node that is one of the containers above it — a layout that contains
+ *    itself, which no document parsed from JSON can be — is `malformed-spec`
+ *    at the node, and the cycle is not followed: without this the walk would
+ *    never end;
+ * 3. a node whose `type` read threw, or names a type the catalog does not
+ *    carry, is `malformed-spec` at its `type` — `['layout', 2, 'type']` — with
+ *    no `nodeType`, since the value is not in the closed vocabulary. The walk
+ *    does not descend into it: nothing says which of an unknown node's fields
+ *    hold children, and guessing would report paths no schema defines;
+ * 4. otherwise its claims are gathered by {@link gatherFromNode} and committed
+ *    only if every read succeeded; a node whose own fields throw is
+ *    `malformed-spec` at the node, with its catalogued `nodeType`, and none of
+ *    what it partly yielded is kept;
+ * 5. a catalogued container's `children` is read as a list — one that is not a
+ *    list, or cannot be read, is `malformed-spec` at `[…, 'children']` — and
+ *    each child is walked on its own, so a readable child of a container whose
+ *    other fields threw is still checked.
+ */
+function gatherFromLayout(
+  layout: readonly ElementRead[],
+  summary: CaptureSnapshot,
+  index: CaptureIndex,
+  fieldPresence: unknown,
+  sink: LayoutSink,
+): void {
+  // Reversed, because the stack is LIFO and the first sibling must come out
+  // first.
+  const stack: NodeFrame[] = framesOf(layout, [PANEL_LAYOUT_FIELD], []).reverse();
+
+  while (stack.length > 0) {
+    const frame = stack.pop();
+
+    // Unreachable while the loop condition holds; `pop` is typed as possibly
+    // empty and this branch is how that is honoured without an assertion.
+    if (frame === undefined) {
+      return;
+    }
+
+    const { element, path, ancestors } = frame;
+    const node = element.readable ? element.value : undefined;
+
+    if (!isRecord(node) || ancestors.includes(node)) {
+      sink.fatal.push(issueAt('malformed-spec', path));
+      continue;
+    }
+
+    const type = readField(node, NODE_TYPE_FIELD).value;
+
+    if (!isKnownPanelNodeType(type)) {
+      sink.fatal.push(issueAt('malformed-spec', [...path, NODE_TYPE_FIELD]));
+      continue;
+    }
+
+    commitNodeClaims(node, path, type, summary, index, fieldPresence, sink);
+
+    if (!catalogEntryFor(type).supportsChildren) {
+      continue;
+    }
+
+    const children = readList(node, PANEL_CHILDREN_FIELD);
+
+    if (children.status !== 'list') {
+      sink.fatal.push(issueAt('malformed-spec', [...path, PANEL_CHILDREN_FIELD], type));
+      continue;
+    }
+
+    const childFrames = framesOf(
+      children.elements,
+      [...path, PANEL_CHILDREN_FIELD],
+      [...ancestors, node],
+    );
+    childFrames.reverse();
+
+    // Pushed one at a time rather than spread, so a node with an implausible
+    // number of children cannot exceed the runtime's argument limit.
+    for (const childFrame of childFrames) {
+      stack.push(childFrame);
+    }
+  }
+}
+
+/**
+ * Gathers one catalogued node's claims and commits them to the walk's sink, or
+ * reports the node as `malformed-spec` when reading them threw. Never throws.
+ */
+function commitNodeClaims(
+  node: object,
+  path: PanelNodePath,
+  type: PanelNodeType,
+  summary: CaptureSnapshot,
+  index: CaptureIndex,
+  fieldPresence: unknown,
+  sink: LayoutSink,
+): void {
+  let claims: NodeClaims;
+
+  try {
+    claims = gatherFromNode(node, path, type, summary, index, fieldPresence);
+  } catch {
+    sink.fatal.push(issueAt('malformed-spec', path, type));
+
     return;
   }
 
-  const query = ownField(node, NODE_QUERY_FIELD);
-  const traceId = stringFieldOf(fieldOf(query, QUERY_FILTER_FIELD), FILTER_TRACE_ID_FIELD);
-
-  if (traceId !== undefined) {
-    traceFilters.push({
-      path: [...path, NODE_QUERY_FIELD, QUERY_FILTER_FIELD, FILTER_TRACE_ID_FIELD],
-      nodeType: type,
-      traceId,
-    });
+  if (claims.traceFilter !== undefined) {
+    sink.traceFilters.push(claims.traceFilter);
   }
 
-  const metrics = collectMetricIssues(node, path, type, summary);
+  sink.fatal.push(...claims.fatal);
+  sink.informational.push(...claims.informational);
+  sink.advisory.push(...claims.advisory);
+}
 
-  fatal.push(...metrics.fatal);
-  informational.push(...metrics.informational);
-  advisory.push(...collectAvailabilityIssues(node, path, type, summary, index, fieldPresence));
+/** Whether a document is exempt from the empty-observed requirement, as read. */
+type FallbackRead =
+  | { readonly readable: true; readonly fallback: boolean }
+  | { readonly readable: false; readonly path: PanelNodePath };
+
+/**
+ * Reads `meta.fallback`, the flag that exempts a fallback panel from the
+ * empty-observed requirement. Never throws.
+ *
+ * A `meta` that is absent or not an object, and a flag that is anything but
+ * `true`, read as "not a fallback panel", exactly as before. A read that throws
+ * is reported at the field that threw, because a flag that cannot be read can
+ * neither exempt a panel nor be assumed not to.
+ */
+function readFallbackFlag(spec: object): FallbackRead {
+  const meta = readField(spec, META_FIELD);
+
+  if (meta.shape === 'unreadable') {
+    return { readable: false, path: [META_FIELD] };
+  }
+
+  if (!isObjectLike(meta.value)) {
+    return { readable: true, fallback: false };
+  }
+
+  const flag = readField(meta.value, FALLBACK_FIELD);
+
+  if (flag.shape === 'unreadable') {
+    return { readable: false, path: [META_FIELD, FALLBACK_FIELD] };
+  }
+
+  return { readable: true, fallback: flag.value === true };
 }
 
 /**
  * Reads a specification once, gathering what has to be asked about and deciding
  * what does not.
  *
- * Everything here is read through the untyped helpers, so a specification that
- * was asserted rather than parsed is checked as far as it can be and never
+ * Works over the lists {@link readDocument} already read, so an empty result
+ * here means "no claims", never "no readable claims": every element that could
+ * not be read is a `malformed-spec` issue in the fatal partition, and every
+ * element that could is gathered as though the others were not there. Never
  * throws.
  *
- * @param spec The specification to read.
+ * @param document The specification's claim lists.
  * @param summary The capture, for the checks that need no resolver.
  * @param index The capture's index, for per-node availability.
  * @param options The caller's strictness, for the empty-observed decision, and
@@ -2050,77 +2919,54 @@ function gatherFromNode(
  * @returns The citations and trace filters to decide, plus what was decided.
  */
 function gatherClaims(
-  spec: PanelSpec,
-  summary: CaptureSummary,
+  document: ReadableDocument,
+  summary: CaptureSnapshot,
   index: CaptureIndex,
   options: SemanticValidationOptions | undefined,
 ): GatheredClaims {
-  const citations: Citation[] = [];
-  const unevidenced: PanelNodePath[] = [];
-  const traceFilters: TraceFilterUse[] = [];
-  const fatal: SemanticIssue[] = [];
-  const advisory: SemanticIssue[] = [];
-  const informational: SemanticIssue[] = [];
+  const statements: CitationSink = { citations: [], unevidenced: [], malformed: [] };
+  const layout: LayoutSink = { traceFilters: [], fatal: [], advisory: [], informational: [] };
+  const { fatal } = layout;
 
-  const summaryValue = fieldOf(spec, SUMMARY_FIELD);
-  const observed = fieldOf(summaryValue, OBSERVED_FIELD);
+  gatherCitations(document.observed, [SUMMARY_FIELD, OBSERVED_FIELD], statements);
+  gatherCitations(document.likelyCauses, [SUMMARY_FIELD, LIKELY_CAUSES_FIELD], statements);
 
-  gatherCitations(observed, [SUMMARY_FIELD, OBSERVED_FIELD], citations, unevidenced);
-  gatherCitations(
-    fieldOf(summaryValue, LIKELY_CAUSES_FIELD),
-    [SUMMARY_FIELD, LIKELY_CAUSES_FIELD],
-    citations,
-    unevidenced,
-  );
-
-  for (const path of unevidenced) {
+  for (const path of statements.unevidenced) {
     fatal.push(issueAt('unevidenced-fact', path));
+  }
+
+  for (const path of statements.malformed) {
+    fatal.push(issueAt('malformed-spec', path));
   }
 
   // A panel with no findings. Legitimate by default — the deterministic fallback
   // panel of AAP 0.5.5 carries no model-derived facts — and a fallback panel is
   // exempt even when a caller demands findings, because requiring them of the
   // document that exists *because* nothing else could be shown would reject the
-  // only panel available.
-  if (
-    options?.allowEmptyObserved === false &&
-    fieldOf(fieldOf(spec, META_FIELD), FALLBACK_FIELD) !== true &&
-    isUnknownArray(observed) &&
-    observed.length === 0
-  ) {
-    fatal.push(issueAt('empty-observed', [SUMMARY_FIELD, OBSERVED_FIELD]));
-  }
+  // only panel available. An omitted list is an empty one, as the shape check
+  // and `panelSummarySchema`'s default both read it: otherwise a document that
+  // left `observed` out would pass a caller that required findings.
+  if (options?.allowEmptyObserved === false && document.observed.length === 0) {
+    const exemption = readFallbackFlag(document.spec);
 
-  if (isUnknownArray(fieldOf(spec, PANEL_LAYOUT_FIELD))) {
-    // Read once, as `unknown`: the tally is caller-supplied input, and every
-    // field of it is classified at runtime where it is used.
-    const fieldPresence: unknown = options?.fieldPresence;
-
-    try {
-      walkPanelNodes(spec.layout, (node, path) => {
-        gatherFromNode(
-          node,
-          path,
-          summary,
-          index,
-          fieldPresence,
-          traceFilters,
-          fatal,
-          advisory,
-          informational,
-        );
-      });
-    } catch {
-      // `./spec.ts`'s traversal ends its children lookup in `assertNever`, which
-      // throws for a node whose type is outside the node *union* — a document
-      // that never passed `panelSpecSchema`, whose discriminated union rejects
-      // one, and which `./validate.ts` rejects with a structural issue. The
-      // nodes after it go ungathered; this module reports what it reached rather
-      // than replacing a report about a panel with a crash inside the reporter.
+    if (!exemption.readable) {
+      fatal.push(issueAt('malformed-spec', exemption.path));
+    } else if (!exemption.fallback) {
+      fatal.push(issueAt('empty-observed', [SUMMARY_FIELD, OBSERVED_FIELD]));
     }
   }
 
-  return { citations, traceFilters, decided: { fatal, advisory, informational } };
+  // Read once, as `unknown`: the tally is caller-supplied input, and every
+  // field of it is classified at runtime where it is used.
+  const fieldPresence: unknown = options?.fieldPresence;
+
+  gatherFromLayout(document.layout, summary, index, fieldPresence, layout);
+
+  return {
+    citations: statements.citations,
+    traceFilters: layout.traceFilters,
+    decided: { fatal, advisory: layout.advisory, informational: layout.informational },
+  };
 }
 
 /*
@@ -2168,10 +3014,9 @@ interface DecidedIssues {
  * failure a resolver cannot: an id that exists paired with a trace or span it
  * does not belong to.
  *
- * A reference whose `eventId` is not a readable string is skipped rather than
- * reported. `eventRefSchema` requires it, so its absence is a shape failure
- * `./spec.ts` owns, and a semantic verdict about a citation that names nothing
- * would describe the wrong problem.
+ * Every citation here names an event: a reference whose `eventId` is not a
+ * readable string never became one, and was reported as `malformed-spec` while
+ * gathering (see {@link readCitation}).
  */
 function decideCitations(
   citations: readonly Citation[],
@@ -2184,11 +3029,6 @@ function decideCitations(
 
   for (const citation of citations) {
     const { eventId } = citation;
-
-    if (eventId === undefined) {
-      continue;
-    }
-
     const eventIdPath: PanelNodePath = [...citation.path, EVENT_ID_FIELD];
     const verdict = verdictFor(events, eventId);
 
@@ -2495,11 +3335,25 @@ export function tallyFieldPresence(events: readonly TelemetryEvent[]): CaptureFi
  *
  * The order of work, which is also the order issues are found in:
  *
- * 1. the capture is indexed once (bounded sections, trace list, event count);
+ * 0. the specification's own shape is checked first (see this module's
+ *    documentation). A value that is not an object, or whose `layout`,
+ *    `summary` or statement lists cannot be read, yields one fatal
+ *    `malformed-spec` issue per unreadable root and **nothing else**: the
+ *    capture is not indexed, no resolver is called and no claim is gathered,
+ *    because a document whose claims cannot be read has none to check and
+ *    answering as though it had none would be a false pass;
+ * 1. the capture is read once into a plain copy of the fields the checks
+ *    consult — or, when any of those reads throws, as a capture that publishes
+ *    nothing — and indexed (bounded sections, trace list, event count);
  * 2. the summary's two statement lists are gathered into citations, and any
- *    statement with no citation at all is recorded;
+ *    statement with no citation at all is recorded. A statement or citation
+ *    that cannot be read is a `malformed-spec` issue at that element, and the
+ *    elements beside it are gathered as usual;
  * 3. every node is walked once — trace filters are gathered, metric ids and
- *    per-node evidence availability are decided on the spot. Availability asks
+ *    per-node evidence availability are decided on the spot. A node that cannot
+ *    be read, or whose type the catalog does not carry, is a `malformed-spec`
+ *    issue at that node and the walk continues with the nodes after it; an
+ *    unknown node's children are not walked. Availability asks
  *    first whether the capture holds records of the kinds the node's catalog
  *    entry declares (`unavailable-source` if not), then whether those records
  *    carry the attribute keys in the entry's `requiredReads`
@@ -2518,14 +3372,19 @@ export function tallyFieldPresence(events: readonly TelemetryEvent[]): CaptureFi
  *    input produce byte-identical reports.
  *
  * **Never throws**, including on a specification or a summary that was asserted
- * rather than parsed, and including when a caller's resolver throws.
+ * rather than parsed — a getter, a trap or a revoked proxy anywhere in either —
+ * and including when a caller's resolver throws or answers with something that
+ * throws while being read.
  *
  * **Reports shape, never content**: every issue is a path, a code, a reason and
  * — for a node — its catalogued type (AAP 0.5.2).
  *
  * @param spec The normalized specification to check. Pass one that has already
- * passed `./validate.ts`; a document that has not is checked as far as it can
- * be, and its structural problems are that module's to report.
+ * passed `./validate.ts`. A value that is not a specification at all, and any
+ * element of one that claims are reached through and cannot be read, is
+ * rejected as `malformed-spec`; the rest of a document that has not passed is
+ * checked as far as it can be, and its other structural problems are that
+ * module's to report.
  * @param summary The capture the specification claims to describe.
  * @param options Resolvers, strictness and the field-presence tally; see
  *   {@link SemanticValidationOptions}.
@@ -2536,8 +3395,20 @@ export function collectSemanticIssues(
   summary: CaptureSummary,
   options?: SemanticValidationOptions,
 ): SemanticIssueSets {
-  const index = indexCapture(summary);
-  const claims = gatherClaims(spec, summary, index, options);
+  const read = readDocument(spec);
+
+  if (!read.readable) {
+    return {
+      issues: sortIssues(read.faults.map((path) => issueAt('malformed-spec', path))),
+      unverifiable: [],
+      advisory: [],
+      informational: [],
+    };
+  }
+
+  const capture = snapshotCapture(summary);
+  const index = indexCapture(capture);
+  const claims = gatherClaims(read.document, capture, index, options);
   const { citations, traceFilters, decided } = claims;
 
   const eventResolution = resolveIds(
@@ -2576,6 +3447,14 @@ export function collectSemanticIssues(
  *   a failure**: the panel may be shown, and a caller that wants certainty
  *   supplies {@link SemanticValidationOptions.resolveEventIds};
  * - nothing at all ⇒ `valid`.
+ *
+ * A value that is not a specification whose claims can be read — not an
+ * object, or one without a `layout` array or a `summary` object — is `invalid`
+ * with `malformed-spec` issues under every option, never `valid`: see
+ * {@link collectSemanticIssues}. So is a readable document holding an element
+ * that cannot be read — a statement, a citation or a node — with that
+ * element's issue reported beside whatever the rest of the document's claims
+ * produced.
  *
  * Under {@link SemanticResultOptions.requireVerifiable}, the unverifiable and
  * advisory issues join the refutations, so an undecided reference or a node with
@@ -2632,6 +3511,67 @@ const SEMANTIC_CHECK_NAME = 'semantic';
  * the telemetry package's vocabulary so the sentence cannot go stale.
  */
 const SEMANTIC_HINT = `Every observed fact and likely cause must cite events this capture holds, a view filtered to a trace must name a trace the capture holds, and a metric tile must name one of the fixed set of ${String(METRIC_IDS.length)} ids. A failure here means the panel describes something the capture does not support: show the deterministic fallback panel for this capture rather than retrying the model, and use the issue paths in this error's details to locate the citations at fault. A reference reported as unverifiable was not refuted — supply an event-id resolver to decide it.`;
+
+/**
+ * The recovery instruction attached instead when the rejection is a
+ * `malformed-spec` one: the value is not a specification whose claims could be
+ * read, so {@link SEMANTIC_HINT}'s advice about citations would point at the
+ * wrong problem.
+ *
+ * States the shape required rather than the value received, and names the
+ * failure for what AAP 0.5.3 makes it — a document that skipped, or no longer
+ * satisfies, the syntactic validation that precedes this step is a product
+ * defect, never a model mistake to repair.
+ */
+const MALFORMED_SPEC_HINT = `A panel specification must be an object with a layout array and a summary object whose observed and likelyCauses lists, where present, are arrays. A value that fails this never passed the syntactic validator: run validatePanelSpec on it before checking it against a capture, treat the failure as a product defect rather than a model mistake, and show the deterministic fallback panel for this capture instead of retrying the model. The issue paths in this error's details name the fields that could not be read; nothing else in the value was checked against the capture.`;
+
+/**
+ * The recovery instruction attached when the document's roots were readable
+ * but some element below them was not: unlike {@link MALFORMED_SPEC_HINT}, the
+ * rest of the document *was* checked, and the rejection may carry evidence
+ * issues beside the unreadable elements.
+ *
+ * Lists the element shapes this module requires rather than the value found,
+ * and gives the same AAP 0.5.3 disposition: a product defect upstream, never a
+ * model mistake to repair.
+ */
+const MALFORMED_ELEMENT_HINT = `Every observed fact and likely cause must be an object whose evidence cites events by eventId, every layout node must be an object whose type is in the node catalog, and every container's children must be a list. Elements that are not could not be read, so the claims inside them were not checked against the capture; every other claim was. A document like this never passed the syntactic validator: run validatePanelSpec on it before checking it against a capture, treat the failure as a product defect rather than a model mistake, and show the deterministic fallback panel for this capture instead of retrying the model. The issue paths in this error's details name each element that could not be read and each claim the capture does not support.`;
+
+/**
+ * The dotted paths at which {@link readDocument} reports a root it could not
+ * read. A `malformed-spec` issue at one of these means nothing of the document
+ * was checked; one anywhere else is about a single element of a document whose
+ * other claims were.
+ */
+const DOCUMENT_ROOT_PATHS: ReadonlySet<string> = new Set(
+  [
+    DOCUMENT_PATH,
+    [PANEL_LAYOUT_FIELD],
+    [SUMMARY_FIELD],
+    [SUMMARY_FIELD, OBSERVED_FIELD],
+    [SUMMARY_FIELD, LIKELY_CAUSES_FIELD],
+  ].map(joinPath),
+);
+
+/** Whether an issue reports a root of the document that could not be read. */
+function isUnreadableRoot(issue: SemanticIssue): boolean {
+  return issue.reason === 'malformed-spec' && DOCUMENT_ROOT_PATHS.has(joinPath(issue.path));
+}
+
+/**
+ * The recovery instruction for a rejection: the root one when the document
+ * could not be read at all, the element one when some element could not be,
+ * and the evidence one otherwise.
+ */
+function rejectionHintFor(issues: readonly SemanticIssue[]): string {
+  if (issues.some(isUnreadableRoot)) {
+    return MALFORMED_SPEC_HINT;
+  }
+
+  return issues.some((issue) => issue.reason === 'malformed-spec')
+    ? MALFORMED_ELEMENT_HINT
+    : SEMANTIC_HINT;
+}
 
 /** One reported issue as it appears in an error's `details`. */
 interface SemanticIssueDetail {
@@ -2692,6 +3632,15 @@ function renderIssueList(issues: readonly SemanticIssue[]): string {
  * `'MODEL_OUTPUT_INVALID'`: a caller at a stage boundary that wants that
  * vocabulary maps this one with the shared `mapErr`.
  *
+ * The rejections here that are about form rather than evidence keep this code,
+ * because a validator's outcome maps onto one code, and are told apart by what
+ * they carry instead: their issues' `panel_spec_malformed` code in `details`
+ * and their own hint. A value that is not a readable specification at all also
+ * gets its own message, since nothing in it was checked; a readable document
+ * with unreadable elements gets the ordinary message, since the rest of it was,
+ * and {@link MALFORMED_ELEMENT_HINT}. Either can only reach here from a caller
+ * that skipped `./validate.ts`, whose `PANEL_INVALID` would have come first.
+ *
  * The complete issue list goes in `details`, which `toPayload` does not forward,
  * and a bounded path-and-code summary goes in `message`, which it does. Neither
  * carries a rejected value.
@@ -2701,25 +3650,25 @@ function semanticRejection(
   unverifiableCount: number,
   escalated: boolean,
 ): DebuggenError {
-  const checks = issues.length === 1 ? 'check' : 'checks';
+  const checks = `${String(issues.length)} ${issues.length === 1 ? 'check' : 'checks'}`;
+  const listed = renderIssueList(issues);
   const subject = escalated
     ? 'could not be fully verified against its capture'
     : 'failed semantic validation against its capture';
+  const message = issues.some(isUnreadableRoot)
+    ? `A value handed to semantic validation is not a readable panel specification, so nothing in it was checked against its capture; ${checks} failed: ${listed}.`
+    : `A panel specification ${subject} in ${checks}: ${listed}.`;
 
-  return new DebuggenError(
-    'PANEL_SEMANTIC_INVALID',
-    `A panel specification ${subject} in ${String(issues.length)} ${checks}: ${renderIssueList(issues)}.`,
-    {
-      hint: SEMANTIC_HINT,
-      details: {
-        schema: PANEL_SPEC_SCHEMA_NAME,
-        check: SEMANTIC_CHECK_NAME,
-        issueCount: issues.length,
-        unverifiableCount,
-        issues: describeIssuesForDetails(issues),
-      },
+  return new DebuggenError('PANEL_SEMANTIC_INVALID', message, {
+    hint: rejectionHintFor(issues),
+    details: {
+      schema: PANEL_SPEC_SCHEMA_NAME,
+      check: SEMANTIC_CHECK_NAME,
+      issueCount: issues.length,
+      unverifiableCount,
+      issues: describeIssuesForDetails(issues),
     },
-  );
+  });
 }
 
 /**

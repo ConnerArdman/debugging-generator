@@ -85,7 +85,12 @@
  *    the views call the view form, `PanelViewActions` (`onSelectEvent`,
  *    `onOpenSource`); `isPanelHostActions`, `toPanelHostActions` and
  *    `toPanelViewActions` are the published compatibility adapters between
- *    the two. `useQuery` is the only module in the
+ *    the two. The host also owns the panel's one shared selection and provides
+ *    it through `PanelSelectionContext`; views read it with `useViewSelection`
+ *    (which falls back to a view's own selection outside a host) or
+ *    `usePanelSelection`/`useSelectedEventId`, and mark matching items with
+ *    `matchesPanelSelection`, so every view of one event agrees on what is
+ *    selected. `useQuery` is the only module in the
  *    library that calls a provider at all, addressing every query to the
  *    session the host places in `PanelSessionContext`. No component here opens
  *    a socket, calls `fetch` or knows a message name (AAP 0.4.2).
@@ -179,6 +184,7 @@ export type { BadgeProps, BadgeTone, BadgeVariant } from './primitives/Badge';
 
 export { DataTable } from './primitives/DataTable';
 export type {
+  DataTableCellMeta,
   DataTableColumn,
   DataTableProps,
   DataTableSort,
@@ -344,17 +350,25 @@ export type {
 
 export {
   isPanelHostActions,
+  matchesPanelSelection,
   PanelActionsContext,
+  PanelSelectionContext,
   toPanelHostActions,
   toPanelViewActions,
   usePanelActions,
+  usePanelSelection,
+  useSelectedEventId,
+  useViewSelection,
 } from './host/PanelActions';
 export type {
   PanelActions,
   PanelEventCoordinates,
   PanelEventRef,
   PanelHostActions,
+  PanelSelection,
+  PanelSelectionState,
   PanelViewActions,
+  ViewSelection,
 } from './host/PanelActions';
 
 export { useQuery } from './host/useQuery';

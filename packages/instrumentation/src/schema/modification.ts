@@ -960,8 +960,11 @@ export function createModificationRecord(
  *   (the developer edited a file while it was instrumented — the headline case)
  * the target file is gone                            → 'file-missing'
  *   (deleted, renamed or moved after the patch was applied)
- * the backup is gone, or fails its own verification   → 'backup-missing'
+ * the backup is gone, or cannot be read back          → 'backup-missing'
  *   (restoration is impossible, so the record is surfaced rather than closed)
+ * the backup's bytes fail their own digest check      → 'backup-corrupt'
+ *   (it no longer hashes to the digest it was filed under, so it cannot be
+ *   trusted as the original: nothing is written and it is kept for inspection)
  * the restored content did not hash to originalHash   → 'restore-verification-failed'
  *   (the write completed but produced the wrong bytes; the backup is kept)
  * the file's open records do not form one chain      → 'record-chain-fork'
@@ -981,6 +984,7 @@ export const MODIFICATION_CONFLICT_REASONS = Object.freeze([
   'content-changed',
   'file-missing',
   'backup-missing',
+  'backup-corrupt',
   'restore-verification-failed',
   'record-chain-fork',
 ] as const);
@@ -1067,7 +1071,8 @@ export const modificationConflictSchema = z.strictObject({
    * the AAP §0.5.5 message quotes so the developer can recover the pristine
    * file by hand if they choose to. Present even for `'backup-missing'`, where
    * it records the path that was expected and is the only useful thing left to
-   * say.
+   * say, and for `'backup-corrupt'`, where it names the untrusted file that was
+   * kept for inspection.
    */
   backupPath: backupPathSchema,
 
@@ -1099,8 +1104,9 @@ export const modificationConflictSchema = z.strictObject({
    * - `originalToCurrent` — the net divergence from the pristine file.
    *
    * The object and every member are optional, because a conflict may leave
-   * nothing to diff: `'file-missing'` has no current text and
-   * `'backup-missing'` has no original text. Each member is bounded by
+   * nothing to diff: `'file-missing'` has no current text, and
+   * `'backup-missing'` and `'backup-corrupt'` have no trusted original text.
+   * Each member is bounded by
    * {@link MAX_CONFLICT_DIFF_LENGTH}, and because this shape carries no
    * truncation flag, a patch that exceeds the bound is omitted rather than
    * shortened: an absent member reads as "nothing to show here", while a

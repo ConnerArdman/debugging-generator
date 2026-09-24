@@ -74,7 +74,8 @@
  * all *domain* vocabularies owned by `@debuggen/panel-schema` and
  * `@debuggen/telemetry`. Each consumer maps its own vocabulary onto `tone`
  * before it renders — `../layout/SummaryHeader` turns a hypothesis confidence
- * level into a tone beside each likely cause, and the visualization components
+ * level into a tone and a per-level glyph beside each likely cause, so the
+ * levels differ by shape as well as by colour, and the visualization components
  * in `../components` turn a tier, a status or a duplicate count into one — so
  * that this atom stays free of every one of those types. A `tone` union
  * enumerating domain states, or a `kind` prop, would invert that and is
@@ -378,9 +379,15 @@ export interface BadgeProps extends HTMLAttributes<HTMLSpanElement> {
  * <Badge tone="danger" variant="solid">conflict</Badge>
  * ```
  *
- * @example A hypothesis confidence level, mapped to a tone by the caller.
+ * @example A hypothesis confidence level, mapped to a tone and a glyph by the
+ * caller, so the level reads by shape and by word as well as by colour.
  * ```tsx
- * <Badge tone={confidenceTone(hypothesis.confidence)}>{hypothesis.confidence}</Badge>
+ * <Badge
+ *   tone={confidenceTone(hypothesis.confidence)}
+ *   icon={confidenceIcon(hypothesis.confidence)}
+ * >
+ *   {hypothesis.confidence}
+ * </Badge>
  * ```
  *
  * @example A kind chip, coloured from the span-kind scale through `../utils/color`.

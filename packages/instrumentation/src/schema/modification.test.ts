@@ -1313,10 +1313,15 @@ describe('MODIFICATION_CONFLICT_REASONS', () => {
     //   'file-missing'                the target file is gone (deleted, renamed
     //                                 or moved after the patch was applied), so
     //                                 there are no bytes to hash;
-    //   'backup-missing'              the backup is gone or fails its own
-    //                                 verification, so restoration is
-    //                                 impossible and the record is surfaced
-    //                                 rather than closed;
+    //   'backup-missing'              the backup is gone or cannot be read
+    //                                 back, so restoration is impossible and
+    //                                 the record is surfaced rather than
+    //                                 closed;
+    //   'backup-corrupt'              the backup is there but no longer hashes
+    //                                 to the digest it was filed under, so its
+    //                                 bytes cannot be trusted as the original,
+    //                                 nothing is written and it is kept for
+    //                                 inspection;
     //   'restore-verification-failed' the write completed but the restored
     //                                 content did not hash to `originalHash`,
     //                                 so the backup is kept;
@@ -1331,9 +1336,22 @@ describe('MODIFICATION_CONFLICT_REASONS', () => {
       'content-changed',
       'file-missing',
       'backup-missing',
+      'backup-corrupt',
       'restore-verification-failed',
       'record-chain-fork',
     ]);
+  });
+
+  it('keeps an untrusted backup apart from an absent one', () => {
+    // A backup that is there but fails its digest is a different fact from one
+    // that is gone, with a different next step: the file exists and can be
+    // inspected, and it must never be restored. Both reasons validate, and they
+    // are not the same member.
+    expect(modificationConflictReasonSchema.safeParse('backup-corrupt').success).toBe(true);
+    expect(validConflict({ reason: 'backup-corrupt' }).reason).toBe('backup-corrupt');
+    expect(MODIFICATION_CONFLICT_REASONS.indexOf('backup-corrupt')).toBe(
+      MODIFICATION_CONFLICT_REASONS.indexOf('backup-missing') + 1,
+    );
   });
 
   it('carries no duplicate', () => {
@@ -1368,11 +1386,12 @@ describe('modificationConflictSchema', () => {
   });
 
   it('accepts a report with no diffs at all', () => {
-    // A conflict may leave nothing to diff: `file-missing` has no current text
-    // and `backup-missing` has no original text. The object and every member of
-    // it are optional for that reason, and an absent member reads as "nothing
-    // to show here" — which is also why a patch past the cap is omitted rather
-    // than clipped, since the shape carries no truncation flag.
+    // A conflict may leave nothing to diff: `file-missing` has no current text,
+    // and `backup-missing` and `backup-corrupt` have no trusted original text.
+    // The object and every member of it are optional for that reason, and an
+    // absent member reads as "nothing to show here" — which is also why a patch
+    // past the cap is omitted rather than clipped, since the shape carries no
+    // truncation flag.
     const bare = okValue(
       parseModificationConflict(conflictWithout('diffs')),
       'a conflict with no diffs',
@@ -1449,10 +1468,14 @@ describe('modificationConflictSchema', () => {
     // AAP §0.5.5 quotes this path to the developer ("Original saved at ‹backup
     // path›") so they can recover the pristine file by hand, and it is present
     // even for `backup-missing`, where it records the path that was expected and
-    // is the only useful thing left to say.
+    // is the only useful thing left to say, and for `backup-corrupt`, where it
+    // names the untrusted file that was kept.
     const conflict = validConflict({ reason: 'backup-missing' });
 
     expect(conflict.backupPath).toBe(backupPathFixture(SESSION_ID, PRISTINE_HASH));
+    expect(validConflict({ reason: 'backup-corrupt' }).backupPath).toBe(
+      backupPathFixture(SESSION_ID, PRISTINE_HASH),
+    );
     expect(modificationConflictSchema.safeParse(conflictWithout('backupPath')).success).toBe(false);
   });
 

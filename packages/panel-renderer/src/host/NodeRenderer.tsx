@@ -28,7 +28,10 @@
  *   There is no `fetch`, no socket, no message port and no host API in this
  *   file, and no provider or callback prop either — the host mounts the
  *   contexts once, around the whole panel.
- * - **It holds nothing.** No state, no hook, no effect. It is memoized, and the
+ * - **It holds no React state.** The dispatch itself has no state, no hook and
+ *   no effect; the one effect in this file belongs to the node frame, which
+ *   holds a DOM focus keeper and nothing React renders from (see "Focus
+ *   survives a node's own remounts" below). The dispatch is memoized, and the
  *   memo is keyed on the node *object*: a node that is the same object as on
  *   the previous render, at the same position and outline level, draws the same
  *   thing, so re-rendering it would only re-render every table and SVG view
@@ -38,6 +41,44 @@
  *   A view that reads a context (its data, its session, its actions) still
  *   re-renders when that context changes; the memo only stops a parent's render
  *   from reaching it.
+ *
+ * ## Focus survives a node's own remounts
+ *
+ * A view replaces parts of its own subtree as its query moves between states,
+ * and a focused element that leaves the document hands focus to `<body>` —
+ * for a keyboard or screen-reader user, the same as being thrown back to the
+ * top of the panel. Pressing **Retry** is the everyday case: the query returns
+ * to loading, the view swaps its `ErrorState` for a `LoadingState`, and the
+ * button that was pressed is gone a moment before a fresh error or the
+ * recovered view takes its place (B1-F14, B2-F12). A paging control disabled
+ * while its page loads, or removed once the last page has arrived, loses focus
+ * the same way.
+ *
+ * The cure lives here because the wrapper this module emits around every node
+ * is the one element that outlives every state its node passes through, and
+ * because every panel surface renders every node through this file: one keeper
+ * per frame covers all sixteen node types, the retry of every error state, a
+ * table's "Load more" and any other control a view remounts, without a line of
+ * focus code in the views themselves. It is plain DOM — listeners and a
+ * `MutationObserver` on the frame, installed by one effect and removed by its
+ * teardown — and writes no React state, so it adds no render. Its rules, in
+ * full on {@link installNodeFocusKeeper}:
+ *
+ * - **It never steals focus.** It acts only when focus it was tracking has
+ *   fallen to `<body>`, or while focus sits where the keeper itself parked it.
+ *   A reader who moved on — to another control, another node, or nowhere — is
+ *   left exactly where they went.
+ * - **An equivalent control wins.** A control carrying the `ErrorState`'s
+ *   focus-key attribute is recognised again after a remount, so a retry that
+ *   fails again puts focus on the *new* Retry.
+ * - **Otherwise the node's own region.** Focus is parked on the node's heading
+ *   (the `Section` heading of a titled node) or, for a node without one, on the
+ *   frame itself — made programmatically focusable with `tabindex="-1"` only
+ *   while it holds focus — and stays there once the node has settled on content
+ *   with no equivalent control.
+ * - **Each frame answers for its own node only.** Frames nest (a container's
+ *   frame holds its children's), so a frame treats as its own only the elements
+ *   whose nearest frame it is.
  *
  * ## A node type with no component is an error ON SCREEN, never a blank area
  *
@@ -155,7 +196,10 @@
  * There is no inline style, no colour, no length and no font in this file, and
  * no raw interactive, tabular or heading element: the heading of a labelled leaf
  * is `../layout/Section`'s, and the failure is `../primitives/ErrorState`'s
- * (AAP 0.6.4).
+ * (AAP 0.6.4). The focus keeper adds no class either: it *reads* the frame
+ * class and `Section`'s heading class as selectors, and the only attribute it
+ * ever writes is a temporary `tabindex="-1"`, so a parked focus is drawn by the
+ * stylesheet's one `:focus-visible` ring like any other.
  *
  * Relative specifiers are extensionless, as everywhere under `src/**` of this
  * package: it resolves with `moduleResolution: "bundler"`, unlike the
@@ -171,11 +215,11 @@ import {
 } from '@debuggen/panel-schema';
 import type { PanelNode, PanelNodePath } from '@debuggen/panel-schema';
 import type { DebuggenErrorCode } from '@debuggen/shared';
-import { createElement, memo } from 'react';
-import type { ReactElement } from 'react';
+import { createElement, memo, useEffect, useRef } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { Section } from '../layout/Section';
-import { ErrorState } from '../primitives/ErrorState';
+import { ErrorState, FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
 import type { HeadingLevel } from '../primitives/Heading';
 import { componentForNodeType } from './registry';
 
@@ -219,6 +263,15 @@ const FAILURE_TITLE = 'Could not render this part of the panel';
  * than a code invented here, and it costs a type-only import.
  */
 const FAILURE_CODE: DebuggenErrorCode = 'PANEL_INVALID';
+
+/**
+ * The accessible name of the failure state's preformatted block.
+ *
+ * The block holds the node's own definition — the JSON this renderer could not
+ * draw — and no data query, so the error primitive's default name ("Failing
+ * query") would tell a screen-reader user it is something it is not (B1-F16).
+ */
+const FAILURE_BLOCK_LABEL = 'Node definition';
 
 /*
  * ---------------------------------------------------------------------------
@@ -407,6 +460,516 @@ function uniqueSiblingKey(id: string, index: number, used: Set<string>): string 
   return key;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * The node frame and its focus keeper
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * {@link NODE_CLASS} as a selector: how an element's nearest frame is found.
+ *
+ * `Element.closest` with this selector is the whole of how nested frames stay
+ * out of each other's way — an element belongs to exactly one frame, the
+ * nearest, so a container's keeper never acts for a control inside one of its
+ * children.
+ */
+const NODE_FRAME_SELECTOR = `.${NODE_CLASS}`;
+
+/**
+ * The heading a titled node's focus is parked on.
+ *
+ * `../layout/Section` renders a titled region as `<section aria-labelledby>`,
+ * labelled by a `Heading` carrying this class: the region's own name and the
+ * first thing announced inside it, which makes it the natural place for focus
+ * to wait while the node reloads. A labelled leaf receives that `Section` from
+ * this module and a `section` container from its layout primitive. Read here
+ * as a selector only — the class is `Section`'s, styled by
+ * `../styles/components.css`, and this file never emits it.
+ */
+const NODE_HEADING_SELECTOR = '.dg-section__title';
+
+/** Any element carrying a focus key, whatever the key's value. */
+const FOCUS_KEY_SELECTOR = `[${FOCUS_KEY_ATTRIBUTE}]`;
+
+/**
+ * A region still loading.
+ *
+ * `LoadingState` renders `aria-busy="true"`. While such a region remains in a
+ * node, focus parked on that node keeps waiting, because the control
+ * equivalent to the one that was lost — the Retry of a retry that fails again —
+ * may still be on its way.
+ */
+const BUSY_SELECTOR = '[aria-busy="true"]';
+
+/** A control that cannot take focus because it, or its fieldset, is disabled. */
+const DISABLED_SELECTOR = ':disabled';
+
+/** A subtree the browser will not focus into: hidden, or made inert. */
+const UNFOCUSABLE_SUBTREE_SELECTOR = '[hidden], [inert]';
+
+/** The attribute a parking target borrows while it holds focus. */
+const TABINDEX_ATTRIBUTE = 'tabindex';
+
+/**
+ * The borrowed value: focusable by script, never a stop in the tab order, so a
+ * parked heading adds no tab stop to the panel and loses even that once focus
+ * moves on.
+ */
+const PARKED_TABINDEX = '-1';
+
+/**
+ * What a keeper's observer watches.
+ *
+ * `childList` over the `subtree` sees a control removed and its successor
+ * inserted anywhere below the frame. The attributes are the ways a control can
+ * stay in the document and still stop being focusable — `disabled` (a paging
+ * control while its page loads), `hidden` and `inert` — plus `aria-busy`, whose
+ * clearing is how a loading region updated in place, rather than replaced,
+ * reports that it settled. Nothing else is observed, so a view restyling or
+ * re-labelling its own subtree wakes the keeper only for the cheap early exit.
+ */
+const FOCUS_KEEPER_OBSERVATION: MutationObserverInit = {
+  childList: true,
+  subtree: true,
+  attributes: true,
+  attributeFilter: ['disabled', 'hidden', 'inert', 'aria-busy'],
+};
+
+/**
+ * An element that can hold focus: HTML, or SVG — the chart views make SVG
+ * marks focusable — both of which implement `focus()` and `tabindex`.
+ */
+type FocusTarget = HTMLElement | SVGElement;
+
+/**
+ * Focus the keeper moved onto the node's own region after the control holding
+ * it was lost, and has not yet handed on.
+ */
+interface ParkedFocus {
+  /** The heading, or the frame, focus is parked on. */
+  readonly target: FocusTarget;
+
+  /** The focus key of the control that was lost, or `null` when it carried none. */
+  readonly key: string | null;
+
+  /**
+   * The control that was lost. It may come back — a paging control disabled
+   * while its page loads is re-enabled once the page arrives — and focus
+   * returns to it when it does.
+   */
+  readonly origin: FocusTarget;
+}
+
+/**
+ * Keeps keyboard focus inside one node while that node's view replaces the
+ * control that held it, and returns the teardown that removes every trace of
+ * itself.
+ *
+ * Installed by {@link NodeFrame} on the wrapper it renders, which is the one
+ * element that survives every state a node passes through. Plain DOM, and
+ * deliberately so: the keeper writes no React state, so it causes no render,
+ * and it needs none of the view's cooperation beyond the optional focus key
+ * `../primitives/ErrorState` already puts on its Retry.
+ *
+ * **Scope.** An element belongs to this frame when its nearest
+ * {@link NODE_FRAME_SELECTOR} ancestor (itself included) is this frame. Every
+ * rule below applies to in-scope elements only, so of two nested frames only
+ * the inner one acts for a control inside it.
+ *
+ * **Tracking.** A `focusin` on an in-scope element records it as the tracked
+ * element, with its focus key: the {@link FOCUS_KEY_ATTRIBUTE} of the element
+ * or of its nearest in-scope ancestor carrying one. A `focusout` towards
+ * anything out of scope forgets it — the reader moved on. A `focusout` towards
+ * nothing (`relatedTarget` null) is judged one microtask later, once the DOM
+ * has settled: an element still connected and focusable that no longer holds
+ * focus was left deliberately (a click into empty space, focus handed outside
+ * the page) and is forgotten; one that was removed or disabled is a loss.
+ *
+ * **Loss.** The observer, a `MutationObserver` connected only while something
+ * is tracked, reconciles after every mutation. Focus is lost when the tracked
+ * element is disconnected, has left this frame's scope, or is disabled, hidden
+ * or inert, **and** the document's focus has fallen to `<body>`. On a loss,
+ * focus moves to the first focusable in-scope element carrying the same focus
+ * key; failing that, it is parked on the node's own region — the first
+ * in-scope {@link NODE_HEADING_SELECTOR}, or the frame when the node has no
+ * heading — which borrows `tabindex="-1"` only if it had no `tabindex` of its
+ * own, and gives it back the moment it loses focus.
+ *
+ * **Parked.** While focus rests where the keeper parked it, every later
+ * mutation checks again: an equivalent control that has appeared (a retry that
+ * failed again renders a new Retry), or the lost control itself focusable
+ * again (a re-enabled "Load more"), takes focus, and the parked state ends.
+ * When neither is possible and neither can still happen — no in-scope region
+ * is busy and the lost control is gone for good — the node has settled on
+ * content with no equivalent control, focus stays on the heading or frame, and
+ * that becomes the tracked element.
+ *
+ * **Never steal.** The keeper moves focus only when focus has fallen to
+ * `<body>` from an element it was tracking, or while focus is exactly where
+ * the keeper parked it. Any focus the reader places elsewhere ends the parked
+ * state, and nothing that settles afterwards moves focus back.
+ *
+ * Every focus move passes `preventScroll`, so recovering focus never jumps the
+ * panel; the one timer is the microtask above.
+ *
+ * @param frame The node's wrapper element.
+ * @returns The teardown: disconnects the observer, removes both listeners and
+ * gives back any borrowed `tabindex`.
+ */
+function installNodeFocusKeeper(frame: HTMLElement): () => void {
+  const ownerDocument = frame.ownerDocument;
+
+  // The frame's own window, so the type checks below hold for a panel rendered
+  // into another document (a portal into a popup) as well as into this one.
+  const view = ownerDocument.defaultView ?? globalThis;
+
+  /** The in-scope element focus was last seen on, while it is worth keeping. */
+  let tracked: FocusTarget | null = null;
+
+  /** The focus key of {@link tracked}, captured while it was still in the document. */
+  let trackedKey: string | null = null;
+
+  /** Where focus waits after a loss, until it can be handed on. */
+  let parked: ParkedFocus | null = null;
+
+  /** The parking target whose `tabindex` the keeper added, and must remove. */
+  let borrowed: FocusTarget | null = null;
+
+  /** Whether the observer is connected; it is only while there is focus to keep. */
+  let watching = false;
+
+  /** Set by the teardown, so a microtask queued before it does nothing after it. */
+  let disposed = false;
+
+  const observer = new view.MutationObserver(reconcile);
+
+  function isFocusTarget(value: unknown): value is FocusTarget {
+    return value instanceof view.HTMLElement || value instanceof view.SVGElement;
+  }
+
+  function inScope(element: Element): boolean {
+    return element.closest(NODE_FRAME_SELECTOR) === frame;
+  }
+
+  function isFocusable(element: FocusTarget): boolean {
+    return (
+      element.isConnected &&
+      !element.matches(DISABLED_SELECTOR) &&
+      element.closest(UNFOCUSABLE_SUBTREE_SELECTOR) === null
+    );
+  }
+
+  function focusFellToBody(): boolean {
+    const active = ownerDocument.activeElement;
+    return active === null || active === ownerDocument.body;
+  }
+
+  function focusKeyOf(element: FocusTarget): string | null {
+    const keyed = element.closest(FOCUS_KEY_SELECTOR);
+    return keyed !== null && inScope(keyed) ? keyed.getAttribute(FOCUS_KEY_ATTRIBUTE) : null;
+  }
+
+  /** The first in-scope, focusable element matching `selector` that `accept` admits. */
+  function findFocusable(
+    selector: string,
+    accept: (element: FocusTarget) => boolean,
+  ): FocusTarget | null {
+    for (const element of frame.querySelectorAll(selector)) {
+      if (isFocusTarget(element) && inScope(element) && isFocusable(element) && accept(element)) {
+        return element;
+      }
+    }
+
+    return null;
+  }
+
+  function isBusy(): boolean {
+    for (const element of frame.querySelectorAll(BUSY_SELECTOR)) {
+      if (inScope(element)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  /**
+   * Where focus lost with `key` from `origin` should go now: the equivalent
+   * control first, then the lost control itself if it is usable again, else
+   * nowhere yet.
+   */
+  function successorFor(key: string | null, origin: FocusTarget): FocusTarget | null {
+    if (key !== null) {
+      const equivalent = findFocusable(
+        FOCUS_KEY_SELECTOR,
+        (element) => element.getAttribute(FOCUS_KEY_ATTRIBUTE) === key,
+      );
+
+      if (equivalent !== null) {
+        return equivalent;
+      }
+    }
+
+    return inScope(origin) && isFocusable(origin) ? origin : null;
+  }
+
+  /** Focuses `target` without scrolling, and reports whether it took focus. */
+  function moveFocus(target: FocusTarget): boolean {
+    target.focus({ preventScroll: true });
+    return ownerDocument.activeElement === target;
+  }
+
+  function returnTabIndex(): void {
+    if (borrowed !== null) {
+      borrowed.removeAttribute(TABINDEX_ATTRIBUTE);
+      borrowed = null;
+    }
+  }
+
+  function borrowTabIndex(target: FocusTarget): void {
+    if (target.hasAttribute(TABINDEX_ATTRIBUTE)) {
+      return;
+    }
+
+    returnTabIndex();
+    target.setAttribute(TABINDEX_ATTRIBUTE, PARKED_TABINDEX);
+    borrowed = target;
+  }
+
+  function watch(): void {
+    if (!watching) {
+      observer.observe(frame, FOCUS_KEEPER_OBSERVATION);
+      watching = true;
+    }
+  }
+
+  function forget(): void {
+    tracked = null;
+    trackedKey = null;
+    parked = null;
+
+    if (watching) {
+      observer.disconnect();
+      watching = false;
+    }
+  }
+
+  /** Parks focus on the node's heading, or on the frame when it has none. */
+  function park(key: string | null, origin: FocusTarget): void {
+    const target = findFocusable(NODE_HEADING_SELECTOR, () => true) ?? frame;
+
+    borrowTabIndex(target);
+    // Recorded before the move, so the `focusin` the move raises is recognised
+    // as the keeper's own and does not end the parked state it starts.
+    parked = { target, key, origin };
+    watch();
+
+    if (!moveFocus(target)) {
+      // Refused (a frame hidden by its host, say): nothing is parked, and the
+      // loss is tried again on the next mutation.
+      parked = null;
+      if (borrowed === target) {
+        returnTabIndex();
+      }
+    }
+  }
+
+  /** Answers a loss: the successor if there is one, else the node's region. */
+  function recover(key: string | null, origin: FocusTarget): void {
+    const successor = successorFor(key, origin);
+
+    if (successor !== null && moveFocus(successor)) {
+      return;
+    }
+
+    park(key, origin);
+  }
+
+  /** Runs after every observed mutation, and after an unexplained `focusout`. */
+  function reconcile(): void {
+    if (disposed) {
+      return;
+    }
+
+    const active = ownerDocument.activeElement;
+    const current = parked;
+
+    if (current !== null) {
+      if (active === current.target) {
+        const successor = successorFor(current.key, current.origin);
+
+        if (successor !== null) {
+          // Cleared first, so the successor's `focusin` records it normally.
+          parked = null;
+          if (!moveFocus(successor)) {
+            parked = current;
+          }
+          return;
+        }
+
+        // Nothing equivalent, and nothing still on its way: the node settled on
+        // content without such a control, and its own region is where focus
+        // belongs from now on.
+        if (!isBusy() && !inScope(current.origin)) {
+          parked = null;
+          tracked = current.target;
+          trackedKey = null;
+        }
+        return;
+      }
+
+      parked = null;
+
+      if (isFocusTarget(active) && inScope(active)) {
+        tracked = active;
+        trackedKey = focusKeyOf(active);
+        return;
+      }
+
+      if (!focusFellToBody()) {
+        forget();
+        return;
+      }
+
+      // The parking target itself was removed while it held focus — a remount
+      // above the view — so the original loss is answered again.
+      recover(current.key, current.origin);
+      return;
+    }
+
+    if (tracked === null || !focusFellToBody()) {
+      return;
+    }
+
+    if (inScope(tracked) && isFocusable(tracked)) {
+      return;
+    }
+
+    recover(trackedKey, tracked);
+  }
+
+  function onFocusIn(event: FocusEvent): void {
+    const { target } = event;
+
+    if (!isFocusTarget(target) || !inScope(target)) {
+      return;
+    }
+
+    if (parked !== null && target === parked.target) {
+      return;
+    }
+
+    parked = null;
+    tracked = target;
+    trackedKey = focusKeyOf(target);
+    watch();
+  }
+
+  /**
+   * The deferred half of a `focusout` towards nothing, judged once the DOM has
+   * settled (see "Tracking" above): left deliberately, or lost.
+   */
+  function judgeFocusOut(target: FocusTarget): void {
+    if (disposed || (target !== tracked && target !== parked?.target)) {
+      return;
+    }
+
+    if (inScope(target) && isFocusable(target) && ownerDocument.activeElement !== target) {
+      forget();
+      return;
+    }
+
+    reconcile();
+  }
+
+  function onFocusOut(event: FocusEvent): void {
+    const { target, relatedTarget } = event;
+
+    if (borrowed !== null && target === borrowed) {
+      returnTabIndex();
+    }
+
+    if (!isFocusTarget(target) || !inScope(target)) {
+      return;
+    }
+
+    if (relatedTarget !== null) {
+      // An in-scope destination is recorded by its own `focusin`; anything
+      // else is the reader leaving this node.
+      if (!isFocusTarget(relatedTarget) || !inScope(relatedTarget)) {
+        forget();
+      }
+      return;
+    }
+
+    view.queueMicrotask(() => {
+      judgeFocusOut(target);
+    });
+  }
+
+  frame.addEventListener('focusin', onFocusIn);
+  frame.addEventListener('focusout', onFocusOut);
+
+  return () => {
+    disposed = true;
+    forget();
+    frame.removeEventListener('focusin', onFocusIn);
+    frame.removeEventListener('focusout', onFocusOut);
+    returnTabIndex();
+  };
+}
+
+/** The inputs of one {@link NodeFrame}. */
+interface NodeFrameProps {
+  /** {@link NODE_CLASS}, or {@link NODE_FAILURE_CLASS} for a node that could not render. */
+  readonly className: string;
+
+  /** The node's document path, written as `data-node-path` for diagnosis. */
+  readonly diagnosticPath: string;
+
+  /** The node's content: its view, its `Section`, or its failure state. */
+  readonly children: ReactNode;
+}
+
+/**
+ * The wrapper every node is drawn in, with its focus keeper.
+ *
+ * Exactly the element this module has always emitted — the same classes, the
+ * same `data-node-path`, the children untouched — plus a ref and one effect
+ * that installs {@link installNodeFocusKeeper} on it and tears it down on
+ * unmount. The effect runs once per frame: the wrapper is this component's
+ * root element and is never replaced while the node is mounted, and the keeper
+ * reads everything else from the live DOM, so it depends on no prop.
+ *
+ * One component for every branch of {@link NodeRendererView}, so a node that
+ * changes branch (a leaf that gains a title) keeps its frame and its keeper,
+ * which then recovers any focus the change removed with the old subtree.
+ *
+ * @param props See {@link NodeFrameProps}.
+ * @returns The wrapper element.
+ */
+function NodeFrame(props: NodeFrameProps): ReactElement {
+  const { className, diagnosticPath, children } = props;
+  const frameRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    const frame = frameRef.current;
+
+    if (frame === null) {
+      return undefined;
+    }
+
+    return installNodeFocusKeeper(frame);
+  }, []);
+
+  return (
+    <div ref={frameRef} className={className} data-node-path={diagnosticPath}>
+      {children}
+    </div>
+  );
+}
+
 /**
  * Renders the failure a node type with no component must show.
  *
@@ -421,14 +984,15 @@ function uniqueSiblingKey(id: string, index: number, used: Set<string>): string 
  */
 function renderNodeFailure(node: PanelNode, message: string, diagnosticPath: string): ReactElement {
   return (
-    <div className={NODE_FAILURE_CLASS} data-node-path={diagnosticPath}>
+    <NodeFrame className={NODE_FAILURE_CLASS} diagnosticPath={diagnosticPath}>
       <ErrorState
         title={FAILURE_TITLE}
         message={message}
         code={FAILURE_CODE}
         query={describeNode(node)}
+        queryLabel={FAILURE_BLOCK_LABEL}
       />
-    </div>
+    </NodeFrame>
   );
 }
 
@@ -519,7 +1083,9 @@ function sameNodeRendererProps(previous: NodeRendererProps, next: NodeRendererPr
  * wrapped in `../layout/Section`; a type the registry has no component for
  * renders a visible failure rather than nothing (AAP 0.6.2, 0.5.5).
  *
- * Pure and presentational: no state, no effect, no hook. The exported
+ * Presentational: no state, no effect and no hook of its own. Every branch
+ * draws its node inside a {@link NodeFrame}, whose one effect installs the
+ * node's focus keeper and holds no React state. The exported
  * {@link NodeRenderer} is this function behind a memo; see
  * {@link sameNodeRendererProps} for when a render is skipped.
  *
@@ -564,7 +1130,7 @@ function NodeRendererView(props: NodeRendererProps): ReactElement {
     }
 
     return (
-      <div className={NODE_CLASS} data-node-path={diagnosticPath}>
+      <NodeFrame className={NODE_CLASS} diagnosticPath={diagnosticPath}>
         {createElement(component, {
           node,
           nodeId: node.id,
@@ -579,7 +1145,7 @@ function NodeRendererView(props: NodeRendererProps): ReactElement {
             headingLevel: hasText(node.title) ? nextHeadingLevel(headingLevel) : headingLevel,
           }),
         })}
-      </div>
+      </NodeFrame>
     );
   }
 
@@ -596,18 +1162,18 @@ function NodeRendererView(props: NodeRendererProps): ReactElement {
   // field for either and this file may not invent one (AAP 0.6.4).
   if (hasText(node.title) || hasText(node.description)) {
     return (
-      <div className={NODE_CLASS} data-node-path={diagnosticPath}>
+      <NodeFrame className={NODE_CLASS} diagnosticPath={diagnosticPath}>
         <Section title={node.title} description={node.description} headingLevel={headingLevel}>
           {view}
         </Section>
-      </div>
+      </NodeFrame>
     );
   }
 
   return (
-    <div className={NODE_CLASS} data-node-path={diagnosticPath}>
+    <NodeFrame className={NODE_CLASS} diagnosticPath={diagnosticPath}>
       {view}
-    </div>
+    </NodeFrame>
   );
 }
 

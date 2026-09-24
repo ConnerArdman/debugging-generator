@@ -19,7 +19,10 @@
  *    interactions without any of them being threaded through each intervening
  *    layer (AAP 0.6.2). The session is `spec.sessionId`, the document's own
  *    statement of which capture it describes; every query a view makes is
- *    addressed to it (`POST /sessions/:id/panel-data`, AAP 0.4.2).
+ *    addressed to it (`POST /sessions/:id/panel-data`, AAP 0.4.2). Beside them
+ *    it provides the panel's one shared selection — the event every view marks
+ *    as selected — which it records from every selection a view or evidence
+ *    chip reports, or takes from the surface when the surface drives it.
  * 3. Renders the head (`../layout/SummaryHeader`), which is where the
  *    observed/inferred separation lives.
  * 4. Renders the layout, node by node, through `./NodeRenderer`.
@@ -60,7 +63,8 @@
  * its details drawer, a connection pill, a fresh `actions` object built from the
  * same callbacks — and a panel is a dozen tables and SVG views deep. So the
  * action context is rebuilt only when one of its callbacks changes identity,
- * the head only when the title, the summary or its two callbacks change, and
+ * the head only when the title, the summary, its two callbacks or the id of the
+ * selected event change, and
  * the rendered layout only when `spec.layout` itself is a different value. The
  * data and session contexts carry values that are already stable (the injected
  * provider, and a string). A replaced specification still re-renders exactly
@@ -94,7 +98,7 @@
 
 import type { PanelSpec } from '@debuggen/panel-schema';
 import { LayoutTemplate, TriangleAlert } from 'lucide-react';
-import { useMemo } from 'react';
+import { useCallback, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import { PanelShell } from '../layout/PanelShell';
@@ -108,11 +112,19 @@ import type { DataProvider } from './DataProvider';
 import { renderPanelNodes } from './NodeRenderer';
 import {
   PanelActionsContext,
+  PanelSelectionContext,
   isPanelHostActions,
   toPanelHostActions,
   toPanelViewActions,
 } from './PanelActions';
-import type { PanelActions, PanelHostActions, PanelViewActions } from './PanelActions';
+import type {
+  PanelActions,
+  PanelEventRef,
+  PanelHostActions,
+  PanelSelection,
+  PanelSelectionState,
+  PanelViewActions,
+} from './PanelActions';
 
 /*
  * ---------------------------------------------------------------------------
@@ -379,6 +391,114 @@ function panelActionForms(members: SuppliedActionMembers): PanelActionForms {
 
 /*
  * ---------------------------------------------------------------------------
+ * The shared selection
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * A selection the host recorded from a view's or the head's report, together
+ * with the panel it was made in.
+ *
+ * The panel is part of the record so a selection can never outlive the
+ * document it was made against: a panel for another session, another panel or
+ * another generation (see {@link panelIdentityKey}) starts with nothing
+ * selected, by derivation during render rather than by an effect that would
+ * paint the stale mark for a frame first.
+ */
+interface RecordedSelection {
+  /** The {@link panelIdentityKey} of the panel the selection was made in. */
+  readonly panelKey: string;
+
+  /** What was selected: the event id and the coordinates the reporter held. */
+  readonly selection: PanelSelection;
+}
+
+/**
+ * The selection a pointer stands for, holding only the coordinates that are
+ * present — never a key written with an `undefined` value, and never anything
+ * but the three addressing fields (an evidence chip's `kind` and `label` are
+ * display sugar, not coordinates).
+ *
+ * @param ref The pointer a view or the head reported.
+ * @returns A fresh selection value.
+ */
+function selectionOf(ref: PanelEventRef): PanelSelection {
+  const { eventId, traceId, spanId } = ref;
+
+  return {
+    eventId,
+    ...(traceId === undefined ? {} : { traceId }),
+    ...(spanId === undefined ? {} : { spanId }),
+  };
+}
+
+/**
+ * Whether two selections name the same event with the same coordinates, so a
+ * repeated activation of one item keeps the recorded value — and with it the
+ * context's identity — instead of re-rendering every view that reads it.
+ *
+ * @param a One selection.
+ * @param b The other.
+ * @returns `true` when every addressing field is equal.
+ */
+function sameSelection(a: PanelSelection, b: PanelSelection): boolean {
+  return a.eventId === b.eventId && a.traceId === b.traceId && a.spanId === b.spanId;
+}
+
+/**
+ * Both action forms with their selection intent routed through the host
+ * first, so the panel's shared selection follows every report — from any view,
+ * through the action context, and from the head's evidence chips, through the
+ * host form — before the surface's own callback runs.
+ *
+ * Only the selection member of each form is replaced; every other member is
+ * carried over as the very same function, so a location still reaches the
+ * surface's `openSource` by reference. The two wrappers never call each other:
+ * a view reports through the view form's wrapper, which records once and then
+ * calls the view form it wrapped (itself the adaptation of the host form when
+ * that is what the surface supplied), so one activation is one recording and
+ * one call of the surface's callback.
+ *
+ * Forms with no actions at all are returned as they are: nothing can report a
+ * selection without a handler, so there is nothing to record.
+ *
+ * @param forms The two forms of the surface's actions.
+ * @param record Records a selection as the panel's current one.
+ * @returns The two forms, reporting through `record` first.
+ */
+function withSelectionRecording(
+  forms: PanelActionForms,
+  record: (selection: PanelSelection) => void,
+): PanelActionForms {
+  const { host, view } = forms;
+
+  if (host === undefined || view === undefined) {
+    return forms;
+  }
+
+  const { selectEvent } = host;
+  const { onSelectEvent } = view;
+
+  return {
+    host: {
+      ...host,
+      selectEvent: (eventId, coordinates) => {
+        record(selectionOf({ eventId, ...coordinates }));
+        selectEvent(eventId, coordinates);
+      },
+    },
+    view: {
+      ...view,
+      onSelectEvent: (ref) => {
+        record(selectionOf(ref));
+        onSelectEvent(ref);
+      },
+    },
+  };
+}
+
+/*
+ * ---------------------------------------------------------------------------
  * The host
  * ---------------------------------------------------------------------------
  */
@@ -443,6 +563,29 @@ export interface PanelHostProps {
   actions: PanelActions;
 
   /**
+   * The event the host surface has selected, when the surface drives the
+   * panel's selection itself — typically from the event its details drawer is
+   * showing (AAP 0.7.3).
+   *
+   * Three readings, so a surface can say each thing it may mean:
+   *
+   * - **omitted or `undefined`** — the panel keeps the selection itself: every
+   *   selection a view or an evidence chip reports becomes the panel's current
+   *   one, and every view marks it. This is the default, and it needs nothing
+   *   from the surface beyond the `selectEvent` it already implements.
+   * - **a string** — that event is the panel's selection, whatever a view last
+   *   reported. Reports still reach the surface's `selectEvent`, which is where
+   *   a surface that drives the selection updates this prop. When the id is the
+   *   one a view just reported, the coordinates that view held travel with it,
+   *   so views keyed by trace and span keep matching.
+   * - **`null`** — the surface has explicitly cleared the selection (its drawer
+   *   closed, say): nothing is marked until the prop changes again.
+   *
+   * A blank string names no event and reads as `null`.
+   */
+  selectedEventId?: string | null | undefined;
+
+  /**
    * The token value set to render, forwarded to the theme root untouched.
    *
    * Omitted, the shell applies the product default. Resolving a host signal —
@@ -468,14 +611,26 @@ export interface PanelHostProps {
 /**
  * Renders a validated panel specification.
  *
- * The theme root, the three ambient contracts, the fallback notice when the
+ * The theme root, the four ambient contracts, the fallback notice when the
  * document carries one, the head, and the layout — in that order and nothing
- * else. Presentational: no state, no effect, no write to the specification.
- * Its only hooks are the three memos described in this module's header, which
- * keep an unrelated host render from reaching the views, and the one key on
- * the panel column, which keeps a view from outliving its session or panel.
+ * else. No effect and no write to the specification, and one piece of state:
+ * the panel's shared selection. Its other hooks are the memos described in
+ * this module's header, which keep an unrelated host render from reaching the
+ * views, and the one key on the panel column, which keeps a view from
+ * outliving its session or panel.
  *
- * Five details are decisions rather than mechanics:
+ * Six details are decisions rather than mechanics:
+ *
+ * - **The panel has one selection, and the host owns it.** Every view that
+ *   draws captured events reads it from the selection context and marks the
+ *   items that stand for it, so a timeline bar, a flame cell, a table row, a
+ *   log line and an evidence chip for one span are selected together, and
+ *   selecting one elsewhere moves every mark (AAP 0.7.3: evidence chips
+ *   "select the underlying events"). A report from any view or chip is
+ *   recorded before the surface's own `selectEvent` runs; a surface that
+ *   drives the selection from its drawer passes `selectedEventId` instead (see
+ *   {@link PanelHostProps.selectedEventId}). A recorded selection belongs to
+ *   the panel it was made in and is dropped with it.
  *
  * - **Queries are addressed to the document's own session.** The session
  *   context carries `spec.sessionId` and nothing else: not a session the host
@@ -523,8 +678,49 @@ export interface PanelHostProps {
  * ```
  */
 export function PanelHost(props: PanelHostProps): ReactElement {
-  const { spec, dataProvider, actions, theme, className, id } = props;
+  const { spec, dataProvider, actions, selectedEventId, theme, className, id } = props;
   const { sessionId, title, summary, layout } = spec;
+  const panelKey = panelIdentityKey(spec);
+
+  // The selection the views and the head reported, with the panel it was made
+  // in. Recording a selection equal to the current one keeps the recorded
+  // object, so a repeated click re-renders nothing.
+  const [recorded, setRecorded] = useState<RecordedSelection | undefined>(undefined);
+  const recordSelection = useCallback(
+    (selection: PanelSelection): void => {
+      setRecorded((previous) =>
+        previous !== undefined &&
+        previous.panelKey === panelKey &&
+        sameSelection(previous.selection, selection)
+          ? previous
+          : { panelKey, selection },
+      );
+    },
+    [panelKey],
+  );
+
+  // The panel's current selection: the surface's when it drives one, and
+  // otherwise the last one reported in THIS panel — a selection made in another
+  // session, panel or generation is never carried into this one. A driven id
+  // keeps the coordinates of the report that named it, so a view that matches
+  // by trace and span keeps matching; any other driven id stands alone.
+  const recordedHere = recorded?.panelKey === panelKey ? recorded.selection : undefined;
+  const selection = useMemo<PanelSelection | undefined>(() => {
+    if (selectedEventId === undefined) {
+      return recordedHere;
+    }
+
+    if (selectedEventId === null || selectedEventId.trim() === '') {
+      return undefined;
+    }
+
+    return recordedHere?.eventId === selectedEventId ? recordedHere : { eventId: selectedEventId };
+  }, [selectedEventId, recordedHere]);
+
+  // What the selection context carries: a holder whose presence tells a view it
+  // is inside a host (and so must not keep a selection of its own), and whose
+  // identity changes only when the selection does.
+  const selectionState = useMemo<PanelSelectionState>(() => ({ selection }), [selection]);
 
   // The supplied callbacks, flattened out of whichever form the surface used:
   // one required pair is set and the other is `undefined`, and the optional
@@ -543,16 +739,24 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   // consumer. The supplied form keeps its callbacks as they are and the other
   // is its adaptation, so what a view or the head reports is what the host
   // receives, location by reference (AAP 0.4.2).
+  //
+  // Each form's selection member records the report as the panel's shared
+  // selection before the surface's own callback runs (see
+  // `withSelectionRecording`); the recorder is stable for as long as the panel
+  // is the same one, so a re-delivered panel still changes nothing a view reads.
   const forms = useMemo(
     () =>
-      panelActionForms({
-        selectEvent: suppliedSelectEvent,
-        openSource: suppliedOpenSource,
-        onSelectEvent: suppliedOnSelectEvent,
-        onOpenSource: suppliedOnOpenSource,
-        onExpand,
-        onFilterChange,
-      }),
+      withSelectionRecording(
+        panelActionForms({
+          selectEvent: suppliedSelectEvent,
+          openSource: suppliedOpenSource,
+          onSelectEvent: suppliedOnSelectEvent,
+          onOpenSource: suppliedOnOpenSource,
+          onExpand,
+          onFilterChange,
+        }),
+        recordSelection,
+      ),
     [
       suppliedSelectEvent,
       suppliedOpenSource,
@@ -560,6 +764,7 @@ export function PanelHost(props: PanelHostProps): ReactElement {
       suppliedOnOpenSource,
       onExpand,
       onFilterChange,
+      recordSelection,
     ],
   );
   const viewActions = forms.view;
@@ -569,7 +774,11 @@ export function PanelHost(props: PanelHostProps): ReactElement {
   // The head, re-rendered only when what it draws or what it reports to has
   // changed. It reports through the host form — `selectEvent(eventId,
   // coordinates)` and `openSource(location)` — whose members are stable for as
-  // long as the supplied callbacks are.
+  // long as the supplied callbacks are. It marks the evidence chips that cite
+  // the panel's shared selection, handed in as the bare id because the head
+  // imports nothing from this folder; the id is a string, so the head
+  // re-renders when a different event is selected and not otherwise.
+  const selectedId = selection?.eventId;
   const head = useMemo<ReactElement>(
     () => (
       <SummaryHeader
@@ -577,11 +786,12 @@ export function PanelHost(props: PanelHostProps): ReactElement {
         summary={summary}
         headingLevel={PANEL_TITLE_HEADING_LEVEL}
         selectEvent={selectEvent}
+        selectedEventId={selectedId}
         openSource={openSource}
         className={SUMMARY_CLASS}
       />
     ),
-    [title, summary, selectEvent, openSource],
+    [title, summary, selectEvent, selectedId, openSource],
   );
 
   // The layout, rendered once per `spec.layout` value. Handing React the very
@@ -604,32 +814,35 @@ export function PanelHost(props: PanelHostProps): ReactElement {
 
   return (
     <PanelShell theme={theme} className={className} id={id}>
-      {/* All three contracts wrap the head as well as the layout. The head is
+      {/* All four contracts wrap the head as well as the layout. The head is
           handed its two callbacks directly, because it imports nothing from
           this folder, but a component it composes still reads the ambient
           contracts — and a tree where only part of the panel can reach the host
           is the harder failure to notice. Each value is stable for as long as
           what it stands for is: the injected provider, the document's session
-          string, and the memoized view form of the actions. */}
+          string, the memoized view form of the actions, and the selection,
+          which changes identity only when a different event is selected. */}
       <DataProviderContext.Provider value={dataProvider}>
         <PanelSessionContext.Provider value={sessionId}>
           <PanelActionsContext.Provider value={viewActions}>
-            {/* Keyed on the document's session, id and generation (see
-                `panelIdentityKey`): a panel for another session, or another
-                panel, remounts every view beneath, so no page, offset or
-                filter a view accumulated survives into a capture it was not
-                drawn from. The shell and the three providers stay mounted. */}
-            <div key={panelIdentityKey(spec)} className={PANEL_CLASS}>
-              {/* Above the summary, so the provenance of what follows is read
-                  first. The explicit `=== true` is the reading `PanelMeta`
-                  prescribes: the flag is absent on an ordinary generated panel
-                  and is never defaulted on parse. */}
-              {spec.meta?.fallback === true ? renderFallbackBanner() : null}
+            <PanelSelectionContext.Provider value={selectionState}>
+              {/* Keyed on the document's session, id and generation (see
+                  `panelIdentityKey`): a panel for another session, or another
+                  panel, remounts every view beneath, so no page, offset or
+                  filter a view accumulated survives into a capture it was not
+                  drawn from. The shell and the four providers stay mounted. */}
+              <div key={panelKey} className={PANEL_CLASS}>
+                {/* Above the summary, so the provenance of what follows is read
+                    first. The explicit `=== true` is the reading `PanelMeta`
+                    prescribes: the flag is absent on an ordinary generated
+                    panel and is never defaulted on parse. */}
+                {spec.meta?.fallback === true ? renderFallbackBanner() : null}
 
-              {head}
+                {head}
 
-              <div className={BODY_CLASS}>{body}</div>
-            </div>
+                <div className={BODY_CLASS}>{body}</div>
+              </div>
+            </PanelSelectionContext.Provider>
           </PanelActionsContext.Provider>
         </PanelSessionContext.Provider>
       </DataProviderContext.Provider>

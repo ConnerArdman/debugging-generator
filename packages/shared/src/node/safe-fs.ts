@@ -11,8 +11,11 @@
  *    `0700` and every file in it `0600`, the ownership and permissions of each
  *    directory are verified before anything is written, and a symlink planted
  *    at a path this module is asked to create is refused rather than followed.
- *    A token file is worth stealing, so "the parent looked fine last time" is
- *    not a check.
+ *    A directory of that tree that already exists is judged, never repaired:
+ *    one that grants group or other access is refused, with its path and mode,
+ *    before anything is created beneath it, because what it already holds may
+ *    have been read or replaced while it was open. A token file is worth
+ *    stealing, so "the parent looked fine last time" is not a check.
  * 2. **A reversible source edit stays reversible.** The instrumentation patcher
  *    writes a modified copy of a file the developer owns. That write is atomic —
  *    a crash leaves either the original or the complete new content, never half
@@ -172,8 +175,9 @@ import { isWithin, toPosix } from '../paths.js';
  * owner read, write and execute, and nothing for anyone else.
  *
  * The state directory tree — session store, file backups, index caches — is
- * created `0700`, and {@link ensureSecureDir} tightens an existing directory in
- * that tree to this value rather than trusting whatever it happens to carry.
+ * created `0700`: {@link ensureSecureDir} applies this value to every directory
+ * it creates, and refuses a directory of that tree that already exists with
+ * group or other access rather than changing its mode.
  * {@link assertSecureDir} is the predicate form of the same rule.
  *
  * It is a plain number rather than a string because that is what `mkdir` and
@@ -317,8 +321,8 @@ function noFollowFlag(): number {
  * for the same reason: the declarations promise the POSIX set, the runtime does
  * not, and a missing constant must contribute nothing to a bit mask rather than
  * a `NaN`. It pairs with `O_NOFOLLOW` when {@link ensureSecureDir} opens a
- * directory it is about to tighten — together they say "this exact object, and
- * only if it really is a directory".
+ * directory it has just created to apply its mode — together they say "this
+ * exact object, and only if it really is a directory".
  */
 function directoryFlag(): number {
   const flag: unknown = constants.O_DIRECTORY;
@@ -435,7 +439,7 @@ function errnoCodeOf(value: unknown): string | undefined {
 }
 
 /**
- * The directories a check or a tightening pass covers, outermost first.
+ * The directories a check or a creation pass covers, outermost first.
  *
  * With no `upToAbs`, that is `dirAbs` alone. With one, it is every component
  * from `upToAbs` down to `dirAbs`, both included — so a caller naming its state
@@ -551,9 +555,18 @@ function assertComponentSecure(componentAbs: string, requireOwner: boolean): voi
 
 /**
  * The owner and permission-bit half of the state-directory policy, applied to
- * stats already read — by `lstat` of a path in {@link assertComponentSecure},
- * or by `fstat` of an open descriptor in {@link pinPrivateFileWithinRoot}, which
- * is what lets the second judge the very directory it will act through.
+ * stats already read — by `lstat` of a path in {@link assertComponentSecure}
+ * and in the creation walk of {@link ensureSecureDir}, or by `fstat` of an open
+ * descriptor in {@link pinPrivateFileWithinRoot}, which is what lets the last
+ * judge the very directory it will act through.
+ *
+ * The permission refusal names the exact directory in both its message and its
+ * hint, because the developer's next action is a `chmod` of that path — or a
+ * different state directory — and never a change this module makes for them:
+ * a directory that was readable by another account may already have been read,
+ * so only the developer can decide whether its contents are still trustworthy.
+ * The hint carries the path and the modes only, never anything the directory
+ * holds.
  *
  * Off POSIX, where there is no user id, both tests are skipped.
  *
@@ -578,7 +591,7 @@ function assertOwnershipAndMode(componentAbs: string, stats: Stats, requireOwner
       `'${componentAbs}' has mode ${octal(stats.mode)}, which grants access to group or other accounts.`,
       'group-or-other-permissions',
       componentAbs,
-      `Tighten it with 'chmod ${octal(SECURE_DIR_MODE)}'.`,
+      `Check what it contains, then tighten it with 'chmod ${octal(SECURE_DIR_MODE)} ${componentAbs}', or point the tool at a directory only this account can reach.`,
       { mode: octal(stats.mode), expectedMode: octal(SECURE_DIR_MODE) },
     );
   }
@@ -713,13 +726,13 @@ function isKnownToExist(pathAbs: string): boolean {
  * that is. That component is **not** part of the chain: it already existed,
  * this call is not creating it, and it may legitimately be a directory the
  * product does not own (a home directory, a temp directory) whose mode this
- * function has no business tightening.
+ * function has no business judging.
  *
  * Stopping there is a statement about *work*, not about trust. The climb uses
  * `lstat`, which resolves every interior component, so the path it stops at can
  * itself sit inside a symbolic link — which is exactly why
  * {@link ensureSecureDir} tests the whole prefix above this chain with
- * {@link assertPrefixIsSymlinkFree} before it creates or tightens anything.
+ * {@link assertPrefixIsSymlinkFree} before it creates anything.
  * Reading this function as "the boundary is trusted" is the error that leaves
  * CWE-59 open.
  *
@@ -771,7 +784,7 @@ function assertExistingComponentIsNotALink(componentAbs: string): void {
   }
 
   if (isLink) {
-    refuseSymlinkComponent(componentAbs, 'nothing was created or tightened through it');
+    refuseSymlinkComponent(componentAbs, 'nothing was created through it');
   }
 }
 
@@ -797,7 +810,7 @@ function assertExistingComponentIsNotALink(componentAbs: string): void {
  *
  * Only *identity* is tested here, never ownership or permissions: these
  * components were not created by this call and may legitimately be directories
- * the product neither owns nor should tighten — a home directory, a temp
+ * the product neither owns nor has any say over — a home directory, a temp
  * directory, the filesystem root. The one thing they may not be is a link,
  * because then the path names something other than what the caller wrote.
  *
@@ -843,15 +856,29 @@ function assertPrefixIsSymlinkFree(deepestAbs: string): void {
  * - anything else that is not a directory rethrows the **original** `EEXIST`
  *   untouched, because "a file occupies this path" is the platform's statement
  *   to make and a caller branches on the errno;
- * - a real directory continues, after its ownership is checked — a directory
- *   another account owns cannot be tightened anyway, and creating the
- *   product's own tree inside it would put that tree at that account's mercy.
+ * - a real directory is held to the whole state-directory policy **as it
+ *   stands** — owned by this account, no group or other permissions — and is
+ *   never `chmod`-ed. A directory another account owns cannot be made private
+ *   by us at all, and creating the product's own tree inside it would put that
+ *   tree at that account's mercy. A directory of ours that grants group or
+ *   other access may already have been read, or had entries planted in it,
+ *   while it was open; quietly tightening it would hide that from the one
+ *   person who can judge what it now holds, so it is refused with its path and
+ *   mode instead (AAP 0.4.2: "refuses to proceed otherwise").
+ *
+ * Because the walk runs outermost first and this triage happens before the
+ * next component is created, the outermost failing directory is the one
+ * reported, and nothing new ever appears beneath it.
  *
  * Every other errno propagates unwrapped: `EACCES`, `ENOSPC` and `ENOTDIR` are
  * answers, not policy failures.
  *
  * @returns `true` when this call created the directory, `false` when it was
  * already there and passed the triage.
+ * @throws {DebuggenError} With code `FS_UNSAFE_PATH` and `details.reason`
+ * `symlink-component`, `foreign-owner` or `group-or-other-permissions` (with
+ * `details.mode` and `details.expectedMode`) for an existing component that
+ * fails the policy.
  */
 function createChainComponent(componentAbs: string): boolean {
   try {
@@ -864,28 +891,36 @@ function createChainComponent(componentAbs: string): boolean {
 
     const stats = lstatSync(componentAbs);
     if (stats.isSymbolicLink()) {
-      refuseSymlinkComponent(componentAbs, 'nothing was created or tightened through it');
+      refuseSymlinkComponent(componentAbs, 'nothing was created through it');
     }
     if (!stats.isDirectory()) {
       throw error;
     }
 
-    const uid = currentUid();
-    if (uid !== undefined) {
-      assertOwnedByThisAccount(componentAbs, stats.uid, uid);
-    }
+    // The same owner-and-mode half `assertSecureDir` applies, on the stats just
+    // read, so a pre-existing directory is refused here with exactly the code,
+    // reason and details the verification pass would report for it.
+    assertOwnershipAndMode(componentAbs, stats, true);
 
     return false;
   }
 }
 
 /**
- * Tightens one directory of a chain to {@link SECURE_DIR_MODE}, without ever
- * following a link.
+ * Applies {@link SECURE_DIR_MODE} to a directory **this call just created**,
+ * without ever following a link.
+ *
+ * Only ever called for a component {@link createChainComponent} reported as
+ * created; a directory that already existed keeps its mode and is judged
+ * instead. The mode passed to `mkdir` is masked by the process umask, which can
+ * only *remove* bits, so a freshly created component never carries group or
+ * other access — but it may carry less than the owner's full `rwx` (`0500`
+ * under `umask 0277`). Setting the mode explicitly is what makes "created
+ * `0700`" a fact rather than a request, whatever the umask.
  *
  * `chmod` takes a path, so it is looked up a second time — and between the
- * `lstat` that proved the path was a directory and that lookup, another process
- * can replace it with a link to something else. That window is the CWE-367 half
+ * `mkdir` that created the directory and that lookup, another process can
+ * replace it with a link to something else. That window is the CWE-367 half
  * of this module's exposure, and the descriptor route closes it: `open` with
  * `O_NOFOLLOW | O_DIRECTORY` refuses a link outright and yields a handle to the
  * object it just resolved, and `fchmod` applies the mode to *that* object, so
@@ -903,7 +938,7 @@ function createChainComponent(componentAbs: string): boolean {
  * means the platform's no-follow flag met a link at this exact path, which is a
  * refusal, not an inability.
  */
-function tightenToSecureDirMode(componentAbs: string): void {
+function applySecureDirMode(componentAbs: string): void {
   const noFollow = noFollowFlag();
 
   if (noFollow !== 0) {
@@ -937,8 +972,9 @@ function tightenToSecureDirMode(componentAbs: string): void {
 }
 
 /**
- * Creates a directory and every missing parent, one component at a time,
- * tightening each to {@link SECURE_DIR_MODE} and verifying the result.
+ * Creates a directory and every missing parent, one component at a time, at
+ * exactly {@link SECURE_DIR_MODE}, refuses any component that already exists
+ * and fails the state-directory policy, and verifies the result.
  *
  * This is how the product's state tree comes into existence at the documented
  * `0700`: the service creates its state root and the per-session backup
@@ -973,39 +1009,61 @@ function tightenToSecureDirMode(componentAbs: string): void {
  * 3. Each component is created with a **non-recursive** `mkdir`, which never
  *    follows a link at the final component: a planted link arrives as `EEXIST`
  *    and is refused by name, an existing file rethrows its own `EEXIST`, and an
- *    existing directory continues only after its ownership is checked.
- * 4. Each component is tightened immediately, through a descriptor opened
- *    `O_NOFOLLOW | O_DIRECTORY` where the platform has those flags, so the mode
- *    lands on the object the descriptor already names and there is no second
- *    path lookup for another process to redirect.
+ *    existing directory continues only when it already satisfies the whole
+ *    state-directory policy — owned by this account, no group or other
+ *    permissions. Nothing is created beneath a component until it has passed.
+ * 4. A component this call created is given {@link SECURE_DIR_MODE}
+ *    immediately, through a descriptor opened `O_NOFOLLOW | O_DIRECTORY` where
+ *    the platform has those flags, so the mode lands on the object the
+ *    descriptor already names and there is no second path lookup for another
+ *    process to redirect.
+ *
+ * ## Why an existing directory is refused rather than tightened
+ *
+ * AAP 0.4.2 states the rule: every parent is verified to be a real directory
+ * owned by this account with mode `0700`, and the write **refuses to proceed
+ * otherwise**. "Mode `0700`" is read here exactly as {@link assertSecureDir}
+ * reads it — no group or other permission bit set — so an owner-only directory
+ * narrower than `0700` is accepted as it stands, and an operation it does not
+ * permit fails later with the platform's own errno. A directory of the state
+ * tree that already grants group or other access — a state root a previous
+ * tool or an unpacked archive left at `0755`, a `backups` directory someone
+ * `chmod`-ed open — has been readable, and possibly writable, by another
+ * account for as long as it was that way: the credential, the backups or the
+ * session store beneath it may already have been read, and entries may have
+ * been planted in it. Silently narrowing the mode would erase the only evidence
+ * of that while carrying on as if the tree had always been private, so the call
+ * throws `FS_UNSAFE_PATH` with `details.reason: 'group-or-other-permissions'`,
+ * the offending absolute path and its mode, and a hint naming the exact
+ * `chmod` — the developer checks what the directory holds and tightens it, or
+ * points the tool elsewhere. The refusal changes nothing: the directory keeps
+ * its mode and gains no entry.
  *
  * ## Why the mode is applied after `mkdir`
  *
  * The mode passed to `mkdir` is masked by the process umask, so a request for
- * `0700` lands as `0700` under the common `umask 022` and as something narrower
- * or wider under another — and a directory that already existed keeps whatever
- * mode it had, which for a directory created by other means is typically
- * `0755`. Neither case is acceptable for a tree holding a credential, so every
- * component is tightened explicitly. An existing over-permissive directory **in
- * the product's own tree is deliberately tightened**; that is the intended
- * repair, and it is why this function is safe to call on every start-up rather
- * than only on first run. A component's mode is never *asserted* before that
- * repair — only its type, its identity and its owner are, because those are the
- * things a repair cannot fix.
+ * `0700` lands as `0700` under the common `umask 022` and as something
+ * narrower — `0500` under `umask 0277` — under another. A mask only ever
+ * removes bits, so a directory this call creates can never gain group or other
+ * access that way, but "created `0700`" is still a promise about the result,
+ * so each created component has the mode applied explicitly and the result
+ * does not depend on the umask. Existing components are never passed through
+ * that step, which is what makes this function safe to call on every start-up:
+ * it changes nothing that was already there.
  *
- * ## The chain that is tightened, and what stays unverified
+ * ## The chain that is verified, and what stays unverified
  *
  * `opts.upTo` when given, otherwise the outermost component this call actually
  * created, otherwise the named directory alone. So a first run that creates the
- * whole tree tightens and verifies all of it, and a later run that creates
- * nothing still tightens what the caller declared its own.
+ * whole tree creates and verifies all of it at `0700`, and a later run that
+ * creates nothing still judges everything the caller declared its own.
  *
  * Stated plainly, the way this module states its POSIX reduction: the
  * components *above* the chain are checked for one thing only — that none of
  * them is a symbolic link — and never for ownership or permissions. They
  * already existed, this call did not create them, and they may legitimately be
- * directories the product neither owns nor should tighten: a home directory, a
- * temp directory, the filesystem root. Which components those are depends on
+ * directories the product neither owns nor has any say over: a home directory,
+ * a temp directory, the filesystem root. Which components those are depends on
  * the boundary, and the two cases differ deliberately:
  *
  * - **Without `opts.upTo`** there is no declaration to rely on, so the *whole*
@@ -1035,12 +1093,16 @@ function tightenToSecureDirMode(componentAbs: string): void {
  *
  * @param dir The directory to create. Resolved against the process's working
  * directory when relative.
- * @param opts `upTo` to tighten and verify a whole chain the caller owns.
+ * @param opts `upTo` to create and verify a whole chain the caller owns.
  * @throws {DebuggenError} With code `FS_UNSAFE_PATH` when a component of the
  * chain — or the directory the chain would be created inside — is a symbolic
- * link, when a component is owned by another account, or when the chain still
- * fails {@link assertSecureDir} after the tightening pass. With code `INTERNAL`
- * when `upTo` does not contain `dir`.
+ * link (`symlink-component`), when an existing component is owned by another
+ * account (`foreign-owner`) or grants group or other access
+ * (`group-or-other-permissions`, with `details.mode` and
+ * `details.expectedMode`), or when the chain still fails
+ * {@link assertSecureDir} after the creation pass. `details.path` is always
+ * the outermost offending component. With code `INTERNAL` when `upTo` does not
+ * contain `dir`.
  * @throws The runtime's own filesystem error, with its `code` intact:
  * `ENOTDIR`/`EEXIST` when a path component is an existing regular file,
  * `EACCES` when the parent cannot be written.
@@ -1066,8 +1128,8 @@ export function ensureSecureDir(dir: string, opts?: SecureBoundaryOptions): void
     // Nothing above the chain has been declared, so nothing above it can be
     // taken on trust: every component the walk will reach through has to be a
     // real directory. The test runs whether or not the chain's outermost
-    // component exists, because the tightening pass reaches through the same
-    // prefix that a creation would.
+    // component exists, because judging an existing component reaches through
+    // the same prefix that a creation would.
     assertPrefixIsSymlinkFree(dirname(outermostAbs));
   } else if (!isKnownToExist(outermostAbs)) {
     // With a boundary, the components from it downward are each verified in the
@@ -1081,11 +1143,14 @@ export function ensureSecureDir(dir: string, opts?: SecureBoundaryOptions): void
   // responsible for, and therefore what it can vouch for without a boundary.
   let firstCreated: string | undefined;
   for (const componentAbs of chain) {
-    const created = createChainComponent(componentAbs);
-    if (created && firstCreated === undefined) {
-      firstCreated = componentAbs;
+    // Outermost first, and each component settled before the next is created:
+    // an existing one is judged as it stands and refused before anything
+    // appears beneath it, and only a component this call created has its mode
+    // set — an existing directory's mode is never changed here.
+    if (createChainComponent(componentAbs)) {
+      firstCreated ??= componentAbs;
+      applySecureDirMode(componentAbs);
     }
-    tightenToSecureDirMode(componentAbs);
   }
 
   const chainTop = upToAbs ?? firstCreated ?? dirAbs;

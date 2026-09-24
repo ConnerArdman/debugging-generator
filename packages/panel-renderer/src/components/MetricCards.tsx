@@ -39,7 +39,12 @@
  * A metric that the capture could not measure renders the package's single
  * spelling of absence — {@link NOT_AVAILABLE_LABEL} — under the
  * `dg-is-unavailable` state, muted, with no severity colour and no unit. Never
- * `0`, never a blank tile, never a dash, and never a hidden card.
+ * `0`, never a blank tile, never a dash, and never a hidden card. Muted is not
+ * enough on its own to tell it apart: a measured fast duration is muted too,
+ * because the fast-duration token IS the muted text colour (AAP 0.6.3). So the
+ * state also changes the tile's shape — a dashed edge and an italic figure —
+ * and a measured zero keeps the solid edge and upright figure of every other
+ * measurement, which is never colour alone (AAP 0.6.4).
  *
  * That is a correctness requirement rather than a cosmetic one. A transfer size
  * is exposed by the browser for same-origin responses only and by a server span
@@ -137,7 +142,10 @@
  * need has settled, so a partial read is never drawn as tiles and mislabelled —
  * then a failed query, reported with the query of the page that failed and a
  * retry that re-requests that page alone, then a capture that computed nothing,
- * then the tiles.
+ * then the tiles. Both failure states are worded by the host's one error-state
+ * contract (`queryFailureProps` and `unsupportedQueryProps` in
+ * `../host/useQuery`) rather than by copy of this file's own, so a failed tile
+ * group reads exactly like every other failed node in the panel.
  *
  * The node's optional `title` and `description` are deliberately **not** drawn
  * here. Every query-backed node carries those two fields identically, and the
@@ -161,7 +169,11 @@
  *   `dg-metric-cards__loading`   every other query-backed view's, so an
  *   `dg-metric-cards__error`     unresolved node is visibly a state and never
  *                                a blank area.
- *   `dg-metric-card`             one tile: the shared elevated card surface.
+ *   `dg-metric-card`             one tile: the shared elevated card surface,
+ *                                a column that holds its heading at the top
+ *                                and its figure at the bottom, so the figures
+ *                                of one grid row line up however many lines
+ *                                a heading wraps to.
  *   `dg-metric-card__label`      the metric's heading.
  *   `dg-metric-card__value`      the figure, in the prominent numeric role. It
  *                                reads `--dgc-severity-color`, which is the one
@@ -171,11 +183,12 @@
  *                                rather than a suffix inside the number.
  *   `dg-metric-card__hint`       the advisory-note affordance.
  *   `dg-is-unavailable`          the state, on the tile, which is where the
- *                                stylesheet's rule expects it. It marks both
+ *                                stylesheet's rule expects it: a dashed edge
+ *                                and a muted, italic figure. It marks both
  *                                the unavailable tile and the not-on-page
- *                                tile: each is muted for the same reason, and
- *                                their figure and note are what tell them
- *                                apart, so no further state class is needed.
+ *                                tile: each shows no measurement, and their
+ *                                figure and note are what tell them apart,
+ *                                so no further state class is needed.
  *
  * The `dg-metric-cards__card`, `__label`, `__value`, `__unit` and `__note`
  * names are emitted alongside the tile's own block names because the component
@@ -209,10 +222,10 @@ import type { DataQuery, DataQuerySource, MetricCardsNode } from '@debuggen/pane
 import { DATA_QUERY_DEFAULT_OFFSET, PANEL_NODE_CATALOG } from '@debuggen/panel-schema';
 import type { MetricId, MetricValue } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { Info } from 'lucide-react';
+import { Gauge, Info } from 'lucide-react';
 import type { CSSProperties, ReactElement } from 'react';
 
-import { useQuery } from '../host/useQuery';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
@@ -222,6 +235,7 @@ import { Tooltip } from '../primitives/Tooltip';
 import { durationColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  formatBytesParts,
   formatCount,
   formatDurationParts,
   formatMetric,
@@ -280,17 +294,14 @@ const CATALOG_ENTRY = PANEL_NODE_CATALOG.metricCards;
 /** Copy for the successful-but-empty case: the capture computed no values. */
 const EMPTY_MESSAGE = 'No metrics were computed for this capture.';
 
-/** Copy for a failed query. The code and the query carry the detail. */
-const ERROR_MESSAGE = 'The computed values of this capture could not be loaded.';
+/** The short label above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No metrics';
 
 /**
- * Copy for a node asking for a source these tiles cannot draw.
- *
- * Unreachable for a specification that passed validation — the validator checks
- * each node's query source against the catalog's `sources` — so this is the
- * honest report of a defect upstream rather than an expected state.
+ * The short label above the off-page empty message: the same words every paged
+ * view uses for a page that is empty while its result may not be.
  */
-const SOURCE_MISMATCH_MESSAGE = `These tiles can only draw the "${METRICS_SOURCE}" source.`;
+const OFF_PAGE_EMPTY_TITLE = 'Nothing on this page';
 
 /** The note a tile carries when the capture computed no value for its id. */
 const MISSING_METRIC_NOTE = 'This value is not part of the computed set of this capture.';
@@ -322,8 +333,11 @@ const OFF_PAGE_EMPTY_MESSAGE =
 /** The accessible name of the advisory-note affordance; its description is the note. */
 const NOTE_AFFORDANCE_LABEL = 'Coverage note';
 
-/** What the loading state announces to a screen reader. */
-const LOADING_LABEL = 'Loading the computed values of this capture';
+/**
+ * What the loading state announces to a screen reader, ending in the single
+ * `…` every busy region in a panel announces itself with.
+ */
+const LOADING_LABEL = 'Loading the computed values of this capture…';
 
 /**
  * One tile, fully resolved: what to show, in what unit, and whether the figure
@@ -375,7 +389,7 @@ interface CollectedValues {
  * A type guard rather than a cast: the node schema types `query.source` as the
  * whole source union, while the data hook is generic over one member of it, and
  * this predicate is the one place the two meet. A query that fails it is
- * reported as an error state (see {@link SOURCE_MISMATCH_MESSAGE}) instead of
+ * reported as an error state (see {@link unsupportedQueryProps}) instead of
  * being coerced, because coercing it would draw metric tiles from whatever the
  * other source resolved to.
  */
@@ -393,26 +407,31 @@ function isMetricsQuery(query: DataQuery): query is MetricsQuery {
  * formats as the absent label, and a tile must not be styled as a measurement
  * while showing one. The two checks together are what make this total.
  *
- * The unit is split from the figure only where the formatters offer that split
- * — durations do, through {@link formatDurationParts} — so the number in the
- * prominent role never has a unit concatenated into it and no string surgery is
- * performed on a formatted value. A count carries no unit symbol at all, and a
- * byte size formats as one string, which is what its tile shows.
+ * The unit is split from the figure wherever the formatters offer that split —
+ * durations through {@link formatDurationParts} and byte sizes through
+ * {@link formatBytesParts} — so the number in the prominent role never has a
+ * unit concatenated into it and no string surgery is performed on a formatted
+ * value. A count carries no unit symbol at all, and a unit this build does not
+ * know is shown as the one string the shared formatter produced for it.
  */
 function describeMetric(metric: MetricValue): MetricCard {
   const display = formatMetric(metric);
 
-  // Narrowed to a number here so the duration split and the severity lookup
-  // below need no second check; `undefined` means "not a measurement".
+  // Narrowed to a number here so the splits and the severity lookup below need
+  // no second check; `undefined` means "not a measurement".
   const measured = display.available && typeof metric.value === 'number' ? metric.value : undefined;
 
-  const parts =
+  // Kept apart from the byte split because only a duration has a severity.
+  const durationParts =
     measured !== undefined && metric.unit === 'milliseconds'
       ? formatDurationParts(measured)
       : undefined;
+  const parts =
+    durationParts ??
+    (measured !== undefined && metric.unit === 'bytes' ? formatBytesParts(measured) : undefined);
 
-  // Both arms of the duration split carry a `value`, the unavailable one being
-  // the absent label itself, so this needs no branch of its own.
+  // Every arm of both splits carries a `value`, the unavailable ones being the
+  // absent label itself, so this needs no branch of its own.
   const figure = parts === undefined ? display.text : parts.value;
   const unit = parts?.available === true ? parts.unit : undefined;
   const available = measured !== undefined && figure !== NOT_AVAILABLE_LABEL;
@@ -430,7 +449,7 @@ function describeMetric(metric: MetricValue): MetricCard {
     // no threshold to be read against, and an unavailable figure must never be
     // coloured as though it had been measured.
     severityColor:
-      available && measured !== undefined && parts !== undefined
+      available && measured !== undefined && durationParts !== undefined
         ? durationColorVar(measured)
         : undefined,
     note: display.note,
@@ -633,11 +652,6 @@ function severityStyle(card: MetricCard): CssVariableStyle | undefined {
     : { '--dgc-severity-color': card.severityColor };
 }
 
-/** The query as text, for the error state's detail block. */
-function describeQuery(query: DataQuery): string {
-  return JSON.stringify(query);
-}
-
 /**
  * One of the three states, in the block's own state box.
  *
@@ -688,7 +702,11 @@ function renderRead(
       return stateFrame(
         'dg-metric-cards__empty',
         className,
-        <EmptyState message={EMPTY_MESSAGE} />,
+        <EmptyState
+          title={EMPTY_TITLE}
+          message={EMPTY_MESSAGE}
+          icon={<Gauge className="dg-icon" />}
+        />,
       );
     }
 
@@ -699,7 +717,11 @@ function renderRead(
       return stateFrame(
         'dg-metric-cards__empty',
         className,
-        <EmptyState message={offPageEmptyMessage(total)} />,
+        <EmptyState
+          title={OFF_PAGE_EMPTY_TITLE}
+          message={offPageEmptyMessage(total)}
+          icon={<Gauge className="dg-icon" />}
+        />,
       );
     }
   }
@@ -819,7 +841,7 @@ interface MetricCardsPageProps {
  */
 function MetricCardsPage(props: MetricCardsPageProps): ReactElement {
   const { node, className, query, firstOffset, collected, knownTotal } = props;
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   if (status === 'loading') {
     // `block` is the skeleton shaped like a group of tiles rather than like a
@@ -834,19 +856,16 @@ function MetricCardsPage(props: MetricCardsPageProps): ReactElement {
   }
 
   if (status === 'error') {
-    // Generic copy plus the machine detail: the failure's own code and the
-    // query of the page that failed, with a retry that re-requests that page
-    // alone. A failure is never dressed up as a finding (AAP 0.5.5), so no part
-    // of the error text is presented as data — and neither are the pages that
-    // did arrive before it.
+    // The shared failure contract: the generic lead with the provider's own
+    // cause, its hint, its code, the query of the page that failed and a retry
+    // that re-requests that page alone. The scope is the whole view even for a
+    // follow-up page, because no tile is drawn from the pages that did arrive
+    // before it — a failure is never dressed up as a finding (AAP 0.5.5).
     return stateFrame(
       'dg-metric-cards__error',
       className,
       <ErrorState
-        message={ERROR_MESSAGE}
-        code={error?.code}
-        query={describeQuery(query)}
-        onRetry={retry}
+        {...queryFailureProps({ error, announcement, retry }, query, { scope: 'view' })}
       />,
     );
   }
@@ -923,13 +942,16 @@ export function MetricCards(props: MetricCardsProps): ReactElement {
 
   // A node naming a source these tiles cannot draw asks the provider for
   // nothing, and its error state shows the node's own query with no retry,
-  // since re-issuing it cannot change the answer. This component calls no hook
-  // itself — each page level calls its own — so returning early is legal.
+  // since re-issuing it cannot change the answer. Unreachable for a
+  // specification that passed validation — the validator checks each node's
+  // query source against the catalog's `sources` — so it is reported as the
+  // upstream defect it is. This component calls no hook itself — each page
+  // level calls its own — so returning early is legal.
   if (!isMetricsQuery(query)) {
     return stateFrame(
       'dg-metric-cards__error',
       className,
-      <ErrorState message={SOURCE_MISMATCH_MESSAGE} query={describeQuery(query)} />,
+      <ErrorState {...unsupportedQueryProps(node.type, query)} />,
     );
   }
 

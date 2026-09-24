@@ -181,7 +181,11 @@ import type {
   ModificationRecord,
   ModificationStatus,
 } from './schema/modification.js';
-import type { BackupStore, RecordedBackup } from './patch/backup-store.js';
+import type {
+  BackupStore,
+  BackupStoreFailureReason,
+  RecordedBackup,
+} from './patch/backup-store.js';
 import { buildConflictReport, detectConflict, isConflictVerdict } from './patch/conflict.js';
 import type {
   ConflictDetectionContext,
@@ -249,10 +253,24 @@ export type BackupDisposition = (typeof BACKUP_DISPOSITIONS)[number];
  * {@link ReconcileOutcome.status}.
  *
  * - `clean` — every record in scope is `reverted` and every file in scope holds
- *   its original bytes. A pass with nothing to do is `clean`, which is what
- *   makes a second {@link cleanupSession} call safe and honest.
- * - `partial` — something was restored and something is outstanding.
- * - `conflict` — nothing was restored and something is outstanding.
+ *   its original bytes: no conflict is outstanding, no record was left open and
+ *   nothing failed. A pass with nothing to do is `clean`, which is what makes a
+ *   second {@link cleanupSession} call safe and honest.
+ * - `conflict` — at least one conflict is outstanding: the pass produced or
+ *   renewed a conflict report, refused a file whose records do not form one
+ *   chain, or left open a record whose status is `conflict`. A file was edited
+ *   (or otherwise diverged) while instrumented, the tool refused to overwrite
+ *   it, and its original stays in the backup directory — AAP §0.5.5's "record
+ *   becomes `conflict`; cleanup leaves the file; `cleanup.status` becomes
+ *   `conflict`".
+ * - `partial` — something is outstanding and none of it is a conflict: a record
+ *   the pass could not attempt or could not finish (a failure, an abort, a
+ *   record it could not place), which a later pass can settle.
+ *
+ * The verdict describes the state a pass leaves behind, never the work it did:
+ * whether this pass restored something beside a conflict does not change the
+ * answer, so a second pass over identical state reports exactly what the first
+ * one did.
  *
  * The session record's `cleanup.status` of AAP §0.5.5 adds a fourth value,
  * `pending`, for the state *before* a pass has run; this module never produces
@@ -334,6 +352,16 @@ const CHAIN_FORK_CONFLICT_REASON: ModificationConflictReason = RECORD_CHAIN_FORK
  * message name the race the same way whichever write refused.
  */
 const TARGET_APPEARED = 'target-appeared';
+
+/**
+ * The backup store's `details.reason` for a stored backup whose bytes do not
+ * hash to the digest it is filed under (`./patch/backup-store.ts`).
+ *
+ * Checked with `satisfies` against the store's own vocabulary, so a rename there
+ * fails to compile here instead of silently reporting a corrupt backup as a
+ * missing one.
+ */
+const STORED_DIGEST_MISMATCH = 'stored-digest-mismatch' satisfies BackupStoreFailureReason;
 
 /**
  * What a pass is allowed to do with a record, decided by the record's status
@@ -1301,8 +1329,8 @@ export async function restoreChain(
  * A file whose open records do not form a single chain is refused whole before
  * anything of it is read or written — see the module overview — and listed in
  * {@link CleanupOutcome.forks}; the session's other files are still restored,
- * so such a pass ends `partial` when they were, and `conflict` when the fork
- * was all there was.
+ * and the pass ends `conflict` whether or not they were, because the refused
+ * fork is an outstanding conflict (see {@link CLEANUP_STATUSES}).
  *
  * Called on `session.end`, on editor deactivation (the extension's
  * `deactivate()` ends the active session), and — through
@@ -1329,8 +1357,9 @@ export async function restoreChain(
  * developer was pointed at.
  *
  * Never rejects and never throws. A journal that will not answer is reported as
- * a failure with no record attributed to it, and the status is `conflict` —
- * nothing could be restored, and something is outstanding.
+ * a failure with no record attributed to it, and the status is `partial` —
+ * nothing could be attempted, and no conflict was observed: a later pass,
+ * against a journal that answers, gives the verdict.
  *
  * @param sessionId The session to clean up.
  * @param context See {@link restoreModification}. Its `backups` must be this
@@ -1359,14 +1388,20 @@ export async function cleanupSession(
       code: listed.error.code,
     });
 
+    // A failure with no conflict observed: nothing was read, so nothing can be
+    // said to have diverged, and the verdict is the table's `partial`.
+    const unanswered: CleanupFailure[] = [
+      { recordId: '', sessionId, file: '', error: listed.error },
+    ];
+
     return {
       sessionId,
-      status: 'conflict',
+      status: statusFor({ conflicts, forks, outstanding: skipped, failures: unanswered }),
       restored,
       conflicts,
       completedAt: clockReading(context, logger),
       skipped,
-      failures: [{ recordId: '', sessionId, file: '', error: listed.error }],
+      failures: unanswered,
       forks,
     };
   }
@@ -1415,7 +1450,9 @@ export async function cleanupSession(
 
   await ledger.sweep(logger);
 
-  const status = statusFor(restored.length, conflicts.length + skipped.length + failures.length);
+  // `skipped` already holds every retained record, so it is the whole of what
+  // this pass leaves open.
+  const status = statusFor({ conflicts, forks, outstanding: skipped, failures });
 
   if (status === 'clean' && restored.length > 0 && options.keepBackupDirectory !== true) {
     await removeSessionBackups(sessionId, context, options.scope, logger);
@@ -1501,15 +1538,25 @@ export async function reconcileModifications(
       code: listed.error.code,
     });
 
+    // As in `cleanupSession`: a failure with no conflict observed is `partial`.
+    const unanswered: CleanupFailure[] = [
+      { recordId: '', sessionId: '', file: '', error: listed.error },
+    ];
+
     return {
-      status: 'conflict',
+      status: statusFor({
+        conflicts,
+        forks,
+        outstanding: [...retained, ...skipped],
+        failures: unanswered,
+      }),
       examined: 0,
       restored,
       closed,
       retained,
       conflicts,
       skipped,
-      failures: [{ recordId: '', sessionId: '', file: '', error: listed.error }],
+      failures: unanswered,
       forks,
       completedAt: clockReading(context, logger),
     };
@@ -1554,10 +1601,12 @@ export async function reconcileModifications(
 
   await ledger.sweep(logger);
 
-  const status = statusFor(
-    restored.length + closed.length,
-    retained.length + conflicts.length + skipped.length + failures.length,
-  );
+  const status = statusFor({
+    conflicts,
+    forks,
+    outstanding: [...retained, ...skipped],
+    failures,
+  });
 
   logger.info('modification reconciliation finished', {
     status,
@@ -2232,24 +2281,14 @@ async function writeRestoration(
       reason,
     });
 
-    return await reportSynthesizedConflict(
-      record,
-      path,
-      'backup-missing',
-      undefined,
-      backupUnreadableMessage(record, reason),
-      context,
-      settings,
-    );
+    return await reportUnusableBackup(record, path, reason, context, settings);
   }
 
   if (isErr(backup)) {
-    return await reportSynthesizedConflict(
+    return await reportUnusableBackup(
       record,
       path,
-      'backup-missing',
-      undefined,
-      backupUnreadableMessage(record, detailsReasonOf(backup.error) ?? backup.error.code),
+      detailsReasonOf(backup.error) ?? backup.error.code,
       context,
       settings,
     );
@@ -2272,7 +2311,7 @@ async function writeRestoration(
     return await reportSynthesizedConflict(
       record,
       path,
-      'backup-missing',
+      'backup-corrupt',
       undefined,
       backupDigestMismatchMessage(record),
       context,
@@ -2442,6 +2481,54 @@ async function writeRestoration(
 }
 
 /**
+ * Reports a backup the restoration could not use, under the reason that names
+ * what the store observed.
+ *
+ * The store's {@link STORED_DIGEST_MISMATCH} means the file is there and was
+ * read, but is not the original: `'backup-corrupt'`, worded as the digest
+ * mismatch it is. Every other reason — nothing there, an errno such as `ELOOP`,
+ * a state-directory policy refusal — means the original could not be read back
+ * at all: `'backup-missing'`, with the reason quoted. Either way nothing is
+ * written and the backup is kept.
+ *
+ * @param record The record whose backup could not be used.
+ * @param path The resolved target, for the report.
+ * @param storeReason The store's `details.reason`, the errno, or the code.
+ * @param context The pass's context, for the journal transition.
+ * @param settings The step's settings.
+ * @returns The conflict outcome.
+ */
+async function reportUnusableBackup(
+  record: ModificationRecord,
+  path: string,
+  storeReason: string,
+  context: CleanupContext,
+  settings: RestoreSettings,
+): Promise<Result<RestoreOutcome>> {
+  if (storeReason === STORED_DIGEST_MISMATCH) {
+    return await reportSynthesizedConflict(
+      record,
+      path,
+      'backup-corrupt',
+      undefined,
+      backupDigestMismatchMessage(record),
+      context,
+      settings,
+    );
+  }
+
+  return await reportSynthesizedConflict(
+    record,
+    path,
+    'backup-missing',
+    undefined,
+    backupUnreadableMessage(record, storeReason),
+    context,
+    settings,
+  );
+}
+
+/**
  * Closes a record whose file already holds the recorded original, without
  * writing a byte.
  *
@@ -2525,9 +2612,10 @@ async function retainRecord(
  * only a restorer can reach.
  *
  * `'restore-verification-failed'` exists only after a write has been attempted
- * and hashed; a backup that cannot be read back or does not hash to its own
- * name is a `'backup-missing'` this function names with the record id, so the
- * developer has something to search the journal with; and a file that already
+ * and hashed; a backup that cannot be read back is a `'backup-missing'`, and
+ * one that is there but does not hash to its own name a `'backup-corrupt'`,
+ * each named with the record id so the developer has something to search the
+ * journal with; and a file that already
  * holds the original is reported as `'content-changed'` where the record's
  * status does not permit closing it. A refused fork reports each of its records
  * through here too, with no path because none was resolved.
@@ -3038,21 +3126,57 @@ function filterBySession(
   return records.filter((record) => sessionIds.has(record.sessionId));
 }
 
+/** What a finished pass leaves behind: the only input its verdict is derived from. */
+interface PassRemainder {
+  /** Every conflict report the pass produced or renewed. */
+  readonly conflicts: readonly ModificationConflict[];
+
+  /** Every file refused because its records do not form a single chain. */
+  readonly forks: readonly ChainFork[];
+
+  /** Every record the pass left open: retained ones and skipped ones alike. */
+  readonly outstanding: readonly ModificationRecord[];
+
+  /** Every failure, including one with no record attributed to it. */
+  readonly failures: readonly CleanupFailure[];
+}
+
 /**
- * The verdict of a finished pass.
+ * The verdict of a finished pass, as {@link CLEANUP_STATUSES} defines it.
  *
- * `clean` only when nothing is outstanding, which includes the pass that had
- * nothing to do — the reading that makes a second {@link cleanupSession} call
- * honest. Otherwise `partial` when something was reverted and `conflict` when
- * nothing was: both say "something is still out there", and the difference is
- * whether the pass made progress.
+ * Derived from what is **outstanding**, never from what the pass did: how many
+ * records this pass happened to restore is deliberately not an input, so a pass
+ * that restores one file and conflicts on another reports exactly what a second
+ * pass over the same state reports.
+ *
+ * - `conflict` when any conflict is outstanding — a conflict report, a refused
+ *   fork (a fork is a conflict whose report an abort may have pre-empted), or
+ *   an open record already in `conflict` status (one that the pass could not
+ *   re-report because its path, scope or journal refused it).
+ * - `clean` when nothing is outstanding at all, which includes the pass that had
+ *   nothing to do — the reading that makes a second {@link cleanupSession} call
+ *   honest.
+ * - `partial` otherwise: a record left open or a failure, with no conflict
+ *   among them.
+ *
+ * A record is outstanding exactly when its disposition is not `none`, the same
+ * test both passes filter their work with, so a `reverted` record that reached
+ * a list is finished business and never counts.
  */
-function statusFor(resolved: number, unresolved: number): CleanupStatus {
-  if (unresolved === 0) {
-    return 'clean';
+function statusFor(remainder: PassRemainder): CleanupStatus {
+  const open = remainder.outstanding.filter(
+    (record) => reconcileDispositionFor(record.status) !== 'none',
+  );
+
+  if (
+    remainder.conflicts.length > 0 ||
+    remainder.forks.length > 0 ||
+    open.some((record) => record.status === 'conflict')
+  ) {
+    return 'conflict';
   }
 
-  return resolved > 0 ? 'partial' : 'conflict';
+  return open.length === 0 && remainder.failures.length === 0 ? 'clean' : 'partial';
 }
 
 /**

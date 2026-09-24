@@ -59,13 +59,18 @@
  *
  * Three actions are raised, and one deliberately is not:
  *
- *   - `onOpenSource` — through the `./SourceLink` chip beside a component's
- *     name and beside an individual render that carried a location. The chip
- *     forwards the `SourceLocation` it was given **by reference**, unmodified.
+ *   - `onOpenSource` — through the component's name itself, which is drawn as a
+ *     `./SourceLink` captioned with that name whenever the row resolved to a
+ *     location, and through the chip beside an individual render that carried
+ *     one. A row offers its location once: the name is the control, with no
+ *     second chip beside it. The link forwards the `SourceLocation` it was
+ *     given **by reference**, unmodified.
  *   - `onExpand` — whenever a row's per-render list is opened or closed, with
  *     this node's `id` and the row's own `id`.
  *   - `onSelectEvent` — from an individual render inside an expanded row, which
- *     is the only item in this view that IS one captured event.
+ *     is the only item in this view that IS one captured event. The render that
+ *     is the panel's selection — reported from here or from any other view — is
+ *     marked, read through `useViewSelection` rather than kept in local state.
  *   - **Not** `onRowActivate`. An aggregate row stands for many events and has
  *     no single event id, so activating one selects nothing: inventing a
  *     representative id would open a details drawer on evidence the reader did
@@ -119,14 +124,25 @@
  *
  * ## STATES: ALL THREE, IN PRECEDENCE
  *
- * Loading (a row silhouette), error (generic copy, the failing query verbatim
- * and a working retry) and empty (a node-specific sentence in generic product
- * vocabulary) — never a blank area, and never a failure dressed as a result
- * (AAP 0.5.5). The node's empty sentence is reserved for an empty result. A
- * count-only query, a page at or past the end of a counted result, an empty
- * page below a positive total and a later page with no total each get their
- * own sentence, stating the total when one was reported. None of them says the
- * capture holds nothing.
+ * Loading (a row silhouette), error (the shared error-state contract of
+ * `../host/useQuery`: its title, a generic lead followed by the provider's own
+ * cause, the failing query as `formatDataQuery` prints it and a working retry)
+ * and empty (a node-specific sentence in generic product vocabulary) — never a
+ * blank area, and never a failure dressed as a result (AAP 0.5.5). The node's
+ * empty sentence is reserved for an empty result. A count-only query, a page at
+ * or past the end of a counted result, an empty page below a positive total and
+ * a later page with no total each get their own sentence, stating the total when
+ * one was reported. None of them says the capture holds nothing.
+ *
+ * Where a state is drawn depends on whether the reader has chosen an order.
+ * The first answer resolves as the block's own state, alone. Once the reader
+ * has re-ordered — from the toolbar or from a sortable header — the toolbar
+ * and the grid's header stay mounted through every state of the re-query, and
+ * the state is drawn in the grid's empty slot beneath the header: unmounting
+ * them would destroy the very control the reader is operating and drop focus
+ * to the document, after every change (AAP 0.6.4, full keyboard navigation).
+ * The rows of the previous order are released by the same gesture, so the
+ * header never stands over rows it no longer describes.
  *
  * ## APPEARANCE IS A CLASS CONTRACT, NEVER AN INLINE STYLE (AAP 0.6.4)
  *
@@ -142,20 +158,30 @@
  *   `dg-render-table__error`           the failure box, for the first page or
  *                                      for a next page beneath loaded rows
  *   `dg-render-table__empty`           the empty box
- *   `dg-render-table__component-cell`  the component name, truncating, mono
+ *   `dg-render-table__component-cell`  the component name — as text, or as the
+ *                                      source link it is — truncating, mono
  *   `dg-render-table__count-cell`      a figure column, mono and tabular
  *   `dg-is-outlier`                    a count far above the loaded median
  *   `dg-render-table__trigger`         one histogram chip, with its five
  *   `dg-render-table__trigger--*`      per-trigger variants
  *   `dg-render-table__changed-props`   the wrapping key list
  *   `dg-render-table__detail`          the per-render list of an expanded row
+ *   `dg-render-table__occurrence`      one render in that list, with
+ *                                      `dg-is-selected` while it is the
+ *                                      panel's selected event
  *   `dg-data-table__footer`            the paging line below the grid
  *
  * `dg-icon` from `../styles/base.css` is reused and never redefined, and the
- * caller's `className` is composed last. `dg-is-expanded`, `dg-is-selected` and
- * every ARIA grid attribute belong to `../primitives/DataTable`, which owns the
- * grid roles, the roving tab stop and the keyboard model — this file configures
- * that primitive rather than competing with it.
+ * caller's `className` is composed last. A grid row's `dg-is-expanded`,
+ * `dg-is-selected` and every ARIA grid attribute belong to
+ * `../primitives/DataTable`, which owns the grid roles, the roving tab stop and
+ * the keyboard model — this file configures that primitive rather than
+ * competing with it. The one piece of disclosure state this file writes is the
+ * one the primitive hands it: a `grid` row may not carry `aria-expanded`, so
+ * the row's expand toggle carries it, with `aria-controls` naming the detail
+ * row, both read off the cell's `DataTableCellMeta`. The one selected state
+ * this file draws itself is an individual render's, inside a detail row the
+ * primitive does not structure.
  *
  * ## NOTHING HERE KNOWS ANY PROJECT (AAP 0.5.4)
  *
@@ -183,9 +209,9 @@ import type {
 import { DATA_QUERY_SORTS, isDataQuerySort } from '@debuggen/panel-schema';
 import type { RenderOccurrence, RenderPhase, RenderStat, RenderTrigger } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight, TriangleAlert } from 'lucide-react';
+import { ChevronDown, ChevronRight, Layers, TriangleAlert } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
-import type { FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import {
   DATA_QUERY_DEFAULT_LIMIT,
@@ -194,8 +220,10 @@ import {
   useDataProvider,
 } from '../host/DataProvider';
 import type { DataProvider } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef } from '../host/PanelActions';
+import { queryFailureProps, useQuery } from '../host/useQuery';
+import type { UseQueryResult } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarSelect } from '../layout/Toolbar';
@@ -245,7 +273,10 @@ const RENDERS_SOURCE = 'renders' satisfies DataQuerySource;
  *
  * Every string a reader sees, declared once, and all of it generic product
  * vocabulary: nothing below names a component, a prop, a file or a route of any
- * inspected application (AAP 0.5.4).
+ * inspected application (AAP 0.5.4). The one exception is the failure copy,
+ * which is not declared here at all: both failure boxes take their title, lead
+ * and query block from `queryFailureProps`, so a failed page of render
+ * statistics reads exactly like every other failed node (B1-F16, B2-F14).
  * ---------------------------------------------------------------------------
  */
 
@@ -255,11 +286,11 @@ const TABLE_CAPTION = 'Render statistics per component';
 /** Announced while the page is resolving; never painted. */
 const LOADING_LABEL = 'Loading render statistics…';
 
-/** The failure line. States what failed, never what it might mean (AAP 0.5.5). */
-const ERROR_MESSAGE = 'The render statistics for this panel could not be loaded.';
-
 /** The empty sentence for this node — the wording AAP 0.6.2 gives this component. */
 const EMPTY_MESSAGE = 'No renders were captured for this interaction.';
+
+/** The first line above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No renders';
 
 /**
  * The sentence for a resolved page that held no rows while the provider still
@@ -317,14 +348,22 @@ const NO_CHANGED_PROPS_LABEL = 'No prop changes reported';
 /** Stated wherever prop names are shown, so no reader infers that values exist. */
 const PROP_VALUES_NOTE = 'Names and change counts only — prop values are never captured.';
 
-/** The disclosure control's name while a row is collapsed. */
+/**
+ * The disclosure control's name while a row is collapsed — the stem
+ * {@link disclosureLabel} completes with the row's component name, so each
+ * row's toggle says which component it opens.
+ */
 const EXPAND_LABEL = 'Show individual renders';
 
-/** The disclosure control's name while a row is open. */
+/** The disclosure control's name while a row is open; completed the same way. */
 const COLLAPSE_LABEL = 'Hide individual renders';
 
-/** The control that selects one render as the panel's current evidence. */
-const SELECT_OCCURRENCE_LABEL = 'Select this render';
+/**
+ * The verb of the control that selects one render as the panel's current
+ * evidence. {@link selectOccurrenceLabel} completes it with the component name
+ * and the offset the control shows, so the name contains the visible text.
+ */
+const SELECT_OCCURRENCE_VERB = 'Select';
 
 /** The paging control. */
 const LOAD_MORE_LABEL = 'Load more';
@@ -333,13 +372,11 @@ const LOAD_MORE_LABEL = 'Load more';
 const LOADING_MORE_LABEL = 'Loading more…';
 
 /**
- * The failure line for a next page, shown beneath rows that are still on screen.
- * States what failed, never what it might mean (AAP 0.5.5).
+ * The sort control's accessible name in the toolbar. Its label is visually
+ * hidden, and the name says what it orders, because a panel can hold several
+ * tables whose order controls would otherwise all be announced as one word.
  */
-const PAGE_ERROR_MESSAGE = 'The next page of render statistics could not be loaded.';
-
-/** The sort control's accessible name in the toolbar. */
-const SORT_LABEL = 'Order';
+const SORT_LABEL = 'Order renders';
 
 /** The toolbar's own accessible name. */
 const TOOLBAR_LABEL = 'Render table order';
@@ -409,6 +446,59 @@ const COLUMN_TOOLTIPS = Object.freeze({
   changedProps: `Names of the props observed to change, with a per-name count in the expanded row. ${PROP_VALUES_NOTE}`,
   phases:
     'Renders by commit phase. A phase that was not recorded is in neither bucket, so these may total less than the render count.',
+});
+
+/**
+ * The grid track of each column: `minmax(<floor>ch, <share>fr)`, never a
+ * `minmax(0, …)`.
+ *
+ * The FLOOR is what the column can never be narrower than, and it is sized to
+ * the wider of two things in `ch` of the table's own type: the column's header
+ * — with room for the sort indicator on the two sortable columns — and the
+ * content a row typically holds there, plus the cell's inline padding. The
+ * primitive sums every floor into the grid's own minimum width
+ * (`--dgc-min-inline`, see `../primitives/DataTable`), so a panel narrower than
+ * the sum scrolls the table horizontally with every column still readable,
+ * instead of squeezing a column to its padding and painting one cell's content
+ * over the next. The SHARE is how spare width is divided once every floor is
+ * met: the name, the trigger histogram and the changed-prop list are the
+ * columns that grow, and a figure column barely does.
+ *
+ * The floors, and what each is sized for:
+ *
+ *   component       26ch   the disclosure toggle, the source glyph and a
+ *                          component name of about twenty characters; a longer
+ *                          name ellipsizes inside the column, never past it
+ *   renderCount     10ch   the `Renders` header with its sort indicator, which
+ *                          is wider than any count and its outlier glyph
+ *   durations       11ch   a formatted duration with its unit (`999.99 ms`)
+ *   triggers        26ch   two trigger chips side by side (`unchanged 12`
+ *                          beside `context 4`); the five wrap onto more lines
+ *   unchanged       14ch   the `Stable inputs` header, whole, as a tab stop
+ *   unknown         14ch   the `Unclassified` header, whole — the two figure
+ *                          columns share one floor so they read as a pair
+ *   changedProps    22ch   the `Changed props` header, and two prop names of
+ *                          about ten characters side by side; further names
+ *                          wrap, so the list is as tall as the histogram
+ *   phases          16ch   the `Phases` header and one phase chip per line
+ *
+ * Their sum (161ch) keeps the table within a typical desktop panel without
+ * scrolling. A ratio and a `ch` floor resolve identically in the header row and
+ * in every data row, which is what keeps each column under its own heading (see
+ * `../primitives/DataTable` on why an intrinsic track does not), and neither is
+ * a hardcoded length (AAP 0.6.4).
+ */
+const COLUMN_TRACKS = Object.freeze({
+  component: 'minmax(26ch, 3fr)',
+  renderCount: 'minmax(10ch, 0.5fr)',
+  totalDuration: 'minmax(11ch, 0.6fr)',
+  averageDuration: 'minmax(11ch, 0.6fr)',
+  maxDuration: 'minmax(11ch, 0.6fr)',
+  triggers: 'minmax(26ch, 3fr)',
+  unchanged: 'minmax(14ch, 0.8fr)',
+  unknown: 'minmax(14ch, 0.8fr)',
+  changedProps: 'minmax(22ch, 2fr)',
+  phases: 'minmax(16ch, 1fr)',
 });
 
 /*
@@ -607,31 +697,6 @@ const NO_ROWS: readonly RenderStat[] = Object.freeze([]);
 
 /*
  * ---------------------------------------------------------------------------
- * The grid's row contract
- *
- * What `../primitives/DataTable` writes on a data row, read here only to learn
- * which row keyboard focus is in (see `RenderTableView`, "The row-scoped tab
- * stop"). Nothing here writes these attributes or competes with the primitive's
- * own keyboard model.
- * ---------------------------------------------------------------------------
- */
-
-/**
- * The attribute a data row element carries its index in — the row's position in
- * the `rows` handed to the grid, and the same attribute the primitive's own
- * keyboard handling reads.
- */
-const ROW_INDEX_ATTRIBUTE = 'data-row-index';
-
-/**
- * A data row element: a `role="row"` that carries a row index. The header row
- * and an expanded detail row are `role="row"` too, without the index, so focus
- * inside either of them matches no data row.
- */
-const DATA_ROW_SELECTOR = `[role="row"][${ROW_INDEX_ATTRIBUTE}]`;
-
-/*
- * ---------------------------------------------------------------------------
  * Pure helpers
  *
  * All of them total over their inputs, including inputs a schema would have
@@ -736,6 +801,16 @@ interface EmptyCopy {
 }
 
 /**
+ * The copy of the empty capture — an empty result, the one case that says no
+ * renders were captured — as one frozen value, so the empty state recognises
+ * it by reference and gives it the view's glyph.
+ */
+const NOTHING_CAPTURED_COPY: EmptyCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
+
+/**
  * The noun a count of rows takes in an empty-state sentence.
  *
  * @param count The number of components the sentence states.
@@ -802,7 +877,7 @@ function emptyStateCopy(limit: number, offset: number, total: number | undefined
   }
 
   if (known === 0 || (known === undefined && offset <= 0)) {
-    return { title: undefined, message: EMPTY_MESSAGE };
+    return NOTHING_CAPTURED_COPY;
   }
 
   if (known === undefined) {
@@ -927,28 +1002,6 @@ function sequenceIdentity(
     nodeId,
     queryIdentity({ ...nodeQuery, source: RENDERS_SOURCE, sort, limit }),
   ]);
-}
-
-/**
- * The failing query as the text an error state shows.
- *
- * Pretty-printed JSON, which is the form `../primitives/ErrorState` documents:
- * a reader who is told a request failed can only act on it if they can see what
- * was requested. Nothing is redacted here because nothing sensitive is in a
- * query — it names a source, a trace, a kind list and a page.
- *
- * @param query The query that failed.
- * @returns The serialised query, or an empty string if it cannot be serialised.
- */
-function serializeQuery(query: DataQuery): string {
-  try {
-    return JSON.stringify(query, undefined, 2);
-  } catch {
-    // Unreachable for a validated query, which holds only JSON primitives. An
-    // error state is the wrong place to fail a second time, so an unserialisable
-    // query costs the block and not the panel.
-    return '';
-  }
 }
 
 /**
@@ -1098,6 +1151,70 @@ function sortOptions(): readonly SelectOption[] {
   return DATA_QUERY_SORTS.map((sort) => ({ value: sort, label: SORT_BINDINGS[sort].label }));
 }
 
+/**
+ * The name a row's controls identify it by: its component name, exactly as
+ * the row's name cell draws it — through the same shared truncation budget —
+ * so a reader hears the name a sighted reader sees beside the control.
+ *
+ * `undefined` for a row whose component name is blank: a name ending in "of"
+ * with nothing after it would be worse than the generic stem alone.
+ *
+ * @param stat The row.
+ * @returns The component name as drawn, or `undefined` when there is none.
+ */
+function rowIdentity(stat: RenderStat): string | undefined {
+  return stat.component.trim().length === 0 ? undefined : truncate(stat.component);
+}
+
+/**
+ * The accessible name of a row's disclosure toggle, which names the row it
+ * belongs to: a toggle announced as "Show individual renders" in every row of
+ * the grid would not say which component it opens.
+ *
+ * The toggle is icon-only, so there is no visible label the name must contain;
+ * its open state is announced separately, through `aria-expanded`.
+ *
+ * @param stat The row.
+ * @param expanded Whether the row's per-render list is open.
+ * @returns The name, built from the row's own data.
+ *
+ * @example
+ * ```ts
+ * disclosureLabel(stat, false); // 'Show individual renders of <component>'
+ * ```
+ */
+function disclosureLabel(stat: RenderStat, expanded: boolean): string {
+  const stem = expanded ? COLLAPSE_LABEL : EXPAND_LABEL;
+  const identity = rowIdentity(stat);
+
+  return identity === undefined ? stem : `${stem} of ${identity}`;
+}
+
+/**
+ * The accessible name of the control that selects one individual render.
+ *
+ * It CONTAINS the control's visible text — the offset, verbatim (WCAG 2.5.3,
+ * label in name), so a speech-input user can activate the control by saying
+ * what it shows — and it names the component the render belongs to, because
+ * offsets are measured per component and two open rows can each list a render
+ * at the same offset.
+ *
+ * @param component The component the render belongs to, or `undefined` when
+ *        its name is blank (see {@link rowIdentity}).
+ * @param offset The offset text the control shows.
+ * @returns The name.
+ *
+ * @example
+ * ```ts
+ * selectOccurrenceLabel('<component>', '320 ms'); // 'Select <component> render at 320 ms'
+ * ```
+ */
+function selectOccurrenceLabel(component: string | undefined, offset: string): string {
+  return component === undefined
+    ? `${SELECT_OCCURRENCE_VERB} render at ${offset}`
+    : `${SELECT_OCCURRENCE_VERB} ${component} render at ${offset}`;
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Parts
@@ -1124,7 +1241,9 @@ interface TriggerChipProps {
   /**
    * A description to attach through `Tooltip`, for the form that has no column
    * header above it to carry the vocabulary's definitions. Supplying one also
-   * makes the chip a tab stop, because focus is how a keyboard reader opens it.
+   * makes the chip focusable (`tabIndex={-1}`), because focus is how a keyboard
+   * reader opens it: the grid's arrow keys land on it, and it stays out of the
+   * Tab order.
    */
   readonly description?: string | undefined;
 }
@@ -1141,12 +1260,16 @@ interface TriggerChipProps {
  * dashed hairline that survives a monochrome surface. The hairline colour comes
  * from `../utils/color`, so this file states no colour of its own.
  *
- * A chip that carries a description is focusable (`tabIndex={0}`): `Tooltip`
- * opens on focus arriving inside it, so a chip nothing can focus would make its
- * description hover-only. Only the single-render form inside an expanded row
- * carries one — content the reader opened on purpose, beside that row's own
- * select and source controls — while the histogram form in every grid row is
- * explained by its column header and adds no tab stop at all.
+ * A chip that carries a description is focusable, and never a Tab stop
+ * (`tabIndex={-1}`). `Tooltip` opens on focus arriving inside it, so a chip
+ * nothing can focus would make its description hover-only; and the chip sits
+ * inside the grid, which is one Tab stop whose arrow keys move focus onto the
+ * controls of a row and its open detail (`../primitives/DataTable`). An arrow
+ * key landing on the chip opens its description exactly as a Tab would, and
+ * the first Escape closes the bubble before the second returns to the row.
+ * Only the single-render form inside an expanded row carries a description,
+ * while the histogram form in every grid row is explained by its column header
+ * and is not focusable at all.
  *
  * @param props See {@link TriggerChipProps}.
  * @returns The chip, wrapped in a tooltip when a description was supplied.
@@ -1161,7 +1284,7 @@ function TriggerChip(props: TriggerChipProps): ReactElement {
       color={renderTriggerColorVar(trigger)}
       className={clsx('dg-render-table__trigger', TRIGGER_CLASSES[trigger])}
       data-trigger={trigger}
-      tabIndex={description === undefined ? undefined : 0}
+      tabIndex={description === undefined ? undefined : -1}
     >
       {count === undefined ? trigger : `${trigger} ${formatCount(count)}`}
     </Badge>
@@ -1177,19 +1300,28 @@ interface DescribedHeaderProps {
 
   /** The definition the header's tooltip carries. */
   readonly description: string;
+
+  /**
+   * The header text's place in the Tab order: `-1` while the grid has data
+   * rows, `0` while it has none. See {@link DescribedHeader}.
+   */
+  readonly tabIndex: 0 | -1;
 }
 
 /**
  * The header of a column that carries a definition: the header text, as the
  * trigger of a tooltip holding that definition.
  *
- * The text is a tab stop of its own (`tabIndex={0}`), because `Tooltip` opens
- * on focus arriving inside it and a trigger nothing can focus is a definition
- * only a pointer can reach — and two of these definitions are what keep
- * `Stable inputs` and `Unclassified` from being read as one figure (AAP 0.2.3).
- * Header controls are ordinary tab stops in `../primitives/DataTable`'s keyboard
- * model, its sort buttons included, and the body's roving tab stop is untouched:
- * the header row carries no row index.
+ * The text is focusable, because `Tooltip` opens on focus arriving inside it
+ * and a trigger nothing can focus is a definition only a pointer can reach —
+ * and two of these definitions are what keep `Stable inputs` and
+ * `Unclassified` from being read as one figure (AAP 0.2.3). It follows the
+ * header rule of `../primitives/DataTable`, the same one the grid applies to
+ * its own sort buttons: while at least one data row renders, it is
+ * `tabIndex={-1}` — the grid is one Tab stop, and ArrowUp from the first row
+ * moves onto the header's controls, where ArrowLeft/ArrowRight walk them and
+ * the definition opens as focus lands — and while the grid has no row to
+ * arrive through, it keeps `tabIndex={0}` so the definition stays reachable.
  *
  * Used only for columns that are **not** sortable. `DataTable` renders a
  * sortable column's header inside its sort `Button`, so a tooltip there would be
@@ -1200,11 +1332,11 @@ interface DescribedHeaderProps {
  * @returns The focusable header text inside its tooltip.
  */
 function DescribedHeader(props: DescribedHeaderProps): ReactElement {
-  const { label, description } = props;
+  const { label, description, tabIndex } = props;
 
   return (
     <Tooltip content={description}>
-      <Text as="span" size="sm" weight="medium" tabIndex={0}>
+      <Text as="span" size="sm" weight="medium" tabIndex={tabIndex}>
         {label}
       </Text>
     </Tooltip>
@@ -1220,11 +1352,24 @@ interface OccurrenceRowProps {
   readonly originEpochMs: number;
 
   /**
+   * The component this render belongs to, as its row draws it, for the select
+   * control's name — or `undefined` when the row's name is blank (see
+   * {@link rowIdentity}).
+   */
+  readonly component: string | undefined;
+
+  /**
    * Selects this render as the panel's current evidence, or `undefined` when no
    * host would handle a selection — in which case the row renders its offset as
    * text rather than as a control that does nothing.
    */
   readonly onSelect?: ((occurrence: RenderOccurrence) => void) | undefined;
+
+  /**
+   * Whether this render is the panel's selected event — the shared selection
+   * under a panel host, this view's own last selection outside one.
+   */
+  readonly selected: boolean;
 }
 
 /**
@@ -1239,17 +1384,33 @@ interface OccurrenceRowProps {
  *
  * This is the only item in this view that is one captured event, so it is the
  * only one that offers selection — the aggregate row above it stands for many.
+ * The render that is the panel's selected event is marked with the design
+ * system's one selected-state class, `dg-is-selected`, on the whole line, and
+ * its select control reports `aria-pressed="true"` — so the render a reader
+ * picked here, or picked as the same event in any other view, stays marked, and
+ * the state is carried by an attribute as well as by a colour (AAP 0.6.4).
+ *
+ * It renders inside the grid's detail row, so every control in it — the select
+ * button, the trigger chip and the source chip — is `tabIndex={-1}`: the grid is
+ * one Tab stop, and its arrow keys walk the controls of a row and its open
+ * detail in document order (`../primitives/DataTable`).
  *
  * @param props See {@link OccurrenceRowProps}.
  * @returns The row.
  */
 function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
-  const { occurrence, originEpochMs, onSelect } = props;
+  const { occurrence, originEpochMs, component, onSelect, selected } = props;
 
   const offset = formatOffset(occurrence.startTime, originEpochMs);
 
   return (
-    <Stack direction="horizontal" gap={2} align="center" wrap>
+    <Stack
+      direction="horizontal"
+      gap={2}
+      align="center"
+      wrap
+      className={clsx('dg-render-table__occurrence', selected && 'dg-is-selected')}
+    >
       {onSelect === undefined ? (
         <Code size="sm" numeric>
           {offset}
@@ -1258,7 +1419,11 @@ function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
         <Button
           variant="ghost"
           size="sm"
-          aria-label={SELECT_OCCURRENCE_LABEL}
+          tabIndex={-1}
+          // Built around the very `offset` string the button shows, so the
+          // name always contains the visible text.
+          aria-label={selectOccurrenceLabel(component, offset)}
+          aria-pressed={selected}
           onClick={() => {
             onSelect(occurrence);
           }}
@@ -1278,7 +1443,9 @@ function OccurrenceRow(props: OccurrenceRowProps): ReactElement {
         trigger={occurrence.trigger}
         description={formatRenderTriggerLabel(occurrence.trigger)}
       />
-      {occurrence.source === undefined ? null : <SourceLink location={occurrence.source} compact />}
+      {occurrence.source === undefined ? null : (
+        <SourceLink location={occurrence.source} compact tabIndex={-1} />
+      )}
     </Stack>
   );
 }
@@ -1290,6 +1457,9 @@ interface RenderDetailProps {
 
   /** Passed through to each {@link OccurrenceRow}; see that component's prop. */
   readonly onSelect?: ((occurrence: RenderOccurrence) => void) | undefined;
+
+  /** Whether one render is the panel's selected event; see {@link OccurrenceRowProps.selected}. */
+  readonly isSelected: (occurrence: RenderOccurrence) => boolean;
 }
 
 /**
@@ -1307,10 +1477,11 @@ interface RenderDetailProps {
  * @returns The detail block.
  */
 function RenderDetail(props: RenderDetailProps): ReactElement {
-  const { stat, onSelect } = props;
+  const { stat, onSelect, isSelected } = props;
 
   const occurrences = stat.occurrences;
   const keys = stat.changedPropKeys;
+  const component = rowIdentity(stat);
 
   return (
     <Stack gap={3} className="dg-render-table__detail">
@@ -1336,7 +1507,9 @@ function RenderDetail(props: RenderDetailProps): ReactElement {
               key={occurrence.id}
               occurrence={occurrence}
               originEpochMs={stat.firstStartTime}
+              component={component}
               onSelect={onSelect}
+              selected={isSelected(occurrence)}
             />
           ))
         )}
@@ -1407,6 +1580,91 @@ function RenderTableShell(props: RenderTableShellProps): ReactElement {
   );
 }
 
+/** Props of {@link RenderTableZeroRows}. */
+interface RenderTableZeroRowsProps {
+  /** The status of the page in flight, as `../host/useQuery` reports it. */
+  readonly status: 'loading' | 'error' | 'success';
+
+  /**
+   * The three members of the hook's result that describe a failure — the
+   * error, the politeness it settled with and the retry that re-requests
+   * exactly {@link RenderTableZeroRowsProps.query} — handed as they are to
+   * `queryFailureProps`, the one failure contract every query-backed node
+   * shares. Read only while `status` is `"error"`.
+   */
+  readonly failure: Pick<UseQueryResult<unknown>, 'error' | 'announcement' | 'retry'>;
+
+  /** The query of the page in flight, which the failure state shows as it was asked. */
+  readonly query: DataQuery;
+
+  /**
+   * Whether the resolved page, although it held no rows, named a next page past
+   * the offset it was requested at. Only that page is then described, because
+   * the rows after it are still reachable.
+   */
+  readonly pageContinues: boolean;
+
+  /** What a resolved sequence with no rows and no next page says it is. */
+  readonly emptyCopy: EmptyCopy;
+}
+
+/**
+ * What stands in for the rows while none are on screen, in precedence: the
+ * page still resolving (a row silhouette), the page failing (the shared
+ * failure contract of `../host/useQuery`: its title, the generic lead and the
+ * provider's cause, the failing query and a working retry), an empty page that
+ * names a next page (a sentence about that page alone) and a resolved sequence
+ * with no rows at all (the copy {@link emptyStateCopy} chose, with the view's
+ * glyph only for the empty capture). Never a blank area, and never a failure
+ * dressed as a result (AAP 0.5.5).
+ *
+ * One definition serves both places the state is drawn — alone in the block
+ * for the first answer, and in the grid's empty slot beneath a header that
+ * stays mounted once the reader has chosen an order (see
+ * {@link RenderTableView}) — so the two can never word, class or retry a state
+ * differently.
+ *
+ * @param props See {@link RenderTableZeroRowsProps}.
+ * @returns The state element.
+ */
+function RenderTableZeroRows(props: RenderTableZeroRowsProps): ReactElement {
+  const { status, failure, query, pageContinues, emptyCopy } = props;
+
+  if (status === 'loading') {
+    return (
+      <LoadingState
+        variant="rows"
+        rows={LOADING_ROWS}
+        label={LOADING_LABEL}
+        className="dg-render-table__loading"
+      />
+    );
+  }
+
+  if (status === 'error') {
+    // The first page of the sequence failed — a failed next page keeps the
+    // loaded rows and is reported beneath them instead (see the end of
+    // {@link RenderTableView}). Both go through the shared contract, with the
+    // query exactly as it was asked.
+    return <ErrorState {...queryFailureProps(failure, query)} className="dg-render-table__error" />;
+  }
+
+  if (pageContinues) {
+    return <EmptyState message={EMPTY_PAGE_MESSAGE} className="dg-render-table__empty" />;
+  }
+
+  // Only the empty capture carries the view's glyph: every other empty answer
+  // is a statement about a page or a count, not about what was captured.
+  return (
+    <EmptyState
+      title={emptyCopy.title}
+      message={emptyCopy.message}
+      icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Layers className="dg-icon" /> : undefined}
+      className="dg-render-table__empty"
+    />
+  );
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Columns
@@ -1424,14 +1682,12 @@ interface ColumnContext {
   readonly markAbove: number | undefined;
 
   /**
-   * Whether a row is the one the reader's keyboard focus last entered — the
-   * only row whose in-cell tooltip triggers are tab stops (see
-   * {@link RenderTableView} on the row-scoped tab stop).
+   * Whether the grid renders at least one data row, which decides the Tab index
+   * of the header's own definition triggers: `-1` while rows exist, when ArrowUp
+   * from the first row reaches them, and `0` while there is no row to arrive
+   * through (see {@link DescribedHeader}).
    */
-  readonly isFocusRow: (stat: RenderStat) => boolean;
-
-  /** Whether a given row's per-render list is open. */
-  readonly isExpanded: (stat: RenderStat) => boolean;
+  readonly hasRows: boolean;
 
   /** Opens or closes a row's per-render list. */
   readonly onToggle: (stat: RenderStat) => void;
@@ -1455,33 +1711,65 @@ interface ColumnContext {
  * combines them, and the histogram beside them prints all five buckets — zeros
  * included — so a bucket can never be inferred from the absence of a chip.
  *
- * Tracks are ratios and `ch` measures only: they resolve identically in the
- * header row and in every data row, which is what keeps a column sitting under
- * its own heading (see `../primitives/DataTable` on why an intrinsic track does
- * not), and neither form is a hardcoded length.
+ * Every track is one of {@link COLUMN_TRACKS}: a `ch` floor sized to the
+ * column's header and content, and a ratio for the spare width. No column can
+ * be squeezed below its floor, so a narrow panel scrolls the table
+ * horizontally rather than collapsing a column and overprinting its neighbour.
  *
- * Every description is reachable from the keyboard, under two rules. A header
- * definition is a {@link DescribedHeader} — its own tab stop — and only ever on
- * a column that is not sortable, so no tooltip is nested inside a sort button;
- * the two sortable columns carry plain-text headers. A description inside a
- * data row is a tab stop only in the row the reader's focus is in
- * (`isFocusRow`), so the body stays one roving tab stop plus that row's own
- * controls instead of gaining a stop per rendered row.
+ * The component name IS the row's link to its declaration (AAP 0.6.2,
+ * "component name → `onOpenSource`"): when the row resolved to a location the
+ * name is drawn as a `./SourceLink` captioned with the name and handed that
+ * very location, so there is one source control per row and the reader clicks
+ * the name itself. A row that resolved to no location draws the name as text.
+ * Either way the name ellipsizes inside its column rather than overprinting the
+ * next one, and a tooltip keeps it readable: an unlinked name's tooltip is the
+ * whole name, and a linked name's is the link's own — the declared symbol and
+ * the full location.
+ *
+ * Every description and every control is reachable from the keyboard, and
+ * none of them adds a Tab stop: the grid is ONE stop, its active row, and
+ * `../primitives/DataTable`'s arrow keys move focus onto everything else. So
+ * every focusable element a cell renders — the disclosure toggle, the source
+ * chip, the full name of a component with no location, a marked count figure —
+ * is `tabIndex={-1}`, and so are the header's
+ * definition triggers while rows exist ({@link DescribedHeader}), which
+ * ArrowUp from the first row reaches as it does the grid's own sort buttons.
+ * A header definition only ever sits on a column that is not sortable, so no
+ * tooltip is nested inside a sort button; the two sortable columns carry
+ * plain-text headers. `Tooltip` opens on any focus, so each description opens
+ * the moment an arrow key lands on its trigger.
  *
  * @param context See {@link ColumnContext}.
  * @returns The column definitions.
  */
 function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderStat>[] {
-  const { markAbove, isFocusRow, isExpanded, onToggle } = context;
+  const { markAbove, hasRows, onToggle } = context;
+
+  // The header's definition triggers follow the grid's own rule for its sort
+  // buttons: out of the Tab order while the body has a row to arrive through.
+  const headerTabIndex = hasRows ? -1 : 0;
 
   return [
     {
       key: COLUMN_KEYS.component,
       header: COLUMN_HEADERS.component,
       rowHeader: true,
-      width: 'minmax(0, 3fr)',
-      cell: (stat) => {
-        const expanded = isExpanded(stat);
+      width: COLUMN_TRACKS.component,
+      cell: (stat, _rowIndex, meta) => {
+        // The grid's own record of this row's disclosure, rather than a second
+        // lookup of the expansion set: `meta.expanded` is the state the grid
+        // rendered the detail row from, and `meta.detailRowId` is that detail
+        // row's id, defined only while it is in the document. The disclosure
+        // pattern puts both on the toggle, because a `grid` row may not carry
+        // `aria-expanded` (see `../primitives/DataTable`).
+        const expanded = meta.expanded;
+
+        // The name as every surface of this cell shows it — the caption, the
+        // unlinked name's tooltip, the row header's escort: bounded by the
+        // shared preview budget (AAP 0.5.2), which no real component name
+        // reaches, and otherwise whole. The column's width clips it visually
+        // only, with an ellipsis; no layout concern shortens the text itself.
+        const name = truncate(stat.component);
 
         return (
           <Stack direction="horizontal" gap={1} align="center">
@@ -1489,8 +1777,10 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
               variant="ghost"
               size="sm"
               iconOnly
-              aria-label={expanded ? COLLAPSE_LABEL : EXPAND_LABEL}
+              tabIndex={-1}
+              aria-label={disclosureLabel(stat, expanded)}
               aria-expanded={expanded}
+              aria-controls={meta.detailRowId}
               icon={
                 expanded ? (
                   <ChevronDown className="dg-icon" />
@@ -1502,10 +1792,39 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
                 onToggle(stat);
               }}
             />
-            <Text as="span" size="sm" truncate className="dg-render-table__component-cell">
-              {truncate(stat.component)}
-            </Text>
-            {stat.source === undefined ? null : <SourceLink location={stat.source} compact />}
+            {stat.source === undefined ? (
+              // No location: the name is a label, and its tooltip is what makes
+              // an ellipsized name readable. The text is the tooltip's trigger,
+              // so it takes focus — as `tabIndex={-1}` in every row, never a Tab
+              // stop, exactly like the outlier figure: the grid's arrow keys
+              // land on it and open the tooltip.
+              <Tooltip content={name}>
+                <Text
+                  as="span"
+                  size="sm"
+                  truncate
+                  className="dg-render-table__component-cell"
+                  tabIndex={-1}
+                >
+                  {name}
+                </Text>
+              </Tooltip>
+            ) : (
+              // The name itself is the control. `stat.source` is handed over by
+              // reference, and the chip's own tooltip names the symbol and the
+              // full location whenever the caption stands in for them. Its
+              // accessible name leads with the name it shows and ends with the
+              // location it opens (`sourceLinkAccessibleName`), so the row
+              // header a screen reader announces for every cell carries the
+              // component without a second, hidden copy of it.
+              <SourceLink
+                location={stat.source}
+                label={name}
+                compact
+                tabIndex={-1}
+                className="dg-render-table__component-cell"
+              />
+            )}
           </Stack>
         );
       },
@@ -1514,7 +1833,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.renderCount,
       header: COLUMN_HEADERS.renderCount,
       align: 'end',
-      width: 'minmax(0, 9ch)',
+      width: COLUMN_TRACKS.renderCount,
       sortable: true,
       defaultSortDirection: 'desc',
       cell: (stat) => {
@@ -1525,18 +1844,19 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         const marked = markAbove !== undefined && stat.renderCount > markAbove;
 
         // A marked figure is its tooltip's trigger, so it must take focus for
-        // the explanation to reach a keyboard reader — but as a tab stop only in
-        // the row that reader is in. Elsewhere it carries no `tabIndex` at all:
-        // not `-1`, which would let a click focus the figure instead of its row
-        // and strand the arrow keys the grid answers only on a row element. So
-        // the body never grows a stop per row.
+        // the explanation to reach a keyboard reader — as `tabIndex={-1}`, never
+        // a Tab stop: the grid's arrow keys land on it and open the explanation,
+        // and a pointer click that focuses it moves the grid's roving stop to
+        // its row, where the grid answers the arrow keys on the figure too. An
+        // unmarked figure explains nothing and takes no focus at all, so the
+        // body never grows a stop per row.
         const figure = (
           <Text
             as="span"
             size="sm"
             numeric
             className={clsx('dg-render-table__count-cell', marked && 'dg-is-outlier')}
-            tabIndex={marked && isFocusRow(stat) ? 0 : undefined}
+            tabIndex={marked ? -1 : undefined}
           >
             {formatCount(stat.renderCount)}
             {marked ? <TriangleAlert aria-hidden="true" className="dg-icon" /> : null}
@@ -1560,7 +1880,7 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.totalDuration,
       header: COLUMN_HEADERS.totalDuration,
       align: 'end',
-      width: 'minmax(0, 11ch)',
+      width: COLUMN_TRACKS.totalDuration,
       sortable: true,
       defaultSortDirection: 'desc',
       cell: (stat) => <DurationCell ms={stat.totalDurationMs} severity="auto" size="sm" />,
@@ -1569,23 +1889,27 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
       key: COLUMN_KEYS.averageDuration,
       header: COLUMN_HEADERS.averageDuration,
       align: 'end',
-      width: 'minmax(0, 11ch)',
+      width: COLUMN_TRACKS.averageDuration,
       cell: (stat) => <DurationCell ms={stat.averageDurationMs} severity="auto" size="sm" />,
     },
     {
       key: COLUMN_KEYS.maxDuration,
       header: COLUMN_HEADERS.maxDuration,
       align: 'end',
-      width: 'minmax(0, 11ch)',
+      width: COLUMN_TRACKS.maxDuration,
       cell: (stat) => <DurationCell ms={stat.maxDurationMs} severity="auto" size="sm" />,
     },
     {
       key: COLUMN_KEYS.triggers,
       header: (
-        <DescribedHeader label={COLUMN_HEADERS.triggers} description={COLUMN_TOOLTIPS.triggers} />
+        <DescribedHeader
+          label={COLUMN_HEADERS.triggers}
+          description={COLUMN_TOOLTIPS.triggers}
+          tabIndex={headerTabIndex}
+        />
       ),
       headerLabel: COLUMN_HEADERS.triggers,
-      width: 'minmax(0, 4fr)',
+      width: COLUMN_TRACKS.triggers,
       cell: (stat) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           {TRIGGER_DISPLAY_ORDER.map((trigger) => (
@@ -1601,11 +1925,15 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.unchanged,
       header: (
-        <DescribedHeader label={COLUMN_HEADERS.unchanged} description={COLUMN_TOOLTIPS.unchanged} />
+        <DescribedHeader
+          label={COLUMN_HEADERS.unchanged}
+          description={COLUMN_TOOLTIPS.unchanged}
+          tabIndex={headerTabIndex}
+        />
       ),
       headerLabel: COLUMN_HEADERS.unchanged,
       align: 'end',
-      width: 'minmax(0, 13ch)',
+      width: COLUMN_TRACKS.unchanged,
       cell: (stat) => (
         <Text as="span" size="sm" numeric className="dg-render-table__count-cell">
           {formatCount(stat.unchangedRenderCount)}
@@ -1615,11 +1943,15 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.unknown,
       header: (
-        <DescribedHeader label={COLUMN_HEADERS.unknown} description={COLUMN_TOOLTIPS.unknown} />
+        <DescribedHeader
+          label={COLUMN_HEADERS.unknown}
+          description={COLUMN_TOOLTIPS.unknown}
+          tabIndex={headerTabIndex}
+        />
       ),
       headerLabel: COLUMN_HEADERS.unknown,
       align: 'end',
-      width: 'minmax(0, 13ch)',
+      width: COLUMN_TRACKS.unknown,
       cell: (stat) => (
         <Text as="span" size="sm" numeric className="dg-render-table__count-cell">
           {formatCount(stat.unknownTriggerCount)}
@@ -1632,10 +1964,11 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
         <DescribedHeader
           label={COLUMN_HEADERS.changedProps}
           description={COLUMN_TOOLTIPS.changedProps}
+          tabIndex={headerTabIndex}
         />
       ),
       headerLabel: COLUMN_HEADERS.changedProps,
-      width: 'minmax(0, 3fr)',
+      width: COLUMN_TRACKS.changedProps,
       cell: (stat) => {
         const keys = stat.changedPropKeys;
 
@@ -1678,10 +2011,14 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<RenderSt
     {
       key: COLUMN_KEYS.phases,
       header: (
-        <DescribedHeader label={COLUMN_HEADERS.phases} description={COLUMN_TOOLTIPS.phases} />
+        <DescribedHeader
+          label={COLUMN_HEADERS.phases}
+          description={COLUMN_TOOLTIPS.phases}
+          tabIndex={headerTabIndex}
+        />
       ),
       headerLabel: COLUMN_HEADERS.phases,
-      width: 'minmax(0, 2fr)',
+      width: COLUMN_TRACKS.phases,
       cell: (stat) => (
         <Stack direction="horizontal" gap={1} align="center" wrap>
           {PHASE_DISPLAY_ORDER.map((phase) => (
@@ -1820,7 +2157,7 @@ interface ProviderBinding {
  * A number that changes exactly when the ambient `DataProvider` is replaced.
  *
  * Used as part of the stateful view's `key`, so the state that belongs to one
- * provider's data — accumulated pages, the next offset, open and focused rows —
+ * provider's data — accumulated pages, the next offset, the open rows —
  * is discarded with the instance instead of being carried into another's. The
  * binding is adjusted during render, React's documented pattern for state that
  * follows a changed input: the replaced render is discarded before commit, so
@@ -1847,23 +2184,34 @@ function useProviderGeneration(): number {
  * The stateful half of {@link RenderTable}: resolves the pages, draws them, and
  * owns the paging, ordering and disclosure of one query.
  *
- * ## The row-scoped tab stop
+ * ## One Tab stop, and the grid's keys for everything inside it
  *
- * `../primitives/DataTable` makes the body one roving tab stop: exactly one row
- * is tabbable, and the arrow keys move it. A tooltip trigger inside a cell must
- * take focus for its description to open, but a trigger that was a tab stop in
- * every rendered row would turn that one stop into hundreds. So the grid is
- * wrapped in an element that listens for focus arriving anywhere inside it and
- * records which data row it landed in — read off the row element's own
- * `role="row"` and `data-row-index`, the attributes the primitive writes — and
- * in-row triggers are tab stops (`tabIndex={0}`) in that row alone and carry no
- * `tabIndex` everywhere else — not `-1`, which would let a pointer click focus
- * the trigger instead of its row, where the primitive's arrow keys do not act.
- * Tab from the row the reader stands on therefore reaches that
- * row's descriptions, and moving to another row moves them with it. Focus in
- * the header or in an expanded detail row belongs to no data row and leaves the
- * record as it was, just as the primitive's own roving stop keeps its row. The
- * row is recorded by key rather than index, so an appended page cannot shift it.
+ * The keyboard model is `../primitives/DataTable`'s, taken whole: the grid is a
+ * single Tab stop — its active row — and every control this view renders into
+ * a cell, into an open detail row or into the header is `tabIndex={-1}` (see
+ * {@link buildColumns} and {@link OccurrenceRow}). From the row, ArrowRight
+ * opens a collapsed row's per-render list and the next ArrowRight moves onto
+ * the row's first control; ArrowLeft/ArrowRight, Home and End walk the
+ * controls of the row and its open detail; ArrowUp from the first row reaches
+ * the header's sort buttons and definition triggers; Escape returns to the row
+ * (after first closing an open description). Focus landing on a control, by
+ * key or by pointer, moves the roving stop to that control's row, so Tab back
+ * into the grid returns where the reader last was. This view keeps no focus
+ * state of its own: every one of those behaviours is the primitive's.
+ *
+ * ## The controls the reader is using stay mounted
+ *
+ * A new order is a new page sequence, so choosing one releases every loaded
+ * row and the next render has none to draw while the new first page resolves.
+ * Before the reader has chosen an order, that zero-row moment is the block's
+ * own state, alone. After it, the same state is handed to the grid's `empty`
+ * slot, which `../primitives/DataTable` renders outside the grid with the
+ * header still mounted, and the toolbar keeps its place above it. Both
+ * elements therefore keep their DOM identity — the `<select>` the reader just
+ * changed, or the header button they just activated, is still the focused
+ * element while the re-query loads, if it fails, and after its rows arrive. The
+ * outer `key` does not take part: the reader's order is state of this instance,
+ * never part of the node's query identity.
  *
  * @param props The same props as {@link RenderTable}.
  * @returns The block, in whichever of its four states applies.
@@ -1876,12 +2224,14 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // view that draws everything and reports nothing.
   const actions = usePanelActions();
 
+  // The event the panel has selected: the host's shared selection, or this
+  // view's own last one when no host is mounted. An individual render is the
+  // only item here that can stand for it, so it is the only item marked.
+  const { selection, markSelected } = useViewSelection();
+
   const [chosenSort, setChosenSort] = useState<DataQuerySort | undefined>(undefined);
   const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
   const [expandedKeys, setExpandedKeys] = useState<readonly string[]>(NO_EXPANDED_KEYS);
-  // The data row keyboard focus last entered, by row key; see "The row-scoped
-  // tab stop" above. `undefined` until focus first reaches a row.
-  const [focusRowKey, setFocusRowKey] = useState<string | undefined>(undefined);
 
   // The size of every page in the sequence, and where its first page starts.
   // Neither moves while the reader pages: "load more" advances the offset only.
@@ -1920,7 +2270,7 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   const query: DataQuery & { source: typeof RENDERS_SOURCE } =
     activePages === undefined ? firstPageQuery : { ...firstPageQuery, offset: activePages.offset };
 
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   // The page that resolved, or `undefined` while it is in flight or has failed.
   const pageRows = status === 'success' ? (data ?? NO_ROWS) : undefined;
@@ -2009,43 +2359,6 @@ function RenderTableView(props: RenderTableProps): ReactElement {
     setPages({ identity, rows, offset: followingOffset, total: knownTotal });
   }, [followingOffset, identity, knownTotal, rows]);
 
-  const isFocusRow = useCallback(
-    (stat: RenderStat): boolean => stat.id === focusRowKey,
-    [focusRowKey],
-  );
-
-  const handleTableFocus = useCallback(
-    (event: ReactFocusEvent<HTMLDivElement>): void => {
-      const target = event.target;
-
-      // Narrowed rather than cast, as the grid primitive does: only an `Element`
-      // can be asked which row it sits in.
-      if (!(target instanceof Element)) {
-        return;
-      }
-
-      // The data row the focus landed in or inside — the row element itself on
-      // a Tab into the body or an arrow key, a control within it otherwise. The
-      // header row and an expanded detail row carry no row index, so focus
-      // there matches nothing and the recorded row stays as it was.
-      const row = target.closest(DATA_ROW_SELECTOR);
-      const index = Number.parseInt(row?.getAttribute(ROW_INDEX_ATTRIBUTE) ?? '', 10);
-      const stat = Number.isInteger(index) ? rows[index] : undefined;
-
-      if (stat === undefined) {
-        return;
-      }
-
-      setFocusRowKey(stat.id);
-    },
-    [rows],
-  );
-
-  const isExpanded = useCallback(
-    (stat: RenderStat): boolean => expandedKeys.includes(stat.id),
-    [expandedKeys],
-  );
-
   const handleToggle = useCallback(
     (stat: RenderStat): void => {
       // The next state is computed here rather than inside the updater: an
@@ -2066,13 +2379,26 @@ function RenderTableView(props: RenderTableProps): ReactElement {
       // Every coordinate here is the occurrence's own. Nothing is synthesised:
       // the aggregate row above it has no event id, which is why the row itself
       // raises no selection at all.
-      actions?.onSelectEvent({
+      const ref: PanelEventRef = {
         eventId: occurrence.eventId,
         spanId: occurrence.spanId,
         traceId: occurrence.traceId,
-      });
+      };
+
+      // Recorded here only when no host is mounted (a no-op under one, whose
+      // own record of the report below is what every view then marks).
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
+    [actions, markSelected],
+  );
+
+  // Whether an individual render stands for the selected event. The occurrence
+  // carries its own id, trace and span, so it is matched as it is, with no
+  // pointer built per row.
+  const isOccurrenceSelected = useCallback(
+    (occurrence: RenderOccurrence): boolean => matchesPanelSelection(selection, occurrence),
+    [selection],
   );
 
   // Over every accumulated row, so the mark describes what the reader has on
@@ -2080,99 +2406,31 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // a page arrives.
   const markAbove = useMemo(() => outlierThreshold(rows), [rows]);
 
-  // The first page is still resolving: nothing is loaded, so the block shows its
-  // silhouette. A next page in flight never reaches this — the rows it follows
-  // stay on screen and the footer reports the request instead.
-  if (status === 'loading' && rows.length === 0) {
-    return (
-      <RenderTableShell className={className}>
-        <LoadingState
-          variant="rows"
-          rows={LOADING_ROWS}
-          label={LOADING_LABEL}
-          className="dg-render-table__loading"
-        />
-      </RenderTableShell>
-    );
-  }
-
-  // The first page failed. A failed next page keeps the loaded rows and is
-  // reported beneath them instead (see the end of this function).
-  if (status === 'error' && rows.length === 0) {
-    return (
-      <RenderTableShell className={className}>
-        <ErrorState
-          message={ERROR_MESSAGE}
-          code={error?.code}
-          query={serializeQuery(query)}
-          onRetry={retry}
-          className="dg-render-table__error"
-        />
-      </RenderTableShell>
-    );
-  }
-
-  if (rows.length === 0 && followingOffset !== undefined) {
-    // A resolved page with no rows that still names where the next page
-    // starts, past the offset this page was requested at — `followingOffset` is
-    // never set for a count-only sequence or for a `nextOffset` that does not
-    // move forward. The provider's offset is the whole of the paging contract,
-    // so the rows after it stay reachable: the page is reported as empty — never
-    // the capture — and the paging control is offered exactly as under a full
-    // page.
-    return (
-      <RenderTableShell className={className}>
-        <EmptyState message={EMPTY_PAGE_MESSAGE} className="dg-render-table__empty" />
-        <Stack
-          direction="horizontal"
-          gap={2}
-          align="center"
-          justify="between"
-          wrap
-          className="dg-data-table__footer"
-        >
-          <Text as="p" size="xs" tone="muted">
-            {knownTotal === undefined
-              ? `${formatCount(0)} components loaded.`
-              : `Showing ${formatCount(0)} of ${formatCount(knownTotal)} components.`}
-          </Text>
-          <Button variant="secondary" size="sm" onClick={handleLoadMore}>
-            {LOAD_MORE_LABEL}
-          </Button>
-        </Stack>
-      </RenderTableShell>
-    );
-  }
-
-  if (rows.length === 0) {
-    // A resolved sequence with no rows and no next page. Only an empty result
-    // is an empty capture: a count-only query, and an empty page of a result
-    // the provider counted as non-empty, each say what they are and state the
-    // total they know (see `emptyStateCopy`). The order control is not
-    // rendered, because reordering nothing is a control that cannot act.
-    return (
-      <RenderTableShell className={className}>
-        <EmptyState
-          title={emptyCopy.title}
-          message={emptyCopy.message}
-          className="dg-render-table__empty"
-        />
-      </RenderTableShell>
-    );
-  }
-
-  const columns = buildColumns({
-    markAbove,
-    isFocusRow,
-    isExpanded,
-    onToggle: handleToggle,
-  });
+  // Nothing is on screen: the page in flight is the first of its sequence, or
+  // it failed, or it resolved with no rows. A next page in flight or failed
+  // behind loaded rows never reaches this — the rows stay where the reader is
+  // reading and the footer reports the request instead. `followingOffset` is
+  // never set for a count-only sequence or for a `nextOffset` that does not
+  // move forward, so an empty page that names one keeps the rows after it
+  // reachable: it is reported as an empty page — never an empty capture — and
+  // the paging control is offered exactly as under a full page.
+  const zeroRowState =
+    rows.length === 0 ? (
+      <RenderTableZeroRows
+        status={status}
+        failure={{ error, announcement, retry }}
+        query={query}
+        pageContinues={followingOffset !== undefined}
+        emptyCopy={emptyCopy}
+      />
+    ) : undefined;
 
   // A next page behind rows already on screen, in flight or failed. Both are
   // reported where the paging control is, never by replacing what the reader is
-  // reading.
-  const appending = status === 'loading';
-  const pageFailed = status === 'error';
+  // reading. With no row on screen the page in flight is a first page, whose
+  // loading and failure are the zero-row state above rather than the footer's.
+  const appending = status === 'loading' && rows.length > 0;
+  const pageFailed = status === 'error' && rows.length > 0;
 
   // `followingOffset` is the provider's own answer about whether more rows
   // exist; it is never inferred from the length of what arrived or from the
@@ -2180,10 +2438,57 @@ function RenderTableView(props: RenderTableProps): ReactElement {
   // is in flight the control stays in place, disabled and saying so.
   const showLoadMore = followingOffset !== undefined || appending;
 
+  // The paging line belongs to rows on screen, and to an empty page that names
+  // a next page; a first page that is loading, failed or empty has nothing to
+  // count and nothing to follow.
+  const showFooter = rows.length > 0 || followingOffset !== undefined;
+
   const loadedText =
     knownTotal === undefined
       ? `${formatCount(rows.length)} components loaded.`
       : `Showing ${formatCount(rows.length)} of ${formatCount(knownTotal)} components.`;
+
+  const footer = showFooter ? (
+    <Stack
+      direction="horizontal"
+      gap={2}
+      align="center"
+      justify="between"
+      wrap
+      className="dg-data-table__footer"
+    >
+      {/* A polite live region, read whole: a page appended by "load more"
+          changes the count, and a reader who pressed the control hears how
+          much of the result is now on screen without leaving it. */}
+      <Text as="p" size="xs" tone="muted" aria-live="polite" aria-atomic="true">
+        {loadedText}
+      </Text>
+      {showLoadMore ? (
+        <Button variant="secondary" size="sm" disabled={appending} onClick={handleLoadMore}>
+          {appending ? LOADING_MORE_LABEL : LOAD_MORE_LABEL}
+        </Button>
+      ) : null}
+    </Stack>
+  ) : null;
+
+  // The first answer, before the reader has chosen an order: the block is the
+  // state alone. There is no order control to keep yet, and a result that
+  // turned out empty offers none, because reordering nothing is a control that
+  // cannot act.
+  if (zeroRowState !== undefined && chosenSort === undefined) {
+    return (
+      <RenderTableShell className={className}>
+        {zeroRowState}
+        {footer}
+      </RenderTableShell>
+    );
+  }
+
+  const columns = buildColumns({
+    markAbove,
+    hasRows: rows.length > 0,
+    onToggle: handleToggle,
+  });
 
   return (
     <RenderTableShell className={className}>
@@ -2203,57 +2508,40 @@ function RenderTableView(props: RenderTableProps): ReactElement {
         ]}
       />
 
-      {/* A plain, unstyled box whose only job is to hear focus arriving inside
-          the grid, which the primitive does not report: the row it lands in is
-          the one row whose tooltip triggers are tab stops. It carries no role,
-          no class and no tab stop of its own, so the grid's semantics, layout
-          and keyboard model are exactly what they are without it. */}
-      <div onFocus={handleTableFocus}>
-        <DataTable
-          rows={rows}
-          columns={columns}
-          rowKey={(stat) => stat.id}
-          caption={TABLE_CAPTION}
-          sort={gridSortFor(appliedSort)}
-          onSortChange={handleGridSort}
-          expandedRowKeys={expandedKeys}
-          onRowToggle={handleToggle}
-          renderExpandedRow={(stat) => (
-            <RenderDetail
-              stat={stat}
-              onSelect={actions === undefined ? undefined : handleSelectOccurrence}
-            />
-          )}
-        />
-      </div>
+      <DataTable
+        rows={rows}
+        columns={columns}
+        rowKey={(stat) => stat.id}
+        caption={TABLE_CAPTION}
+        sort={gridSortFor(appliedSort)}
+        onSortChange={handleGridSort}
+        expandedRowKeys={expandedKeys}
+        onRowToggle={handleToggle}
+        renderExpandedRow={(stat) => (
+          <RenderDetail
+            stat={stat}
+            onSelect={actions === undefined ? undefined : handleSelectOccurrence}
+            isSelected={isOccurrenceSelected}
+          />
+        )}
+        // Reached only once the reader has chosen an order: the re-queried
+        // sequence has no row on screen yet (or resolved without one), and
+        // its state is drawn where the rows will be, outside the grid, while
+        // the header and the toolbar above keep their elements — and the
+        // reader's focus. Never a row of the previous order: those were
+        // released by the gesture that chose this one.
+        empty={zeroRowState}
+      />
 
-      <Stack
-        direction="horizontal"
-        gap={2}
-        align="center"
-        justify="between"
-        wrap
-        className="dg-data-table__footer"
-      >
-        <Text as="p" size="xs" tone="muted">
-          {loadedText}
-        </Text>
-        {showLoadMore ? (
-          <Button variant="secondary" size="sm" disabled={appending} onClick={handleLoadMore}>
-            {appending ? LOADING_MORE_LABEL : LOAD_MORE_LABEL}
-          </Button>
-        ) : null}
-      </Stack>
+      {footer}
 
       {pageFailed ? (
         // The next page's own failure, with the query that failed — at the
         // offset the provider reported — and a retry that re-requests exactly
-        // that page. The rows above it are the earlier answers, untouched.
+        // that page. The rows above it are the earlier answers, untouched,
+        // which is what the page scope's title and lead tell the reader.
         <ErrorState
-          message={PAGE_ERROR_MESSAGE}
-          code={error?.code}
-          query={serializeQuery(query)}
-          onRetry={retry}
+          {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}
           className="dg-render-table__error"
         />
       ) : null}

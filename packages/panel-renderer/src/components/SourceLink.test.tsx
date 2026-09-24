@@ -60,17 +60,19 @@
  *     `jest-dom` matcher is available in this repository, so class and
  *     attribute assertions go through `classList` and `getAttribute`.
  *   - **No timers, no `waitFor`, no snapshots.** Every case is synchronous
- *     apart from the `userEvent` activations it awaits.
+ *     apart from the `userEvent` activations it awaits — and the one case that
+ *     hovers the inert chip, which awaits the tooltip's own hover dwell through
+ *     `findByRole`, because a label that cannot take focus can only be hovered.
  *
  * @see ./SourceLink for the component, its class contract and its three forms.
  * @see ../host/PanelActions for the interaction contract this suite exercises.
  */
 
+import type { PanelSummary } from '@debuggen/panel-schema';
 import { formatSourceLocation } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import { cleanup, render, screen } from '@testing-library/react';
+import { act, cleanup, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
@@ -81,8 +83,10 @@ import type {
   PanelEventRef,
   PanelHostActions,
 } from '../host/PanelActions';
+import { SummaryHeader } from '../layout/SummaryHeader';
 import { NOT_AVAILABLE_LABEL } from '../utils/format';
-import { SourceLink } from './SourceLink';
+import { SourceLink, sourceLinkAccessibleName } from './SourceLink';
+import type { SourceLinkTextInputs } from './SourceLink';
 
 /*
  * ---------------------------------------------------------------------------
@@ -138,12 +142,40 @@ const CALLER_LABEL = 'Inspect the call site';
 const CALLER_CLASS = 'custom-chip-class';
 
 /**
- * The accessible name the interactive chip must announce, spelled out rather
- * than derived through `formatSourceLocation`, so that this suite pins the
- * `Open <file>:<line>:<column>` shape instead of restating whatever the helper
- * currently returns.
+ * The full location every chip built on the fixture opens, and the text every
+ * accessible name below ends with. Spelled out rather than derived through
+ * `formatSourceLocation`, so this suite pins the `<file>:<line>:<column>` shape
+ * instead of restating whatever the helper currently returns.
  */
-const ACCESSIBLE_NAME = `Open ${LOCATION_FILE}:${String(LOCATION_LINE)}:${String(LOCATION_COLUMN)}`;
+const TARGET = `${LOCATION_FILE}:${String(LOCATION_LINE)}:${String(LOCATION_COLUMN)}`;
+
+/**
+ * The accessible name of the default chip, which shows the symbol run and a
+ * compacted path. Neither is inside `Open <target>`, so the name leads with the
+ * visible text (label in name, WCAG 2.5.3) and still ends with the target.
+ */
+const ACCESSIBLE_NAME = `${LOCATION_SYMBOL} ${CHIP_TEXT} — open ${TARGET}`;
+
+/**
+ * The accessible name of the compact chip: its visible `file:line` is already
+ * inside `Open <target>`, so the plain form stands, unchanged.
+ */
+const COMPACT_ACCESSIBLE_NAME = `Open ${TARGET}`;
+
+/** The accessible name of a non-compact chip that shows no symbol run. */
+const PATH_ONLY_ACCESSIBLE_NAME = `${CHIP_TEXT} — open ${TARGET}`;
+
+/** The accessible name of a chip whose visible text is {@link CALLER_LABEL}. */
+const LABEL_ACCESSIBLE_NAME = `${CALLER_LABEL} — open ${TARGET}`;
+
+/**
+ * Text as the naming rule compares it: whitespace collapsed, trimmed and
+ * lowercased. Restated here on purpose — this is the suite's own reading of
+ * WCAG 2.5.3, against which the component's rule is checked.
+ */
+function normalizedText(text: string | null): string {
+  return (text ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+}
 
 /** A complete location: both optional fields present, both coordinates usable. */
 const BASE_LOCATION: SourceLocation = {
@@ -370,8 +402,11 @@ describe('SourceLink activation payload', () => {
     expect(received.confidence).toBe(0.85);
 
     // The canonical label the rest of the product prints for this location is
-    // the one the control announced.
-    expect(chip.getAttribute('aria-label')).toBe(`Open ${formatSourceLocation(location)}`);
+    // the place the control announced it opens: the name ends with it.
+    expect(chip.getAttribute('aria-label')).toBe(ACCESSIBLE_NAME);
+    expect(
+      chip.getAttribute('aria-label')?.endsWith(`open ${formatSourceLocation(location)}`),
+    ).toBe(true);
   });
 
   it("falls back to the host's actions when no handler prop is given", async () => {
@@ -442,8 +477,9 @@ describe('SourceLink activation payload', () => {
 });
 
 describe('SourceLink without a resolvable handler', () => {
-  it('renders a static chip rather than a control that leads nowhere', () => {
+  it('renders a static chip rather than a control that leads nowhere', async () => {
     const location = makeLocation();
+    const user = userEvent.setup();
 
     // The editor webview's path: no provider above it, no handler prop. It has
     // to render, and it has to render as a label.
@@ -467,10 +503,15 @@ describe('SourceLink without a resolvable handler', () => {
     expect(root.querySelector('button')).toBeNull();
 
     // The full target stays reachable through the tooltip's description, which
-    // is in the accessibility tree even while the bubble is closed.
-    expect(
-      screen.getByText(`${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`),
-    ).toBeDefined();
+    // `Tooltip` keeps mounted but `hidden` while it is closed: at rest no
+    // tooltip is exposed, and hovering the label shows it.
+    expect(screen.queryByRole('tooltip')).toBeNull();
+
+    await user.hover(root);
+
+    expect((await screen.findByRole('tooltip')).textContent).toBe(
+      `${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`,
+    );
   });
 
   it('marks the interactive chip as not static', () => {
@@ -490,12 +531,27 @@ describe('SourceLink tooltip wrapping', () => {
     render(<SourceLink location={location} onOpenSource={makeOpenSourceSpy()} />);
 
     // The path lost its first segment on screen, so the full symbol-first form
-    // has to stay reachable - which, for a closed bubble, means staying in the
-    // accessibility tree rather than appearing on hover alone.
-    const description = screen.getByRole('tooltip');
-    expect(description.textContent).toBe(`${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`);
-
+    // has to stay reachable - from the keyboard as well as by hover. Closed, no
+    // tooltip is exposed, yet the chip is already described: the bubble stays
+    // mounted but `hidden`, so the id it names resolves to the full target.
+    const target = `${LOCATION_SYMBOL} — ${formatSourceLocation(location)}`;
     const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    expect(screen.queryByRole('tooltip')).toBeNull();
+
+    const closed = screen.getByRole('tooltip', { hidden: true });
+    expect(closed.hasAttribute('hidden')).toBe(true);
+    expect(closed.textContent).toBe(target);
+    expect(chip.getAttribute('aria-describedby')).toBe(closed.getAttribute('id'));
+
+    // Focus shows that very bubble at once, and the chip stays described by it.
+    act(() => {
+      chip.focus();
+    });
+
+    const description = screen.getByRole('tooltip');
+    expect(description).toBe(closed);
+    expect(description.hasAttribute('hidden')).toBe(false);
+    expect(description.textContent).toBe(target);
     expect(chip.getAttribute('aria-describedby')).toBe(description.getAttribute('id'));
   });
 
@@ -510,13 +566,70 @@ describe('SourceLink tooltip wrapping', () => {
     expect(screen.getByText(SHORT_CHIP_TEXT).textContent).toBe(SHORT_CHIP_TEXT);
     expect(screen.queryByRole('tooltip')).toBeNull();
 
+    // The symbol and the whole short path are on screen, and neither is inside
+    // `Open <target>` as shown, so the name still leads with them.
     const chip = screen.getByRole('button', {
-      name: `Open ${formatSourceLocation(location)}`,
+      name: `${LOCATION_SYMBOL} ${SHORT_CHIP_TEXT} — open ${formatSourceLocation(location)}`,
     });
     expect(chip.getAttribute('aria-describedby')).toBeNull();
     expect(chip.closest('.dg-tooltip')).toBeNull();
   });
 });
+
+/**
+ * One chip shape the naming rule distinguishes: the text-bearing props (the
+ * location is always {@link makeLocation}'s default), the name the rule must
+ * produce, spelled out, and what the case demonstrates.
+ */
+interface NamingCase {
+  readonly what: string;
+  readonly props: Omit<SourceLinkTextInputs, 'location'>;
+  readonly expectedName: string;
+}
+
+/** Every shape the rule distinguishes, including both normalisations it applies. */
+const NAMING_CASES: readonly NamingCase[] = [
+  {
+    what: 'the default chip leads with its symbol and compacted path',
+    props: {},
+    expectedName: ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a compact chip keeps the plain form its file:line already sits in',
+    props: { compact: true },
+    expectedName: COMPACT_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a chip without its symbol run leads with the compacted path',
+    props: { showSymbol: false },
+    expectedName: PATH_ONLY_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a label chip leads with the label',
+    props: { label: CALLER_LABEL },
+    expectedName: LABEL_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a compact label chip leads with the label too',
+    props: { compact: true, showSymbol: false, label: CALLER_LABEL },
+    expectedName: LABEL_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a label contained in the target keeps the plain form',
+    props: { label: COMPACT_CHIP_TEXT },
+    expectedName: COMPACT_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'containment ignores letter case',
+    props: { label: COMPACT_CHIP_TEXT.toUpperCase() },
+    expectedName: COMPACT_ACCESSIBLE_NAME,
+  },
+  {
+    what: 'a label is announced with its whitespace collapsed',
+    props: { label: `  ${CALLER_LABEL.split(' ').join('   ')}  ` },
+    expectedName: LABEL_ACCESSIBLE_NAME,
+  },
+];
 
 describe('SourceLink accessible name', () => {
   it('announces the file, the line and the column of the target', () => {
@@ -533,33 +646,56 @@ describe('SourceLink accessible name', () => {
     expect(chip.textContent).toContain(CHIP_TEXT);
     expect(chip.textContent).not.toContain(ACCESSIBLE_NAME);
     expect(chip.textContent).not.toContain(`:${String(LOCATION_COLUMN)}`);
+    expect(chip.getAttribute('aria-label')?.endsWith(`open ${TARGET}`)).toBe(true);
   });
 
-  it('keeps that name when compact, showSymbol or a label abbreviate the chip', () => {
+  it('separates the symbol run from the path in the text the button carries', () => {
+    render(<SourceLink location={makeLocation()} onOpenSource={makeOpenSourceSpy()} />);
+
+    // An accessibility checker reads the visible text off the DOM, not off the
+    // layout: without a real separator the two runs would read as one word
+    // that no name could contain.
+    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    expect(chip.textContent).toBe(`${LOCATION_SYMBOL} ${CHIP_TEXT}`);
+    expect(chip.getAttribute('aria-label')?.startsWith(chip.textContent ?? '')).toBe(true);
+  });
+
+  it.each(NAMING_CASES)('names the chip by the rule: $what', async ({ props, expectedName }) => {
     const location = makeLocation();
+    const onOpenSource = makeOpenSourceSpy();
 
-    const abbreviations: readonly ReactElement[] = [
-      <SourceLink location={location} compact onOpenSource={makeOpenSourceSpy()} />,
-      <SourceLink location={location} showSymbol={false} onOpenSource={makeOpenSourceSpy()} />,
-      <SourceLink location={location} label={CALLER_LABEL} onOpenSource={makeOpenSourceSpy()} />,
-      <SourceLink
-        location={location}
-        compact
-        showSymbol={false}
-        label={CALLER_LABEL}
-        onOpenSource={makeOpenSourceSpy()}
-      />,
-    ];
+    render(<SourceLink location={location} {...props} onOpenSource={onOpenSource} />);
 
-    for (const element of abbreviations) {
-      const view = render(element);
+    const chip = screen.getByRole('button', { name: expectedName });
+    const name = chip.getAttribute('aria-label');
 
-      expect(screen.getByRole('button', { name: ACCESSIBLE_NAME }).getAttribute('aria-label')).toBe(
-        ACCESSIBLE_NAME,
-      );
+    // Spelled out, and the exported helper agrees: the helper is the rule the
+    // component itself calls, so other suites naming a chip through it name it
+    // exactly as it renders.
+    expect(name).toBe(expectedName);
+    expect(sourceLinkAccessibleName({ location, ...props })).toBe(expectedName);
 
-      view.unmount();
-    }
+    // Label in name: the text on the button, normalised, is inside the name,
+    // and the name still ends with the full location the chip opens.
+    expect(normalizedText(chip.textContent)).not.toBe('');
+    expect(normalizedText(name)).toContain(normalizedText(chip.textContent));
+    expect(name?.endsWith(TARGET)).toBe(true);
+
+    // Naming changes nothing about what a click emits: one call, the very
+    // object the chip was given.
+    await clickChip(expectedName);
+    expect(soleLocation(onOpenSource)).toBe(location);
+  });
+
+  it('keeps the plain form when there is no visible text to contain', () => {
+    // An empty caption leaves nothing on screen to match, so nothing is
+    // prefixed and the name is the plain form.
+    expect(sourceLinkAccessibleName({ location: makeLocation(), label: '' })).toBe(
+      COMPACT_ACCESSIBLE_NAME,
+    );
+    expect(sourceLinkAccessibleName({ location: makeLocation(), label: '   ' })).toBe(
+      COMPACT_ACCESSIBLE_NAME,
+    );
   });
 });
 
@@ -586,7 +722,7 @@ describe('SourceLink variants', () => {
   it('reduces the chip to the file name and the line in the compact variant', () => {
     render(<SourceLink location={makeLocation()} compact onOpenSource={makeOpenSourceSpy()} />);
 
-    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    const chip = screen.getByRole('button', { name: COMPACT_ACCESSIBLE_NAME });
     expect(chip.classList.contains('dg-source-link--compact')).toBe(true);
     expect(screen.getByText(COMPACT_CHIP_TEXT).textContent).toBe(COMPACT_CHIP_TEXT);
     expect(screen.queryByText(CHIP_TEXT)).toBeNull();
@@ -612,11 +748,11 @@ describe('SourceLink variants', () => {
       />,
     );
 
-    const chip = screen.getByRole('button', { name: ACCESSIBLE_NAME });
+    const chip = screen.getByRole('button', { name: LABEL_ACCESSIBLE_NAME });
     expect(screen.getByText(CALLER_LABEL).textContent).toBe(CALLER_LABEL);
     expect(screen.queryByText(CHIP_TEXT)).toBeNull();
     expect(screen.queryByText(LOCATION_SYMBOL)).toBeNull();
-    expect(chip.getAttribute('aria-label')).toBe(ACCESSIBLE_NAME);
+    expect(chip.getAttribute('aria-label')).toBe(LABEL_ACCESSIBLE_NAME);
   });
 
   it("appends the caller's class after the chip's own", () => {
@@ -652,7 +788,7 @@ describe('SourceLink variants', () => {
     expect(screen.queryByText(LOCATION_SYMBOL)).toBeNull();
     expect(screen.getByText(CHIP_TEXT).textContent).toBe(CHIP_TEXT);
 
-    await clickChip(ACCESSIBLE_NAME);
+    await clickChip(PATH_ONLY_ACCESSIBLE_NAME);
 
     // A five-field location travels as a five-field location: the absent
     // optional fields are not filled in on the way out.
@@ -669,7 +805,9 @@ describe('SourceLink unresolved coordinates', () => {
     // Values a validated location can never hold, and exactly what reaches a
     // renderer from an object that never passed the shared schema.
     const unusableLines: readonly number[] = [Number.NaN, 0, -3, 4.5];
-    const expectedName = `Open ${LOCATION_FILE}:${NOT_AVAILABLE_LABEL}:${String(LOCATION_COLUMN)}`;
+    // The chip shows the symbol and the path without a line, so the name leads
+    // with exactly that and names the missing line in the target it ends with.
+    const expectedName = `${LOCATION_SYMBOL} …/example/widget.ts — open ${LOCATION_FILE}:${NOT_AVAILABLE_LABEL}:${String(LOCATION_COLUMN)}`;
 
     for (const line of unusableLines) {
       const location = makeLocation({ line });
@@ -696,7 +834,7 @@ describe('SourceLink unresolved coordinates', () => {
 
   it('names an unusable column with the package label as well', () => {
     const location = makeLocation({ column: Number.NaN });
-    const expectedName = `Open ${LOCATION_FILE}:${String(LOCATION_LINE)}:${NOT_AVAILABLE_LABEL}`;
+    const expectedName = `${LOCATION_SYMBOL} ${CHIP_TEXT} — open ${LOCATION_FILE}:${String(LOCATION_LINE)}:${NOT_AVAILABLE_LABEL}`;
 
     const view = render(<SourceLink location={location} onOpenSource={makeOpenSourceSpy()} />);
 
@@ -747,6 +885,66 @@ describe('SourceLink inside a composite widget', () => {
 
     chip.focus();
     expect(document.activeElement).toBe(chip);
+  });
+
+  it('forwards a -1 index to the button whether or not the tooltip wraps it', async () => {
+    // The three interactive shapes a composite can embed. The default fixture's
+    // three-segment path is abbreviated, and so is every compact chip - the
+    // shape a grid cell passes - so both of those buttons are the tooltip's
+    // cloned trigger; the two-segment path with its symbol shows everything, so
+    // that button stands alone. The index has to survive the clone.
+    const shapes: readonly {
+      readonly location: SourceLocation;
+      readonly compact: boolean;
+      readonly wrapped: boolean;
+    }[] = [
+      { location: makeLocation(), compact: false, wrapped: true },
+      { location: makeLocation(), compact: true, wrapped: true },
+      { location: makeLocation({ file: SHORT_LOCATION_FILE }), compact: false, wrapped: false },
+    ];
+
+    for (const { location, compact, wrapped } of shapes) {
+      const onOpenSource = makeOpenSourceSpy();
+      const user = userEvent.setup();
+      const view = render(
+        <SourceLink
+          location={location}
+          compact={compact}
+          onOpenSource={onOpenSource}
+          tabIndex={-1}
+        />,
+      );
+
+      const chip = screen.getByRole('button');
+      expect(chip.getAttribute('tabindex')).toBe('-1');
+      expect(chip.closest('.dg-tooltip') !== null).toBe(wrapped);
+
+      // Wrapping adds the description and nothing else: the clone that merged
+      // `aria-describedby` kept every other prop of the trigger. The bubble it
+      // names is mounted from the start, `hidden` until something opens it.
+      if (wrapped) {
+        expect(screen.queryByRole('tooltip')).toBeNull();
+        expect(chip.getAttribute('aria-describedby')).toBe(
+          screen.getByRole('tooltip', { hidden: true }).getAttribute('id'),
+        );
+      }
+
+      // Out of the Tab order, and still what a grid's cell navigation can land
+      // on and activate from the keyboard: focus it programmatically, as the
+      // composite does, and confirm with Enter. Focus opens a wrapped chip's
+      // tooltip, a state update, so it is moved inside `act`.
+      await user.tab();
+      expect(document.activeElement).not.toBe(chip);
+
+      act(() => {
+        chip.focus();
+      });
+      expect(document.activeElement).toBe(chip);
+      await user.keyboard('{Enter}');
+      expect(soleLocation(onOpenSource)).toBe(location);
+
+      view.unmount();
+    }
   });
 
   it('writes an explicit zero index when one is asked for', () => {
@@ -810,5 +1008,157 @@ describe('SourceLink purity', () => {
     expect(errorSpy).toHaveBeenCalledTimes(0);
     expect(warnSpy).toHaveBeenCalledTimes(0);
     expect(logSpy).toHaveBeenCalledTimes(0);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The head that embeds this chip
+ *
+ * `../layout/SummaryHeader` is the one module outside the host tier that
+ * renders this chip, and it is exercised here — with no host mounted, exactly
+ * as the editor webview renders it — for the two states it draws beside the
+ * chip: which evidence citations are the selected event, and how confident each
+ * likely cause is.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('SummaryHeader beside its source chips', () => {
+  /** The event the first statement and the likely cause both cite. */
+  const SHARED_EVENT_ID = 'event-example-0101';
+
+  /** An event only the first statement cites. */
+  const OTHER_EVENT_ID = 'event-example-0102';
+
+  /** A summary citing both events, with one likely cause at each confidence level. */
+  const SUMMARY: PanelSummary = {
+    observed: [
+      {
+        statement: 'One operation held most of the interaction.',
+        evidence: [
+          { eventId: SHARED_EVENT_ID, label: 'first citation' },
+          { eventId: OTHER_EVENT_ID, label: 'second citation' },
+        ],
+      },
+    ],
+    likelyCauses: [
+      {
+        statement: 'The operation is the slow step.',
+        confidence: 'high',
+        evidence: [{ eventId: SHARED_EVENT_ID, label: 'cause citation' }],
+        suggestedLocation: makeLocation(),
+      },
+      {
+        statement: 'A repeat adds to it.',
+        confidence: 'medium',
+        evidence: [{ eventId: OTHER_EVENT_ID, label: 'medium citation' }],
+      },
+      {
+        statement: 'Other work adds a little.',
+        confidence: 'low',
+        evidence: [{ eventId: OTHER_EVENT_ID, label: 'low citation' }],
+      },
+    ],
+  };
+
+  /** The selectable chip captions citing {@link SHARED_EVENT_ID}. */
+  const SHARED_CHIPS = ['first citation', 'cause citation'];
+
+  /** The selectable chip captions citing {@link OTHER_EVENT_ID}. */
+  const OTHER_CHIPS = ['second citation', 'medium citation', 'low citation'];
+
+  /**
+   * Whether each named chip is drawn pressed, asserted to agree with its state
+   * class.
+   *
+   * @param names The chips' accessible names.
+   * @returns One flag per chip.
+   */
+  function pressed(names: readonly string[]): boolean[] {
+    return names.map((name) => {
+      const chip = screen.getByRole('button', { name });
+      const isPressed = chip.getAttribute('aria-pressed') === 'true';
+
+      expect(chip.classList.contains('dg-is-selected')).toBe(isPressed);
+
+      return isPressed;
+    });
+  }
+
+  it('draws every chip citing the selected event pressed, and every other chip released', () => {
+    const selectEvent = vi.fn<NonNullable<PanelHostActions['selectEvent']>>();
+    const { rerender } = render(
+      <SummaryHeader title="Example" summary={SUMMARY} selectEvent={selectEvent} />,
+    );
+
+    // Nothing selected: every selectable chip reports `false`, never nothing.
+    for (const name of [...SHARED_CHIPS, ...OTHER_CHIPS]) {
+      expect(screen.getByRole('button', { name }).getAttribute('aria-pressed')).toBe('false');
+    }
+
+    rerender(
+      <SummaryHeader
+        title="Example"
+        summary={SUMMARY}
+        selectEvent={selectEvent}
+        selectedEventId={SHARED_EVENT_ID}
+      />,
+    );
+
+    // Both statements' chips for that event, in either region.
+    expect(pressed(SHARED_CHIPS)).toEqual([true, true]);
+    expect(pressed(OTHER_CHIPS)).toEqual([false, false, false]);
+
+    rerender(
+      <SummaryHeader
+        title="Example"
+        summary={SUMMARY}
+        selectEvent={selectEvent}
+        selectedEventId={OTHER_EVENT_ID}
+      />,
+    );
+
+    expect(pressed(SHARED_CHIPS)).toEqual([false, false]);
+    expect(pressed(OTHER_CHIPS)).toEqual([true, true, true]);
+    expect(selectEvent).not.toHaveBeenCalled();
+  });
+
+  it('gives an inert citation no pressed state, because it is not a control', () => {
+    render(<SummaryHeader title="Example" summary={SUMMARY} selectedEventId={SHARED_EVENT_ID} />);
+
+    const citation = screen.getByText('first citation');
+
+    expect(screen.queryByRole('button', { name: 'first citation' })).toBeNull();
+    expect(citation.getAttribute('aria-pressed')).toBeNull();
+    expect(citation.classList.contains('dg-is-selected')).toBe(false);
+  });
+
+  it('gives each confidence level a glyph of its own beside the word that names it', () => {
+    render(<SummaryHeader title="Example" summary={SUMMARY} />);
+
+    const causes = screen.getByRole('region', { name: 'Likely cause' });
+    const glyphs = (['high', 'medium', 'low'] as const).map((level) => {
+      // The level word is the badge's own text, so the ranking is readable.
+      const badge = within(causes).getByText(level);
+
+      expect(badge.classList.contains('dg-summary-header__confidence')).toBe(true);
+
+      // A decorative glyph box, never the name.
+      const box = badge.querySelector('.dg-badge__icon');
+
+      expect(box).not.toBeNull();
+      expect(box?.getAttribute('aria-hidden')).toBe('true');
+
+      const glyph = box?.querySelector('svg');
+
+      expect(glyph?.classList.contains('dg-icon')).toBe(true);
+
+      return glyph?.innerHTML ?? '';
+    });
+
+    // Three levels, three different shapes: the levels never differ by tone
+    // alone.
+    expect(new Set(glyphs).size).toBe(3);
+    expect(glyphs.every((markup) => markup.length > 0)).toBe(true);
   });
 });

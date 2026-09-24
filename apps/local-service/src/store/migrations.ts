@@ -98,9 +98,12 @@ import type { DatabaseSync } from 'node:sqlite';
  * Version 1 is the schema declared by `./schema.sql`. Version 2 adds the
  * single-child invariant of the modification journal's chains and the
  * traversal-aligned telemetry purge indexes — see
- * {@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}.
+ * {@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}. Version 3 adds the two
+ * ordered telemetry lookup indexes, which serve a page of one span kind and the
+ * occurrences of one request group in their reading order without a sort — see
+ * {@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}.
  */
-export const STORE_SCHEMA_VERSION = 2;
+export const STORE_SCHEMA_VERSION = 3;
 
 /**
  * The `subsystem` field every log record from this module carries, so store
@@ -421,6 +424,92 @@ const CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION: StoreMigration = {
   },
 };
 
+/* -------------------------------------------------------------------------------------------------
+ * Version 3 — ordered telemetry lookups
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The two ordered telemetry lookup indexes.
+ *
+ * ## Why the planner needed them
+ *
+ * The store never runs `ANALYZE`, so SQLite plans every read from its default
+ * estimates, under which an index matched by one equality and one matched by
+ * two are rated almost alike (about ten rows against about nine).
+ * `idx_telemetry_events_session_id_start_time_ingest_seq`, added by version 2
+ * for the purge, also satisfies the leading `start_time` term of every read
+ * ordering, which tips that near-tie its way: the planner read a whole
+ * session through it — sorting what it found — for a page of one kind and for
+ * the occurrences of one request group, even though
+ * `idx_telemetry_events_session_id_kind` and
+ * `idx_telemetry_events_session_id_request_key` narrow those reads to the rows
+ * they return. Each index below is matched by the same equalities *and*
+ * yields the read's whole ordering, so it answers the page as an ordered range
+ * that stops at `LIMIT`, and the planner prefers it:
+ *
+ * - `(session_id, kind, start_time, id)` serves a single-kind page of
+ *   `./telemetry-repo.ts`'s panel-data surface in its `start_time, id` order,
+ *   with a capture narrowing applied as a residual filter. Its count reads this
+ *   index or `(session_id, kind)`, whichever the planner rates cheaper; both
+ *   are narrowed by the same two equalities.
+ * - `(session_id, request_key, start_time, producer_id, seq)` serves
+ *   `listByRequestKey` in the canonical order. The canonical chain's last key,
+ *   `ingest_seq`, is the table's rowid, which SQLite appends to every index
+ *   entry, so the index ends in exactly that chain.
+ *
+ * ## Why these two keys, and only these
+ *
+ * Every index on this table is paid for on the ingest path of a running
+ * capture, which is why a composite is only worth adding where its inserts
+ * are cheap. Here the leading key after `session_id` is low-cardinality — the
+ * kind vocabulary has seventeen members — or `NULL` for most rows, since only
+ * a request carries a request key, and `start_time` grows as a capture runs.
+ * Almost every insert therefore lands at the end of a range already being
+ * written: the indexes grow append-mostly.
+ *
+ * Span, parent-span and trace ids get no composite. They are random keys, so a
+ * `(session_id, span_id, …)` entry lands at a random page of the B-tree on
+ * every insert; measured on a forty-thousand-event store, such composites cost
+ * two to three times the ingest time of a batch. They are not needed either:
+ * those ids are selective across the whole table, and
+ * `idx_telemetry_events_span_id`, `idx_telemetry_events_parent_span_id` and
+ * `idx_telemetry_events_trace_id_start_time` already answer each lookup in a
+ * handful of rows once the session scope is applied to the rows they return
+ * rather than chosen as the access path. `./telemetry-repo.ts` arranges exactly
+ * that by writing the session term as `+session_id = ?` whenever one of those
+ * ids, or a list of event ids, is looked up (see its `RESIDUAL_SESSION_TERM`).
+ *
+ * A `kinds` filter naming several kinds deliberately keeps the planner's
+ * ordered session read. No single index yields the start order across several
+ * kind ranges, so reading the kind index would mean sorting every matching row
+ * before the first page could be returned: forcing it measured about 669 ms
+ * against about 9 ms for a deep page of the dominant kinds.
+ *
+ * The single-column and two-column indexes version 1 declared stay, as the
+ * additive-only ladder policy requires.
+ */
+const CREATE_ORDERED_LOOKUP_INDEXES_SQL = `CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_kind_start_time_id
+  ON telemetry_events (session_id, kind, start_time, id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_events_session_id_request_key_start_time_producer_id_seq
+  ON telemetry_events (session_id, request_key, start_time, producer_id, seq);`;
+
+/**
+ * Schema version 3: the ordered telemetry lookup indexes — see
+ * {@link CREATE_ORDERED_LOOKUP_INDEXES_SQL} for which reads they serve and why
+ * no other key gets one.
+ *
+ * Purely additive: two `IF NOT EXISTS` indexes and nothing else, so no row of
+ * any table is read, rewritten or removed, and a store already carrying either
+ * index is left as it is.
+ */
+const ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION: StoreMigration = {
+  version: 3,
+  description: 'add the ordered telemetry kind and request group indexes',
+  apply: (db) => {
+    db.exec(CREATE_ORDERED_LOOKUP_INDEXES_SQL);
+  },
+};
+
 /**
  * The store's schema ladder, in ascending version order.
  *
@@ -430,12 +519,18 @@ const CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION: StoreMigration = {
  * journal in here is what restores a developer's patched files, so an existing
  * database must always be able to migrate forward without losing a row.
  *
+ * Version 1 establishes `./schema.sql`; version 2 enforces single-child
+ * modification chains and adds the telemetry purge indexes
+ * ({@link CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION}); version 3 adds the
+ * ordered telemetry lookup indexes
+ * ({@link ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION}).
+ *
  * The shape of a future step, for the record:
  *
  * @example
  * ```ts
  * {
- *   version: 3,
+ *   version: 4,
  *   description: 'add the capture retention index',
  *   apply: (db) => {
  *     db.exec(
@@ -465,6 +560,7 @@ export const STORE_MIGRATIONS: readonly StoreMigration[] = [
     },
   },
   CHAIN_INTEGRITY_AND_PURGE_INDEXES_MIGRATION,
+  ORDERED_TELEMETRY_LOOKUP_INDEXES_MIGRATION,
 ];
 
 /**

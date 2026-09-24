@@ -117,9 +117,13 @@ import { describe, expect, it } from 'vitest';
 
 import {
   contrastRatio,
+  DEPENDENCY_NODE_TOKEN_KEYS,
   isHexColor,
+  KIND_FILL_INK_TOKEN_KEYS,
+  KIND_TOKEN_KEYS,
   meetsContrast,
   roundContrastRatio,
+  UNCLASSIFIED_TOKEN_KEY,
   WCAG_AA_NON_TEXT_CONTRAST,
   WCAG_AA_TEXT_CONTRAST,
 } from '../utils/color';
@@ -302,12 +306,23 @@ const EXPECTED_CSS_PROPERTY_NAMES: readonly string[] = [
   '--dg-icon-size',
   '--dg-info',
   '--dg-kind-db',
+  '--dg-kind-db-ink',
   '--dg-kind-error',
+  '--dg-kind-error-ink',
+  '--dg-kind-external',
+  '--dg-kind-external-ink',
   '--dg-kind-fetch',
+  '--dg-kind-fetch-ink',
   '--dg-kind-function',
+  '--dg-kind-function-ink',
   '--dg-kind-http',
+  '--dg-kind-http-ink',
   '--dg-kind-interaction',
+  '--dg-kind-interaction-ink',
   '--dg-kind-render',
+  '--dg-kind-render-ink',
+  '--dg-kind-service',
+  '--dg-kind-service-ink',
   '--dg-mono-md',
   '--dg-mono-sm',
   '--dg-motion-duration',
@@ -385,7 +400,78 @@ const KIND_FILL_KEYS = [
   'kindFunction',
   'kindDb',
   'kindError',
+  'kindService',
+  'kindExternal',
 ] as const satisfies readonly TokenKey[];
+
+/**
+ * The label ink paired with each span-kind fill, as the aliases the token
+ * source declares them: the base surface for every fill, except the light
+ * fetch fill, which takes the primary text colour because white on it measures
+ * 3.77:1. Pinned in full so an ink cannot quietly change which token it names.
+ */
+const KIND_INK_ALIASES: Readonly<
+  Record<PanelTheme, Readonly<Record<(typeof KIND_FILL_KEYS)[number], string>>>
+> = {
+  dark: {
+    kindInteraction: 'var(--dg-surface-base)',
+    kindRender: 'var(--dg-surface-base)',
+    kindFetch: 'var(--dg-surface-base)',
+    kindHttp: 'var(--dg-surface-base)',
+    kindFunction: 'var(--dg-surface-base)',
+    kindDb: 'var(--dg-surface-base)',
+    kindError: 'var(--dg-surface-base)',
+    kindService: 'var(--dg-surface-base)',
+    kindExternal: 'var(--dg-surface-base)',
+  },
+  light: {
+    kindInteraction: 'var(--dg-surface-base)',
+    kindRender: 'var(--dg-surface-base)',
+    kindFetch: 'var(--dg-text-primary)',
+    kindHttp: 'var(--dg-surface-base)',
+    kindFunction: 'var(--dg-surface-base)',
+    kindDb: 'var(--dg-surface-base)',
+    kindError: 'var(--dg-surface-base)',
+    kindService: 'var(--dg-surface-base)',
+    kindExternal: 'var(--dg-surface-base)',
+  },
+  highContrast: {
+    kindInteraction: 'var(--dg-surface-base)',
+    kindRender: 'var(--dg-surface-base)',
+    kindFetch: 'var(--dg-surface-base)',
+    kindHttp: 'var(--dg-surface-base)',
+    kindFunction: 'var(--dg-surface-base)',
+    kindDb: 'var(--dg-surface-base)',
+    kindError: 'var(--dg-surface-base)',
+    kindService: 'var(--dg-surface-base)',
+    kindExternal: 'var(--dg-surface-base)',
+  },
+};
+
+/**
+ * The fill a selected row, tree node or graph box is painted with. Every
+ * selected surface draws its text in the primary colour (the stylesheet's
+ * selected-surface rule), so the primary text colour is held to the text
+ * minimum on it, in every theme, beside the three panel surfaces.
+ */
+const SELECTION_FILL_KEY = 'accentMuted' satisfies TokenKey;
+
+/**
+ * The stylesheet rules that paint the selection fill behind content, and the
+ * selector the selected-surface text rule must cover each with. Pinned so that
+ * a new selected surface cannot be added without also drawing its text in the
+ * colour measured on the fill. The graph box is SVG: its text is its following
+ * siblings, so its cover is the sibling rule rather than the descendant one.
+ */
+const SELECTED_SURFACE_RULES = [
+  '.dg-data-table__row.dg-is-selected',
+  '.dg-waterfall__row.dg-is-selected',
+  '.dg-flame__equivalent-row.dg-is-selected',
+  '.dg-component-tree__node.dg-is-selected',
+  '.dg-render-table__occurrence.dg-is-selected',
+  '.dg-request-table__occurrence-row.dg-is-selected',
+  '.dg-query-table__occurrence-row.dg-is-selected',
+] as const;
 
 /**
  * The relationship connectors: the stroke of a dependency-graph edge and of a
@@ -876,6 +962,40 @@ function styleRules(rules: string): StyleRule[] {
   return found;
 }
 
+/**
+ * The selectors of one rule's selector list, split on the commas that separate
+ * them and never on a comma inside a functional pseudo-class such as `:not()`,
+ * whose argument is itself a list. Whitespace-normalised like
+ * {@link styleRules}.
+ */
+function selectorParts(selectorList: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+  for (const character of selectorList) {
+    if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth -= 1;
+    }
+    if (character === ',' && depth === 0) {
+      parts.push(current.trim());
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+  parts.push(current.trim());
+  return parts.filter((part) => part !== '');
+}
+
+/** The comment-free style rules of every authored stylesheet, in file order. */
+function authoredStyleRules(): StyleRule[] {
+  return AUTHORED_STYLESHEETS.flatMap(({ file }) =>
+    styleRules(readFileSync(file, 'utf8').replace(/\/\*[\s\S]*?\*\//gu, '')),
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /* 1. Drift and naming agreement (AAP 0.6.1)                                  */
 /* -------------------------------------------------------------------------- */
@@ -949,7 +1069,7 @@ describe('generated token stylesheet', () => {
   });
 
   it('declares exactly the catalogued custom properties', () => {
-    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(60);
+    expect(EXPECTED_CSS_PROPERTY_NAMES).toHaveLength(71);
     expect(
       new Set(EXPECTED_CSS_PROPERTY_NAMES).size,
       'the catalogue lists a custom property twice',
@@ -1473,6 +1593,128 @@ describe('design token contrast', () => {
     }
   });
 
+  it('pairs every fill the kind scale can produce with a label ink', () => {
+    // A flame block's label is text on its fill; `kindInkTokenKey` looks the
+    // fill up in this table, so a fill without an entry would silently fall
+    // back to one ink for every fill — the defect the pairing exists to end.
+    const fills = new Set<TokenKey>([
+      ...Object.values(KIND_TOKEN_KEYS),
+      ...Object.values(DEPENDENCY_NODE_TOKEN_KEYS),
+      UNCLASSIFIED_TOKEN_KEY,
+    ]);
+
+    for (const fill of fills) {
+      expect(KIND_FILL_INK_TOKEN_KEYS[fill], `${fill} has no paired label ink`).toBeDefined();
+    }
+    for (const fill of KIND_FILL_KEYS) {
+      expect(KIND_FILL_INK_TOKEN_KEYS[fill], `${fill} has no paired label ink`).toBe(`${fill}Ink`);
+    }
+  });
+
+  for (const theme of PANEL_THEMES) {
+    for (const [fill, ink] of Object.entries(KIND_FILL_INK_TOKEN_KEYS)) {
+      it(`labels ${fill} with its paired ink at the text minimum in ${theme}`, () => {
+        const background = TOKEN_KEYS.find((key) => key === fill);
+        if (background === undefined || ink === undefined) {
+          throw new Error(`${fill} is not a token, so it cannot be measured as a fill`);
+        }
+        const ratio = measureContrast(theme, ink, background);
+
+        expect(
+          meetsContrast(ratio, REQUIRED_TEXT_CONTRAST),
+          describePair({ theme, foreground: ink, background, ratio }, REQUIRED_TEXT_CONTRAST),
+        ).toBe(true);
+      });
+    }
+
+    it(`declares each label ink as the alias it is pinned to in ${theme}`, () => {
+      for (const fill of KIND_FILL_KEYS) {
+        const ink = KIND_FILL_INK_TOKEN_KEYS[fill];
+        if (ink === undefined) {
+          throw new Error(`${fill} has no paired label ink`);
+        }
+        expect(DESIGN_TOKENS[theme][ink], `${theme}.${ink}`).toBe(KIND_INK_ALIASES[theme][fill]);
+      }
+    });
+
+    it(`renders primary text on the selection fill at the text minimum in ${theme}`, () => {
+      const ratio = measureContrast(theme, 'textPrimary', SELECTION_FILL_KEY);
+
+      expect(
+        meetsContrast(ratio, REQUIRED_TEXT_CONTRAST),
+        describePair(
+          { theme, foreground: 'textPrimary', background: SELECTION_FILL_KEY, ratio },
+          REQUIRED_TEXT_CONTRAST,
+        ),
+      ).toBe(true);
+    });
+  }
+
+  it('inks every flame label from the frame-ink property, falling back to a paired ink', () => {
+    // The pairs are measured above; this pins the rule that must spend them. A
+    // rule reverting to one fixed label colour would pass every ratio while
+    // rendering white on the light fetch fill at 3.77:1.
+    const fills = authoredStyleRules()
+      .filter((rule) => selectorParts(rule.selector).includes('.dg-flame__frame-label'))
+      .flatMap((rule) => rule.declarations.filter((d) => d.startsWith('fill:')));
+
+    expect(fills).toEqual([`fill: var(--dgc-frame-ink, ${cssVar('kindFunctionInk')})`]);
+  });
+
+  it('draws the text of every selected surface in the colour measured on the selection fill', () => {
+    // Every rule that paints the selection fill must also say what text on it
+    // is drawn in: itself, when it sets the primary text colour; through the
+    // selected-surface rule, for a row or tree node whose cells carry their own
+    // colours; or through a sibling rule, for an SVG box whose text follows it.
+    // The accent, secondary, muted and danger tones measure 4.02, 4.31, 3.12 and
+    // 3.50:1 on the dark selection fill, so an uncovered surface fails the text
+    // bar the moment it is selected.
+    const rules = authoredStyleRules();
+    const selectionFill = cssVar(SELECTION_FILL_KEY);
+    const primary = cssVar('textPrimary');
+    const painters = rules.filter((rule) =>
+      rule.declarations.some(
+        (d) => d === `background: ${selectionFill}` || d === `fill: ${selectionFill}`,
+      ),
+    );
+    expect(painters.length).toBeGreaterThan(0);
+
+    /** The selectors of every rule that draws text in the primary colour. */
+    const primaryTextSelectors = (property: 'color' | 'fill'): Set<string> =>
+      new Set(
+        rules
+          .filter((rule) => rule.declarations.includes(`${property}: ${primary}`))
+          .flatMap((rule) => selectorParts(rule.selector)),
+      );
+    const primaryColour = primaryTextSelectors('color');
+    const primaryFill = primaryTextSelectors('fill');
+
+    for (const painter of painters) {
+      const paintsBackground = painter.declarations.includes(`background: ${selectionFill}`);
+      for (const surface of selectorParts(painter.selector)) {
+        if (painter.declarations.includes(`color: ${primary}`)) {
+          continue;
+        }
+        if (paintsBackground) {
+          expect(
+            (SELECTED_SURFACE_RULES as readonly string[]).includes(surface),
+            `${surface} paints the selection fill but is not a catalogued selected surface`,
+          ).toBe(true);
+          expect(primaryColour.has(surface), `${surface} itself draws primary text`).toBe(true);
+          expect(
+            [...primaryColour].some((selector) => selector.startsWith(`${surface} :not(`)),
+            `${surface}'s descendants draw primary text`,
+          ).toBe(true);
+        } else {
+          expect(
+            [...primaryFill].some((selector) => selector.startsWith(`${surface} ~ `)),
+            `the SVG text drawn over ${surface} is filled in primary text`,
+          ).toBe(true);
+        }
+      }
+    }
+  });
+
   it('states the high-contrast border colour as an identity rather than a ratio', () => {
     // A border carries no text, so it belongs to no ratio suite above. The
     // guarantee it carries instead is the delta AAP 0.6.1 states: both border
@@ -1563,6 +1805,45 @@ describe('published contrast reference figures', () => {
       worstPairOf(measurePairs(['dark'], GRAPH_EDGE_KEYS)).ratio,
       "the dark palette's worst relationship-edge pair",
     ).toBeCloseTo(5.09, 2);
+  });
+
+  it('reproduces the tightest label ink on a span-kind fill', () => {
+    // The light fetch fill is the one fill white does not clear 4.5:1 on
+    // (3.77:1), which is why its ink is the primary text colour instead; that
+    // pair, at 4.67:1, is the tightest label contrast the scale carries.
+    const pairs = PANEL_THEMES.flatMap((theme) =>
+      Object.entries(KIND_FILL_INK_TOKEN_KEYS).flatMap(([fill, ink]) => {
+        const background = TOKEN_KEYS.find((key) => key === fill);
+        return background === undefined || ink === undefined
+          ? []
+          : [
+              {
+                theme,
+                foreground: ink,
+                background,
+                ratio: measureContrast(theme, ink, background),
+              },
+            ];
+      }),
+    );
+    const worst = worstPairOf(pairs);
+
+    expect(worst.theme).toBe('light');
+    expect(worst.background).toBe('kindFetch');
+    expect(worst.foreground).toBe('kindFetchInk');
+    expect(worst.ratio).toBeCloseTo(4.67, 2);
+    expect(measureContrast('light', 'surfaceBase', 'kindFetch')).toBeCloseTo(3.77, 2);
+  });
+
+  it('reproduces the selection-fill figures the selected-surface rule rests on', () => {
+    // Primary text is what every selected surface draws in; the four tones it
+    // replaces are the ones that fail on the dark selection fill.
+    expect(measureContrast('dark', 'textPrimary', 'accentMuted')).toBeCloseTo(7.99, 2);
+    expect(measureContrast('light', 'textPrimary', 'accentMuted')).toBeCloseTo(14.16, 2);
+    expect(measureContrast('dark', 'accent', 'accentMuted')).toBeCloseTo(4.02, 2);
+    expect(measureContrast('dark', 'textSecondary', 'accentMuted')).toBeCloseTo(4.31, 2);
+    expect(measureContrast('dark', 'textMuted', 'accentMuted')).toBeCloseTo(3.12, 2);
+    expect(measureContrast('dark', 'danger', 'accentMuted')).toBeCloseTo(3.5, 2);
   });
 
   it('measures the high-contrast palette exactly as the dark palette', () => {

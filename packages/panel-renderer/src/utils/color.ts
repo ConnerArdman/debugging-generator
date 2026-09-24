@@ -92,11 +92,14 @@ export const UNCLASSIFIED_TOKEN_KEY: TokenKey = 'textMuted';
  * ---------------------------------------------------------------------------
  * Telemetry kind → span-kind token
  *
- * AAP 0.6.3 defines exactly seven span-kind tokens and the telemetry
- * vocabulary has seventeen kinds, so the scale is a fold rather than a
- * bijection. The seven tokens are read as semantic *families* — what the
- * operation is, not which producer reported it — and the fold below is the
- * decision about which family each kind belongs to.
+ * AAP 0.6.3 defines seven span-kind tokens, and `../tokens/tokens` adds two
+ * supplementary members of the same scale — `kindService` and
+ * `kindExternal` — so that each of the dependency graph's six participant
+ * classes owns a colour its spans also carry. The telemetry vocabulary has
+ * seventeen kinds, so the nine tokens are still a fold rather than a
+ * bijection. They are read as semantic *families* — what the operation is,
+ * not which producer reported it — and the fold below is the decision about
+ * which family each kind belongs to.
  * ---------------------------------------------------------------------------
  */
 
@@ -125,15 +128,22 @@ export const UNCLASSIFIED_TOKEN_KEY: TokenKey = 'textMuted';
  *   (AAP 0.6.6). Kept apart from the server-side HTTP family below, because the
  *   client end and the server end of one request are the two rows a reader
  *   compares to see where the time went.
- * - `kindHttp` — `http.server` and `http.client`. Server-side HTTP boundaries:
- *   the request the server answered, and a request the server made onwards. The
+ * - `kindHttp` — `http.server`, the request the server answered: the incoming
  *   boundary, not the work behind it.
- * - `kindFunction` — `route.handler`, `function`, `log` and `perf.longtask`.
- *   Application code executing. A route handler is the server's own code rather
- *   than transport, which is what makes a server lane read "boundary → code →
- *   datastore" instead of one undifferentiated block; a log record names the
- *   code that emitted it; and a long task is script execution blocking the main
- *   thread, which is code too.
+ * - `kindService` — `route.handler`, the server's own work behind that
+ *   boundary. Kept apart from both the boundary and named application code, so
+ *   a server lane reads "boundary → handler → code → datastore" instead of one
+ *   undifferentiated block, and so the graph's `service` participants — which
+ *   are route handlers — are drawn in the colour their spans have here.
+ * - `kindFunction` — `function`, `log` and `perf.longtask`. Application code
+ *   executing: a patched named function, a log record naming the code that
+ *   emitted it, and a long task, which is script execution blocking the main
+ *   thread.
+ * - `kindExternal` — `http.client`, a request the server made onwards to
+ *   another system. Its own family rather than the incoming boundary's, because
+ *   "the server was asked" and "the server asked someone else" are the two ends
+ *   a reader separates when a server span is slow, and because it is what the
+ *   graph's `external` participants collapse.
  * - `kindDb` — `db.query`, the datastore's own family.
  * - `kindError` — `error` and `server.error`, the two kinds whose *subject* is
  *   a failure, from either tier. An operation of another kind that failed keeps
@@ -155,10 +165,10 @@ export const KIND_TOKEN_KEYS: Readonly<Record<TelemetryKind, TokenKey>> = Object
   error: 'kindError',
   state: 'kindRender',
   'http.server': 'kindHttp',
-  'route.handler': 'kindFunction',
+  'route.handler': 'kindService',
   function: 'kindFunction',
   'db.query': 'kindDb',
-  'http.client': 'kindHttp',
+  'http.client': 'kindExternal',
   'server.error': 'kindError',
   log: 'kindFunction',
 });
@@ -187,6 +197,56 @@ export function kindTokenKey(kind: TelemetryKind): TokenKey {
  */
 export function kindColorVar(kind: TelemetryKind): string {
   return cssVar(kindTokenKey(kind));
+}
+
+/**
+ * The label ink for text drawn *on* each fill {@link kindTokenKey} can return.
+ *
+ * A span-kind fill is held to the 3:1 non-text bar, but a label printed on it
+ * is text and needs 4.5:1 (AAP 0.6.3). No one ink reaches that on every fill:
+ * the light scale has fills that need a light ink and one — fetch — that needs
+ * a dark one. So each fill is paired with its own `…Ink` token, whose value
+ * `../tokens/tokens` chooses per theme by contrast, and a view that labels a
+ * fill asks for the fill's ink rather than writing a colour of its own.
+ *
+ * The unclassified fill ({@link UNCLASSIFIED_TOKEN_KEY}, the muted text colour)
+ * takes the base surface, which clears 4.5:1 on it in every theme. The token
+ * test measures every pair in this table in all three themes.
+ *
+ * Partial over the key union only because most tokens are not fills; every fill
+ * the kind table can produce has an entry, which the token test asserts.
+ * Frozen: a read-only lookup table.
+ */
+export const KIND_FILL_INK_TOKEN_KEYS: Readonly<Partial<Record<TokenKey, TokenKey>>> =
+  Object.freeze({
+    kindInteraction: 'kindInteractionInk',
+    kindRender: 'kindRenderInk',
+    kindFetch: 'kindFetchInk',
+    kindHttp: 'kindHttpInk',
+    kindFunction: 'kindFunctionInk',
+    kindDb: 'kindDbInk',
+    kindError: 'kindErrorInk',
+    kindService: 'kindServiceInk',
+    kindExternal: 'kindExternalInk',
+    textMuted: 'surfaceBase',
+  });
+
+/**
+ * The ink a label drawn on `kind`'s fill is written in — the pair of
+ * {@link kindTokenKey} for text. Falls back to the base surface for a fill the
+ * table does not list, which is the ink every fill used before the pairing.
+ * Never throws, for the reason given on {@link kindTokenKey}.
+ */
+export function kindInkTokenKey(kind: TelemetryKind): TokenKey {
+  return KIND_FILL_INK_TOKEN_KEYS[kindTokenKey(kind)] ?? 'surfaceBase';
+}
+
+/**
+ * {@link kindInkTokenKey} as a CSS value reference, for the inline label ink of
+ * an SVG block whose fill is {@link kindColorVar}.
+ */
+export function kindInkColorVar(kind: TelemetryKind): string {
+  return cssVar(kindInkTokenKey(kind));
 }
 
 /*
@@ -244,49 +304,34 @@ export function tierColorVar(tier: TelemetryTier): string {
  * The dependency graph collapses a correlated trace into participants: what
  * took part in the interaction, and who called whom (AAP 0.6.2). Its
  * vocabulary is coarser than the kind vocabulary — several kinds collapse into
- * one class — so the fold below cannot agree with the kind scale everywhere.
- * Where it cannot, the mismatch is named in the entry rather than left for a
- * reader to discover from the screen.
+ * one class — so a node is coloured in two steps: by the span kinds it
+ * collapsed when those agree on one colour, and by its class otherwise. The
+ * first step is what keeps a participant in the colour its spans have in every
+ * other view; the second is the class's own, distinct colour.
  * ---------------------------------------------------------------------------
  */
 
 /**
- * The token each participant class of the dependency graph is drawn in.
+ * The token each participant class of the dependency graph is drawn in when
+ * its span kinds do not settle a colour of their own.
  *
  * The key type is derived from the node shape itself, so the table tracks the
  * participant vocabulary automatically and a class added upstream is a compile
- * error here. The assignment keeps a graph node in the same colour family as
- * the spans it collapsed, which is the whole point of having one mapping
- * module — a reader who followed a green request bar in the timeline finds the
- * same green participant in the graph.
+ * error here. The six classes take six *distinct* tokens — a legend that
+ * repeats a colour tells a reader two classes apart by nothing — and each is
+ * the token its class's defining kind has in {@link KIND_TOKEN_KEYS}, so the
+ * class colour and the span colour of the class's typical member agree:
  *
- * The classes, and the two deliberate compromises:
- *
- * - `ui-event` → `kindInteraction`. The page acting: the interaction and
- *   everything that followed it in the document. The interaction is the class's
- *   root, so the class takes its colour; the individual renders and performance
- *   entries keep their own colours in the views that show them span by span.
- * - `api` → `kindFetch`. The request boundary. The class holds *both* ends of
- *   one request — the call the page made and the request the server
- *   answered — as separate nodes, and one token has to serve both: the caller's
- *   colour is chosen because the graph is read left to right from the page.
- *   A server-side boundary node therefore reads as the transfer family rather
- *   than the server-HTTP family it has in the timeline; its `tier` field is
- *   what a renderer distinguishes the two ends by.
- * - `service` → `kindFunction`. Server-side work behind the boundary. The class
- *   is dominated by the route handler, which is `kindFunction` in the kind
- *   scale too, so the common case agrees exactly. A failure charged to a
- *   service also lands in this class while its own span stays in the error
- *   family — the same separation of "what it was" from "it failed" that
- *   {@link KIND_TOKEN_KEYS} makes.
- * - `function` → `kindFunction`. Named application code, either tier; exact
- *   agreement with the kind scale. It shares its colour with `service`
- *   deliberately: both are this application's code, and the distinction that
- *   matters to a reader — which side of the boundary it ran on — is carried by
- *   the node's layer and label rather than by a sixth colour.
- * - `database` → `kindDb`, and `external` → `kindHttp`: both agree exactly with
- *   the kind scale, since a participant of either class is collapsed from
- *   database spans and from server-side outgoing requests respectively.
+ * - `ui-event` → `kindInteraction`, the page acting, rooted in the interaction.
+ * - `api` → `kindFetch`, the request boundary as the page sees it: the class is
+ *   read left to right from the page, so the caller's end names it. The
+ *   server's end of the same request collapses into the class too, and is drawn
+ *   in its own span colour by {@link dependencyParticipantTokenKey}.
+ * - `service` → `kindService`, server-side work behind the boundary: the route
+ *   handler.
+ * - `function` → `kindFunction`, named application code on either tier.
+ * - `database` → `kindDb`, the datastore.
+ * - `external` → `kindExternal`, a request the server made onwards.
  *
  * Frozen: a read-only lookup table.
  */
@@ -295,9 +340,9 @@ export const DEPENDENCY_NODE_TOKEN_KEYS: Readonly<Record<DependencyGraphNode['ki
     'ui-event': 'kindInteraction',
     function: 'kindFunction',
     api: 'kindFetch',
-    service: 'kindFunction',
+    service: 'kindService',
     database: 'kindDb',
-    external: 'kindHttp',
+    external: 'kindExternal',
   });
 
 /**
@@ -316,6 +361,42 @@ export function dependencyNodeTokenKey(kind: DependencyGraphNode['kind']): Token
  */
 export function dependencyNodeColorVar(kind: DependencyGraphNode['kind']): string {
   return cssVar(dependencyNodeTokenKey(kind));
+}
+
+/**
+ * The token one dependency-graph participant is drawn in.
+ *
+ * The participant's span kinds (`DependencyGraphNode.spanKinds`) decide first:
+ * when every kind it collapsed maps to one token in {@link KIND_TOKEN_KEYS},
+ * that token is the answer, so a render participant is the render colour, the
+ * server's end of a request is the server-request colour and a server failure
+ * is the error colour — exactly as the timeline, flame and waterfall draw the
+ * same spans. A participant whose kinds span several families, or that carries
+ * no kinds (one contributed without captured records), falls back to its class
+ * token, {@link dependencyNodeTokenKey}.
+ *
+ * @param node - The participant's class and, when it has them, its span kinds.
+ * @returns The token to stroke and label the participant with.
+ */
+export function dependencyParticipantTokenKey(
+  node: Pick<DependencyGraphNode, 'kind' | 'spanKinds'>,
+): TokenKey {
+  const kinds = node.spanKinds ?? [];
+  const [first, ...rest] = kinds.map(kindTokenKey);
+  if (first !== undefined && rest.every((token) => token === first)) {
+    return first;
+  }
+  return dependencyNodeTokenKey(node.kind);
+}
+
+/**
+ * {@link dependencyParticipantTokenKey} as a CSS value reference, for the
+ * inline stroke of one SVG graph node.
+ */
+export function dependencyParticipantColorVar(
+  node: Pick<DependencyGraphNode, 'kind' | 'spanKinds'>,
+): string {
+  return cssVar(dependencyParticipantTokenKey(node));
 }
 
 /*

@@ -823,7 +823,7 @@ describe('a schema failure earns a bounded repair', () => {
   });
 
   it.each([-1, 1.5, Number.NaN])(
-    'refuses the budget %p before asking the provider for anything',
+    'refuses the budget %s before asking the provider for anything',
     async (maxRepairs) => {
       const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
 
@@ -847,7 +847,7 @@ describe('a schema failure earns a bounded repair', () => {
   // first is the smallest budget that crosses the ceiling, the second is far
   // past it.
   it.each([DEFAULT_MAX_REPAIRS + 1, DEFAULT_MAX_REPAIRS * 50])(
-    'refuses the over-ceiling budget %p before asking the provider for anything',
+    'refuses the over-ceiling budget %s before asking the provider for anything',
     async (maxRepairs) => {
       const provider = createFakeProvider([decoded(VALID_OUTPUT)]);
       const call = generateStructuredWithRepair(provider, reportSchema, makeRequest(), {
@@ -1429,7 +1429,7 @@ describe('formatZodIssues', () => {
     expect(formatZodIssues(error, { maxIssues: DEFAULT_MAX_ISSUES })).not.toContain('more');
   });
 
-  it.each([0, -1, 1.5, Number.NaN])('refuses maxIssues %p as a programmer error', (maxIssues) => {
+  it.each([0, -1, 1.5, Number.NaN])('refuses maxIssues %s as a programmer error', (maxIssues) => {
     const error = rejectionOf(reportSchema, BOUND_VIOLATING_OUTPUT);
 
     expect(() => formatZodIssues(error, { maxIssues })).toThrowError(DebuggenError);
@@ -1569,7 +1569,7 @@ describe('buildRepairRequest', () => {
     expect(REPAIR_ASSISTANT_NOTICE).toContain('omitted');
   });
 
-  it.each([0, -1, 1.5, Number.NaN])('refuses the attempt number %p', (attempt) => {
+  it.each([0, -1, 1.5, Number.NaN])('refuses the attempt number %s', (attempt) => {
     const original = makeRequest();
 
     expect(() => buildRepairRequest(original, 'count: out of range', attempt)).toThrowError(

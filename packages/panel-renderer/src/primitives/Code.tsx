@@ -45,20 +45,21 @@
  * here sets a colour, a length, a font or an inline style, and there is no literal CSS value in
  * this file at all:
  *
- *   `dg-code`             the base, on both forms
+ *   `dg-code`             the base, on both forms - the chip and tabular figures
  *   `dg-code--block`      the preformatted box (block form only)
  *   `dg-code--md`         the `--dg-mono-md` type role - 12/16 (AAP 0.6.3)
  *   `dg-code--sm`         the `--dg-mono-sm` type role - 11/16
- *   `dg-code--numeric`    tabular figures, so digits line up in a column
+ *   `dg-code--numeric`    marks numeric content; rendering is identical to the base
  *   `dg-code--wrap`       wrap long content instead of scrolling it
  *
  * The two type roles are the only monospace sizes the design system has; both are complete `font`
  * shorthands over `--dg-font-mono`, and because that shorthand resets `font-variant`, the
- * stylesheet declares `font-variant-numeric` after it rather than before. That ordering is also
- * why `dg-code--numeric` is a class rather than nothing at all: the base layer already gives
- * every `<code>` and `<pre>` tabular figures at zero specificity, so a size class carrying the
- * shorthand resets them, and this variant is the declaration that asks for them back on the one
- * instance whose digits have to line up.
+ * stylesheet declares `font-variant-numeric` after it rather than before. Tabular figures are the
+ * default for every Code, because AAP 0.6.3 pairs `--dg-font-mono` with `tabular-nums` for code,
+ * SQL, paths and numeric columns: the stylesheet restores them on `dg-code` after every size
+ * class, so digits line up in a column whatever the size. `dg-code--numeric` predates that
+ * default and is kept for API stability - the `numeric` prop still emits it, marking content
+ * whose digits are the point - but it no longer changes how anything renders.
  *
  * ACCESSIBILITY
  * The block form carries `tabIndex={0}`: a box that can scroll horizontally has to be reachable
@@ -190,9 +191,13 @@ export interface CodeProps extends HTMLAttributes<HTMLElement> {
   size?: CodeSize | undefined;
 
   /**
-   * Opts into tabular figures, so digits occupy identical widths and a column of numbers aligns
-   * on the decimal point rather than drifting. Worth setting for counts, durations, sizes and
-   * identifiers made of digits; it changes nothing about non-numeric text.
+   * Marks the content as numeric - a count, a duration, a size, an identifier made of digits - by
+   * adding `dg-code--numeric`.
+   *
+   * It no longer changes the rendering: every Code already renders tabular figures, so digits
+   * occupy identical widths and a column of numbers aligns on the decimal point rather than
+   * drifting (AAP 0.6.3 pairs the monospace family with `tabular-nums`). The prop is kept for API
+   * stability and so numeric content stays identifiable in the DOM.
    *
    * @default false
    */

@@ -51,8 +51,9 @@
  *   level below, ending in a union of leaves only. Rendered with references,
  *   each level is one definition the three containers above it point at, and
  *   `./input.ts` shares one instance of each leaf and of each field schema
- *   across every level and all sixteen node types, so the document stays
- *   roughly 60 KB. Inlined, every level would be copied into each of the three
+ *   across every level and all sixteen node types — one source enumeration per
+ *   node type, derived from the catalog — so the document stays roughly 87 KB.
+ *   Inlined, every level would be copied into each of the three
  *   containers above it, and the rendering outgrows the longest string the
  *   runtime can hold — measured on this schema. The chain has no cycle, so
  *   `cycles: 'ref'` changes nothing today; it is kept so that a reference cycle

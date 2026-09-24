@@ -10,10 +10,11 @@
  *     component's shape explicitly: ARIA roles on the tree, full keyboard
  *     navigation, and a highlight that is never colour alone. So the tree's
  *     roles, its single roving tab stop — with the toggles and source chips kept
- *     out of the Tab order —, each of the seven navigation and activation keys
- *     it owns, the Shift+Enter command that opens a row's source, and the word
- *     beside the highlight's icon are all asserted mechanically rather than
- *     described in a comment.
+ *     out of the Tab order —, each of the seven navigation and selection keys
+ *     it owns, the Shift+Enter command that opens a row's source, the words
+ *     beside the highlight's icon and the badge a collapsed branch carries for
+ *     the marks it hides are all asserted mechanically rather than described in
+ *     a comment.
  *   - **A snapshot states its own limits (AAP 0.6.6).** The structure is taken
  *     at the last commit of a capture and cannot always be reconstructed, so
  *     `origin` and `degraded` are part of the answer. Two cases hold that line:
@@ -23,11 +24,16 @@
  *     hierarchy nobody observed. That is the same class of error as an
  *     unevidenced fact in an analysis, which AAP 0.8.4 rules out structurally.
  *   - **Nothing is selected that does not exist.** A node of this datum is an
- *     aggregate with no event of its own, so activating one must never report a
- *     selected event; the single legitimate reference — the commit the structure
- *     came from — is offered once, in the toolbar, and only when the capture
- *     recorded it. Both halves are asserted, because a fabricated coordinate in
- *     an evidence drawer is worse than an absent one.
+ *     aggregate; the producer names one real render to stand for it, and
+ *     selecting the node reports exactly that reference with only the
+ *     coordinates it carries, while a node that never rendered selects locally
+ *     and reports nothing. The commit the structure came from is offered once,
+ *     in the toolbar, and only when the capture recorded it. Every half is
+ *     asserted, because a fabricated coordinate in an evidence drawer is worse
+ *     than an absent one.
+ *   - **Selecting is not disclosing.** A click on a row and Enter/Space select
+ *     it and never toggle it; the toggle, ArrowRight/ArrowLeft and the toolbar
+ *     disclose, and are asserted to keep doing so.
  *   - **Names and counts only (AAP 0.5.2).** Prop and state values are
  *     structurally absent from the datum. One case renders a payload that
  *     smuggles them in anyway and asserts they never reach the DOM, and another
@@ -105,8 +111,13 @@ import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type {
+  PanelActions,
+  PanelEventRef,
+  PanelSelection,
+  PanelEventCoordinates,
+} from '../host/PanelActions';
 import { formatCount, formatDurationCompact, formatRenderTriggerLabel } from '../utils/format';
 import { ComponentTree } from './ComponentTree';
 
@@ -142,6 +153,27 @@ const TRACE_ID = 'a1b2c3d4e5f60718293a4b5c6d7e8f90';
 const COMMIT_SPAN_ID = '00000000000000c1';
 const COMMIT_EVENT_ID = 'event-example-commit-0001';
 
+/**
+ * The representative render of the second-level branch: the render that
+ * supplied its last trigger, as the producer names it, with its span and trace.
+ */
+const BRANCH_RENDER_EVENT_ID = 'event-example-render-0002';
+const BRANCH_RENDER_SPAN_ID = '00000000000000b2';
+
+/**
+ * The representative render of the located leaf, carried **without** its span
+ * and trace: a payload the view must forward with the one coordinate present,
+ * never with keys whose value is `undefined`.
+ */
+const LEAF_RENDER_EVENT_ID = 'event-example-render-0003';
+
+/** What the host hears when the branch is selected. */
+const BRANCH_RENDER_REF: PanelEventRef = Object.freeze({
+  eventId: BRANCH_RENDER_EVENT_ID,
+  spanId: BRANCH_RENDER_SPAN_ID,
+  traceId: TRACE_ID,
+});
+
 /** A project-relative, POSIX path for the node that resolved to source. */
 const SOURCE_FILE = 'src/example/widget.tsx';
 
@@ -173,9 +205,10 @@ const SOURCE_CHIP_NAME = `Open ${SOURCE_FILE}:${String(SOURCE_LINE)}:${String(SO
 /**
  * A second resolved location, for a **branch** row.
  *
- * On a branch Enter toggles rather than opening anything, so this is where the
- * Shift+Enter command is the only keyboard route to the source. Frozen for the
- * same identity assertions as {@link LEAF_SOURCE}.
+ * Enter selects a row rather than opening anything, so the Shift+Enter command
+ * is the keyboard route to a row's source — and on a branch it must also leave
+ * the disclosure alone. Frozen for the same identity assertions as
+ * {@link LEAF_SOURCE}.
  */
 const BRANCH_SOURCE_FILE = 'src/example/section.tsx';
 const BRANCH_SOURCE_LINE = 12;
@@ -220,6 +253,22 @@ const LIST_NAME = 'Captured components';
 
 /** The threshold field, the two bulk disclosure chips and the commit action. */
 const THRESHOLD_FIELD_NAME = 'Mark at renders ≥';
+
+/**
+ * The full reason for text that names no threshold — the field's description
+ * and live region — completed with the derived default that applies meanwhile.
+ */
+function thresholdRejectedText(derived: number): string {
+  return `Enter a whole number of at least ${formatCount(1)}. The default of ${formatCount(
+    derived,
+  )} applies until then.`;
+}
+
+/** The toolbar pill's short form of the same: the default in force. */
+function defaultInForceText(derived: number): string {
+  return `Using the default of ${formatCount(derived)}`;
+}
+
 const EXPAND_ALL_NAME = 'Expand all';
 const COLLAPSE_ALL_NAME = 'Collapse all';
 const SHOW_COMMIT_NAME = 'Show the commit';
@@ -227,8 +276,21 @@ const SHOW_COMMIT_NAME = 'Show the commit';
 /** The toolbar's own accessible name, which makes it a labelled group. */
 const TOOLBAR_NAME = 'Component tree controls';
 
-/** The non-colour half of the threshold highlight. */
-const ABOVE_THRESHOLD_TEXT = 'Above threshold';
+/**
+ * The non-colour half of the threshold highlight. "At or above", because the
+ * rule is `≥` — the field's own label says so.
+ */
+const AT_OR_ABOVE_THRESHOLD_TEXT = 'At or above threshold';
+
+/**
+ * The badge a collapsed branch carries for the marked nodes beneath it.
+ *
+ * @param hidden How many marked nodes the closed branch hides, at every depth.
+ * @returns The badge's text.
+ */
+function hiddenMarkedText(hidden: number): string {
+  return `${formatCount(hidden)} hidden at or above threshold`;
+}
 
 /** The error state's retry control and the name it gives the failing query. */
 const RETRY_NAME = 'Retry';
@@ -248,21 +310,32 @@ const RECONSTRUCTED_ORIGIN_DETAIL =
 const FLAT_ORIGIN_DETAIL =
   'No hierarchy could be rebuilt, so every observed component is listed at a single level.';
 
-/** The error state's own title and the generic sentence under it. */
-const ERROR_TITLE = 'Could not load the component tree';
-const ERROR_MESSAGE_PATTERN = /could not be read from the capture/i;
+/**
+ * The shared error-state contract, spelled out rather than imported so a drift
+ * in the one place that words it fails here too (B1-F16, B2-F14): the title of
+ * a failed view, the generic lead its message opens with, the title of a query
+ * this view cannot draw and the focus key its retry control carries.
+ */
+const ERROR_TITLE = 'Could not load this view';
+const ERROR_LEAD = 'The data for this view could not be loaded.';
+const UNSUPPORTED_TITLE = 'This view cannot draw the requested data';
+const RETRY_FOCUS_KEY = 'error-state-retry';
 
 /**
- * A provider's own failure message, which must **not** reach the screen.
- *
- * A transport diagnostic is not a finding, so the error state shows this
- * component's copy plus the failure's code and the query that failed; the
- * provider's sentence stays in the log (AAP 0.5.5).
+ * A provider's own failure message, which reaches the screen as the cause
+ * after the generic lead: the lead alone would hide what failed, and an error
+ * state reports what failed without reading like an analysis (AAP 0.5.5).
  */
 const PROVIDER_FAILURE_MESSAGE = 'The channel to the service is closed.';
 
 /** The code that failure carries, from the shared error vocabulary. */
 const PROVIDER_FAILURE_CODE = 'TRANSPORT_DISCONNECTED';
+
+/** What a reader can do about that failure, as the provider states it. */
+const PROVIDER_FAILURE_HINT = 'Start the local service, then retry.';
+
+/** The code a payload this view cannot read is reported with. */
+const SHAPE_FAILURE_CODE = 'PROTOCOL_INVALID_MESSAGE';
 
 /** The empty state's message, matched by a generic fragment of the product copy. */
 const EMPTY_MESSAGE_PATTERN = /no component tree was captured/i;
@@ -285,7 +358,22 @@ const SMUGGLED_STATE_VALUE = 'state-value-that-must-never-render';
  * @returns The chip's text.
  */
 function markedStatus(marked: number): string {
-  return `${formatCount(marked)} above threshold`;
+  return `${formatCount(marked)} at or above threshold`;
+}
+
+/**
+ * A counted unit in the form the count calls for: singular for exactly one.
+ *
+ * Restated here rather than imported, like the copy above: the suite pins the
+ * words a developer reads, "1 node" and "2 nodes", not a helper's output.
+ *
+ * @param count The count the unit follows.
+ * @param one The singular form.
+ * @param other The plural form.
+ * @returns The agreeing form.
+ */
+function counted(count: number, one: string, other: string): string {
+  return `${formatCount(count)} ${count === 1 ? one : other}`;
 }
 
 /**
@@ -301,8 +389,8 @@ function markedStatus(marked: number): string {
  */
 function statisticsLine(snapshot: ComponentTreeSnapshot, shown: number): string {
   return [
-    `${formatCount(snapshot.nodeCount)} nodes`,
-    `${formatCount(snapshot.maxDepth + 1)} levels`,
+    counted(snapshot.nodeCount, 'node', 'nodes'),
+    counted(snapshot.maxDepth + 1, 'level', 'levels'),
     `${formatCount(shown)} shown`,
   ].join(' · ');
 }
@@ -315,7 +403,11 @@ const TRUNCATED_NOTE = 'Some nodes were dropped when a size bound was reached.';
 const PROVENANCE_NOTE =
   'Structure as it stood at the last commit of the capture; render counts are cumulative for the whole capture.';
 
-/** The units the row's two numeric cells announce to a screen reader. */
+/**
+ * The units the row's two numeric cells announce to a screen reader; the count
+ * agrees with its number, so one render is `render` and any other is `renders`.
+ */
+const RENDER_UNIT = 'render';
 const RENDERS_UNIT = 'renders';
 const RENDER_TIME_UNIT = 'total render time';
 
@@ -345,6 +437,9 @@ type TreeNodeOverrides = Partial<
 > & {
   readonly key?: string | undefined;
   readonly lastTrigger?: RenderTrigger | undefined;
+  readonly lastRenderEventId?: string | undefined;
+  readonly lastRenderSpanId?: string | undefined;
+  readonly lastRenderTraceId?: string | undefined;
   readonly source?: SourceLocation | undefined;
   readonly children?: readonly ComponentTreeNode[] | undefined;
 };
@@ -355,7 +450,8 @@ type TreeNodeOverrides = Partial<
  * Complete and datum-shaped by construction: an id carrying the producer's own
  * prefix, a display name, the node's depth, a cumulative render count and a
  * cumulative render time. The optional fields — instance key, last trigger,
- * source location, children — are present only when a case asks for them.
+ * the representative render's ids, source location, children — are present
+ * only when a case asks for them.
  *
  * @param overrides Fields to replace, or `undefined` to omit an optional one.
  * @returns A fresh node; nothing is shared between calls.
@@ -369,6 +465,9 @@ function makeTreeNode(overrides: TreeNodeOverrides = {}): ComponentTreeNode {
     totalDurationMs = 12,
     key,
     lastTrigger,
+    lastRenderEventId,
+    lastRenderSpanId,
+    lastRenderTraceId,
     source,
     children = [],
   } = overrides;
@@ -382,6 +481,9 @@ function makeTreeNode(overrides: TreeNodeOverrides = {}): ComponentTreeNode {
     children,
     ...(key === undefined ? {} : { key }),
     ...(lastTrigger === undefined ? {} : { lastTrigger }),
+    ...(lastRenderEventId === undefined ? {} : { lastRenderEventId }),
+    ...(lastRenderSpanId === undefined ? {} : { lastRenderSpanId }),
+    ...(lastRenderTraceId === undefined ? {} : { lastRenderTraceId }),
     ...(source === undefined ? {} : { source }),
   };
 }
@@ -522,7 +624,10 @@ function snapshotWithOrigin(
  * ---------------------------------------------------------------------------
  */
 
-/** A leaf with a resolved location: the one node that offers a source chip. */
+/**
+ * A leaf with a resolved location: the one node that offers a source chip. Its
+ * representative render carries an event id and nothing else.
+ */
 const LEAF_NODE = makeTreeNode({
   id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0/0`,
   component: 'ExampleLeaf',
@@ -530,10 +635,11 @@ const LEAF_NODE = makeTreeNode({
   renderCount: 3,
   totalDurationMs: 6,
   lastTrigger: 'context',
+  lastRenderEventId: LEAF_RENDER_EVENT_ID,
   source: LEAF_SOURCE,
 });
 
-/** Its sibling, with no location, so a case can activate a row without a chip. */
+/** Its sibling, with no location, so a case can select a row without a chip. */
 const SIBLING_NODE = makeTreeNode({
   id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0/1`,
   component: 'ExampleSibling',
@@ -543,17 +649,28 @@ const SIBLING_NODE = makeTreeNode({
   key: 'example-key-1',
 });
 
-/** The second-level parent: collapsed on first paint, which the key cases need. */
+/**
+ * The second-level parent: collapsed on first paint, which the key cases need,
+ * and carrying a complete representative render — event, span and trace — so
+ * the selection cases can prove a branch reports it without being toggled.
+ */
 const BRANCH_NODE = makeTreeNode({
   id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0`,
   component: 'ExampleBranch',
   depth: 1,
   renderCount: 3,
   totalDurationMs: 9,
+  lastRenderEventId: BRANCH_RENDER_EVENT_ID,
+  lastRenderSpanId: BRANCH_RENDER_SPAN_ID,
+  lastRenderTraceId: TRACE_ID,
   children: [LEAF_NODE, SIBLING_NODE],
 });
 
-/** A first-level leaf, so the top level holds both a parent and a leaf. */
+/**
+ * A first-level leaf, so the top level holds both a parent and a leaf. It names
+ * no representative render, so selecting it must stay local and report nothing
+ * — the view never borrows another node's reference or invents one.
+ */
 const ASIDE_NODE = makeTreeNode({
   id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/1`,
   component: 'ExampleAside',
@@ -818,10 +935,11 @@ function rejectingProvider(error: DebuggenError): StubProvider {
 }
 
 /*
- * The three payloads that violate their own type.
+ * The four payloads that violate their own type.
  *
- * This file contains exactly three type assertions — {@link MALFORMED_PAYLOAD},
- * {@link SMUGGLED_NODE} and {@link UNMEASURED_NODE} — and each one is the
+ * This file contains exactly four type assertions — {@link MALFORMED_PAYLOAD},
+ * {@link INCOMPLETE_PAYLOAD}, {@link SMUGGLED_NODE} and {@link UNMEASURED_NODE}
+ * — and each one is the
  * subject of a case rather than a convenience. The component guards its input
  * at runtime because it is the end of a chain it does not control: a host
  * surface decodes the payload from a transport, and a producer writes the nodes.
@@ -836,13 +954,29 @@ function rejectingProvider(error: DebuggenError): StubProvider {
  * precisely a provider that broke that promise — a transport that decoded
  * something else, or a route that answered from the wrong aggregate.
  *
- * It carries a snapshot's envelope — an own `capturedAt` and an array `roots`,
- * which is all a host-side response check can confirm without walking the
- * structure — and lacks `origin`, `degraded` and `nodeCount`, which this view
- * reads before it draws. So it is the component's own guard that refuses it,
- * whatever the host checks upstream.
+ * It carries every member the host's response check requires — an own
+ * `capturedAt`, `origin`, `degraded` and `nodeCount` and an array `roots`,
+ * which is all that check confirms without walking the structure — but
+ * `degraded` is not a boolean. So it is the component's own guard that refuses
+ * it, whatever the host checks upstream.
  */
 const MALFORMED_PAYLOAD = {
+  capturedAt: CAPTURED_AT,
+  origin: 'commit-snapshot',
+  degraded: 'unknown',
+  nodeCount: 0,
+  roots: [],
+} as unknown as ComponentTreeSnapshot;
+
+/**
+ * A payload missing members this view reads, for the host's response check.
+ *
+ * Only a snapshot's envelope — an own `capturedAt` and an array `roots` — and
+ * none of `origin`, `degraded` and `nodeCount`. The host's check requires each
+ * of them, so it refuses this answer before the view sees it, and the refusal
+ * reaches the view as an ordinary failed query.
+ */
+const INCOMPLETE_PAYLOAD = {
   capturedAt: CAPTURED_AT,
   roots: [],
 } as unknown as ComponentTreeSnapshot;
@@ -1097,6 +1231,48 @@ function describedBy(widget: HTMLElement): HTMLElement {
 }
 
 /**
+ * The text a row's `aria-describedby` resolves to: one entry per element the
+ * row names, in the order it names them — which is the order a screen reader
+ * announces them after the row's name.
+ *
+ * Throws on a token that names no element, because a dangling description
+ * reference is a defect this helper must not paper over.
+ *
+ * @param row The row.
+ * @returns The text of each describing element.
+ */
+function rowDescription(row: HTMLElement): string[] {
+  const ids = (row.getAttribute('aria-describedby') ?? '').split(/\s+/).filter((id) => id !== '');
+
+  return ids.map((id) => {
+    const element = document.getElementById(id);
+
+    if (element === null) {
+      throw new Error(`the row names a description element that does not exist: ${id}`);
+    }
+
+    return element.textContent ?? '';
+  });
+}
+
+/**
+ * A row's label element: the part of the row a pointer clicks to select it,
+ * away from its toggle and its source chip.
+ *
+ * @param row The row.
+ * @returns Its label.
+ */
+function labelOf(row: HTMLElement): HTMLElement {
+  const label = row.querySelector<HTMLElement>(`.${LABEL_CLASS}`);
+
+  if (label === null) {
+    throw new Error('the row has no label element');
+  }
+
+  return label;
+}
+
+/**
  * Asserts that a sentence is on screen as ordinary visible text inside a
  * widget's description.
  *
@@ -1195,10 +1371,17 @@ describe('ComponentTree states', () => {
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
     expect(message.closest(`.${EMPTY_CLASS}`)).not.toBeNull();
 
+    // Announced as the settled status, with its short title and a decorative
+    // glyph above the sentence, like every other view's empty capture.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('Nothing to show');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty snapshot is a success, so it is drawn as an absence and not as a
     // failure — and there is no tree, no toolbar and no threshold to operate.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
     expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
@@ -1221,7 +1404,7 @@ describe('ComponentTree states', () => {
     // no tree, rows, list or toolbar drawn as if a structure had arrived.
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('list')).toBeNull();
     expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
@@ -1240,12 +1423,13 @@ describe('ComponentTree states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.closest(`.${ERROR_CLASS}`)).not.toBeNull();
     expect(within(alert).getByText(ERROR_TITLE)).toBeDefined();
-    expect(within(alert).getByText(ERROR_MESSAGE_PATTERN)).toBeDefined();
 
-    // The failure's code reaches the reader, because it is actionable; the
-    // provider's own sentence does not take the place of the product's copy.
+    // The failure's code reaches the reader, because it is actionable, and so
+    // does the provider's own sentence — after the generic lead, never instead
+    // of it.
     expect(alert.textContent).toContain(PROVIDER_FAILURE_CODE);
-    expect(alert.textContent).not.toContain(PROVIDER_FAILURE_MESSAGE);
+    expect(alert.textContent).toContain(ERROR_LEAD);
+    expect(alert.textContent).toContain(PROVIDER_FAILURE_MESSAGE);
 
     // The query that failed is shown in full. It serialises as JSON, so it is
     // compared as a value rather than as a spelling.
@@ -1264,6 +1448,50 @@ describe('ComponentTree states', () => {
     expect(screen.queryAllByRole('treeitem')).toHaveLength(0);
   });
 
+  it('renders a provider rejection through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError(PROVIDER_FAILURE_CODE, PROVIDER_FAILURE_MESSAGE, {
+        hint: PROVIDER_FAILURE_HINT,
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // One failure on its own is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest(`.${ERROR_CLASS}`)).not.toBeNull();
+
+    // The glyph every error state draws, decorative and hidden from the name.
+    const glyph = alert.querySelector('.dg-error-state__icon');
+    expect(glyph?.getAttribute('aria-hidden')).toBe('true');
+    expect(glyph?.querySelector('svg.dg-icon')).not.toBeNull();
+
+    // The shared title, then the generic lead followed by the provider's own
+    // cause, then the provider's hint on a line of its own.
+    const title = within(alert).getByText(ERROR_TITLE);
+    expect(title.classList.contains('dg-error-state__title')).toBe(true);
+    const lines = Array.from(alert.querySelectorAll('.dg-error-state__message')).map(
+      (line) => line.textContent ?? '',
+    );
+    expect(lines).toHaveLength(2);
+    expect(lines[0]?.startsWith(ERROR_LEAD)).toBe(true);
+    expect(lines[0]).toContain(PROVIDER_FAILURE_MESSAGE);
+    expect(lines[1]).toBe(PROVIDER_FAILURE_HINT);
+
+    // The code as a chip, not as prose.
+    expect(within(alert).getByText(PROVIDER_FAILURE_CODE).closest('.dg-badge')).not.toBeNull();
+
+    // The query block holds exactly the query that was asked.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(stub.queries).toHaveLength(1);
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(stub.queries[0]);
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(TREE_QUERY);
+
+    // The retry carries the key the host frame restores focus by.
+    const retry = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retry.getAttribute('data-dg-focus-key')).toBe(RETRY_FOCUS_KEY);
+  });
+
   it('reports a node whose query names a source it cannot draw, and asks for nothing', async () => {
     const stub = resolvingProvider(makeSnapshot({ roots: UNIFORM_STRUCTURE }));
 
@@ -1273,6 +1501,10 @@ describe('ComponentTree states', () => {
     });
 
     const alert = await screen.findByRole('alert');
+
+    // The shared wording of a panel defect, stated from the node catalog.
+    expect(within(alert).getByText(UNSUPPORTED_TITLE)).toBeDefined();
+    expect(alert.textContent).toContain('PANEL_INVALID');
 
     // The node's own query is what the reader is shown, and no retry is offered:
     // re-issuing it cannot change the answer.
@@ -1285,7 +1517,33 @@ describe('ComponentTree states', () => {
     expect(screen.queryByRole('tree')).toBeNull();
   });
 
-  it('refuses to draw a payload that is not a snapshot, and names the provider', async () => {
+  it('refuses a snapshot missing a member it reads at the host check, through the same contract', async () => {
+    const stub = recordingProvider(() =>
+      Promise.resolve<DataQueryResponse>({ source: 'componentTree', data: INCOMPLETE_PAYLOAD }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const alert = await screen.findByRole('alert');
+    expect(within(alert).getByText(ERROR_TITLE)).toBeDefined();
+    expect(alert.textContent).toContain(ERROR_LEAD);
+    expect(alert.textContent).toContain(
+      '"componentTree" data for this view arrived in a form it cannot read',
+    );
+    expect(alert.textContent).toContain(SHAPE_FAILURE_CODE);
+    expect(within(alert).getByRole('button', { name: RETRY_NAME })).toBeDefined();
+
+    // Which member was missing is developer detail: it sits in the closed
+    // disclosure, never on the lines a reader meets first.
+    const disclosure = alert.querySelector('details');
+    expect(disclosure?.open).toBe(false);
+    expect(disclosure?.textContent).toContain('data.origin');
+    const shownQuery = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shownQuery.textContent ?? '')).toEqual(TREE_QUERY);
+    expect(screen.queryByRole('tree')).toBeNull();
+  });
+
+  it('refuses to draw a payload of the wrong shape, worded as the host words a refusal', async () => {
     const stub = recordingProvider(() =>
       Promise.resolve<DataQueryResponse>({ source: 'componentTree', data: MALFORMED_PAYLOAD }),
     );
@@ -1293,8 +1551,21 @@ describe('ComponentTree states', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('provider');
+    expect(alert.textContent).toContain(
+      '"componentTree" data for this view arrived in a form it cannot read',
+    );
+    expect(alert.textContent).not.toContain('provider');
+    expect(alert.textContent).toContain('Retry to request the data again.');
+    expect(alert.querySelector('details')?.textContent).toContain('boolean degraded');
     expect(within(alert).getByRole('button', { name: RETRY_NAME })).toBeDefined();
+
+    // An unreadable answer reads like any other failed view: the shared title
+    // and lead, the protocol code and the query that was asked.
+    expect(within(alert).getByText(ERROR_TITLE)).toBeDefined();
+    expect(alert.textContent).toContain(ERROR_LEAD);
+    expect(alert.textContent).toContain(SHAPE_FAILURE_CODE);
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(TREE_QUERY);
 
     // A payload it cannot read is not an empty capture: no tree, and no empty
     // state either, since nothing established that the capture holds nothing.
@@ -1662,30 +1933,39 @@ describe('ComponentTree keyboard navigation', () => {
     expect(document.activeElement).toBe(rowNamed('ExampleRoot'));
   });
 
-  it('activates the focused row with Enter and with Space', async () => {
+  it('selects the focused row with Enter and with Space, and toggles nothing', async () => {
     const { spies, user } = await renderUniformTree();
 
-    // Enter on a row that owns children toggles it, exactly as its toggle does.
+    // Enter on a closed branch selects it and reports its render — and leaves
+    // it closed: selection is not disclosure.
     focusRow(rowNamed('ExampleBranch'));
     await user.keyboard('{Enter}');
 
     await waitFor(() => {
-      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('true');
+      expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
     });
-    expect(spies.onExpand.mock.calls).toEqual([[NODE_ID, BRANCH_NODE.id, true]]);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
 
     // Space does the same thing, which is what a composite widget owes both keys.
     await user.keyboard(' ');
 
-    await waitFor(() => {
-      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
-    });
-    expect(spies.onExpand.mock.calls).toEqual([
-      [NODE_ID, BRANCH_NODE.id, true],
-      [NODE_ID, BRANCH_NODE.id, false],
-    ]);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF], [BRANCH_RENDER_REF]]);
 
-    // Enter on a row that resolved to source opens it, and reports nothing else.
+    // Enter on an open root leaves it open too.
+    focusRow(rowNamed('ExampleRoot'));
+    await user.keyboard('{Enter}');
+
+    expect(rowNamed('ExampleRoot').getAttribute('aria-expanded')).toBe('true');
+    expect(rowNamed('ExampleRoot').getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+
+    // Enter on a row that resolved to source selects it and opens nothing: the
+    // chip and Shift+Enter are the routes to a file.
     await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
     await waitFor(() => {
       expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
@@ -1694,8 +1974,13 @@ describe('ComponentTree keyboard navigation', () => {
     focusRow(rowNamed('ExampleLeaf'));
     await user.keyboard('{Enter}');
 
-    expect(spies.onOpenSource.mock.calls).toEqual([[LEAF_SOURCE]]);
-    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowNamed('ExampleLeaf').getAttribute('aria-selected')).toBe('true');
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({ eventId: LEAF_RENDER_EVENT_ID });
+
+    // The only disclosure reported is the one the toolbar made.
+    expect(spies.onExpand.mock.calls).toEqual([[NODE_ID, BRANCH_NODE.id, true]]);
+    expect(spies.onFilterChange).not.toHaveBeenCalled();
   });
 
   it('leaves a key it does not own to the page', async () => {
@@ -1730,8 +2015,7 @@ describe('ComponentTree open-source command', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
     await screen.findByRole('tree');
 
-    // Closed on first paint: Enter would toggle it, so this is the row whose
-    // source only the command can reach from the keyboard.
+    // Closed on first paint, and the command must leave it closed.
     expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
 
     focusRow(rowNamed('ExampleBranch'));
@@ -1755,8 +2039,20 @@ describe('ComponentTree open-source command', () => {
     expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
     expect(spies.onOpenSource.mock.calls[1]?.[0]).toBe(BRANCH_SOURCE);
 
-    // Plain Enter keeps its meaning on the same row: it toggles, and opens nothing.
+    // Plain Enter keeps its own meaning on the same row: it selects, and
+    // neither toggles nor opens anything. This branch names no representative
+    // render, so the selection stays inside the view.
     await user.keyboard('{Enter}');
+    await waitFor(() => {
+      expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
+    });
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Disclosure is still one arrow away, and is reported as such.
+    await user.keyboard('{ArrowRight}');
     await waitFor(() => {
       expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('true');
     });
@@ -1764,7 +2060,7 @@ describe('ComponentTree open-source command', () => {
     expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
   });
 
-  it('opens a leaf’s source with Shift+Enter, exactly as its Enter does', async () => {
+  it('opens a leaf’s source with Shift+Enter, which its plain Enter does not', async () => {
     const { spies, user } = await renderUniformTree();
 
     await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
@@ -1777,9 +2073,16 @@ describe('ComponentTree open-source command', () => {
 
     expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
     expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(LEAF_SOURCE);
-    // A command, not an activation: the row is not selected by it.
+    // A command, not a selection: the row is not selected by it.
     expect(rowNamed('ExampleLeaf').getAttribute('aria-selected')).toBe('false');
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Plain Enter on the same row selects it and opens nothing further.
+    await user.keyboard('{Enter}');
+
+    expect(rowNamed('ExampleLeaf').getAttribute('aria-selected')).toBe('true');
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls).toEqual([[{ eventId: LEAF_RENDER_EVENT_ID }]]);
   });
 
   it('leaves Shift+Enter to the page on a row that has no source to open', async () => {
@@ -1970,10 +2273,77 @@ describe('ComponentTree counts', () => {
     expect(within(row).getAllByText('n/a')).toHaveLength(2);
     expect(row.textContent).not.toContain('undefined');
   });
+
+  it('says one render and one node in the singular, and every other count in the plural', async () => {
+    const snapshot = makeSnapshot({
+      roots: [
+        makeTreeNode({
+          id: `${COMPONENT_TREE_NODE_ID_PREFIX}0`,
+          component: 'ExampleRoot',
+          renderCount: 1,
+          totalDurationMs: 2,
+        }),
+      ],
+    });
+    const stub = resolvingProvider(snapshot);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    // The row's description is its count with an agreeing unit: "1 render".
+    const row = rowNamed('ExampleRoot');
+    expect(rowDescription(row)).toEqual([`${formatCount(1)} ${RENDER_UNIT}`]);
+    expect(row.textContent).not.toContain(RENDERS_UNIT);
+
+    // And the statistics line agrees with each of its counts.
+    expect(snapshot.nodeCount).toBe(1);
+    expect(snapshot.maxDepth).toBe(0);
+    expect(screen.getByText('1 node · 1 level · 1 shown')).toBeDefined();
+    expect(screen.getByText(statisticsLine(snapshot, 1))).toBeDefined();
+
+    cleanup();
+
+    // The plural for everything else, zero included. Per-component counts of
+    // 2, 0 and 2 derive a threshold of four, so no mark joins the description.
+    const plural = makeSnapshot({
+      roots: [
+        makeTreeNode({
+          id: `${COMPONENT_TREE_NODE_ID_PREFIX}0`,
+          component: 'ExampleRoot',
+          renderCount: 2,
+          children: [
+            makeTreeNode({
+              id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/0`,
+              component: 'ExampleLeaf',
+              depth: 1,
+              renderCount: 0,
+            }),
+            makeTreeNode({
+              id: `${COMPONENT_TREE_NODE_ID_PREFIX}0/1`,
+              component: 'ExampleAside',
+              depth: 1,
+              renderCount: 2,
+            }),
+          ],
+        }),
+      ],
+    });
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(plural).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+
+    expect(rowDescription(rowNamed('ExampleRoot'))).toEqual([`${formatCount(2)} ${RENDERS_UNIT}`]);
+    expect(rowDescription(rowNamed('ExampleLeaf'))).toEqual([`${formatCount(0)} ${RENDERS_UNIT}`]);
+    expect(screen.getByText('3 nodes · 2 levels · 3 shown')).toBeDefined();
+    expect(screen.getByText(statisticsLine(plural, 3))).toBeDefined();
+  });
 });
 
 describe('ComponentTree threshold', () => {
-  it('marks a node above the derived threshold with a word as well as a state', async () => {
+  it('marks a node at or above the derived threshold with words as well as a state', async () => {
     const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1988,20 +2358,29 @@ describe('ComponentTree threshold', () => {
     // a gesture.
     expect(rowNames()).toEqual(['ExampleRoot', 'ExampleBranch', 'ExampleLeaf', 'ExampleSibling']);
 
-    // The mark is a word beside an icon and a state class — never colour alone.
+    // The mark is words beside an icon and a state class — never colour alone —
+    // and the row names it in its description, so it is announced with the row.
     const marked = rowNamed('ExampleLeaf');
-    expect(within(marked).getByText(ABOVE_THRESHOLD_TEXT)).toBeDefined();
+    expect(within(marked).getByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toBeDefined();
     expect(marked.classList.contains(HIGHLIGHTED_CLASS)).toBe(true);
+    expect(rowDescription(marked)).toEqual([
+      `${formatCount(40)} ${RENDERS_UNIT}`,
+      AT_OR_ABOVE_THRESHOLD_TEXT,
+    ]);
 
     // A node below the threshold carries neither.
     const unmarked = rowNamed('ExampleSibling');
-    expect(within(unmarked).queryByText(ABOVE_THRESHOLD_TEXT)).toBeNull();
+    expect(within(unmarked).queryByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toBeNull();
     expect(unmarked.classList.contains(HIGHLIGHTED_CLASS)).toBe(false);
+    expect(rowDescription(unmarked)).toEqual([`${formatCount(1)} ${RENDER_UNIT}`]);
     expect(rowNamed('ExampleRoot').classList.contains(HIGHLIGHTED_CLASS)).toBe(false);
+
+    // Every ancestor of the mark is open, so no row hides one.
+    expect(screen.queryByText(/hidden at or above threshold/)).toBeNull();
 
     // And the reader is told how many rows carry the mark.
     expect(screen.getByText(markedStatus(1))).toBeDefined();
-    expect(screen.getAllByText(ABOVE_THRESHOLD_TEXT)).toHaveLength(1);
+    expect(screen.getAllByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toHaveLength(1);
   });
 
   it('follows a threshold the developer types, and reports it to the host', async () => {
@@ -2025,9 +2404,9 @@ describe('ComponentTree threshold', () => {
     expect(rowNamed('ExampleBranch').classList.contains(HIGHLIGHTED_CLASS)).toBe(true);
     expect(rowNamed('ExampleLeaf').classList.contains(HIGHLIGHTED_CLASS)).toBe(true);
     expect(rowNamed('ExampleSibling').classList.contains(HIGHLIGHTED_CLASS)).toBe(false);
-    expect(screen.getAllByText(ABOVE_THRESHOLD_TEXT)).toHaveLength(3);
+    expect(screen.getAllByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toHaveLength(3);
 
-    // Reported as the reader typed it, against this node's id: a host may
+    // Reported as the threshold in force, against this node's id: a host may
     // remember a filter, and nothing in the renderer depends on it doing so.
     expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '2' });
 
@@ -2042,6 +2421,199 @@ describe('ComponentTree threshold', () => {
       expect(screen.getByText(markedStatus(1))).toBeDefined();
     });
     expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
+  });
+
+  it('bounds the field to whole renders, from one up to the highest count captured', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    // The highest count in the capture is forty: past it nothing more can be
+    // marked, so that is where the spin buttons stop.
+    const field = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
+    expect(field.getAttribute('min')).toBe('1');
+    expect(field.getAttribute('step')).toBe('1');
+    expect(field.getAttribute('max')).toBe('40');
+
+    cleanup();
+
+    // Where the derived default is higher than every count, the bound includes
+    // it, so the value the field starts at is inside its own range.
+    await renderUniformTree();
+
+    const uniform = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
+    expect(uniform.getAttribute('max')).toBe('6');
+    expect(screen.getByDisplayValue('6')).toBe(uniform);
+  });
+
+  it('reads an entered threshold by one rule, and reports the threshold in force', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    const field = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
+
+    // Leading zeros are spelling: "03" is three, and three is what is reported.
+    await user.clear(field);
+    await user.type(field, '03');
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(2))).toBeDefined();
+    });
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '3' });
+    expect(field.getAttribute('aria-invalid')).toBeNull();
+
+    // Zero is below the bound, so it names no threshold: the derived default
+    // is in force — one mark — and the host hears "", its spelling of that.
+    // The text stays so it can be corrected, but the field is marked invalid,
+    // the toolbar shows which default applies — a short pill beside the
+    // controls, not an error line that would widen the field's column — and
+    // the full reason describes the field and is announced by a live region.
+    const toolbar = screen.getByRole('group', { name: TOOLBAR_NAME });
+    const liveRegion = toolbar.querySelector<HTMLElement>('[aria-live="polite"]');
+
+    if (liveRegion === null) {
+      throw new Error('The threshold field has no live region for its rejection.');
+    }
+
+    // A live region, but not a `status`: that role marks a view still loading.
+    expect(liveRegion.getAttribute('role')).toBeNull();
+    expect(liveRegion.getAttribute('aria-atomic')).toBe('true');
+    expect(within(toolbar).queryByRole('status')).toBeNull();
+    expect(liveRegion.textContent).toBe('');
+    expect(field.getAttribute('aria-describedby') ?? '').not.toContain(liveRegion.id);
+
+    await user.clear(field);
+    await user.type(field, '0');
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(1))).toBeDefined();
+    });
+    expect(screen.getByDisplayValue('0')).toBe(field);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
+    expect(field.getAttribute('aria-invalid')).toBe('true');
+    const pill = within(screen.getByRole('group', { name: TOOLBAR_NAME })).getByText(
+      defaultInForceText(6),
+    );
+    expect(pill.closest('.dg-badge--danger')).not.toBeNull();
+    expect(field.closest('.dg-field')?.querySelector('.dg-field__error')).toBeNull();
+    expect(liveRegion.textContent).toBe(thresholdRejectedText(6));
+    expect(liveRegion.classList.contains('dg-visually-hidden')).toBe(true);
+    expect((field.getAttribute('aria-describedby') ?? '').split(' ')).toContain(liveRegion.id);
+
+    // A fraction is not a whole number of renders, and falls back the same way.
+    await user.clear(field);
+    await user.type(field, '2.5');
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(1))).toBeDefined();
+    });
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '' });
+    expect(field.getAttribute('aria-invalid')).toBe('true');
+
+    // Above the field's max is honoured, not clamped: no component reached
+    // fifty renders, so nothing is marked, and fifty is what is in force.
+    await user.clear(field);
+    await user.type(field, '50');
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(0))).toBeDefined();
+    });
+    expect(screen.queryAllByText(AT_OR_ABOVE_THRESHOLD_TEXT)).toHaveLength(0);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { renderThreshold: '50' });
+    expect(field.getAttribute('aria-invalid')).toBeNull();
+    expect(screen.queryByText(defaultInForceText(6))).toBeNull();
+    expect(liveRegion.textContent).toBe('');
+    expect(field.getAttribute('aria-describedby') ?? '').not.toContain(liveRegion.id);
+
+    // An empty field is the documented way back to the default, not an error.
+    await user.clear(field);
+
+    await waitFor(() => {
+      expect(screen.getByText(markedStatus(1))).toBeDefined();
+    });
+    expect(field.getAttribute('aria-invalid')).toBeNull();
+
+    // Every report was a canonical decimal integer or "", never raw text.
+    for (const [nodeId, filter] of spies.onFilterChange.mock.calls) {
+      expect(nodeId).toBe(NODE_ID);
+      expect(filter.renderThreshold).toMatch(/^(?:[1-9]\d*)?$/);
+    }
+  });
+
+  it('states on a collapsed branch how many marks it hides, and announces the count', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNEVEN_STRUCTURE }));
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    // The derived threshold of six marks the leaf alone. Closing everything
+    // leaves only the root on screen, and the root says what it hides.
+    await user.click(screen.getByRole('button', { name: COLLAPSE_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual(['ExampleRoot']);
+    });
+
+    const root = rowNamed('ExampleRoot');
+    const hiddenBadge = within(root).getByText(hiddenMarkedText(1));
+
+    // An icon and words, never colour alone, drawn by the badge primitive —
+    // and the icon is decoration, out of the accessibility tree.
+    expect(hiddenBadge.classList.contains('dg-badge')).toBe(true);
+    expect(hiddenBadge.classList.contains('dg-badge--warning')).toBe(true);
+    expect(hiddenBadge.classList.contains('dg-badge--outline')).toBe(true);
+    expect(hiddenBadge.querySelector('svg')?.getAttribute('aria-hidden')).toBe('true');
+
+    // Announced with the row, after its count.
+    expect(rowDescription(root)).toEqual([
+      `${formatCount(2)} ${RENDERS_UNIT}`,
+      hiddenMarkedText(1),
+    ]);
+
+    // At a threshold of two the root is marked itself and hides two more marks,
+    // one level down and two levels down: the count covers every depth.
+    const field = screen.getByRole('spinbutton', { name: THRESHOLD_FIELD_NAME });
+    await user.clear(field);
+    await user.type(field, '2');
+
+    await waitFor(() => {
+      expect(within(rowNamed('ExampleRoot')).getByText(hiddenMarkedText(2))).toBeDefined();
+    });
+    expect(rowNames()).toEqual(['ExampleRoot']);
+    expect(rowDescription(rowNamed('ExampleRoot'))).toEqual([
+      `${formatCount(2)} ${RENDERS_UNIT}`,
+      AT_OR_ABOVE_THRESHOLD_TEXT,
+      hiddenMarkedText(2),
+    ]);
+
+    // Opening the root puts its children on screen, so it hides nothing any
+    // more — and the branch, still closed, states the one mark it hides.
+    await user.click(within(rowNamed('ExampleRoot')).getByRole('button', { name: /^Expand / }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual(['ExampleRoot', 'ExampleBranch']);
+    });
+    expect(rowDescription(rowNamed('ExampleRoot'))).toEqual([
+      `${formatCount(2)} ${RENDERS_UNIT}`,
+      AT_OR_ABOVE_THRESHOLD_TEXT,
+    ]);
+    expect(rowDescription(rowNamed('ExampleBranch'))).toEqual([
+      `${formatCount(4)} ${RENDERS_UNIT}`,
+      AT_OR_ABOVE_THRESHOLD_TEXT,
+      hiddenMarkedText(1),
+    ]);
+
+    // With every branch open, no badge of the kind remains anywhere.
+    focusRow(rowNamed('ExampleBranch'));
+    await user.keyboard('{ArrowRight}');
+    await waitFor(() => {
+      expect(rowNames()).toEqual(['ExampleRoot', 'ExampleBranch', 'ExampleLeaf', 'ExampleSibling']);
+    });
+    expect(screen.queryByText(/hidden at or above threshold/)).toBeNull();
   });
 });
 
@@ -2071,9 +2643,11 @@ describe('ComponentTree host reporting', () => {
     expect(Object.keys(forwarded ?? {}).sort()).toEqual(Object.keys(LEAF_SOURCE).sort());
     expect(forwarded).toBe(LEAF_SOURCE);
 
-    // A chip click is not also a row activation, so it neither expands nor
-    // selects anything behind the navigation.
+    // A chip click is not also a row selection — the leaf names a render it
+    // could have reported — so it neither selects nor expands anything behind
+    // the navigation.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(leaf.getAttribute('aria-selected')).toBe('false');
     expect(spies.onExpand).toHaveBeenCalledTimes(1);
   });
 
@@ -2098,11 +2672,13 @@ describe('ComponentTree host reporting', () => {
     expect(tabStops()).toEqual([rowNamed('ExampleBranch')]);
 
     // Enter on the focused chip is the chip's: one more open, and the branch it
-    // sits on is not toggled — which a row activation would have done.
+    // sits on is neither selected — which a row selection would have done —
+    // nor toggled.
     await user.keyboard('{Enter}');
 
     expect(spies.onOpenSource).toHaveBeenCalledTimes(2);
     expect(spies.onOpenSource.mock.calls[1]?.[0]).toBe(BRANCH_SOURCE);
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
     expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
     expect(spies.onExpand).not.toHaveBeenCalled();
 
@@ -2122,14 +2698,15 @@ describe('ComponentTree host reporting', () => {
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
   });
 
-  it('never reports a selected event for a node, which stands for none', async () => {
+  it('keeps a selection local for a node that names no render, and invents none', async () => {
     const { spies, user } = await renderUniformTree();
 
     // No commit was captured with this snapshot, so nothing offers one.
     expect(screen.queryByRole('button', { name: SHOW_COMMIT_NAME })).toBeNull();
 
-    // A leaf with no location: activating it by pointer and by both activation
-    // keys must invent neither an event reference nor a location.
+    // A leaf with no location and no representative render: selecting it by
+    // pointer and by both keys must invent neither an event reference — nor
+    // borrow the branch beside it, which has one — nor a location.
     await user.click(rowNamed('ExampleAside'));
     focusRow(rowNamed('ExampleAside'));
     await user.keyboard('{Enter}');
@@ -2162,12 +2739,152 @@ describe('ComponentTree host reporting', () => {
 
     await user.click(screen.getByRole('button', { name: SHOW_COMMIT_NAME }));
 
-    // The one legitimate reference in the snapshot, offered once for the whole
-    // view and passed on with the hints it carried.
+    // The snapshot's own reference — a property of the whole view, not of a
+    // node — offered once and passed on with the hints it carried.
     expect(spies.onSelectEvent.mock.calls).toEqual([
       [{ eventId: COMMIT_EVENT_ID, spanId: COMMIT_SPAN_ID, traceId: TRACE_ID }],
     ]);
     expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
+describe('ComponentTree selection', () => {
+  it('selects a closed branch on a click on its label, keeps it closed, and reports its render', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    const branch = rowNamed('ExampleBranch');
+    expect(branch.getAttribute('aria-expanded')).toBe('false');
+
+    await user.click(labelOf(branch));
+
+    // Selected, and still closed: a click on a row is not a disclosure.
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+
+    // The node's representative render, exactly as the datum names it, with
+    // every coordinate it carries and no other key.
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    expect(Object.keys(spies.onSelectEvent.mock.calls[0]?.[0] ?? {}).sort()).toEqual([
+      'eventId',
+      'spanId',
+      'traceId',
+    ]);
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+
+    // The ids are coordinates for the host, never text on screen.
+    expect(document.body.textContent).not.toContain(BRANCH_RENDER_EVENT_ID);
+  });
+
+  it('selects an open branch on a click without collapsing it', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    await user.click(labelOf(rowNamed('ExampleRoot')));
+
+    expect(rowNamed('ExampleRoot').getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed('ExampleRoot').getAttribute('aria-expanded')).toBe('true');
+    expect(rowNames()).toEqual([...INITIAL_ROW_NAMES]);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    // The root names no representative render, so the selection stays local.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('forwards only the coordinates a node carries, never an undefined one', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    await user.click(screen.getByRole('button', { name: EXPAND_ALL_NAME }));
+    await waitFor(() => {
+      expect(rowNames()).toEqual([...EXPANDED_ROW_NAMES]);
+    });
+
+    await user.click(labelOf(rowNamed('ExampleLeaf')));
+
+    // The leaf's render carries an event id alone, so that is the whole
+    // reference: no span or trace key, not even one set to `undefined`.
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    const reference = spies.onSelectEvent.mock.calls[0]?.[0];
+    expect(reference).toStrictEqual({ eventId: LEAF_RENDER_EVENT_ID });
+    expect(Object.keys(reference ?? {})).toEqual(['eventId']);
+
+    // A click on the row is not a click on its chip: no file opens.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+
+  it('still discloses with the toggle and the arrow keys, reporting each change', async () => {
+    const { spies, user } = await renderUniformTree();
+
+    // The toggle opens the branch and reports it — and selects nothing.
+    await user.click(
+      within(rowNamed('ExampleBranch')).getByRole('button', { name: 'Expand ExampleBranch' }),
+    );
+    await waitFor(() => {
+      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('true');
+    });
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
+    expect(spies.onExpand.mock.calls).toEqual([[NODE_ID, BRANCH_NODE.id, true]]);
+
+    // ArrowLeft closes it, ArrowRight opens it again, each reported once.
+    focusRow(rowNamed('ExampleBranch'));
+    await user.keyboard('{ArrowLeft}');
+    await waitFor(() => {
+      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
+    });
+
+    await user.keyboard('{ArrowRight}');
+    await waitFor(() => {
+      expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('true');
+    });
+
+    expect(spies.onExpand.mock.calls).toEqual([
+      [NODE_ID, BRANCH_NODE.id, true],
+      [NODE_ID, BRANCH_NODE.id, false],
+      [NODE_ID, BRANCH_NODE.id, true],
+    ]);
+    // Disclosure is disclosure: nothing was selected along the way.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowNamed('ExampleBranch').getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('marks a selected row of a flat listing as current, and reports its render', async () => {
+    const stub = resolvingProvider(
+      snapshotWithOrigin('flat', { roots: UNIFORM_STRUCTURE, maxDepth: 0 }),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('list', { name: LIST_NAME });
+
+    await user.click(labelOf(rowNamed('ExampleBranch', 'listitem')));
+
+    // A list has no selection state of its own, so the row is the current one.
+    const selected = rowNamed('ExampleBranch', 'listitem');
+    expect(selected.getAttribute('aria-current')).toBe('true');
+    expect(selected.hasAttribute('aria-selected')).toBe(false);
+    expect(rowNamed('ExampleRoot', 'listitem').hasAttribute('aria-current')).toBe(false);
+    expect(spies.onSelectEvent.mock.calls).toEqual([[BRANCH_RENDER_REF]]);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('reaches a host that implements the host form, with the coordinates beside the id', async () => {
+    const stub = resolvingProvider(makeSnapshot({ roots: UNIFORM_STRUCTURE }));
+    const selectEvent = vi.fn<(eventId: string, coordinates?: PanelEventCoordinates) => void>();
+    const openSource = vi.fn<(location: SourceLocation) => void>();
+    const user = userEvent.setup();
+
+    // The form a DevTools panel or an editor webview implements, adapted by
+    // the library rather than by this view.
+    renderComponent(makeNode(), { provider: stub.provider, actions: { selectEvent, openSource } });
+    await screen.findByRole('tree');
+
+    await user.click(labelOf(rowNamed('ExampleBranch')));
+
+    expect(selectEvent.mock.calls).toEqual([
+      [BRANCH_RENDER_EVENT_ID, { spanId: BRANCH_RENDER_SPAN_ID, traceId: TRACE_ID }],
+    ]);
+    expect(openSource).not.toHaveBeenCalled();
+    expect(rowNamed('ExampleBranch').getAttribute('aria-expanded')).toBe('false');
   });
 });
 
@@ -2214,5 +2931,148 @@ describe('ComponentTree bounds and privacy', () => {
 
     // What it does draw is the node it was given.
     expect(rowNames()).toEqual(['ExampleRoot']);
+  });
+});
+
+describe('ComponentTree shared selection', () => {
+  /** The snapshot these cases draw: the uniform structure, with its commit recorded. */
+  const COMMITTED_SNAPSHOT = makeSnapshot({
+    roots: UNIFORM_STRUCTURE,
+    commitEventId: COMMIT_EVENT_ID,
+    commitSpanId: COMMIT_SPAN_ID,
+    traceId: TRACE_ID,
+  });
+
+  /**
+   * The tree, under a host whose shared selection is `selection`.
+   *
+   * @param provider The provider to resolve its query.
+   * @param actions The actions to report to.
+   * @param selection The panel's current selection.
+   * @returns The element tree.
+   */
+  function hostedTree(
+    provider: DataProvider,
+    actions: PanelActions,
+    selection: PanelSelection | undefined,
+  ) {
+    return (
+      <DataProviderContext.Provider value={provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={actions}>
+            <PanelSelectionContext.Provider value={{ selection }}>
+              <ComponentTree node={makeNode()} />
+            </PanelSelectionContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+  }
+
+  /**
+   * The names of the rows drawn as selected, each asserted to carry the state
+   * class and `aria-selected` together.
+   *
+   * @returns The selected rows' names, in document order.
+   */
+  function selectedRowNames(): string[] {
+    return rows()
+      .filter((row) => {
+        const selected = row.getAttribute('aria-selected') === 'true';
+
+        expect(row.classList.contains('dg-is-selected')).toBe(selected);
+
+        return selected;
+      })
+      .map((row) => row.querySelector(`.${LABEL_CLASS}`)?.textContent ?? '');
+  }
+
+  it('lets a node it marked give way the moment the panel selects an event', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    const { rerender } = render(hostedTree(stub.provider, spies.actions, undefined));
+    await screen.findByRole('tree');
+
+    // A node activated while nothing is selected is marked as the tree's row.
+    await user.click(rowNamed('ExampleAside'));
+
+    expect(selectedRowNames()).toEqual(['ExampleAside']);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // Re-delivering the same (absent) selection changes nothing.
+    rerender(hostedTree(stub.provider, spies.actions, undefined));
+    expect(selectedRowNames()).toEqual(['ExampleAside']);
+
+    // Another view selects an event: the node stands for none, so the tree
+    // stops claiming a selection that would contradict the panel's.
+    rerender(hostedTree(stub.provider, spies.actions, { eventId: 'event-example-elsewhere' }));
+    expect(selectedRowNames()).toEqual([]);
+
+    // A node activated under that selection is marked again, until it moves.
+    await user.click(rowNamed('ExampleRoot'));
+    expect(selectedRowNames()).toEqual(['ExampleRoot']);
+
+    rerender(hostedTree(stub.provider, spies.actions, { eventId: 'event-example-later' }));
+    expect(selectedRowNames()).toEqual([]);
+  });
+
+  it('draws the commit control pressed exactly while the commit is the selected event', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    const { rerender } = render(hostedTree(stub.provider, spies.actions, undefined));
+    await screen.findByRole('tree');
+
+    const commit = (): HTMLElement => screen.getByRole('button', { name: SHOW_COMMIT_NAME });
+
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+
+    // Under a host the control reports and the host records; its pressed state
+    // follows the host's selection, not a copy kept here.
+    await user.click(commit());
+
+    expect(spies.onSelectEvent.mock.calls).toEqual([
+      [{ eventId: COMMIT_EVENT_ID, spanId: COMMIT_SPAN_ID, traceId: TRACE_ID }],
+    ]);
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+
+    rerender(hostedTree(stub.provider, spies.actions, { eventId: COMMIT_EVENT_ID }));
+    expect(commit().getAttribute('aria-pressed')).toBe('true');
+
+    // The same span named under another record's id is still the commit.
+    rerender(
+      hostedTree(stub.provider, spies.actions, {
+        eventId: 'event-example-other',
+        traceId: TRACE_ID,
+        spanId: COMMIT_SPAN_ID,
+      }),
+    );
+    expect(commit().getAttribute('aria-pressed')).toBe('true');
+
+    rerender(hostedTree(stub.provider, spies.actions, { eventId: 'event-example-elsewhere' }));
+    expect(commit().getAttribute('aria-pressed')).toBe('false');
+  });
+
+  it('keeps its own selection outside a host, where the commit supersedes a node', async () => {
+    const stub = resolvingProvider(COMMITTED_SNAPSHOT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('tree');
+
+    await user.click(rowNamed('ExampleBranch'));
+    expect(selectedRowNames()).toEqual(['ExampleBranch']);
+
+    const commit = screen.getByRole('button', { name: SHOW_COMMIT_NAME });
+    await user.click(commit);
+
+    // With no host to share with, the view records the commit itself: the
+    // control is pressed, and the node it had marked gives way to it.
+    expect(commit.getAttribute('aria-pressed')).toBe('true');
+    expect(selectedRowNames()).toEqual([]);
   });
 });

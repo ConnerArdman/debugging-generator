@@ -1480,6 +1480,12 @@ class SequencedPatcher implements Patcher {
         return await failed(parent.error);
       }
 
+      // The developer's own text, for a file this session already patched: the
+      // transform rewrites the layered bytes it was just handed, but records the
+      // target's position in these, so a span points at the line the developer
+      // has rather than one shifted by the wrappers above it.
+      let locationText: string | undefined;
+
       if (parent.value !== undefined) {
         previousRecordId = parent.value.id;
 
@@ -1500,6 +1506,17 @@ class SequencedPatcher implements Patcher {
 
           return await failed(baseline.error.error);
         }
+
+        // Only once the baseline is confirmed: the root's backup is the
+        // developer's text only while the chain above it is intact, and a
+        // conflict must be reported as a conflict, not as an unreadable root.
+        const developerText = await this.#chainRootText(parent.value);
+
+        if (isErr(developerText)) {
+          return await failed(developerText.error);
+        }
+
+        locationText = separateByteOrderMark(developerText.value).transformText;
       }
 
       const abortedBeforeTransform = this.#abortCheck(file, symbol, stage);
@@ -1526,6 +1543,7 @@ class SequencedPatcher implements Patcher {
         file,
         symbol,
         text: boundary.transformText,
+        ...(locationText !== undefined ? { locationText } : {}),
         ...(input.action !== undefined ? { action: input.action } : {}),
         ...(input.spanName !== undefined ? { spanName: input.spanName } : {}),
       };
@@ -1594,22 +1612,7 @@ class SequencedPatcher implements Patcher {
 
         backup = stored.value;
       } catch (cause) {
-        return await failed(
-          new DebuggenError(
-            'INSTRUMENTATION_INSTALL_FAILED',
-            'The original bytes could not be backed up, so nothing was patched.',
-            {
-              hint: 'Check that the Debug Generator state directory is writable; the project was not modified.',
-              details: {
-                reason: 'backup-write-failed',
-                file,
-                originalHash,
-                errno: errnoCodeOf(cause),
-              },
-              cause,
-            },
-          ),
-        );
+        return await failed(backupWriteFailure(cause, file, originalHash));
       }
 
       await completed(stage);
@@ -1940,6 +1943,118 @@ class SequencedPatcher implements Patcher {
   }
 
   /**
+   * The developer's own text of a file this session already patched: the
+   * backup at the **root** of the file's chain.
+   *
+   * A chained patch is computed against layered bytes — the helper alias and
+   * every earlier wrapper are already in them — so a position read from those
+   * bytes points below where the developer's function actually is, by as many
+   * lines as the layers above it added (AAP §0.4.2 gives the patch route its
+   * authority precisely from recording the developer's position). The chain's
+   * root record is the one patch whose `originalHash` describes bytes this
+   * session never touched, and its backup holds exactly those bytes, so that is
+   * the text the transform resolves the position in.
+   *
+   * The walk follows `previousRecordId` through this session's journal from the
+   * parent back to the record with none. Every link must be a record of the same
+   * file, and the walk refuses a missing link or a cycle rather than stopping
+   * short: a record reached that way would not be the root, and its backup
+   * would carry an earlier patch. The root's backup is then read from where the
+   * record says it is — the same read restoration performs — and its digest is
+   * checked against the root's `originalHash`, because the store does not
+   * re-check on read and the bytes are about to decide what the developer is
+   * sent to.
+   *
+   * Called only after the baseline is confirmed, and it reads nothing but the
+   * state directory: no project byte is involved.
+   *
+   * @param parent The applied record the new patch layers on.
+   * @returns The root backup's decoded text, or `INSTRUMENTATION_INSTALL_FAILED`
+   * with reason `chain-root-unreadable` naming why it could not be established.
+   */
+  async #chainRootText(parent: ModificationRecord): Promise<Result<string>> {
+    const unreadable = (cause: string, extra: Record<string, unknown> = {}): Result<never> =>
+      err(
+        new DebuggenError(
+          'INSTRUMENTATION_INSTALL_FAILED',
+          'The original of this already-instrumented file could not be read back, so the position of a further patch in it could not be recorded.',
+          {
+            hint: 'Nothing was written. End the session to restore the file, then plan the target again.',
+            details: {
+              reason: 'chain-root-unreadable',
+              cause,
+              file: parent.file,
+              recordId: parent.id,
+              ...extra,
+            },
+          },
+        ),
+      );
+
+    const listed = await this.#journal.listBySession(this.sessionId);
+
+    if (isErr(listed)) {
+      return listed;
+    }
+
+    const byId = new Map(listed.value.map((candidate) => [candidate.id, candidate] as const));
+    const visited = new Set<string>([parent.id]);
+    let root = parent;
+
+    while (root.previousRecordId !== undefined) {
+      const previous = byId.get(root.previousRecordId);
+
+      if (previous === undefined) {
+        return unreadable('chain-link-missing', { missingRecordId: root.previousRecordId });
+      }
+
+      if (previous.file !== parent.file) {
+        return unreadable('chain-link-other-file', { linkRecordId: previous.id });
+      }
+
+      if (visited.has(previous.id)) {
+        return unreadable('chain-cycle', { linkRecordId: previous.id });
+      }
+
+      visited.add(previous.id);
+      root = previous;
+    }
+
+    let bytes: Uint8Array;
+
+    try {
+      const read = await this.#backups.readRecorded(root.backupPath, root.originalHash);
+
+      if (isErr(read)) {
+        return unreadable('backup-unreadable', {
+          rootRecordId: root.id,
+          code: read.error.code,
+          backupReason: read.error.details?.['reason'],
+        });
+      }
+
+      bytes = read.value.bytes;
+    } catch (cause) {
+      return unreadable('backup-unreadable', {
+        rootRecordId: root.id,
+        errno: errnoCodeOf(cause),
+      });
+    }
+
+    if (this.#files.hashBytes(bytes) !== root.originalHash) {
+      return unreadable('backup-digest-mismatch', { rootRecordId: root.id });
+    }
+
+    const decoded = decodeSource(bytes, parent.file);
+
+    if (isErr(decoded)) {
+      return unreadable('backup-not-utf8', { rootRecordId: root.id });
+    }
+
+    return ok(decoded.value);
+  }
+
+  /**
    * The abort check, as a value rather than a throw.
    *
    * Called at stage boundaries only: interrupting between the temp write and
@@ -2086,6 +2201,130 @@ function readFailure(cause: unknown, file: string): DebuggenError {
       cause,
     },
   );
+}
+
+/**
+ * The coded failure for original bytes the backup store could not file.
+ *
+ * Always `INSTRUMENTATION_INSTALL_FAILED` with `details.reason`
+ * `'backup-write-failed'` and the store's throw as the cause — nothing was
+ * patched, and nothing in the project was touched — but worded for the
+ * condition the store actually met, because each has a different remedy:
+ *
+ * - **`ELOOP`** is how a no-follow open reports a symbolic link at the final
+ *   component: something planted a link at the backup path, and the store
+ *   refused to follow it rather than write through it or trust what it points
+ *   at. Removing the link is what lets the install proceed.
+ * - **A `DebuggenError`** is the store's own refusal — `FS_UNSAFE_PATH` from the
+ *   state-directory policy of `@debuggen/shared/node` for a directory that is a
+ *   link, owned by another account or open to others — and its message and hint
+ *   already name the directory and the fix, so both are quoted.
+ * - **Any other errno** (`EACCES`, `EROFS`, `ENOSPC`, …) is named, with the
+ *   remedy the common ones call for.
+ *
+ * The errno or code goes into `details.errno` as it always has. The backup
+ * path a platform error carries is quoted: it is the product's own state
+ * directory, never a byte of the developer's file.
+ *
+ * @param cause What `BackupStore.put` threw.
+ * @param file The project-relative file being patched.
+ * @param originalHash The digest the original was to be filed under.
+ * @returns The coded failure.
+ */
+function backupWriteFailure(cause: unknown, file: string, originalHash: string): DebuggenError {
+  const errno = errnoCodeOf(cause);
+  const headline = 'The original bytes could not be backed up, so nothing was patched';
+  const unmodified = 'The project was not modified.';
+  const options = {
+    details: { reason: 'backup-write-failed', file, originalHash, errno },
+    cause,
+  };
+
+  if (DebuggenError.is(cause)) {
+    return new DebuggenError(
+      'INSTRUMENTATION_INSTALL_FAILED',
+      `${headline}: ${sentenceOf(cause.message)}`,
+      {
+        ...options,
+        hint:
+          cause.hint === undefined || cause.hint.trim().length === 0
+            ? `Check the Debug Generator state directory against the refusal above (${cause.code}). ${unmodified}`
+            : `${sentenceOf(cause.hint)} ${unmodified}`,
+      },
+    );
+  }
+
+  const path = pathOf(cause);
+  const where = path === undefined ? 'at the backup path' : `at '${path}'`;
+
+  if (errno === 'ELOOP') {
+    return new DebuggenError(
+      'INSTRUMENTATION_INSTALL_FAILED',
+      `${headline}: a symbolic link is planted ${where} in the Debug Generator state directory, and it was refused rather than followed (ELOOP).`,
+      {
+        ...options,
+        hint: `Remove the symbolic link ${where} so the backup can be written there, then install again. ${unmodified}`,
+      },
+    );
+  }
+
+  return new DebuggenError(
+    'INSTRUMENTATION_INSTALL_FAILED',
+    `${headline}: writing the backup ${where} failed with ${errno ?? 'an unrecognised error'}.`,
+    { ...options, hint: `${backupWriteRemedy(errno)} ${unmodified}` },
+  );
+}
+
+/**
+ * The next step for a backup write that failed with a platform errno.
+ *
+ * @param errno The errno, when the failure carried one.
+ * @returns One sentence.
+ */
+function backupWriteRemedy(errno: string | undefined): string {
+  switch (errno) {
+    case 'EACCES':
+    case 'EPERM':
+      return `Make the Debug Generator state directory writable by the account the service runs as (${errno}: permission denied).`;
+    case 'EROFS':
+      return 'Point DEBUGGEN_HOME at a writable location: the Debug Generator state directory is on a read-only file system (EROFS).';
+    case 'ENOSPC':
+    case 'EDQUOT':
+      return `Free space on the disk that holds the Debug Generator state directory (${errno}: no space or quota left).`;
+    case 'EISDIR':
+      return 'Remove the directory standing at the backup path in the Debug Generator state directory (EISDIR).';
+    default:
+      return 'Check that the Debug Generator state directory is writable and has space.';
+  }
+}
+
+/**
+ * The `path` a platform error carries, when it carries one.
+ *
+ * @param value A caught value.
+ * @returns The path, or `undefined`.
+ */
+function pathOf(value: unknown): string | undefined {
+  if (typeof value === 'object' && value !== null && 'path' in value) {
+    const path: unknown = value.path;
+
+    return typeof path === 'string' && path.length > 0 ? path : undefined;
+  }
+
+  return undefined;
+}
+
+/**
+ * Ends a quoted message the way a sentence mid-paragraph needs.
+ *
+ * @param text A developer-facing message or hint.
+ * @returns The trimmed text, with a full stop when it had no terminal
+ * punctuation.
+ */
+function sentenceOf(text: string): string {
+  const trimmed = text.trim();
+
+  return /[.!?]$/u.test(trimmed) ? trimmed : `${trimmed}.`;
 }
 
 /**

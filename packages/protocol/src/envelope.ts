@@ -21,7 +21,11 @@
  *   declares in `MESSAGE_TYPES`.
  * - `sessionId` — the service's **routing** key, present when the frame belongs
  *   to a session. Optional because a handshake (`client.hello`) and a tab-level
- *   frame (`tab.navigated`) precede any session.
+ *   frame (`tab.navigated`) precede any session. When the payload names the
+ *   session it is about — its own `sessionId`, or the record `id` a
+ *   `session.created` / `session.updated` broadcast carries — a present routing
+ *   key must be that same session, and a frame where the two disagree is
+ *   refused (see "One frame, one session" below).
  * - `ts` — the moment the sender stamped the frame, on the product's one time
  *   base: Unix epoch **milliseconds** as a double, sub-millisecond precision
  *   preserved (AAP §0.2.3). The schema is `epochMsSchema` from `./version.ts`,
@@ -60,6 +64,35 @@
  * events, and the browser agent emits batches continuously while a capture runs.
  * A receiver validates what arrived because that is where the value came from
  * another process; a sender validating its own typed literal only pays twice.
+ *
+ * The one check the send path does make is not payload validation: it is the
+ * constant-time comparison below, of two identifiers the caller supplied, and
+ * it exists because the type system cannot express it.
+ *
+ * ## One frame, one session
+ *
+ * A frame can name a session twice: the envelope's `sessionId`, which the
+ * service routes and authorizes by, and the payload's own subject — its
+ * `sessionId`, or the `session.id` of a `session.created` / `session.updated`
+ * record — which is what a handler acts on. AAP §0.5.6 authorizes a devtools
+ * principal only for the session bound to its tab, so a frame whose two answers
+ * differ is a confused-deputy request: one field passes the authorization check
+ * and the other names the session that is changed. Neither field may be trusted
+ * over the other, so such a frame is refused rather than repaired.
+ *
+ * - {@link protocolMessageSchema} attaches the rule to every member of the
+ *   union: when both are present they must be equal, and the rejection is a
+ *   `custom` issue at path `sessionId` with the label
+ *   `routing-matches-payload` — never either identifier (AAP §0.5.2).
+ * - {@link createEnvelope} refuses to build such a frame, because every
+ *   receiver would refuse it: an explicit routing key that contradicts the
+ *   payload's subject throws `PROTOCOL_INVALID_MESSAGE` at the call site that
+ *   made the mistake instead of surfacing as an `error` frame from another
+ *   process.
+ *
+ * An absent routing key stays valid, and so does a routing key on a payload that
+ * names no session of its own (`client.hello`, `agent.ready`, `tab.navigated`,
+ * `session.unbind`, `telemetry.event`, `error`): there is nothing to contradict.
  *
  * ## A rejected frame is never echoed
  *
@@ -160,7 +193,9 @@ export const envelopeBaseShape = Object.freeze({
    * The routing key, absent on a frame that precedes or outlives a session.
    * Optional in the schema and therefore an *absent key* in a valid frame, never
    * a present `undefined` — which is also the only spelling that survives a JSON
-   * round trip unchanged.
+   * round trip unchanged. Its agreement with the payload's own subject is a
+   * cross-field rule, so it is enforced per union member by
+   * {@link requireRoutingKeyMatchesSubject} rather than by this field schema.
    */
   sessionId: identifierSchema.optional(),
   /** The sender's timestamp, in epoch milliseconds. See `./version.ts`. */
@@ -321,6 +356,151 @@ function payloadSchemaFor<K extends MessageType>(type: K): (typeof MESSAGE_PAYLO
 }
 
 /**
+ * The label a routing contradiction is reported under.
+ *
+ * Rendered by `describeZodIssues` as `sessionId (custom label=routing-matches-payload)`,
+ * so the rejection says which rule failed and nothing about the identifiers that
+ * failed it. It satisfies the renderer's name gate (`[A-Za-z0-9_$.-]`, at most
+ * forty characters rendered), so it is shown verbatim rather than redacted.
+ */
+const ROUTING_MISMATCH_LABEL = 'routing-matches-payload';
+
+/**
+ * The issue message of a routing contradiction.
+ *
+ * Constant, like every rejection text in this module: it names the two fields
+ * and never their values (AAP §0.5.2). `protocolParseError` does not render
+ * issue messages at all; this one is stated for a caller that inspects the raw
+ * `safeParse` result of {@link protocolMessageSchema}.
+ */
+const ROUTING_MISMATCH_RULE =
+  'expected the routing sessionId to equal the session the payload names';
+
+/**
+ * The session a payload is *about*, read structurally, if it names one.
+ *
+ * Two spellings exist in the registry, and both are read:
+ *
+ * 1. the payload's own `sessionId` — the field most payloads carry, and the one
+ *    {@link sessionIdFromPayload} lifts into the routing key;
+ * 2. otherwise `payload.session.id` — the `SessionRecord` id of a
+ *    `session.created` / `session.updated` broadcast, whose payload is
+ *    `{ session }` and has no top-level `sessionId`.
+ *
+ * Structural for the reason {@link sessionIdFromPayload} is: the payload schemas
+ * belong to eleven modules, and asking the value keeps this correct for every
+ * message — including one added later under either spelling — without a
+ * per-type table beside the registry. A payload with neither (`client.hello`,
+ * `tab.navigated`, `telemetry.event`, …) has no subject, and this answers
+ * `undefined`.
+ *
+ * Deliberately distinct from the lifting rule: `createEnvelope` still lifts only
+ * the payload's own `sessionId`, so which frames receive a routing key is
+ * unchanged; this function only decides what a present routing key must agree
+ * with.
+ *
+ * @param payload A frame's payload, validated or not.
+ * @returns The session the payload names, or `undefined` when it names none.
+ */
+function payloadSubjectSessionId(payload: unknown): SessionId | undefined {
+  const own = sessionIdFromPayload(payload);
+
+  if (own !== undefined || !isPlainRecord(payload)) {
+    return own;
+  }
+
+  const record = payload.session;
+
+  if (!isPlainRecord(record)) {
+    return undefined;
+  }
+
+  const recordId = record.id;
+
+  return typeof recordId === 'string' ? recordId : undefined;
+}
+
+/**
+ * Whether a routing key names a different session than its payload does.
+ *
+ * The single statement of the rule, shared by the receive path
+ * ({@link requireRoutingKeyMatchesSubject}) and the send path
+ * ({@link createEnvelope}), so a frame this package builds and a frame it
+ * accepts cannot disagree about it. A payload with no subject contradicts
+ * nothing.
+ *
+ * @param routingKey The envelope's `sessionId`.
+ * @param payload The frame's payload.
+ * @returns `true` only when the payload names a session and it is not
+ * `routingKey`.
+ */
+function routingKeyContradictsPayload(routingKey: string, payload: unknown): boolean {
+  const subject = payloadSubjectSessionId(payload);
+
+  return subject !== undefined && subject !== routingKey;
+}
+
+/**
+ * Refuses a frame whose routing key and payload subject name different
+ * sessions: the object-level check every union member carries.
+ *
+ * The service routes and authorizes by the envelope's `sessionId`, while a
+ * handler acts on the payload's own subject. AAP §0.5.6 authorizes a devtools
+ * principal only for the session bound to its tab, so a frame that satisfied the
+ * check with one field while naming another session in the other would make the
+ * service a confused deputy. Refusing the frame here, at the one validator every
+ * receiver shares, closes that without each handler having to remember which
+ * field it authorized.
+ *
+ * Reported on the `sessionId` path with {@link ROUTING_MISMATCH_LABEL}, and
+ * with `input` left empty, exactly as `../analysis.ts`'s object check is: the
+ * rejection names the rule, never either identifier (AAP §0.5.2).
+ *
+ * The comparison is made only on an otherwise valid frame. Zod skips an object
+ * check after an *aborting* issue, but a string-length bound is not one — an
+ * empty payload `sessionId` still reaches this function — so the guard is
+ * explicit: a frame that already has an issue is already refused, and comparing
+ * the routing key with a malformed identifier would add noise rather than
+ * information. A frame whose payload is wrong is therefore reported by its
+ * payload issues alone.
+ *
+ * `payload` is declared optional in the parameter type for the compiler's sake
+ * alone. {@link envelopeSchemaFor} is generic in `K`, and while `K` is
+ * unresolved Zod's output type cannot say whether the registry's payload schema
+ * for it yields a required or an optional key; an optional `unknown` is the
+ * spelling every instantiation is assignable to. At run time the key is always
+ * present, because this check runs only after the member's fields have parsed.
+ *
+ * @param parsed The member's parse state, whose `value` is the parsed frame.
+ */
+function requireRoutingKeyMatchesSubject(
+  parsed: z.core.ParsePayload<{
+    readonly sessionId?: string | undefined;
+    readonly payload?: unknown;
+  }>,
+): void {
+  if (parsed.issues.length > 0) {
+    return;
+  }
+
+  const routingKey = parsed.value.sessionId;
+
+  if (routingKey === undefined || !routingKeyContradictsPayload(routingKey, parsed.value.payload)) {
+    return;
+  }
+
+  parsed.issues.push({
+    code: 'custom',
+    path: ['sessionId'],
+    message: ROUTING_MISMATCH_RULE,
+    params: { label: ROUTING_MISMATCH_LABEL },
+    // Left empty on purpose: a failure here never carries the identifiers that
+    // caused it (AAP §0.5.2).
+    input: undefined,
+  });
+}
+
+/**
  * Builds the envelope schema for exactly one message type.
  *
  * Generic in `K` on purpose: that is what keeps `z.literal(type)` a
@@ -334,13 +514,21 @@ function payloadSchemaFor<K extends MessageType>(type: K): (typeof MESSAGE_PAYLO
  * it would let a producer's typo (`sessionID` beside a dropped `sessionId`) look
  * like a valid session-less frame and quietly break routing, and it would let an
  * unknown field ride through a boundary this package exists to define.
+ *
+ * `.check(requireRoutingKeyMatchesSubject)` adds the one cross-field rule of the
+ * envelope (see "One frame, one session" in the module documentation). A check
+ * returns the same `ZodObject` type, so the member keeps its `.shape`, the union
+ * still discriminates on `type`, and {@link ProtocolMessageMatchesSchema} is
+ * unaffected: the rule narrows which values are accepted, not their type.
  */
 function envelopeSchemaFor<K extends MessageType>(type: K) {
-  return z.strictObject({
-    ...envelopeBaseShape,
-    type: z.literal(type),
-    payload: payloadSchemaFor(type),
-  });
+  return z
+    .strictObject({
+      ...envelopeBaseShape,
+      type: z.literal(type),
+      payload: payloadSchemaFor(type),
+    })
+    .check(requireRoutingKeyMatchesSubject);
 }
 
 /**
@@ -499,7 +687,22 @@ const INVALID_MESSAGE_PREFIX = 'Invalid protocol message';
  * is held to the same rule as the message (AAP §0.5.2).
  */
 const INVALID_MESSAGE_HINT =
-  'A protocol frame is { id, type, sessionId?, ts, payload } with no other top-level key: `type` must be one of the declared message types, `ts` a Unix epoch timestamp in milliseconds, and `payload` must match that type’s schema.';
+  'A protocol frame is { id, type, sessionId?, ts, payload } with no other top-level key: `type` must be one of the declared message types, `ts` a Unix epoch timestamp in milliseconds, `payload` must match that type’s schema, and a routing `sessionId` must equal the session the payload names (its own `sessionId`, or `session.id`) when both are present.';
+
+/**
+ * What {@link createEnvelope} throws when an explicit routing key contradicts
+ * the session its payload names.
+ *
+ * Constant for the reason every rejection text here is: neither identifier is
+ * interpolated (AAP §0.5.2). The message type travels in `details`, because it
+ * is a name from this package's own vocabulary rather than a value.
+ */
+const ROUTING_CONTRADICTION_MESSAGE =
+  'Cannot build a protocol frame: options.sessionId names a different session than the payload does';
+
+/** The constant next step for {@link ROUTING_CONTRADICTION_MESSAGE}. */
+const ROUTING_CONTRADICTION_HINT =
+  'Omit options.sessionId so the routing key is taken from the payload, or build the payload for the session the frame is routed to; every receiver refuses a frame whose two sessions disagree.';
 
 /**
  * What a frame that is not JSON at all is reported as.
@@ -659,6 +862,12 @@ export interface CreateEnvelopeOptions {
    * Supply it when the payload carries no `sessionId` of its own but the frame
    * still belongs to a session. When omitted, {@link createEnvelope} lifts the
    * payload's own `sessionId` if it has one.
+   *
+   * It may restate the session the payload names, but never contradict it:
+   * when the payload names a session — its own `sessionId`, or the `session.id`
+   * of a `session.created` / `session.updated` record — a different value here
+   * makes {@link createEnvelope} throw `PROTOCOL_INVALID_MESSAGE`, because every
+   * receiver would refuse the frame it built.
    */
   readonly sessionId?: SessionId | undefined;
   /** The frame identifier. Defaults to a freshly minted `newMessageId()`. */
@@ -708,14 +917,22 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * ## The `sessionId` rule, which is behaviour rather than schema
  *
  * The envelope's `sessionId` is the service's **routing** key — the field
- * `apps/local-service/src/server/clients.ts` broadcasts by — while the payload's
- * own `sessionId` stays the authoritative statement of which session the message
- * is *about*. Those are two jobs, and a frame that carries the second without
- * the first parses perfectly and reaches nobody.
+ * `apps/local-service/src/server/clients.ts` broadcasts and authorizes by —
+ * while the payload's own subject (its `sessionId`, or the `session.id` of a
+ * `session.created` / `session.updated` record) stays the authoritative
+ * statement of which session the message is *about*. Those are two jobs, and a
+ * frame that carries the second without the first parses perfectly and reaches
+ * nobody.
  *
  * So the routing key is resolved here, in this order:
  *
- * 1. `options.sessionId`, when given;
+ * 1. `options.sessionId`, when given — and only when it does not contradict the
+ *    payload's subject. A payload with no subject (`tab.navigated`, say) may be
+ *    routed by the option alone, and an option equal to the subject is merely
+ *    explicit; an option naming a *different* session throws
+ *    `PROTOCOL_INVALID_MESSAGE`, because {@link protocolMessageSchema} refuses
+ *    such a frame on every receiver (see "One frame, one session" in the module
+ *    documentation) and a frame nobody accepts is a bug at this call site;
  * 2. otherwise the payload's own `sessionId`, when it has one as a string;
  * 3. otherwise the key is **omitted entirely** — not set to `undefined` — so a
  *    session-less frame such as `client.hello` reaches the receiver with no
@@ -723,18 +940,24 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  *    dropped anyway, and the two ends agree about which frames are session-less.
  *
  * Lifting in step 2 is what makes it impossible for a call site to forget and
- * silently break routing. It happens in a function rather than in a schema
- * because this package's schemas validate and never rewrite: no `.transform()`,
- * no `.default()`, no `.coerce` appears anywhere in it.
+ * silently break routing. It lifts the payload's own `sessionId` only: a
+ * `session.created` / `session.updated` frame is routed when its caller supplies
+ * the record's id as the option, and is otherwise session-less. It happens in a
+ * function rather than in a schema because this package's schemas validate and
+ * never rewrite: no `.transform()`, no `.default()`, no `.coerce` appears
+ * anywhere in it.
  *
  * ## What it deliberately does not do
  *
- * It does not validate. The signature is already type-safe — the payload type is
- * resolved from the registry for the `type` given, so the wrong payload is a
- * compile error — and validating every send would double the cost of the
- * `telemetry.event` path, which carries up to a few thousand events per frame
- * while a capture runs. Validation happens on receive
- * ({@link parseMessage}).
+ * It does not validate the payload. The signature is already type-safe — the
+ * payload type is resolved from the registry for the `type` given, so the wrong
+ * payload is a compile error — and validating every send would double the cost
+ * of the `telemetry.event` path, which carries up to a few thousand events per
+ * frame while a capture runs. Validation happens on receive
+ * ({@link parseMessage}). The routing-key comparison in step 1 is not
+ * validation in that sense: it reads at most two fields of the payload, costs
+ * the same for a batch of one event as for five thousand, and guards the one
+ * mistake the compiler cannot see, because both identifiers are plain strings.
  *
  * It does not mutate or copy the payload either: the returned frame holds the
  * caller's own payload reference, which is what keeps a large telemetry batch a
@@ -754,6 +977,11 @@ function sessionIdFromPayload(payload: unknown): SessionId | undefined {
  * @param options Optional overrides for the routing key, the frame id and the
  * timestamp.
  * @returns A plain JSON-safe frame, typed as that message's envelope.
+ * @throws DebuggenError With code `'PROTOCOL_INVALID_MESSAGE'` when
+ * `options.sessionId` names a different session than the payload does. The
+ * message and hint are constant and `details` carries only `type`, so neither
+ * identifier is echoed (AAP §0.5.2). `client/ws-client.ts` calls this inside
+ * `tryCatch`, so its `send` answers that error as an `err` rather than throwing.
  */
 export function createEnvelope<K extends MessageType>(
   type: K,
@@ -762,7 +990,19 @@ export function createEnvelope<K extends MessageType>(
 ): MessageByType<K> {
   const id = options?.id ?? newMessageId();
   const ts = options?.ts ?? nowEpochMs();
-  const sessionId = options?.sessionId ?? sessionIdFromPayload(payload);
+  const explicitSessionId = options?.sessionId;
+
+  // The same rule `protocolMessageSchema` applies on receive, checked here so
+  // the mistake is reported at the call site that made it rather than as an
+  // `error` frame from whichever process refuses the result.
+  if (explicitSessionId !== undefined && routingKeyContradictsPayload(explicitSessionId, payload)) {
+    throw new DebuggenError(INVALID_MESSAGE_CODE, ROUTING_CONTRADICTION_MESSAGE, {
+      hint: ROUTING_CONTRADICTION_HINT,
+      details: { type },
+    });
+  }
+
+  const sessionId = explicitSessionId ?? sessionIdFromPayload(payload);
 
   // Two literals rather than a spread, so the key order matches the documented
   // shape and an absent routing key is an absent key rather than a present

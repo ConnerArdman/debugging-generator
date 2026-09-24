@@ -22,10 +22,11 @@
  * 3. **With no preload attached, not one byte is written.** A file
  *    modification that cannot produce a span is pure risk to a developer's
  *    working tree, so the install applies nothing, journals nothing, and
- *    reports the gap with a relaunch instruction that names the project root
- *    (AAP §0.5.5). The cases that assert this run against a *copy* of the
- *    corpus with a real backup store, so a violation is detectable rather than
- *    merely improbable.
+ *    reports the gap with the exact relaunch command (AAP §0.5.5) — naming the
+ *    project root once, inside the command, whenever it fits the hint bound,
+ *    and never cut short however deep the root is. The cases that assert this
+ *    run against a *copy* of the corpus with a real backup store, so a
+ *    violation is detectable rather than merely improbable.
  * 4. **With a preload attached, the real patcher does the writing.** The
  *    records that come back are the ones the journal received, in the order
  *    that makes crash reconciliation decidable — a `pending` row carrying both
@@ -166,6 +167,8 @@ import type {
 import {
   CAPTURE_SIGNALS,
   DISABLED_SERVER_AGENT_SIGNALS,
+  READINESS_HINT_MAX_LENGTH,
+  READINESS_REASON_MAX_LENGTH,
   READINESS_STATUSES,
   SERVER_AGENT_SIGNAL_KEYS,
   readinessSchema,
@@ -183,6 +186,7 @@ import {
   NEXTJS_SERVER_SIGNAL_KEYS,
   createNextJsAdapter,
 } from './nextjs.js';
+import type { NextJsAdapterRelaunchDescriptor } from './nextjs.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Paths and fixed values
@@ -1188,20 +1192,142 @@ function patchableFunctionNames(project: IndexedProject): readonly string[] {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * The bound `../schema/plan.ts` puts on an action's rationale.
+ *
+ * Restated because that module keeps it private. {@link expectActionShape}
+ * also parses every action against `instrumentationActionSchema`, which applies
+ * the real number, so a drift between the two fails there first.
+ */
+const PLAN_RATIONALE_MAX_LENGTH = 500;
+
+/**
  * Asserts that a developer-facing string is one bounded, non-blank line.
  *
- * The readiness schema refuses a blank, multi-line or over-long `reason` or
- * `hint` at the boundary, and a refusal there would drop the one sentence that
- * told the developer what to do.
+ * The receiving schema refuses a blank, multi-line or over-long string at the
+ * boundary, and a refusal there would drop the one sentence that told the
+ * developer what to do. The bound is the one of the field being checked —
+ * `READINESS_REASON_MAX_LENGTH` for a reason or a failure message,
+ * `READINESS_HINT_MAX_LENGTH` for a hint, {@link PLAN_RATIONALE_MAX_LENGTH}
+ * for a rationale — because a hint that carries a command is allowed twice the
+ * room an explanation is.
  *
  * @param text The string to check.
  * @param label What the string is, for the failure message.
+ * @param bound The longest string the receiving field accepts.
  */
-function expectSingleLine(text: string, label: string): void {
+function expectSingleLine(text: string, label: string, bound: number): void {
   expect(text.length, `${label} must not be empty`).toBeGreaterThan(0);
   expect(text, `${label} must be trimmed`).toBe(text.trim());
   expect(text, `${label} must be one line`).not.toMatch(/[\r\n]/u);
-  expect(text.length, `${label} must stay within the schema's bound`).toBeLessThanOrEqual(500);
+  expect(text.length, `${label} must stay within the schema's bound`).toBeLessThanOrEqual(bound);
+}
+
+/**
+ * Asserts that a hint is one line within the hint bound that was never cut.
+ *
+ * A hint is fitted to its bound by choosing a shorter complete spelling, never
+ * by slicing, so an ellipsis at its end is the signature of the defect this
+ * guards against: a relaunch command with its tail cut off.
+ *
+ * @param hint The hint.
+ * @param label What the hint is, for the failure message.
+ */
+function expectWholeHint(hint: string, label: string): void {
+  expectSingleLine(hint, label, READINESS_HINT_MAX_LENGTH);
+  expect(hint.endsWith('…'), `${label} must never be cut short: ${hint}`).toBe(false);
+}
+
+/**
+ * How many times `needle` occurs in `text`, without overlaps.
+ *
+ * @param text The text to search.
+ * @param needle The substring to count. An empty needle counts as absent.
+ * @returns The number of occurrences.
+ */
+function occurrencesOf(text: string, needle: string): number {
+  return needle === '' ? 0 : text.split(needle).length - 1;
+}
+
+/**
+ * Asserts how a hint names the project it is about, for a root of any length.
+ *
+ * At most once, because the root is actionable in exactly one place — as the
+ * directory of the hand-typed command — and naming it twice is what used to push
+ * that command past the bound. Exactly once whenever the root is no longer than
+ * half the hint bound: everything else these hints carry sits well inside the
+ * other half, so such a root always fits. A longer root may legitimately be
+ * dropped in favour of the command, which is what keeps this assertion true for
+ * a sandbox under any `TMPDIR` rather than only under a short one.
+ *
+ * @param hint The hint.
+ * @param projectRoot The root of the project the hint is about.
+ * @param label What the hint is, for the failure message.
+ */
+function expectRootNamed(hint: string, projectRoot: string, label: string): void {
+  const named = occurrencesOf(hint, projectRoot);
+
+  expect(named, `${label} must name the project root at most once`).toBeLessThanOrEqual(1);
+
+  if (projectRoot.length <= READINESS_HINT_MAX_LENGTH / 2) {
+    // The hint has to name WHICH project to relaunch whenever it can: a
+    // developer with two dev servers open cannot act on an instruction that
+    // names neither.
+    expect(named, `${label} must name a project root that fits: ${hint}`).toBe(1);
+  }
+}
+
+/** What a relaunch hint must carry, as a case knows it. */
+interface RelaunchExpectation {
+  /** The module specifier the hint must preload. */
+  readonly specifier: string;
+
+  /** The exact dev command, when the case knows which one the hint composes. */
+  readonly devCommand?: string | undefined;
+
+  /** The environment variable names the hint must mention. */
+  readonly envVarNames?: readonly string[] | undefined;
+}
+
+/**
+ * Asserts everything AAP §0.5.5 asks of a relaunch hint, for a root of any
+ * length: one whole line within the hint bound, the preload assignment and the
+ * exact command, every environment variable name, and the project root named
+ * at most once — as the directory of that command whenever it is named.
+ *
+ * @param hint The hint.
+ * @param projectRoot The root of the project the hint is about.
+ * @param expected What the hint must carry.
+ * @param label What the hint is, for the failure message.
+ */
+function expectRelaunchHint(
+  hint: string,
+  projectRoot: string,
+  expected: RelaunchExpectation,
+  label: string,
+): void {
+  const preload = `NODE_OPTIONS="--import ${expected.specifier}"`;
+
+  expectWholeHint(hint, label);
+  // One copy-pasteable instruction rather than a paragraph of advice.
+  expect(hint, `${label} must carry the preload assignment`).toContain(preload);
+
+  if (expected.devCommand !== undefined) {
+    expect(hint, `${label} must carry the exact command`).toContain(
+      `${preload} ${expected.devCommand}`,
+    );
+  }
+
+  for (const name of expected.envVarNames ?? []) {
+    expect(hint, `${label} must name ${name}`).toContain(name);
+  }
+
+  expectRootNamed(hint, projectRoot, label);
+
+  if (expected.devCommand !== undefined && hint.includes(projectRoot)) {
+    expect(hint, `${label} must name the root as the command's directory`).toContain(
+      `cd ${projectRoot} && ${preload} ${expected.devCommand}`,
+    );
+  }
 }
 
 /**
@@ -1221,7 +1347,11 @@ function expectActionShape(action: InstrumentationAction, project: IndexedProjec
   expect(action.adapter).toBe(NEXTJS_ADAPTER_ID);
   expect(action.mode).toBe('patch');
   expect(claimedTypes).toContain(action.type);
-  expectSingleLine(action.rationale, `the rationale of ${action.file}#${action.symbol}`);
+  expectSingleLine(
+    action.rationale,
+    `the rationale of ${action.file}#${action.symbol}`,
+    PLAN_RATIONALE_MAX_LENGTH,
+  );
   expect(
     project.queries.hasSymbol(action.file, action.symbol),
     `${action.file}#${action.symbol} must be a symbol the code graph declares`,
@@ -1235,8 +1365,8 @@ function expectActionShape(action: InstrumentationAction, project: IndexedProjec
  */
 function expectGapShape(gap: UnavailableSignal): void {
   expect(CAPTURE_SIGNALS as readonly string[]).toContain(gap.signal);
-  expectSingleLine(gap.reason, `the reason for ${String(gap.signal)}`);
-  expectSingleLine(gap.hint, `the hint for ${String(gap.signal)}`);
+  expectSingleLine(gap.reason, `the reason for ${String(gap.signal)}`, READINESS_REASON_MAX_LENGTH);
+  expectWholeHint(gap.hint, `the hint for ${String(gap.signal)}`);
 }
 
 /**
@@ -2026,12 +2156,15 @@ describe('install with no preload attached', () => {
     for (const gap of result.unavailable) {
       expectGapShape(gap);
       expect(gap.reason.toLowerCase()).toContain('preload');
-      // The hint has to name WHICH project to relaunch: a developer with two
-      // dev servers open cannot act on an instruction that names neither.
-      expect(gap.hint, 'the hint must name the project root').toContain(world.projectRoot);
-      expect(gap.hint).toContain(DEBUGGEN_NODE_PRELOAD_SPECIFIER);
-      // One copy-pasteable instruction rather than a paragraph of advice.
-      expect(gap.hint).toContain('NODE_OPTIONS');
+      // The published preload entry and the project root, whatever TMPDIR
+      // made that root's length: named once, as the command's directory,
+      // whenever it fits, and never at the command's expense.
+      expectRelaunchHint(
+        gap.hint,
+        world.projectRoot,
+        { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER },
+        `the hint for ${gap.signal}`,
+      );
     }
 
     // The patched-span signal says so explicitly, because its gap is the one
@@ -2079,12 +2212,11 @@ describe('install with no preload attached', () => {
     vi.stubEnv('NODE_OPTIONS', '--import /stubbed/from/the/environment.mjs');
     vi.stubEnv('DEBUGGEN_INGEST_URL', 'http://127.0.0.1:65535/stubbed-ingest');
 
-    // A sandbox rather than the committed corpus, and not for the write: the
-    // hint is one bounded line (the readiness schema refuses a longer one), so
-    // a project root as deep as this repository's own checkout would legitimately
-    // truncate the tail the descriptor contributes. The sandbox's root is short,
-    // which is what lets the verbatim assertions below be about the composition
-    // instead of about the bound.
+    // A sandbox, so the no-write claim below is about a real copy. The
+    // verbatim assertions hold for a sandbox root of any length: the hint is
+    // fitted to its bound by dropping prose and then the root before anything
+    // this descriptor contributes, so they are about the composition whatever
+    // TMPDIR this suite runs under.
     const world = await sandbox();
     const { context, journal } = writableContext(world, {
       readiness: preloadPresets(world.projectRoot).notConnected,
@@ -2097,16 +2229,19 @@ describe('install with no preload attached', () => {
     expect(result.unavailable.length).toBeGreaterThan(0);
 
     for (const gap of result.unavailable) {
-      expect(gap.hint).toContain(`--import ${relaunch.preloadSpecifier}`);
-      expect(gap.hint).toContain(relaunch.devCommand);
-      expect(gap.hint).toContain(world.projectRoot);
-
-      for (const name of relaunch.envVarNames) {
-        // Names only, never values: the ingest URL and the per-launch
-        // credential are minted by the launcher (AAP §0.5.6), and a hint that
-        // quoted one would be a credential in a user interface.
-        expect(gap.hint).toContain(name);
-      }
+      // Names only, never values: the ingest URL and the per-launch
+      // credential are minted by the launcher (AAP §0.5.6), and a hint that
+      // quoted one would be a credential in a user interface.
+      expectRelaunchHint(
+        gap.hint,
+        world.projectRoot,
+        {
+          specifier: relaunch.preloadSpecifier,
+          devCommand: relaunch.devCommand,
+          envVarNames: relaunch.envVarNames,
+        },
+        `the hint for ${gap.signal}`,
+      );
 
       expect(gap.hint).not.toContain(DEBUGGEN_NODE_PRELOAD_SPECIFIER);
       expect(gap.hint).not.toContain('/stubbed/from/the/environment.mjs');
@@ -2148,7 +2283,7 @@ describe('install with no preload attached', () => {
       expect(sameSignal).toBeDefined();
       expect(gap.reason).not.toBe(sameSignal?.reason);
       expect(gap.hint).not.toBe(sameSignal?.hint);
-      expect(gap.hint).toContain(world.projectRoot);
+      expectRootNamed(gap.hint, world.projectRoot, `the silent hint for ${gap.signal}`);
     }
   });
 });
@@ -2377,7 +2512,7 @@ describe('install with the preload attached', () => {
     expect(failure?.file).toBe(generatorFile);
     expect(failure?.symbol).toBe(generatorSymbol);
     expect(failure?.error.code).toBe('PATCH_UNSUPPORTED');
-    expectSingleLine(failure?.error.hint ?? '', 'the refusal hint');
+    expectWholeHint(failure?.error.hint ?? '', 'the refusal hint');
     expect(failure?.record, 'a refused declaration never reaches the journal').toBeUndefined();
 
     // Exactly the targets ordered before the failure were applied, and they
@@ -2430,8 +2565,12 @@ describe('install with the preload attached', () => {
     expect(failure?.error.details?.['reason']).toBe('aborted');
     expect(failure?.signal).toBe('functions');
     expect(failure?.record).toBeUndefined();
-    expectSingleLine(failure?.error.message ?? '', 'the cancellation message');
-    expectSingleLine(failure?.error.hint ?? '', 'the cancellation hint');
+    expectSingleLine(
+      failure?.error.message ?? '',
+      'the cancellation message',
+      READINESS_REASON_MAX_LENGTH,
+    );
+    expectWholeHint(failure?.error.hint ?? '', 'the cancellation hint');
 
     expect(result.applied).toEqual([]);
     expect(result.runtimeHooks).toEqual([]);
@@ -2868,9 +3007,13 @@ describe('readiness', () => {
         // non-ready signal carries both halves.
         expect(signal.reason).toBeDefined();
         expect(signal.hint).toBeDefined();
-        expectSingleLine(signal.reason ?? '', `the reason for ${signal.signal}`);
-        expectSingleLine(signal.hint ?? '', `the hint for ${signal.signal}`);
-        expect(signal.hint).toContain(fixture.root);
+        expectSingleLine(
+          signal.reason ?? '',
+          `the reason for ${signal.signal}`,
+          READINESS_REASON_MAX_LENGTH,
+        );
+        expectWholeHint(signal.hint ?? '', `the hint for ${signal.signal}`);
+        expectRootNamed(signal.hint ?? '', fixture.root, `the '${name}' hint for ${signal.signal}`);
       }
 
       // `degraded` does not hold a capture back; `unavailable` does.
@@ -2910,6 +3053,302 @@ describe('readiness', () => {
     expect(report.signals).toEqual([]);
     expect(report.ready).toBe(true);
     expect(readinessSchema.parse(report)).toEqual(report);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Relaunch hints at any project-root depth (AAP §0.5.5)
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * A relaunch descriptor with values no default could produce, so a hint found
+ * to carry them is carrying the injected composition.
+ */
+const INJECTED_RELAUNCH = {
+  preloadSpecifier: '/opt/debuggen/telemetry/register.mjs',
+  devCommand: 'bun run start-dev',
+  envVarNames: ['ZEPHYR_INGEST_URL', 'ALPHA_TOKEN_NAME'],
+} as const satisfies NextJsAdapterRelaunchDescriptor;
+
+/** What {@link INJECTED_RELAUNCH} obliges every relaunch hint to carry. */
+const INJECTED_EXPECTATION: RelaunchExpectation = {
+  specifier: INJECTED_RELAUNCH.preloadSpecifier,
+  devCommand: INJECTED_RELAUNCH.devCommand,
+  envVarNames: INJECTED_RELAUNCH.envVarNames,
+};
+
+/**
+ * Directory names that on their own nest a sandbox deeper than the hint bound.
+ *
+ * Six names of under two hundred characters — each inside the 255-byte name
+ * limit of common filesystems — so the copied project's root is longer than
+ * `READINESS_HINT_MAX_LENGTH` whatever `TMPDIR` puts in front of it. No
+ * spelling of the hint that names such a root can fit, which is what makes the
+ * rootless spelling the one this nesting always reaches.
+ */
+const DEEP_SEGMENTS: readonly string[] = Array.from(
+  { length: 6 },
+  (_, index) => `nested-${String(index)}-${'d'.repeat(180)}`,
+);
+
+/**
+ * An absolute POSIX root of exactly `length` characters that exists nowhere.
+ *
+ * For the cases that only compose text: with no preload attached, `install`
+ * returns before anything touches the filesystem, and `readiness` never does,
+ * so the root is a string the hint is built from and nothing more — which is
+ * what makes its length exact rather than whatever `TMPDIR` made it.
+ *
+ * @param length The root's length, at least 2.
+ * @returns The root.
+ */
+function syntheticRoot(length: number): string {
+  return `/${'r'.repeat(length - 1)}`;
+}
+
+/**
+ * A context over the committed corpus whose project root is `projectRoot`.
+ *
+ * The code graph stays the corpus's, so the server tier is real; only the root
+ * the hints are composed from, and optionally the summary the dev command is
+ * derived from, are replaced.
+ *
+ * @param projectRoot The root the context claims.
+ * @param readiness What the service observed, stated about `projectRoot`.
+ * @param projectSummary The summary to report. Defaults to the corpus's.
+ * @returns The context.
+ */
+function contextAtRoot(
+  projectRoot: string,
+  readiness: ObservedReadinessInputs,
+  projectSummary: ProjectSummary = fixture.projectSummary,
+): InstrumentationContext {
+  return { ...contextFor({ project: fixture, readiness }), projectRoot, projectSummary };
+}
+
+/**
+ * Every hint one adapter gives for a context with no preload attached, from
+ * both surfaces a developer reads it on: the install's gaps and the readiness
+ * rows, each labelled for a failure message.
+ *
+ * The report is parsed against the schema the service aggregates, so a hint
+ * past the bound fails here as the boundary would refuse it; the install is
+ * asserted to have written nothing, which is what makes it safe to run against
+ * a synthetic root.
+ *
+ * @param relaunch The descriptor to inject, if any.
+ * @param context A context whose preload is absent.
+ * @param actions The actions to offer the install.
+ * @returns `[label, hint]` pairs, install gaps first.
+ */
+async function noPreloadHints(
+  relaunch: NextJsAdapterRelaunchDescriptor | undefined,
+  context: InstrumentationContext,
+  actions: readonly InstrumentationAction[],
+): Promise<readonly (readonly [string, string])[]> {
+  const adapter = createNextJsAdapter({ relaunch });
+  const installed = await adapter.install(actions, context);
+  const report = await adapter.readiness(context);
+
+  expect(installed.applied).toEqual([]);
+  expect(installed.unavailable.map((gap) => gap.signal)).toEqual([...NEXTJS_SERVER_SIGNAL_KEYS]);
+  expect(readinessSchema.parse(report)).toEqual(report);
+  expect(report.signals.map((row) => row.signal)).toEqual([...NEXTJS_SERVER_SIGNAL_KEYS]);
+
+  return [
+    ...installed.unavailable.map((gap) => [`the install gap for ${gap.signal}`, gap.hint] as const),
+    ...report.signals.map(
+      (row) => [`the readiness row for ${row.signal}`, row.hint ?? ''] as const,
+    ),
+  ];
+}
+
+describe('relaunch hints at any project-root depth', () => {
+  it('names a project root that fits exactly once, as the directory of the command', async () => {
+    const root = syntheticRoot(64);
+    const context = contextAtRoot(root, preloadPresets(root).notConnected);
+    const actions = await smallPlan(fixture);
+
+    for (const [label, hint] of await noPreloadHints(INJECTED_RELAUNCH, context, actions)) {
+      expectRelaunchHint(hint, root, INJECTED_EXPECTATION, label);
+      expect(occurrencesOf(hint, root), `${label} must name the root exactly once`).toBe(1);
+    }
+
+    // The published entry and the corpus's own package manager, too.
+    for (const [label, hint] of await noPreloadHints(undefined, context, actions)) {
+      expectRelaunchHint(hint, root, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expect(occurrencesOf(hint, root), `${label} must name the root exactly once`).toBe(1);
+    }
+  });
+
+  it('carries the exact command for an on-disk project nested deeper than the hint bound', async () => {
+    const world = await sandbox(join(...DEEP_SEGMENTS));
+
+    expect(world.projectRoot.length).toBeGreaterThan(READINESS_HINT_MAX_LENGTH);
+
+    const { context, journal } = writableContext(world, {
+      readiness: preloadPresets(world.projectRoot).notConnected,
+    });
+    const actions = await smallPlan(world.project);
+
+    expect(actions.length).toBeGreaterThan(0);
+
+    for (const [label, hint] of await noPreloadHints(INJECTED_RELAUNCH, context, actions)) {
+      expectRelaunchHint(hint, world.projectRoot, INJECTED_EXPECTATION, label);
+      // No spelling that names a root this long can fit, so the command is
+      // spelled relative to it rather than cut.
+      expect(hint, `${label} must drop a root that cannot fit`).not.toContain(world.projectRoot);
+    }
+
+    for (const [label, hint] of await noPreloadHints(undefined, context, actions)) {
+      expectRelaunchHint(
+        hint,
+        world.projectRoot,
+        { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER },
+        label,
+      );
+      expect(hint, `${label} must drop a root that cannot fit`).not.toContain(world.projectRoot);
+    }
+
+    // Still the no-write branch, however deep the project is.
+    expect(journal.events).toEqual([]);
+    expect(backupEntries(world)).toEqual([]);
+    expect(changedPaths(world.before, treeSnapshot(world.projectRoot))).toEqual([]);
+  });
+
+  it('spells the command from the project root when no form naming the root fits', async () => {
+    const root = syntheticRoot(READINESS_HINT_MAX_LENGTH);
+    const actions = await smallPlan(fixture);
+
+    for (const [label, hint] of await noPreloadHints(
+      INJECTED_RELAUNCH,
+      contextAtRoot(root, preloadPresets(root).notConnected),
+      actions,
+    )) {
+      expectRelaunchHint(hint, root, INJECTED_EXPECTATION, label);
+      expect(hint, `${label} must drop a root that cannot fit`).not.toContain(root);
+    }
+
+    // With no dev command known, the hint is the one fragment to add to
+    // whatever command the developer uses — and it degrades the same way.
+    const unknownManager: ProjectSummary = { ...fixture.projectSummary, packageManager: 'unknown' };
+    const shortRoot = syntheticRoot(64);
+
+    for (const [label, hint] of await noPreloadHints(
+      undefined,
+      contextAtRoot(shortRoot, preloadPresets(shortRoot).notConnected, unknownManager),
+      actions,
+    )) {
+      expectRelaunchHint(hint, shortRoot, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expect(occurrencesOf(hint, shortRoot), `${label} must name the root exactly once`).toBe(1);
+    }
+
+    for (const [label, hint] of await noPreloadHints(
+      undefined,
+      contextAtRoot(root, preloadPresets(root).notConnected, unknownManager),
+      actions,
+    )) {
+      expectRelaunchHint(hint, root, { specifier: DEBUGGEN_NODE_PRELOAD_SPECIFIER }, label);
+      expect(hint, `${label} must drop a root that cannot fit`).not.toContain(root);
+    }
+  });
+
+  it('degrades the silent-preload hint by dropping the root, never by cutting it', async () => {
+    const adapter = createNextJsAdapter();
+    const shortRoot = syntheticRoot(64);
+    const longRoot = syntheticRoot(READINESS_HINT_MAX_LENGTH);
+    const short = await adapter.readiness(
+      contextAtRoot(shortRoot, preloadPresets(shortRoot).stale),
+    );
+    const long = await adapter.readiness(contextAtRoot(longRoot, preloadPresets(longRoot).stale));
+
+    for (const report of [short, long]) {
+      expect(readinessSchema.parse(report)).toEqual(report);
+      expect(report.signals.map((row) => row.status)).toEqual(
+        NEXTJS_SERVER_SIGNAL_KEYS.map(() => 'degraded'),
+      );
+    }
+
+    for (const row of short.signals) {
+      const label = `the silent hint for ${row.signal}`;
+
+      expectWholeHint(row.hint ?? '', label);
+      expect(occurrencesOf(row.hint ?? '', shortRoot), `${label} must name the root`).toBe(1);
+    }
+
+    for (const row of long.signals) {
+      const label = `the silent hint for ${row.signal} under a root that cannot fit`;
+
+      expectWholeHint(row.hint ?? '', label);
+      expect(row.hint, `${label} must drop the root`).not.toContain(longRoot);
+    }
+  });
+
+  it('drops the variable names before the command when they alone would crowd it out', async () => {
+    const root = syntheticRoot(64);
+    // Longer together than the whole hint bound, so no spelling carrying both
+    // them and the command can fit.
+    const envVarNames = Array.from(
+      { length: 64 },
+      (_, index) => `INJECTED_VARIABLE_NUMBER_${String(index).padStart(2, '0')}`,
+    );
+
+    expect(envVarNames.join(', ').length).toBeGreaterThan(READINESS_HINT_MAX_LENGTH);
+
+    for (const [label, hint] of await noPreloadHints(
+      { ...INJECTED_RELAUNCH, envVarNames },
+      contextAtRoot(root, preloadPresets(root).notConnected),
+      await smallPlan(fixture),
+    )) {
+      expectRelaunchHint(
+        hint,
+        root,
+        { specifier: INJECTED_RELAUNCH.preloadSpecifier, devCommand: INJECTED_RELAUNCH.devCommand },
+        label,
+      );
+      expect(occurrencesOf(hint, root), `${label} must still name the root`).toBe(1);
+
+      for (const name of envVarNames) {
+        // All or none: a partial list would read as the complete one.
+        expect(hint, `${label} must not carry a partial variable list`).not.toContain(name);
+      }
+    }
+  });
+
+  it('names no command at all rather than a truncated one', async () => {
+    const root = syntheticRoot(64);
+    const context = contextAtRoot(root, preloadPresets(root).notConnected);
+    const actions = await smallPlan(fixture);
+    // A specifier longer than the whole hint bound: no spelling of the
+    // command can fit, so the hint sends the developer to the editor command.
+    const preloadSpecifier = `/opt/${'s'.repeat(READINESS_HINT_MAX_LENGTH)}/register.mjs`;
+
+    for (const [label, hint] of await noPreloadHints(
+      { ...INJECTED_RELAUNCH, preloadSpecifier },
+      context,
+      actions,
+    )) {
+      expectWholeHint(hint, label);
+      expect(hint, `${label} must carry no partial command`).not.toContain('NODE_OPTIONS');
+      expect(hint, `${label} must carry no partial command`).not.toContain('--import');
+
+      for (const name of INJECTED_RELAUNCH.envVarNames) {
+        expect(hint, `${label} must still name ${name}`).toContain(name);
+      }
+    }
+
+    // And with the variable names too long as well, the editor command alone.
+    const envVarNames = [`INJECTED_${'V'.repeat(READINESS_HINT_MAX_LENGTH)}`];
+
+    for (const [label, hint] of await noPreloadHints(
+      { ...INJECTED_RELAUNCH, preloadSpecifier, envVarNames },
+      context,
+      actions,
+    )) {
+      expectWholeHint(hint, label);
+      expect(hint, `${label} must carry no partial command`).not.toContain('NODE_OPTIONS');
+      expect(hint, `${label} must carry no partial variable list`).not.toContain('INJECTED_');
+    }
   });
 });
 

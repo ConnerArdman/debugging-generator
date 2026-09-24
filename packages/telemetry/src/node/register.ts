@@ -308,8 +308,9 @@ export interface InstalledPreload {
   readonly instrumentations: readonly ToggleableInstrumentation[];
 
   /**
-   * Tear this installation down: dispose the control object, shut the processor
-   * down and undo any diagnostics wiring. Idempotent, and it never rejects.
+   * Tear this installation down: remove the `globalThis.__DEBUGGEN__` span
+   * helper, dispose the control object, shut the processor down and undo any
+   * diagnostics wiring. Idempotent, and it never rejects.
    *
    * Declared as a property holding a function rather than as a method, because
    * that is what it is: a closure over one installation, safe to pass around
@@ -415,6 +416,26 @@ interface PreloadLog {
 }
 
 /**
+ * Replace every occurrence of the credential in a string.
+ *
+ * The one scrub this module applies, shared by {@link createPreloadLog} — every
+ * diagnostic line — and by the `failed` result of {@link installPreload}, whose
+ * `reason` is a string a host reads and may print. An error thrown by a
+ * collaborator that was handed the configuration can quote the credential in
+ * its message, and {@link describeError} reproduces that message verbatim.
+ *
+ * @param text The text to clean.
+ * @param token The server-agent credential, or `''` when there is none yet.
+ * @returns `text` with the credential replaced by {@link REDACTED_PLACEHOLDER}.
+ */
+function scrubCredential(text: string, token: string): string {
+  if (token.length === 0 || !text.includes(token)) {
+    return text;
+  }
+  return text.split(token).join(REDACTED_PLACEHOLDER);
+}
+
+/**
  * Wrap a {@link Logger} so nothing this module emits can carry the credential.
  *
  * @param logger The underlying sink.
@@ -422,12 +443,7 @@ interface PreloadLog {
  * @returns A scrubbed, never-throwing logging facade.
  */
 function createPreloadLog(logger: Logger, token: string): PreloadLog {
-  const scrub = (text: string): string => {
-    if (token.length === 0 || !text.includes(token)) {
-      return text;
-    }
-    return text.split(token).join(REDACTED_PLACEHOLDER);
-  };
+  const scrub = (text: string): string => scrubCredential(text, token);
 
   const emit = (
     level: 'debug' | 'warn',
@@ -979,12 +995,24 @@ function createShutdownSequence(
 }
 
 /**
- * Close the control channel, make a last bounded attempt at the buffered
- * evidence, and undo the diagnostics wiring.
+ * Remove the span helper global, close the control channel, make a last
+ * bounded attempt at the buffered evidence, and undo the diagnostics wiring.
  *
  * Every step is independently guarded, so a failure in one still leaves the
  * others to run, and the whole sequence resolves rather than rejecting: it is
  * awaited from a signal handler in the developer's own process.
+ *
+ * After it, the process holds none of the six process-global effects the
+ * installation took — the same state the failure path of
+ * {@link installPreload} leaves, which is what AAP §0.5.1's "no active
+ * patches, no provider" requires of a preload that has been torn down.
+ *
+ * `globalThis.__DEBUGGEN__` goes first, synchronously, before the first
+ * `await`: it is the one global effect `control.dispose()` does not own, and
+ * revoking it before anything asynchronous begins mirrors the failure path,
+ * which revokes every global effect before it drains anything. A patched
+ * function called from then on runs its original body directly, because the
+ * patch template branches on the helper's availability.
  *
  * @param control Disposed first: it closes the socket, flushes, unwraps `pg`,
  * clears Prisma's hook and removes the global provider and propagator.
@@ -999,6 +1027,14 @@ async function runShutdown(
   diagWired: boolean,
   log: PreloadLog,
 ): Promise<void> {
+  try {
+    // Identity-tracked and total: a helper another copy of the preload
+    // installed, or a global replaced since, is left exactly where it is.
+    uninstallSpanHelper();
+  } catch (error) {
+    log.warn('the span helper global could not be removed', { error: describeError(error) });
+  }
+
   try {
     await control.dispose();
   } catch (error) {
@@ -1258,7 +1294,10 @@ export function installPreload(options: PreloadInstallOptions = {}): PreloadInst
       shutdown,
     };
   } catch (error) {
-    const reason = describeError(error);
+    // Scrubbed here rather than only on the way into the log: the reason is
+    // also handed back as `InactivePreload.reason`, which a host reads and may
+    // print, and that field is documented as value-free.
+    const reason = scrubCredential(describeError(error), config.token);
     log.warn(
       'the Debug Generator preload could not install; this dev server will run without server telemetry',
       { error: reason },
@@ -1477,8 +1516,9 @@ async function releasePreloadSlotAfter(
 /**
  * Tear down the preload installed in this process, if any.
  *
- * Delegates to the installation's own shutdown — `control.dispose()`, then the
- * exporter's final flush — and resolves immediately when nothing is installed.
+ * Delegates to the installation's own shutdown — the span helper's removal,
+ * `control.dispose()`, then the exporter's final flush — and resolves
+ * immediately when nothing is installed.
  * Idempotent: the sequence runs once and every later call awaits that same
  * result. It never rejects.
  *

@@ -71,9 +71,12 @@
  * `dg-field__hint`, `dg-field__error`, and this component's own `dg-select`,
  * `dg-select__native` and `dg-select__chevron` - against the token set of AAP
  * 0.6.3. Suppressing the user agent's own picker chrome and reserving the inline
- * space the chevron occupies are that stylesheet's work, never this file's. The
- * global `:focus-visible` ring of `../styles/base.css` resolves `--dg-focus-ring`
- * and is never overridden or removed.
+ * space the chevron occupies are that stylesheet's work, never this file's.
+ * Keyboard focus is always indicated by `--dg-focus-ring`: for this field the
+ * stylesheet draws the ring on the `dg-field__control` box - the field's
+ * visible edge - instead of on the borderless native `<select>` inside it,
+ * which is why the control must stay inside that box. The ring is relocated,
+ * never removed.
  *
  * TWO REQUIREMENTS THE STYLESHEET MUST HONOUR, measured in a browser rather
  * than assumed, because the markup below cannot express either without an
@@ -266,10 +269,14 @@ export interface SelectProps extends Omit<
    * Sets the NATIVE `disabled` attribute - not `aria-disabled` - so the picker
    * is genuinely inert and unfocusable rather than merely announced as
    * unavailable, and adds `dg-is-disabled` to the wrapper so the label, hint and
-   * error dim with it (`--dg-text-muted`, `--dg-border-subtle`). An empty
-   * `options` array disables the control on the same two channels, because a
-   * picker with nothing to pick is unavailable whatever this prop says. Defaults
-   * to `false`.
+   * error dim with it. The stylesheet gives the field the design system's one
+   * disabled treatment, the same as a disabled `Button` and `Input`: the enabled
+   * box's elevated surface, a `--dg-border-subtle` edge, `--dg-text-muted` text
+   * and a not-allowed cursor. It also cancels the user agent's own translucency
+   * for a disabled `<select>`, so the state is never signalled by `opacity`. An
+   * empty `options` array disables the control on the same two channels,
+   * because a picker with nothing to pick is unavailable whatever this prop
+   * says. Defaults to `false`.
    */
   disabled?: boolean | undefined;
 

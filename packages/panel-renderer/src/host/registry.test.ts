@@ -120,6 +120,7 @@ import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
+import { sourceLinkAccessibleName } from '../components/SourceLink';
 import { DataProviderContext, PanelSessionContext, createDataProvider } from './DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from './DataProvider';
 import { NodeRenderer } from './NodeRenderer';
@@ -215,6 +216,17 @@ const COMPONENT_SOURCE: SourceLocation = {
   resolvedBy: 'code-graph',
   confidence: 0.9,
 };
+
+/**
+ * The accessible name of the `sourceLink` node's chip.
+ *
+ * Asked of the component's own naming rule with exactly the props
+ * `SourceLinkNodeAdapter` passes — the location alone, so the default chip that
+ * shows the symbol and a compacted path — rather than restated here: the rule
+ * is pinned by `../components/SourceLink.test.tsx`, and these cases only need
+ * the name the dispatched chip actually carries.
+ */
+const COMPONENT_SOURCE_CHIP_NAME = sourceLinkAccessibleName({ location: COMPONENT_SOURCE });
 
 /** A location resolved through the code graph, for the statement's caller. */
 const CALLER_SOURCE: SourceLocation = {
@@ -1004,16 +1016,17 @@ async function findGridWithRows(scope: HTMLElement): Promise<HTMLElement> {
  * Asserts that nothing transient is left on screen: no query still resolving and
  * no failure.
  *
- * The loading placeholder is the package's only `role="status"` and the failure
- * state its only `role="alert"`, so both are reached semantically. The empty
- * placeholder deliberately declares no role at all — announcing "nothing to
- * show" on every unrelated re-render would be worse than silence — so it is the
- * one state read by class, off the node's own container.
+ * The loading placeholder is the package's only BUSY `role="status"` and the
+ * failure state its only `role="alert"`, so both are reached semantically. The
+ * empty placeholder is a settled `role="status"` too — the polite answer a
+ * query that found nothing gives — so it is excluded from the busy query and
+ * read by its class instead, off the node's own container: a successful render
+ * with rows carries none.
  *
  * @param scope The node's render container.
  */
 function expectSettledSuccess(scope: HTMLElement): void {
-  expect(within(scope).queryByRole('status')).toBeNull();
+  expect(within(scope).queryByRole('status', { busy: true })).toBeNull();
   expect(within(scope).queryByRole('alert')).toBeNull();
   expect(scope.querySelectorAll('.dg-empty-state')).toHaveLength(0);
   expect(scope.querySelector('.dg-panel__node')).not.toBeNull();
@@ -1218,9 +1231,10 @@ const RENDER_CASES: Readonly<Record<PanelNodeType, RenderCase>> = {
     async expectSuccess(scope) {
       await within(scope).findByRole('img');
 
-      // The equivalent list is what a keyboard or screen-reader user reads the
+      // The equivalent tree is what a keyboard or screen-reader user reads the
       // hierarchy from, so a drawn icicle alone is not this view's success.
-      expect(within(scope).getAllByRole('list').length).toBeGreaterThan(0);
+      const tree = within(scope).getByRole('tree');
+      expect(within(tree).getAllByRole('treeitem').length).toBeGreaterThan(0);
     },
   },
 
@@ -1310,12 +1324,14 @@ const RENDER_CASES: Readonly<Record<PanelNodeType, RenderCase>> = {
   sourceLink: {
     node: sourceLinkNode('node:sourceLink', COMPONENT_SOURCE),
     async expectSuccess(scope) {
-      // The chip's accessible name is built from the shared package's own
-      // spelling of a location, so this case cannot drift from the format the
-      // click path carries.
-      await within(scope).findByRole('button', {
-        name: `Open ${formatSourceLocation(COMPONENT_SOURCE)}`,
-      });
+      // The chip's accessible name ends with the shared package's own spelling
+      // of a location, so this case cannot drift from the format the click path
+      // carries.
+      const chip = await within(scope).findByRole('button', { name: COMPONENT_SOURCE_CHIP_NAME });
+
+      expect(
+        chip.getAttribute('aria-label')?.endsWith(formatSourceLocation(COMPONENT_SOURCE)),
+      ).toBe(true);
     },
   },
 };
@@ -1523,7 +1539,7 @@ describe('a node type the registry has no component for', () => {
 
     // A failure is not a loading state and not an empty one, and nothing was
     // asked of the provider for a node that could never have been drawn.
-    expect(within(scope).queryByRole('status')).toBeNull();
+    expect(within(scope).queryByRole('status', { busy: true })).toBeNull();
     expect(scope.querySelectorAll('.dg-empty-state')).toHaveLength(0);
     expect(stub.resolve).not.toHaveBeenCalled();
   });
@@ -1537,9 +1553,7 @@ describe('a dispatched component reaches the ambient host actions', () => {
 
     const scope = renderNode(RENDER_CASES.sourceLink.node, stub, spies);
 
-    const chip = await within(scope).findByRole('button', {
-      name: `Open ${formatSourceLocation(COMPONENT_SOURCE)}`,
-    });
+    const chip = await within(scope).findByRole('button', { name: COMPONENT_SOURCE_CHIP_NAME });
 
     await user.click(chip);
 
@@ -1597,9 +1611,7 @@ describe('a dispatched component reaches host-form actions through the adapter',
       panelTree(RENDER_CASES.sourceLink.node, stub.provider, spies.actions),
     ).container;
 
-    const chip = await within(scope).findByRole('button', {
-      name: `Open ${formatSourceLocation(COMPONENT_SOURCE)}`,
-    });
+    const chip = await within(scope).findByRole('button', { name: COMPONENT_SOURCE_CHIP_NAME });
 
     await user.click(chip);
 

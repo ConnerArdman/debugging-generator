@@ -109,10 +109,14 @@
  * ## Constraints this module works under
  *
  *   - **Contract only.** Two event-pointer types, the two forms and their
- *     union, one type guard, two pure adapters, one context and one hook. No
- *     state, no effect, no timer, no storage, no environment read, and no side
- *     effect at import time beyond the `createContext` call that *is* the
- *     context.
+ *     union, one type guard, two pure adapters, the action context and its
+ *     hook, and the shared-selection context with its read hooks and one pure
+ *     matcher (see "The shared selection" below). No effect, no timer, no
+ *     storage, no environment read, and no side effect at import time beyond
+ *     the two `createContext` calls that *are* the contexts. The shared
+ *     selection's state lives in the panel host, which provides it; the only
+ *     state here is `useViewSelection`'s standalone fallback, used by a view
+ *     rendered outside any host.
  *   - **Schema types reused, never restated.** The event pointer is picked from
  *     the schema's own `EventRef`, so a citation's field names and optionality
  *     have one definition (AAP 0.2.3); the renderer depends on the schema,
@@ -131,7 +135,7 @@
 
 import type { EventRef } from '@debuggen/panel-schema';
 import type { SourceLocation } from '@debuggen/shared';
-import { createContext, useContext, useMemo } from 'react';
+import { createContext, useCallback, useContext, useMemo, useState } from 'react';
 
 /*
  * ---------------------------------------------------------------------------
@@ -583,5 +587,225 @@ export function usePanelActions(): PanelViewActions | undefined {
   return useMemo(
     () => (provided === undefined ? undefined : toPanelViewActions(provided)),
     [provided],
+  );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shared selection
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The event the panel currently has selected, as every view beneath the panel
+ * host reads it: the pointer a view reported, or the id a host surface drives
+ * from its own details drawer.
+ *
+ * **Why the selection is shared, and why it is read here.** Several views of
+ * one panel draw the same captured events — a timeline bar, a flame cell, a
+ * slowest-operations row, an event-log line and an evidence chip can all stand
+ * for one span — so a selection kept inside each view lets them contradict one
+ * another: one chart highlights the span the developer clicked a moment ago
+ * while the next highlights the one clicked now, and the details drawer shows a
+ * third. The panel has one selected event, because the drawer shows one event
+ * (AAP 0.7.3: evidence chips "select the underlying events"). The panel host
+ * owns it and provides it through {@link PanelSelectionContext}; views read it
+ * through {@link useViewSelection} (or {@link usePanelSelection}) and mark the
+ * rows, bars and chips that stand for it, and they report a new selection
+ * exactly as before, through {@link PanelViewActions.onSelectEvent} — which is
+ * where the host records it. Under a host, no view keeps a selection of its own
+ * for an event it can name.
+ *
+ * The same type as the pointer a view reports ({@link PanelEventRef}), so what
+ * a view reported is what every view reads back: the id, plus only the trace
+ * and span coordinates the reporting view actually held. A host surface that
+ * drives the selection by id alone yields `{ eventId }` and nothing more — no
+ * coordinate is invented on the way in either direction.
+ */
+export type PanelSelection = PanelEventRef;
+
+/**
+ * What the panel host provides through {@link PanelSelectionContext}: the
+ * panel's current selection, `undefined` while nothing is selected.
+ *
+ * A holder object rather than the bare selection, so the context's own
+ * absence stays distinguishable from "a host with nothing selected": a view
+ * outside any host falls back to a selection of its own (see
+ * {@link useViewSelection}), while a view inside one never does.
+ */
+export interface PanelSelectionState {
+  /** The selected event, or `undefined` while nothing is selected. */
+  readonly selection: PanelSelection | undefined;
+}
+
+/**
+ * The context the panel host mounts around its whole subtree with the current
+ * {@link PanelSelectionState}.
+ *
+ * Its default is `undefined`: no host is mounted. That is a meaningful value,
+ * not an error — the editor webview reuses views without a host — and it is
+ * what {@link useViewSelection} keys its standalone fallback off. The host
+ * provides a value whose identity changes only when the selection does, so a
+ * view that reads it re-renders exactly when what it marks may change.
+ */
+export const PanelSelectionContext = createContext<PanelSelectionState | undefined>(undefined);
+
+/**
+ * Reads the panel's current selection, or `undefined` when nothing is selected
+ * or no host is mounted.
+ *
+ * **This hook never throws**, for the reason {@link usePanelActions} never
+ * does: the editor webview reuses views without mounting a host, and a view
+ * there renders rather than failing. A view that marks its own items should
+ * prefer {@link useViewSelection}, which adds the standalone fallback; this
+ * hook is the plain read for a consumer that only displays the selection.
+ *
+ * @returns The selected event's pointer, or `undefined`.
+ */
+export function usePanelSelection(): PanelSelection | undefined {
+  return useContext(PanelSelectionContext)?.selection;
+}
+
+/** What {@link useViewSelection} returns to a view. */
+export interface ViewSelection {
+  /**
+   * The selection this view marks: the panel's shared selection under a host,
+   * and the view's own last selection outside one. `undefined` when nothing is
+   * selected.
+   */
+  readonly selection: PanelSelection | undefined;
+
+  /**
+   * Whether the selection is the panel host's shared one (`true`) or this
+   * view's own standalone fallback (`false`).
+   */
+  readonly shared: boolean;
+
+  /**
+   * Records a selection this view made, **in addition to** reporting it through
+   * {@link PanelViewActions.onSelectEvent}.
+   *
+   * Under a host this does nothing — the host records every report itself, so
+   * a second write here would be a second source of truth. Outside a host it
+   * is the view's own selection state, so a view reused without a host still
+   * marks what the reader activated. Stable for the life of the view.
+   */
+  readonly markSelected: (ref: PanelEventRef) => void;
+}
+
+/**
+ * The selection a view marks, and how it records one it made — the one idiom
+ * every event-bearing view uses in place of a selection state of its own.
+ *
+ * ```tsx
+ * const { selection, markSelected } = useViewSelection();
+ * const actions = usePanelActions();
+ *
+ * const select = (ref: PanelEventRef) => {
+ *   markSelected(ref);            // a no-op under a host
+ *   actions?.onSelectEvent(ref);  // the host records it and every view follows
+ * };
+ *
+ * <DataTable selectedRowKey={rows.find((r) => matchesPanelSelection(selection, r))?.id ?? null} … />
+ * ```
+ *
+ * **Inside the panel host** the selection is the host's shared one, so a
+ * timeline bar, a flame cell, a table row, a log line and an evidence chip for
+ * one event are marked together and a selection made in any of them moves
+ * every mark. **Outside a host** — a surface that embeds a single view, or a
+ * component suite that mounts one — there is nothing to share with, and the
+ * view falls back to its own last selection, which is exactly what it would
+ * have kept before the selection was shared.
+ *
+ * Mark the matching items with {@link matchesPanelSelection}: `dg-is-selected`
+ * together with `aria-selected` on a grid row, tree item or list option, or
+ * `aria-pressed` on a toggle-like chip, so the state is carried by an attribute
+ * as well as by a colour (AAP 0.6.4). Never throws.
+ *
+ * This is the one hook in this module that holds state, and the state is used
+ * only while no host is mounted.
+ *
+ * @returns The selection to mark, whether it is shared, and the recorder.
+ */
+export function useViewSelection(): ViewSelection {
+  const hosted = useContext(PanelSelectionContext);
+  const [own, setOwn] = useState<PanelSelection | undefined>(undefined);
+  const shared = hosted !== undefined;
+
+  const markSelected = useCallback(
+    (ref: PanelEventRef): void => {
+      if (shared) {
+        return;
+      }
+
+      const next: PanelSelection = {
+        eventId: ref.eventId,
+        ...(ref.traceId === undefined ? {} : { traceId: ref.traceId }),
+        ...(ref.spanId === undefined ? {} : { spanId: ref.spanId }),
+      };
+
+      setOwn((previous) =>
+        previous !== undefined &&
+        previous.eventId === next.eventId &&
+        previous.traceId === next.traceId &&
+        previous.spanId === next.spanId
+          ? previous
+          : next,
+      );
+    },
+    [shared],
+  );
+
+  const selection = shared ? hosted.selection : own;
+
+  return useMemo(() => ({ selection, shared, markSelected }), [selection, shared, markSelected]);
+}
+
+/**
+ * The id of the panel's selected event, or `undefined` when nothing is
+ * selected or no host is mounted — the one coordinate most views key on.
+ *
+ * @returns The selected event id, or `undefined`.
+ */
+export function useSelectedEventId(): string | undefined {
+  return usePanelSelection()?.eventId;
+}
+
+/**
+ * Whether an item a view drew stands for the panel's selected event.
+ *
+ * The event id is the identity of a captured event, so an equal `eventId` is a
+ * match. A view that draws one span under another record's id — a tree built
+ * by span id, a participant that collapsed one record — also matches when
+ * **both** pointers name the same trace **and** the same span: that pair is the
+ * span's own identity across tiers (AAP 0.2.3), so it cannot name a different
+ * event. A single shared coordinate is never enough — two spans of different
+ * traces may carry the same span id — and an absent coordinate never matches
+ * an absent one.
+ *
+ * Pure and allocation-free, so a view may call it once per rendered row.
+ *
+ * @param selection The panel's selection, as {@link usePanelSelection} returns it.
+ * @param candidate The pointer of the item being drawn, or `undefined` for an
+ * item that stands for no single event (an aggregate with no representative).
+ * @returns `true` exactly when `candidate` stands for the selected event.
+ */
+export function matchesPanelSelection(
+  selection: PanelSelection | undefined,
+  candidate: PanelEventRef | undefined,
+): boolean {
+  if (selection === undefined || candidate === undefined) {
+    return false;
+  }
+
+  if (candidate.eventId === selection.eventId) {
+    return true;
+  }
+
+  return (
+    selection.traceId !== undefined &&
+    selection.spanId !== undefined &&
+    candidate.traceId === selection.traceId &&
+    candidate.spanId === selection.spanId
   );
 }

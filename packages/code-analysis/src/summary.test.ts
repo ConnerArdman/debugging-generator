@@ -69,9 +69,10 @@ import { dirnamePosix, isSafeRelativePath, joinPosix, toPosix } from '@debuggen/
 import type { LogFields, LogLevel, Logger } from '@debuggen/shared';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 
-import { CodeGraph } from './graph/graph.js';
+import { CodeGraph, makeEdgeId } from './graph/graph.js';
 import { CODE_INDEX_SCHEMA_VERSION } from './graph/types.js';
 import type {
+  CodeEdge,
   CodeIndex,
   CodeNode,
   CodeNodeOf,
@@ -92,6 +93,7 @@ import {
   detectFramework,
   detectPackageManager,
   detectRouterStyle,
+  isToolingModulePath,
   parseManifest,
   readTargetManifest,
   summarizeProject,
@@ -255,18 +257,42 @@ function dbCallNode(id: string, driver: DbDriver, file: string): CodeNodeOf<'db-
   };
 }
 
-/** A graph over synthesised nodes, built exactly as a persisted index is read back. */
-function graphOf(nodes: readonly CodeNode[]): CodeGraph {
+/**
+ * A graph over synthesised nodes and edges, built exactly as a persisted index
+ * is read back.
+ *
+ * @param nodes The nodes.
+ * @param edges The edges; none by default, which is all the style detector needs.
+ * @returns The graph.
+ */
+function graphOf(nodes: readonly CodeNode[], edges: readonly CodeEdge[] = []): CodeGraph {
   const index: CodeIndex = {
     schemaVersion: CODE_INDEX_SCHEMA_VERSION,
     projectRoot: '/project',
     indexerVersion: 'summary.test',
     generatedAt: 0,
     nodes: [...nodes],
-    edges: [],
+    edges: [...edges],
     files: [],
   };
   return CodeGraph.fromIndex(index);
+}
+
+/**
+ * A resolved in-project `imports` edge from one `file` node to another, which
+ * is what tells the construction-module ranking that a module is shared.
+ *
+ * @param from The importing file node's id.
+ * @param to The imported file node's id.
+ * @returns The edge.
+ */
+function importEdge(from: string, to: string): CodeEdge {
+  return {
+    id: makeEdgeId({ kind: 'imports', from, to, line: 1, column: 1 }),
+    kind: 'imports',
+    from,
+    to,
+  };
 }
 
 /** A route map over a literal entry list, resolving through the real matcher. */
@@ -1013,6 +1039,149 @@ describe('detectDatabaseAccess', () => {
     ]);
 
     expect(detectDatabaseAccess(graph, undefined, EMPTY_PROBE).pgPoolModule).toBe('src/a-pool.ts');
+  });
+
+  it('prefers the shared handle module over a seed or script that constructs its own', () => {
+    // The seed and the script both sort before `src/`, so a path order alone
+    // would name them. Neither runs inside the dev server, and the services the
+    // application runs import the `src/db` modules instead.
+    const graph = graphOf(
+      [
+        dbCallNode('db:1', 'prisma', 'src/services/catalog.ts'),
+        dbCallNode('db:2', 'pg', 'src/services/inventory.ts'),
+        dbCallNode('db:3', 'prisma', 'prisma/seed.ts'),
+        dbCallNode('db:4', 'pg', 'scripts/backfill.ts'),
+        fileNode('file:seed', 'prisma/seed.ts', [
+          { specifier: '@prisma/client', typeOnly: false, names: ['PrismaClient'] },
+          { specifier: 'pg', typeOnly: false, names: ['Pool'] },
+        ]),
+        fileNode('file:script', 'scripts/backfill.ts', [
+          { specifier: 'pg', typeOnly: false, names: ['Pool'] },
+        ]),
+        fileNode('file:client', 'src/db/client.ts', [
+          { specifier: '@prisma/client', typeOnly: false, names: ['PrismaClient'] },
+        ]),
+        fileNode('file:pool', 'src/db/pool.ts', [
+          { specifier: 'pg', typeOnly: false, names: ['Pool'] },
+        ]),
+        fileNode('file:catalog', 'src/services/catalog.ts', []),
+        fileNode('file:inventory', 'src/services/inventory.ts', []),
+      ],
+      [importEdge('file:catalog', 'file:client'), importEdge('file:inventory', 'file:pool')],
+    );
+
+    expect(detectDatabaseAccess(graph, undefined, EMPTY_PROBE)).toEqual({
+      style: 'both',
+      prismaClientModule: 'src/db/client.ts',
+      pgPoolModule: 'src/db/pool.ts',
+      callSiteCount: 4,
+    });
+  });
+
+  it('ranks an imported application module first, counting only application importers', () => {
+    const importsPool: readonly ExternalImportRef[] = [
+      { specifier: 'pg', typeOnly: false, names: ['Pool'] },
+    ];
+    const nodes = [
+      dbCallNode('db:1', 'pg', 'src/services/inventory.ts'),
+      fileNode('file:a', 'src/a-pool.ts', importsPool),
+      fileNode('file:m', 'src/m-pool.ts', importsPool),
+      fileNode('file:z', 'src/z-pool.ts', importsPool),
+      fileNode('file:inventory', 'src/services/inventory.ts', []),
+      fileNode('file:load', 'scripts/load.ts', []),
+    ];
+
+    // The one module an application module imports wins, whatever its path.
+    expect(
+      detectDatabaseAccess(
+        graphOf(nodes, [importEdge('file:inventory', 'file:z'), importEdge('file:load', 'file:m')]),
+        undefined,
+        EMPTY_PROBE,
+      ).pgPoolModule,
+    ).toBe('src/z-pool.ts');
+
+    // An import from a script does not make a module the application's own
+    // handle, so the lexicographic order decides between the unshared modules;
+    // and a module importing itself shares nothing.
+    expect(
+      detectDatabaseAccess(
+        graphOf(nodes, [importEdge('file:load', 'file:m'), importEdge('file:z', 'file:z')]),
+        undefined,
+        EMPTY_PROBE,
+      ).pgPoolModule,
+    ).toBe('src/a-pool.ts');
+  });
+
+  it('still names a tooling module when it is the only construction site', () => {
+    const graph = graphOf([
+      dbCallNode('db:1', 'prisma', 'prisma/seed.ts'),
+      fileNode('file:seed', 'prisma/seed.ts', [
+        { specifier: '@prisma/client', typeOnly: false, names: ['PrismaClient'] },
+      ]),
+      fileNode('file:tests', 'tests/client.test.ts', [
+        { specifier: '@prisma/client', typeOnly: false, names: ['PrismaClient'] },
+      ]),
+    ]);
+
+    // Both qualifying modules are tooling, so the path order decides: the
+    // answer stays deterministic and the summary still says where the client
+    // is built rather than pretending it is built nowhere.
+    expect(detectDatabaseAccess(graph, undefined, EMPTY_PROBE).prismaClientModule).toBe(
+      'prisma/seed.ts',
+    );
+  });
+});
+
+describe('isToolingModulePath', () => {
+  it('recognises seed, migration, script, test and configuration modules', () => {
+    for (const path of [
+      'prisma/seed.ts',
+      'db/seeds.mjs',
+      'db/seeds/accounts.ts',
+      'src/db/seed/load.ts',
+      'seed.ts',
+      'db/migrations/x.ts',
+      'src/db/migrations/0001_init.ts',
+      'scripts/load.ts',
+      'script/run.mjs',
+      'test/cart.ts',
+      'tests/helpers/fixture.ts',
+      'e2e/checkout.ts',
+      'src/__tests__/cart.ts',
+      'src/__mocks__/client.ts',
+      'src/__fixtures__/rows.ts',
+      'src/cart.test.ts',
+      'src/cart.spec.tsx',
+      'src/widgets/Gauge.stories.tsx',
+      'next.config.ts',
+      'vitest.config.mts',
+      'prisma.config.ts',
+      './prisma/seed.ts',
+      'scripts\\load.ts',
+    ]) {
+      expect(isToolingModulePath(path), path).toBe(true);
+    }
+  });
+
+  it('leaves application modules alone, including ones that merely share a word', () => {
+    for (const path of [
+      'src/seedling.ts',
+      'src/lib/seed-utils.ts',
+      'src/components/Seed.tsx',
+      'src/server/db/client.ts',
+      'src/server/db/pool.ts',
+      'src/config.ts',
+      'src/test.ts',
+      'src/scripts/editor.ts',
+      'src/tests-dashboard/page.tsx',
+      'lib/migration.ts',
+      'testing/cart.ts',
+      'app/api/gauges/route.ts',
+      'scripts',
+      '',
+    ]) {
+      expect(isToolingModulePath(path), path).toBe(false);
+    }
   });
 });
 

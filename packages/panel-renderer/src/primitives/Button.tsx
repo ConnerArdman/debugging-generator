@@ -39,14 +39,20 @@
  *
  *   dg-button                 the block — an inline-flex chip, label and
  *                             leading icon centred, gap and padding from
- *                             `--dg-space-*`, `--dg-radius-sm`/`-md`
+ *                             `--dg-space-*`, `--dg-radius-sm`/`-md`, and at
+ *                             least `--dg-space-7` (24 px) on both axes: the
+ *                             WCAG 2.2 SC 2.5.8 target size, a minimum that
+ *                             every variant and density inherits
  *   dg-button--primary        `--dg-accent` fill; `--dg-accent-muted` on hover
  *   dg-button--secondary      `--dg-surface-elevated` on `--dg-border-subtle`
  *   dg-button--ghost          transparent until hover, `--dg-text-secondary`
  *   dg-button--danger         `--dg-danger`
- *   dg-button--sm             the `--dg-text-sm` role, tighter `--dg-space-*`
- *   dg-button--md             the `--dg-text-md` role (the default)
- *   dg-button--icon-only      a square chip with no label box
+ *   dg-button--sm             the `--dg-text-sm` role, tighter `--dg-space-*`;
+ *                             24 px tall through the block's floor
+ *   dg-button--md             the `--dg-text-md` role (the default), 28 px tall
+ *   dg-button--icon-only      a square chip with no label box: 24 × 24 at `sm`,
+ *                             28 × 28 (the labelled `md` height) at `md`,
+ *                             whatever the glyph's own proportions
  *   dg-button--full           `inline-size: 100%` for a stacked form action
  *   dg-button__icon           the leading-icon box
  *   dg-button__label          the label box
@@ -131,6 +137,10 @@ export type ButtonVariant = 'primary' | 'secondary' | 'ghost' | 'danger';
  * (`--dg-text-sm`) exists for the dense rows the product is full of — toolbar
  * strips, table headers, event-log rows — and is the only other size: a third
  * would be a design decision the token table does not carry.
+ *
+ * Density changes the type role and the padding, never the target: both sizes
+ * are at least 24 px on each axis (WCAG 2.2 SC 2.5.8), so the dense chip a row
+ * embeds is as easy to hit as any other control.
  */
 export type ButtonSize = 'sm' | 'md';
 
@@ -241,7 +251,9 @@ export interface ButtonOwnProps extends Omit<
 
   /**
    * Render the glyph alone, with no visible label — the square chip form a
-   * dense toolbar or a row affordance uses.
+   * dense toolbar or a row affordance uses. The square is the stylesheet's,
+   * not the glyph's: 24 × 24 at `sm` and 28 × 28 at `md`, so a narrow glyph
+   * still yields a full-size target.
    *
    * The control still needs an accessible name, and it cannot be the glyph:
    * the `dg-button__icon` box is always `aria-hidden`. The name arrives in one

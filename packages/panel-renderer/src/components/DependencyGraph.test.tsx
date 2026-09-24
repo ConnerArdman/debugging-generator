@@ -95,6 +95,13 @@
  *     `layoutDependencyGraph` in a hoisted record, so `layering` can prove the
  *     layering is resolved once per payload and reused rather than computed a
  *     second time. Nothing about the geometry changes under the mock.
+ *   - **Layout-free, except where sizing is the subject.** happy-dom has no
+ *     layout, so the component's viewport measures as unmeasured and every
+ *     positional case asserts the default rhythm. The `canvas sizing` cases
+ *     alone give the one element the component measures — its scroll viewport
+ *     — a `clientWidth`, and the window a `ResizeObserver` they can fire, and
+ *     restore the window's own observer when they finish; nothing else about
+ *     layout is stubbed.
  *   - **No timers, no fake clocks, no arbitrary waits.** Post-resolution
  *     assertions go through `await screen.findBy…`; `userEvent` drives pointer
  *     activation, and `fireEvent` the two low-level gestures (a wheel and a key
@@ -113,13 +120,19 @@
  * @see ../utils/scale for the layered geometry the positional assertions derive from.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import type {
   DataQuery,
   DependencyGraphNode as DependencyGraphNodeSpec,
+  FlameNode,
 } from '@debuggen/panel-schema';
+import { catalogEntryFor } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import { buildDependencyGraph } from '@debuggen/telemetry';
+import { buildDependencyGraph, correlateTrace } from '@debuggen/telemetry';
 import type {
   DependencyGraphData,
   DependencyGraphEdge,
@@ -128,20 +141,30 @@ import type {
 } from '@debuggen/telemetry';
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { useMemo, useState } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type {
+  PanelActions,
+  PanelEventRef,
+  PanelSelection,
+  PanelSelectionState,
+} from '../host/PanelActions';
 import { dependencyNodeColorVar } from '../utils/color';
-import { formatDurationCompact, formatTierLabel } from '../utils/format';
+import { formatCount, formatDurationCompact, formatTierLabel } from '../utils/format';
+import { DEFAULT_LABEL_FONT_SIZE, estimateTextWidth } from '../utils/measure';
 import {
   DEFAULT_GRAPH_COLUMN_GAP,
   DEFAULT_GRAPH_NODE_HEIGHT,
   DEFAULT_GRAPH_NODE_WIDTH,
   DEFAULT_GRAPH_ROW_GAP,
+  MAX_GRAPH_COLUMN_GAP,
+  MIN_GRAPH_COLUMN_GAP,
   assignGraphLayers,
   layoutDependencyGraph,
   resolveGraphLayering,
@@ -149,6 +172,7 @@ import {
 import type { GraphLayering } from '../utils/scale';
 import type * as ScaleModule from '../utils/scale';
 import { DependencyGraph } from './DependencyGraph';
+import { FlameChart } from './FlameChart';
 
 /*
  * ---------------------------------------------------------------------------
@@ -292,6 +316,57 @@ const FAILING_QUERY_NAME = 'Failing query';
 
 /** The error state's retry control. */
 const RETRY_NAME = 'Retry';
+
+/*
+ * The shared error-state contract, spelled out rather than read back from
+ * `../host/useQuery`, so this suite pins the words a reader sees on this node
+ * instead of restating whatever the contract currently holds (B1-F16, B2-F14).
+ */
+
+/** The first line of a node whose own data could not be loaded. */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+
+/** The generic lead every failed view's message opens with. */
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+
+/** The first line of a node whose query names a source it cannot draw. */
+const UNSUPPORTED_TITLE = 'This view cannot draw the requested data';
+
+/** The attribute and value the retry control carries so focus can follow it. */
+const RETRY_FOCUS_ATTRIBUTE = 'data-dg-focus-key';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/**
+ * The parts of a rendered error state, read through the class contract
+ * `primitives/ErrorState` declares.
+ *
+ * @param alert The error state's live-region container.
+ * @returns Its title, its message paragraphs (message, then hint) and its code chip.
+ */
+function errorStateParts(alert: HTMLElement): {
+  readonly title: string | undefined;
+  readonly paragraphs: readonly string[];
+  readonly code: string | undefined;
+} {
+  return {
+    title: alert.querySelector('.dg-error-state__title')?.textContent ?? undefined,
+    paragraphs: Array.from(alert.querySelectorAll('.dg-error-state__message')).map(
+      (paragraph) => paragraph.textContent ?? '',
+    ),
+    code: alert.querySelector(':scope > .dg-badge')?.textContent ?? undefined,
+  };
+}
+
+/** The badge a bounded graph carries, as every chart marks a partial result. */
+const PARTIAL_RESULT_BADGE = 'Partial result';
+
+/**
+ * The note for participants whose declared event contradicts their records, in
+ * either agreement: "its records" for one participant, "their records" for
+ * several. The cases that pin a count pin the whole sentence.
+ */
+const INCONSISTENT_COORDINATES_NOTE =
+  /declared an event that does not match (?:its|their) records/i;
 
 /**
  * The 1-based `aria-colindex` of each column of the participants grid, in the
@@ -939,10 +1014,8 @@ function cellOf(row: HTMLElement, columnIndex: number): HTMLElement {
  * participant's id.
  *
  * Read by that attribute rather than by the header's whole text content: the
- * cell also carries the detail — in the tooltip's description while the row is
- * unfocused, on a second line while it holds focus — which a bare `textContent`
- * would concatenate. The attribute is on the label in both forms, so the reader
- * works whichever one the row is in.
+ * cell also carries the participant's detail on a second line, which a bare
+ * `textContent` would concatenate onto the label.
  *
  * @param row A row obtained by role.
  * @returns The label element.
@@ -1048,6 +1121,24 @@ function shapeNamed(label: string): Element {
   return shape;
 }
 
+/**
+ * The pointer title of a participant's shape: the SVG `<title>` of the group
+ * the shape is drawn in, which is also the element a click on the shape
+ * reaches.
+ *
+ * @param shape A shape obtained through {@link shapeNamed}.
+ * @returns The title's text.
+ */
+function titleOfShape(shape: Element): string {
+  const title = shape.parentElement?.querySelector(':scope > title');
+
+  if (title === null || title === undefined) {
+    throw new Error('the shape is drawn without a title');
+  }
+
+  return title.textContent ?? '';
+}
+
 /** The column groups of the canvas, in document order. */
 function columnGroups(): Element[] {
   return Array.from(canvas().querySelectorAll('g.dg-dependency-graph__column'));
@@ -1104,6 +1195,120 @@ function legendOf(container: HTMLElement): HTMLElement {
   return legend;
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * A measured viewport
+ *
+ * The component measures one element — the scroll viewport around its canvas —
+ * through `useChartCanvas`, which reads the element's `clientWidth` when its
+ * ref attaches and again on every `ResizeObserver` callback. happy-dom reports
+ * a zero width and its observer never calls back, so the sizing cases stand in
+ * for exactly those two things and nothing else.
+ * ---------------------------------------------------------------------------
+ */
+
+/** A stand-in for the layout of the graph's viewport, installed for one case. */
+interface MeasuredViewport {
+  /**
+   * Gives the rendered viewport an inner width and delivers the resize the
+   * component observes, inside `act` so the redraw has committed on return.
+   */
+  resize(width: number): void;
+
+  /** Puts the window's own `ResizeObserver` back. */
+  restore(): void;
+}
+
+/**
+ * Installs a `ResizeObserver` the case can fire. Call it before rendering: the
+ * component's measure looks the constructor up when its viewport attaches.
+ *
+ * @returns The controls, and the restore the case must call in `finally`.
+ */
+function installMeasuredViewport(): MeasuredViewport {
+  const view = window as unknown as { ResizeObserver: unknown };
+  const original = view.ResizeObserver;
+  const callbacks = new Set<() => void>();
+
+  class ControlledObserver {
+    private readonly callback: () => void;
+
+    public constructor(callback: () => void) {
+      this.callback = callback;
+    }
+
+    public observe(): void {
+      callbacks.add(this.callback);
+    }
+
+    public unobserve(): void {
+      callbacks.delete(this.callback);
+    }
+
+    public disconnect(): void {
+      callbacks.delete(this.callback);
+    }
+  }
+
+  view.ResizeObserver = ControlledObserver;
+
+  return {
+    resize(width: number): void {
+      const element = canvas().closest('.dg-dependency-graph__viewport');
+      if (element === null) {
+        throw new Error('the canvas is not drawn inside its viewport');
+      }
+      Object.defineProperty(element, 'clientWidth', { configurable: true, get: () => width });
+      act(() => {
+        for (const callback of [...callbacks]) {
+          callback();
+        }
+      });
+    },
+    restore(): void {
+      view.ResizeObserver = original;
+    },
+  };
+}
+
+/** The canvas's declared size, and its `viewBox` as four numbers. */
+function canvasFrame(): { width: number; height: number; viewBox: number[] } {
+  const picture = canvas();
+  return {
+    width: Number(picture.getAttribute('width')),
+    height: Number(picture.getAttribute('height')),
+    viewBox: (picture.getAttribute('viewBox') ?? '').split(' ').map(Number),
+  };
+}
+
+/** The left edge of every participant shape, in document order. */
+function shapeLefts(): number[] {
+  return nodeShapes().map((shape) => Number(shape.getAttribute('x')));
+}
+
+/**
+ * Asserts, for a graph whose relationships all run from one column to the
+ * next, that every curve leaves a box's right outline and meets the next
+ * column's left outline with no box between the two — horizontal control
+ * points keep a cubic within its anchors' x, so no curve crosses a box.
+ */
+function expectCurvesBetweenColumns(): void {
+  const lefts = shapeLefts();
+  for (const curve of edgeCurves()) {
+    const numbers = (curve.getAttribute('d') ?? '').match(/-?\d+(?:\.\d+)?/g)?.map(Number) ?? [];
+    const [startX, , , , , , endX] = numbers;
+    if (startX === undefined || endX === undefined) {
+      throw new Error(`a curve carries no path: ${curve.getAttribute('d') ?? ''}`);
+    }
+    expect(lefts.map((left) => left + DEFAULT_GRAPH_NODE_WIDTH)).toContain(startX);
+    expect(lefts).toContain(endX);
+    for (const left of lefts) {
+      const right = left + DEFAULT_GRAPH_NODE_WIDTH;
+      expect(right <= startX || left >= endX).toBe(true);
+    }
+  }
+}
+
 // Explicit, per the harness note above: automatic cleanup belongs to the
 // runner's configuration, this guarantee belongs to the suite. Restoring spies
 // in the same place keeps one case's mock out of the next.
@@ -1154,10 +1359,17 @@ describe('DependencyGraph states', () => {
       expect(message.textContent).not.toContain(label);
     }
 
+    // Announced as the settled status, with a short title and a decorative
+    // glyph above the sentence, like every other view's empty capture.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('No relationships');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty graph is a success, so it is drawn as an absence rather than as
     // a failure, and there is no picture and no grid to hold participants.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
@@ -1179,8 +1391,9 @@ describe('DependencyGraph states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.closest('.dg-dependency-graph__error')).not.toBeNull();
 
-    // The provider's own message, hint and code reach the reader rather than a
-    // generic sentence written over them.
+    // The provider's own message, hint and code reach the reader after the
+    // shared lead, rather than being replaced by a generic sentence.
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
     expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(alert.textContent).toContain('Reconnect the panel and ask again.');
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
@@ -1237,9 +1450,123 @@ describe('DependencyGraph states', () => {
     expect(screen.queryByRole('img')).toBeNull();
     expect(screen.queryByRole('grid')).toBeNull();
   });
+
+  it('draws a rejected query through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.', {
+        hint: 'Reconnect the panel and ask again.',
+      }),
+    );
+
+    renderComponent(makeNode({ query: { source: 'graph', filter: { traceId: TRACE_ID } } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    // A lone failure alerts: nothing else on screen failed with it.
+    const alert = await screen.findByRole('alert');
+    expect(alert.classList.contains('dg-error-state')).toBe(true);
+
+    // Title, then the generic lead followed by the provider's own cause — with
+    // the hint on a line of its own rather than appended to the message — then
+    // the code chip.
+    const parts = errorStateParts(alert);
+    expect(parts.title).toBe(VIEW_FAILURE_TITLE);
+    expect(parts.paragraphs).toEqual([
+      `${VIEW_FAILURE_LEAD} The channel to the service is closed.`,
+      'Reconnect the panel and ask again.',
+    ]);
+    expect(parts.code).toBe('TRANSPORT_DISCONNECTED');
+
+    // The query block, found by its name — the error state's `<details>` is an
+    // unnamed group too — parses back to exactly the query that was asked.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the node frame restores focus by.
+    const retryControl = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retryControl.getAttribute(RETRY_FOCUS_ATTRIBUTE)).toBe(RETRY_FOCUS_KEY);
+
+    // One glyph for every failure: the primitive's own, decorative.
+    expect(alert.querySelector('.dg-error-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('draws a source it cannot read through the shared unsupported-query contract', async () => {
+    const stub = resolvingProvider(chainGraph());
+
+    renderComponent(makeNode({ query: { source: 'spans', sort: 'duration_desc' } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.closest('.dg-dependency-graph__error')).not.toBeNull();
+
+    // The contract's title and code, and a message worded from the node
+    // catalog: what this view reads next to what it was asked for.
+    const parts = errorStateParts(alert);
+    expect(parts.title).toBe(UNSUPPORTED_TITLE);
+    expect(parts.paragraphs).toEqual([
+      `The ${catalogEntryFor('dependencyGraph').label} view reads "graph" data, but this panel asks it for "spans".`,
+    ]);
+    expect(parts.code).toBe('PANEL_INVALID');
+
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({ source: 'spans', sort: 'duration_desc' });
+
+    // A defect in the panel, not a failed request: nothing to retry.
+    expect(within(alert).queryByRole('button', { name: RETRY_NAME })).toBeNull();
+    expect(alert.querySelector(`[${RETRY_FOCUS_ATTRIBUTE}]`)).toBeNull();
+    expect(stub.resolve).not.toHaveBeenCalled();
+  });
 });
 
 describe('DependencyGraph rendering', () => {
+  it('floors every participants-grid track in ch, so a narrow panel scrolls the grid instead of squeezing it', async () => {
+    const stub = resolvingProvider(chainGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const template = grid.style.getPropertyValue('--dgc-columns').trim();
+
+    // Split at top-level spaces only, so the space after the comma inside
+    // `minmax(24ch, 2fr)` stays inside the track it belongs to.
+    const tracks: string[] = [];
+    let depth = 0;
+    let current = '';
+    for (const character of template) {
+      if (character === ' ' && depth === 0) {
+        if (current !== '') {
+          tracks.push(current);
+        }
+        current = '';
+        continue;
+      }
+      depth += character === '(' ? 1 : character === ')' ? -1 : 0;
+      current += character;
+    }
+    if (current !== '') {
+      tracks.push(current);
+    }
+
+    // Six columns, none of them the floorless `minmax(0, …)` that let the
+    // participant label collapse to a few characters per line in a narrow
+    // panel; the participant column keeps the widest floor and twice the share,
+    // and the relationships column, whose chips wrap their full target, a floor
+    // wide enough for one chip per line.
+    expect(tracks).toHaveLength(6);
+    for (const track of tracks) {
+      expect(track).toMatch(/^minmax\(\d+ch, \d+fr\)$/u);
+    }
+    expect(tracks[1]).toBe('minmax(24ch, 2fr)');
+    expect(tracks[4]).toBe('minmax(22ch, 2fr)');
+
+    // The floors reach the grid's own minimum inline size, which is what turns
+    // a too-narrow panel into a horizontal scroll.
+    expect(grid.style.getPropertyValue('--dgc-min-inline')).toContain('24ch');
+  });
+
   it('draws one shape and one row per participant, and one curve per relationship', async () => {
     const stub = resolvingProvider(chainGraph());
 
@@ -1299,6 +1626,33 @@ describe('DependencyGraph rendering', () => {
     expect(style).toContain(dependencyNodeColorVar('database'));
     expect(style).not.toContain('#');
     expect(style).not.toContain('rgb');
+  });
+
+  it('agrees every count in the text alternative with its noun, singular and plural', async () => {
+    // One participant in one column, joined by nothing.
+    const lone = resolvingProvider(makeGraph({ nodes: [INTERACTION], edges: [] }));
+    const view = renderComponent(makeNode(), {
+      provider: lone.provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+
+    const loneAlternative = canvas().getAttribute('aria-label') ?? '';
+    expect(loneAlternative).toContain('1 participant in 1 layer, joined by 0 relationships and');
+    expect(loneAlternative).not.toContain('1 participants');
+    expect(loneAlternative).not.toContain('1 layers');
+    view.unmount();
+
+    // Two participants in two columns, joined by exactly one relationship.
+    const pair = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, HANDLER], edges: [makeEdge(INTERACTION.id, HANDLER.id)] }),
+    );
+    renderComponent(makeNode(), { provider: pair.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const pairAlternative = canvas().getAttribute('aria-label') ?? '';
+    expect(pairAlternative).toContain('2 participants in 2 layers, joined by 1 relationship and');
+    expect(pairAlternative).not.toContain('1 relationships');
   });
 
   it('states what the picture holds and repeats every participant in the grid', async () => {
@@ -1405,6 +1759,48 @@ describe('DependencyGraph rendering', () => {
     const note = await screen.findByText(/this layout is static in this version/i);
     expect(note.textContent).toContain('Dragging, panning and zooming are not available.');
     expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
+
+    // It also says what a click does, and says nothing about hover or focus
+    // revealing detail: every row of the table carries its detail already.
+    expect(note.textContent).toContain(
+      'Clicking a participant on the picture also opens its source location in the editor when it has one',
+    );
+    expect(note.textContent).not.toMatch(/hover|focus/i);
+  });
+
+  it('states a bounded graph as a partial result beside the canvas, with the route to more', async () => {
+    const stub = resolvingProvider(chainGraph({ truncated: true }));
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // The badge the other charts use, and one statement of what is drawn and
+    // how to see more — never a control, since nothing more is in memory.
+    const drawn = `Showing the ${String(CHAIN_PARTICIPANTS.length)} most significant participants`;
+    const badge = screen.getByText(PARTIAL_RESULT_BADGE);
+    const notice = screen.getByText(/most significant participants/);
+    expect(notice.textContent).toContain(drawn);
+    expect(notice.textContent).toMatch(/narrow the query to one trace or interaction/i);
+    expect(badge.parentElement).toBe(notice.parentElement);
+    expect(screen.queryByRole('button', { name: /^(show|load) more/i })).toBeNull();
+
+    // Beside the canvas it qualifies — before it — rather than under the grid.
+    expect(notice.compareDocumentPosition(canvas()) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
+    expect(notice.closest('.dg-dependency-graph__note')).toBeNull();
+
+    // The picture's text alternative says the same.
+    expect(canvas().getAttribute('aria-label') ?? '').toContain(drawn);
+  });
+
+  it('marks nothing as partial for a graph that reached no bound', async () => {
+    const stub = resolvingProvider(chainGraph());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
+    expect(screen.queryByText(/most significant participants/)).toBeNull();
+    expect(canvas().getAttribute('aria-label') ?? '').not.toContain('most significant');
   });
 
   it('places the columns on the shared layered scale', async () => {
@@ -1446,10 +1842,9 @@ describe('DependencyGraph rendering', () => {
   });
 });
 
-describe('DependencyGraph keyboard detail', () => {
-  /** A generic label far longer than the participant column shows, so the column truncates it. */
-  const LONG_LABEL =
-    'example.participant.with.a.label.long.enough.that.its.column.has.to.shorten.it';
+describe('DependencyGraph participant detail', () => {
+  /** A generic label far longer than the participant column is wide, so the column has to wrap it. */
+  const LONG_LABEL = 'example.participant.with.a.label.long.enough.that.its.column.has.to.wrap.it';
 
   /** The chain, with the participant of its first row given {@link LONG_LABEL}. */
   function longLabelGraph(): DependencyGraphData {
@@ -1461,28 +1856,27 @@ describe('DependencyGraph keyboard detail', () => {
     });
   }
 
-  /**
-   * Asserts that a row shows its label in the pointer form: truncated by the
-   * stylesheet, inside the tooltip trigger.
-   *
-   * @param row A row obtained by role.
-   */
-  function expectTooltipForm(row: HTMLElement): void {
-    const label = participantLabelElementOf(row);
-    expect(label.classList.contains('dg-text--truncate')).toBe(true);
-    expect(label.closest('.dg-tooltip__trigger')).not.toBeNull();
-  }
+  /** The participants of {@link longLabelGraph}, in the canonical order the grid reads them in. */
+  const LONG_LABEL_PARTICIPANTS: readonly DependencyGraphNode[] = [
+    makeParticipant({ ...INTERACTION, label: LONG_LABEL }),
+    HANDLER,
+    REQUEST,
+    ROUTE,
+    DATASTORE,
+  ];
 
   /**
-   * Asserts that a row shows its participant's detail inline: the full label,
-   * untruncated and outside any tooltip, then the tier and the metrics.
+   * Asserts that a row shows its participant in the one form the cell has: the
+   * full label, untruncated, wrapping and outside any tooltip, then the tier and
+   * the metrics on a second line.
    *
    * @param row A row obtained by role.
    * @param node The participant it stands for.
    */
-  function expectInlineForm(row: HTMLElement, node: DependencyGraphNode): void {
+  function expectFullForm(row: HTMLElement, node: DependencyGraphNode): void {
     const label = participantLabelElementOf(row);
     expect(label.textContent).toBe(node.label);
+    expect(label.classList.contains('dg-dependency-graph__participant-label')).toBe(true);
     expect(label.classList.contains('dg-text--truncate')).toBe(false);
     expect(label.closest('.dg-tooltip')).toBeNull();
 
@@ -1493,74 +1887,162 @@ describe('DependencyGraph keyboard detail', () => {
     expect(header.querySelector('[role="tooltip"]')).toBeNull();
   }
 
-  /** The grid, and every element in it that carries a tab index. */
-  function gridTabIndices(): { readonly zero: number; readonly total: number } {
-    const indexed = Array.from(screen.getByRole('grid').querySelectorAll('[tabindex]'));
+  /**
+   * Every data row's content, cell by cell: the comparison surface of the
+   * invariance cases.
+   *
+   * Each cell is read as its markup, so a changed element, class, attribute or
+   * text anywhere in it fails the comparison. One column is read differently:
+   * the source chip is wrapped in the library's tooltip, which opens on focus
+   * and on hover by swapping classes on its bubble — an absolutely positioned
+   * overlay that takes no space in the row — so that cell is compared by its
+   * element count and its text, which is everything about it that could move
+   * the chip.
+   *
+   * The row element's own attributes are deliberately not part of it: the
+   * `DataTable` primitive moves its roving tab stop there and writes
+   * `aria-selected`, `dg-is-active` and `dg-is-selected`, colour-only states
+   * that resize nothing.
+   *
+   * @returns One list of cell readings per data row, in document order.
+   */
+  function rowContents(): string[][] {
+    return dataRows().map((row) =>
+      Array.from(row.querySelectorAll<HTMLElement>('[aria-colindex]')).map((cell) =>
+        cell.getAttribute('aria-colindex') === String(SOURCE_COLUMN_INDEX)
+          ? `${String(cell.querySelectorAll('*').length)}|${cell.textContent ?? ''}`
+          : cell.innerHTML,
+      ),
+    );
+  }
+
+  /**
+   * The grid's Tab order, read from the DOM: how many of its elements are Tab
+   * stops, and how many of its data rows carry the roving index.
+   *
+   * A Tab stop is a focusable element whose tab index is not `-1`: a
+   * `tabindex="0"`, or a native control that states no index and so keeps the
+   * browser's own order. A control inside a cell carries `tabindex="-1"` — the
+   * `DataTable` caller's obligation — which keeps it focusable by the pointer
+   * and by the grid's cell navigation but out of the Tab order.
+   */
+  function gridTabIndices(): { readonly stops: number; readonly rows: number } {
+    const focusable = Array.from(
+      screen
+        .getByRole('grid')
+        .querySelectorAll('[tabindex], a[href], button, input, select, textarea'),
+    );
     return {
-      zero: indexed.filter((element) => element.getAttribute('tabindex') === '0').length,
-      total: indexed.length,
+      stops: focusable.filter((element) => element.getAttribute('tabindex') !== '-1').length,
+      rows: dataRows().filter((row) => row.hasAttribute('tabindex')).length,
     };
   }
 
-  it('shows the focused row its full label and detail inline, and nothing else changes form', async () => {
-    const user = userEvent.setup();
+  it('shows every row its full label and its detail inline, with no tooltip to open', async () => {
     const stub = resolvingProvider(longLabelGraph());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await screen.findByRole('grid');
 
-    // Unfocused, every label is the pointer form: truncated, with the tooltip.
-    for (const row of dataRows()) {
-      expectTooltipForm(row);
-    }
+    const rows = dataRows();
+    expect(rows).toHaveLength(LONG_LABEL_PARTICIPANTS.length);
 
-    // One Tab reaches the grid's single tab stop, the first row.
-    await user.tab();
-
-    const [first, ...others] = dataRows();
-    if (first === undefined) {
-      throw new Error('the grid rendered no data row');
-    }
-
-    expect(document.activeElement).toBe(first);
-    expectInlineForm(first, makeParticipant({ ...INTERACTION, label: LONG_LABEL }));
-
-    // The rows that do not hold focus keep the pointer form.
-    for (const row of others) {
-      expectTooltipForm(row);
+    // Before anything holds focus or the pointer, every row already reads in
+    // full: nothing about a participant is reachable by hover alone.
+    for (const [index, row] of rows.entries()) {
+      const node = LONG_LABEL_PARTICIPANTS[index];
+      if (node === undefined) {
+        throw new Error(`the fixture has no participant for row ${String(index)}`);
+      }
+      expectFullForm(row, node);
     }
   });
 
-  it('moves the detail with the arrow keys and restores the pointer form when focus leaves', async () => {
+  it('keeps every row identical through focus, the pointer and the selection', async () => {
     const user = userEvent.setup();
     const stub = resolvingProvider(longLabelGraph());
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await screen.findByRole('grid');
 
+    const before = rowContents();
+
+    // Keyboard focus on the grid's single tab stop, then on the next row.
     await user.tab();
+    expect(document.activeElement).toBe(dataRows()[0]);
+    expect(rowContents()).toEqual(before);
+
     await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(dataRows()[1]);
+    expect(rowContents()).toEqual(before);
 
-    // Re-read: the key re-renders the rows.
-    const [first, second] = dataRows();
-    if (first === undefined || second === undefined) {
-      throw new Error('the grid rendered fewer than two data rows');
-    }
+    // The pointer over a row, and over a shape on the canvas — which the
+    // canvas answers, and the grid does not.
+    await user.hover(rowNamed(ROUTE_LABEL));
+    expect(rowContents()).toEqual(before);
 
-    expect(document.activeElement).toBe(second);
-    expectInlineForm(second, HANDLER);
-    expectTooltipForm(first);
-    expect(participantLabelOf(first)).toBe(LONG_LABEL);
+    await user.hover(shapeNamed(REQUEST_LABEL));
+    expect(shapeNamed(REQUEST_LABEL).classList.contains('dg-is-hovered')).toBe(true);
+    expect(rowContents()).toEqual(before);
 
-    // Focus leaving the grid takes the detail with it.
+    // A selection, made in the grid.
+    await user.click(rowNamed(HANDLER_LABEL));
+    expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
+    expect(rowContents()).toEqual(before);
+
+    // Focus on a control inside a row, and then leaving the view altogether.
+    const chip = screen.getByRole('button', { name: SOURCE_CHIP_NAME });
     act(() => {
-      second.blur();
+      chip.focus();
+    });
+    expect(document.activeElement).toBe(chip);
+    expect(rowContents()).toEqual(before);
+
+    act(() => {
+      chip.blur();
+    });
+    expect(document.activeElement).not.toBe(chip);
+    expect(rowContents()).toEqual(before);
+
+    for (const [index, row] of dataRows().entries()) {
+      const node = LONG_LABEL_PARTICIPANTS[index];
+      if (node === undefined) {
+        throw new Error(`the fixture has no participant for row ${String(index)}`);
+      }
+      expectFullForm(row, node);
+    }
+  });
+
+  it('opens source on the first press of a chip, because the row does not move under it', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const spies = makeActions();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const chip = await screen.findByRole('button', { name: SOURCE_CHIP_NAME });
+    const before = rowContents();
+
+    // A primary-button press, as a browser delivers it: `mousedown` on the
+    // chip, and focus moving to the chip before the button is released. A row
+    // that answered that focus by growing would carry the chip out from under
+    // the pointer, and the release — and so the click — would land on the row.
+    fireEvent.mouseDown(chip, { button: 0 });
+    act(() => {
+      chip.focus();
     });
 
-    expect(document.activeElement).not.toBe(second);
-    for (const row of dataRows()) {
-      expectTooltipForm(row);
-    }
+    expect(document.activeElement).toBe(chip);
+    expect(rowContents()).toEqual(before);
+
+    // The release and the click land where the press did: on the chip.
+    fireEvent.mouseUp(chip, { button: 0 });
+    fireEvent.click(chip, { button: 0 });
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('false');
+    expect(rowContents()).toEqual(before);
   });
 
   it('adds no tab stop: the grid keeps exactly one before, during and after focus', async () => {
@@ -1570,15 +2052,19 @@ describe('DependencyGraph keyboard detail', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await screen.findByRole('grid');
 
-    // Only the rows carry a tab index, and exactly one of them is the stop.
+    // Every row carries the roving index and exactly one element is a Tab stop:
+    // the source chip, the grid's one in-cell control, is out of the Tab order.
     const rowCount = dataRows().length;
-    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+    expect(gridTabIndices()).toEqual({ stops: 1, rows: rowCount });
+    expect(screen.getByRole('button', { name: SOURCE_CHIP_NAME }).getAttribute('tabindex')).toBe(
+      '-1',
+    );
 
     await user.tab();
-    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+    expect(gridTabIndices()).toEqual({ stops: 1, rows: rowCount });
 
     await user.keyboard('{ArrowDown}');
-    expect(gridTabIndices()).toEqual({ zero: 1, total: rowCount });
+    expect(gridTabIndices()).toEqual({ stops: 1, rows: rowCount });
 
     // Nothing focusable was put in a participant cell to carry the detail.
     for (const row of dataRows()) {
@@ -2059,6 +2545,190 @@ describe('DependencyGraph static layout', () => {
   });
 });
 
+describe('DependencyGraph canvas sizing', () => {
+  /** The chain's column count: it places one participant per column. */
+  const COLUMNS = CANONICAL_LABELS.length;
+
+  /** The inset the canvas keeps on every side: half the participant outline's 2-unit stroke. */
+  const INSET = 1;
+
+  /** How often the relationship into the datastore ran in the count-label case. */
+  const LARGE_COUNT = 123_456_789;
+
+  /** The left edge of every chain column at a given gap, in reading order. */
+  function columnLefts(gap: number): number[] {
+    return CANONICAL_LABELS.map((_label, column) => column * (DEFAULT_GRAPH_NODE_WIDTH + gap));
+  }
+
+  /** The canvas width the chain needs at a given gap, its inset included. */
+  function chainCanvasWidth(gap: number): number {
+    return COLUMNS * DEFAULT_GRAPH_NODE_WIDTH + (COLUMNS - 1) * gap + 2 * INSET;
+  }
+
+  /**
+   * Asserts the canvas is drawn one user unit to a CSS pixel — its `viewBox` is
+   * its own declared size — and is exactly as tall as its one row of boxes, so
+   * no text is rescaled and no band is left beneath the drawing.
+   */
+  function expectDrawnAtPixelSize(): void {
+    const frame = canvasFrame();
+    expect(frame.viewBox).toEqual([-INSET, -INSET, frame.width, frame.height]);
+    expect(frame.height).toBe(DEFAULT_GRAPH_NODE_HEIGHT + 2 * INSET);
+    expect(nodeShapes().map((shape) => shape.getAttribute('width'))).toEqual(
+      CANONICAL_LABELS.map(() => String(DEFAULT_GRAPH_NODE_WIDTH)),
+    );
+  }
+
+  /**
+   * Renders a payload and waits for the grid. Call it after
+   * {@link installMeasuredViewport}, so the viewport attaches to the stand-in.
+   *
+   * @param data The payload to draw.
+   */
+  async function renderMeasured(data: DependencyGraphData): Promise<void> {
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(data).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('grid');
+  }
+
+  it('spreads its columns across a measured viewport, one user unit to a pixel', async () => {
+    const viewport = installMeasuredViewport();
+    try {
+      resetScaleCalls();
+      await renderMeasured(chainGraph());
+
+      // Before any measurement the unmeasured rhythm, as every other case draws it.
+      expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+
+      const measured = 1000;
+      viewport.resize(measured);
+
+      // The gap at which five boxes fill the viewport less the inset, floored
+      // to a whole unit so the canvas never overflows by a fraction.
+      const gap = Math.floor(
+        (measured - 2 * INSET - COLUMNS * DEFAULT_GRAPH_NODE_WIDTH) / (COLUMNS - 1),
+      );
+      expect(gap).toBeGreaterThan(MIN_GRAPH_COLUMN_GAP);
+      expect(gap).toBeLessThan(MAX_GRAPH_COLUMN_GAP);
+      expect(shapeLefts()).toEqual(columnLefts(gap));
+
+      // It fills the viewport and never overflows it: all that is left over is
+      // the floor's remainder, under one unit per gap.
+      const { width } = canvasFrame();
+      expect(width).toBe(chainCanvasWidth(gap));
+      expect(width).toBeLessThanOrEqual(measured);
+      expect(measured - width).toBeLessThan(COLUMNS - 1);
+      expectDrawnAtPixelSize();
+      expectCurvesBetweenColumns();
+
+      // The reading order is the payload's, whatever the width.
+      expect(canvasLabels()).toEqual(CANONICAL_LABELS);
+      expect(participantLabels()).toEqual(CANONICAL_LABELS);
+
+      // The resize rebuilt the geometry from the layering already resolved:
+      // still one layering for the payload, handed to both layouts.
+      expect(scaleCalls.resolved).toHaveLength(1);
+      expect(scaleCalls.supplied).toHaveLength(2);
+      const [resolved] = scaleCalls.resolved;
+      expect(scaleCalls.supplied.every((layering) => layering === resolved)).toBe(true);
+    } finally {
+      viewport.restore();
+    }
+  });
+
+  it('draws a graph too wide for its viewport at the narrowest gap and full size, to scroll', async () => {
+    const viewport = installMeasuredViewport();
+    try {
+      await renderMeasured(chainGraph());
+
+      const measured = 400;
+      viewport.resize(measured);
+
+      // Tightened as far as it goes, and then drawn wider than its viewport at
+      // full size rather than scaled down to fit it: the viewport scrolls.
+      expect(shapeLefts()).toEqual(columnLefts(MIN_GRAPH_COLUMN_GAP));
+      const { width } = canvasFrame();
+      expect(width).toBe(chainCanvasWidth(MIN_GRAPH_COLUMN_GAP));
+      expect(width).toBeGreaterThan(measured);
+      expectDrawnAtPixelSize();
+      expectCurvesBetweenColumns();
+    } finally {
+      viewport.restore();
+    }
+  });
+
+  it('stops spreading at the widest gap on a viewport far wider than the graph', async () => {
+    const viewport = installMeasuredViewport();
+    try {
+      await renderMeasured(chainGraph());
+
+      const measured = 3000;
+      viewport.resize(measured);
+
+      expect(shapeLefts()).toEqual(columnLefts(MAX_GRAPH_COLUMN_GAP));
+      const { width } = canvasFrame();
+      expect(width).toBe(chainCanvasWidth(MAX_GRAPH_COLUMN_GAP));
+      expect(width).toBeLessThan(measured);
+      expectDrawnAtPixelSize();
+      expectCurvesBetweenColumns();
+    } finally {
+      viewport.restore();
+    }
+  });
+
+  it('widens the narrowest gap to hold a relationship count drawn in it', async () => {
+    const viewport = installMeasuredViewport();
+    try {
+      await renderMeasured(
+        makeGraph({
+          nodes: CHAIN_PARTICIPANTS,
+          edges: [
+            makeEdge(ROUTE.id, DATASTORE.id, { count: LARGE_COUNT, totalDurationMs: 640 }),
+            ...CHAIN_RELATIONSHIPS.filter((edge) => edge.from !== ROUTE.id),
+          ],
+        }),
+      );
+
+      // Unmeasured, the count changes nothing: the default rhythm still holds.
+      expect(shapeLefts()).toEqual(columnLefts(DEFAULT_GRAPH_COLUMN_GAP));
+
+      viewport.resize(400);
+
+      const label = canvas().querySelector('text.dg-dependency-graph__edge-label');
+      if (label === null) {
+        throw new Error('the repeated relationship drew no count label');
+      }
+      const text = label.textContent ?? '';
+      expect(text).toBe(`×${formatCount(LARGE_COUNT)}`);
+
+      // Every gap is the same, and wider than the narrowest a curve alone needs.
+      const lefts = shapeLefts();
+      const [, , , routeLeft, datastoreLeft] = lefts;
+      if (routeLeft === undefined || datastoreLeft === undefined) {
+        throw new Error('the chain drew fewer than five columns');
+      }
+      const gap = datastoreLeft - routeLeft - DEFAULT_GRAPH_NODE_WIDTH;
+      expect(gap).toBeGreaterThan(MIN_GRAPH_COLUMN_GAP);
+      expect(lefts).toEqual(columnLefts(gap));
+
+      // The label is centred in the gap it labels, and its ink — measured the
+      // way the component measures without canvas metrics — clears both
+      // outlines, whose strokes reach one unit into the gap.
+      const routeRight = routeLeft + DEFAULT_GRAPH_NODE_WIDTH;
+      const centre = Number(label.getAttribute('x'));
+      const advance = estimateTextWidth(text, DEFAULT_LABEL_FONT_SIZE);
+      expect(centre).toBeCloseTo(routeRight + gap / 2);
+      expect(centre - advance / 2).toBeGreaterThanOrEqual(routeRight + INSET);
+      expect(centre + advance / 2).toBeLessThanOrEqual(datastoreLeft - INSET);
+      expectDrawnAtPixelSize();
+    } finally {
+      viewport.restore();
+    }
+  });
+});
+
 describe('DependencyGraph interactions', () => {
   it('hands the host the very location a participant resolved to, and selects nothing', async () => {
     const stub = resolvingProvider(chainGraph());
@@ -2204,10 +2874,11 @@ describe('DependencyGraph interactions', () => {
     // aimed; only the host is told nothing.
     expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('true');
 
-    const note = await screen.findByText(/declared an event that does not match their records/i);
+    // One participant: the noun, the pronouns and the verb all agree with it.
+    const note = await screen.findByText(INCONSISTENT_COORDINATES_NOTE);
     expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
     expect(note.textContent).toBe(
-      '1 participant(s) declared an event that does not match their records, so selecting them opens no event.',
+      '1 participant declared an event that does not match its records, so selecting it opens no event.',
     );
   });
 
@@ -2244,8 +2915,11 @@ describe('DependencyGraph interactions', () => {
 
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
 
-    const note = await screen.findByText(/declared an event that does not match their records/i);
-    expect(note.textContent).toContain(`${String(broken.length)} participant(s)`);
+    // Several participants: the plural throughout.
+    const note = await screen.findByText(INCONSISTENT_COORDINATES_NOTE);
+    expect(note.textContent).toBe(
+      `${String(broken.length)} participants declared an event that does not match their records, so selecting them opens no event.`,
+    );
   });
 
   it('reports nothing inconsistent for a payload whose coordinates all hold', async () => {
@@ -2257,7 +2931,7 @@ describe('DependencyGraph interactions', () => {
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
     await screen.findByRole('grid');
 
-    expect(screen.queryByText(/does not match their records/i)).toBeNull();
+    expect(screen.queryByText(INCONSISTENT_COORDINATES_NOTE)).toBeNull();
     expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
   });
 
@@ -2276,6 +2950,141 @@ describe('DependencyGraph interactions', () => {
     expect(shapeNamed(REQUEST_LABEL).classList.contains('dg-is-selected')).toBe(true);
     expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('false');
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
+
+    // This participant resolved to no location, so the click opens nothing and
+    // its title promises nothing.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(titleOfShape(shapeNamed(REQUEST_LABEL))).not.toContain('Click to open');
+  });
+
+  it('opens the very location a participant resolved to when its shape is clicked', async () => {
+    // A single-record participant carrying both an event coordinate and a
+    // location: one click raises both intents, each exactly once.
+    const located = makeParticipant({
+      ...HANDLER,
+      eventId: EVENT_ID,
+      traceId: TRACE_ID,
+      source: BASE_SOURCE,
+    });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, located], edges: [makeEdge(INTERACTION.id, HANDLER.id)] }),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    // Taken BEFORE the render, as in the chip case above: a component that
+    // added a field to the location in place would still pass a comparison
+    // against the live fixture.
+    const expectedKeys = Object.keys({ ...BASE_SOURCE }).sort();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    // The title tells the pointer user what the click will do.
+    expect(titleOfShape(shapeNamed(HANDLER_LABEL))).toContain(
+      `Click to open ${SOURCE_FILE} in the editor.`,
+    );
+
+    await user.click(shapeNamed(HANDLER_LABEL));
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+
+    // The payload's own object, by reference, with its key set untouched.
+    expect(call[0]).toBe(BASE_SOURCE);
+    expect(Object.keys(call[0]).sort()).toEqual(expectedKeys);
+
+    // The selection half of the click is unchanged: the declared coordinate,
+    // once, and the participant highlighted in both representations.
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent.mock.calls[0]?.[0]).toEqual({
+      eventId: EVENT_ID,
+      spanId: spanIdFor(2),
+      traceId: TRACE_ID,
+    });
+    expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
+    expect(shapeNamed(HANDLER_LABEL).classList.contains('dg-is-selected')).toBe(true);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+    expect(spies.onFilterChange).not.toHaveBeenCalled();
+  });
+
+  it('opens the location of a participant that collapsed several records, and selects no event', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    // The datastore collapsed two records, so it declares no event coordinate —
+    // but it did resolve to a location, and the location is what a click on
+    // its shape opens.
+    await user.click(shapeNamed(DATASTORE_LABEL));
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('opens nothing from the shape of a participant without a location, even one with an event', async () => {
+    const enriched = makeParticipant({ ...HANDLER, eventId: EVENT_ID, traceId: TRACE_ID });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, enriched], edges: [makeEdge(INTERACTION.id, HANDLER.id)] }),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    await user.click(shapeNamed(HANDLER_LABEL));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(titleOfShape(shapeNamed(HANDLER_LABEL))).not.toContain('Click to open');
+  });
+
+  it('keeps grid activation to selecting, so only the chip opens source from the table', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+    await screen.findByRole('grid');
+
+    // A click on the row and Enter on it: both select the participant, and
+    // neither opens the location it resolved to.
+    await user.click(cellOf(rowNamed(DATASTORE_LABEL), LAYER_COLUMN));
+    fireEvent.keyDown(rowNamed(DATASTORE_LABEL), { key: 'Enter' });
+
+    expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('true');
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+
+  it('promises no navigation from a shape where no host can open one', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const user = userEvent.setup();
+
+    // Rendered with a data provider and no panel actions: a surface that can
+    // draw a panel but cannot navigate.
+    render(
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <DependencyGraph node={makeNode()} />
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>,
+    );
+    await screen.findByRole('grid');
+
+    expect(titleOfShape(shapeNamed(DATASTORE_LABEL))).not.toContain('Click to open');
+
+    // The click still selects, and raises nothing that could throw.
+    await user.click(shapeNamed(DATASTORE_LABEL));
+    expect(rowNamed(DATASTORE_LABEL).getAttribute('aria-selected')).toBe('true');
   });
 });
 
@@ -2322,7 +3131,7 @@ describe('DependencyGraph legend', () => {
 });
 
 describe('DependencyGraph relationships', () => {
-  it('marks an inferred relationship as inferred, on the chip and on the curve', async () => {
+  it('marks an inferred relationship as inferred, and not as ambiguous, on the chip and the curve', async () => {
     const inferred = makeEdge(HANDLER.id, REQUEST.id, { inferredCount: 1 });
     const stub = resolvingProvider(
       makeGraph({
@@ -2339,12 +3148,21 @@ describe('DependencyGraph relationships', () => {
       throw new Error('the participant rendered no relationship chip');
     }
 
-    // The distinction survives in text as well as in the dash pattern: a
-    // guessed relationship must never read as a measured one (AAP 0.4.2,
-    // 0.6.4).
+    // The distinction survives in text as well as in the tone: a guessed
+    // relationship must never read as a measured one (AAP 0.4.2, 0.6.4). But
+    // an attribution with one candidate was not in doubt, so it is inferred —
+    // the info tone, a solid curve — and never marked ambiguous, which is the
+    // one state the stylesheet dashes.
     expect(chip.getAttribute('data-edge-id')).toBe(inferred.id);
-    expect(chip.classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(chip.classList.contains('dg-is-inferred')).toBe(true);
+    expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
+    expect(chip.classList.contains('dg-badge--info')).toBe(true);
     expect(chip.textContent).toBe(`→ ${REQUEST_LABEL} (inferred)`);
+
+    // The chip is the grid's own element, not a second use of the canvas
+    // curve's class, whose SVG paint rules mean nothing on an HTML chip.
+    expect(chip.classList.contains('dg-dependency-graph__relationship')).toBe(true);
+    expect(chip.classList.contains('dg-dependency-graph__edge')).toBe(false);
 
     // The measured relationship beside it is not marked, in either
     // representation.
@@ -2353,11 +3171,16 @@ describe('DependencyGraph relationships', () => {
       throw new Error('the page event rendered no relationship chip');
     }
 
+    expect(measured.classList.contains('dg-is-inferred')).toBe(false);
     expect(measured.classList.contains('dg-is-ambiguous')).toBe(false);
+    expect(measured.classList.contains('dg-badge--neutral')).toBe(true);
     expect(measured.textContent).not.toContain('inferred');
+    expect(edgeCurves().filter((curve) => curve.classList.contains('dg-is-inferred'))).toHaveLength(
+      1,
+    );
     expect(
       edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
-    ).toHaveLength(1);
+    ).toHaveLength(0);
   });
 
   it('states the inferred share and the ambiguous part of a relationship in text', async () => {
@@ -2387,12 +3210,20 @@ describe('DependencyGraph relationships', () => {
     expect(partialChip.textContent).toBe(`→ ${REQUEST_LABEL} ×3 (2 of 3 inferred, 1 ambiguous)`);
     expect(wholeChip.textContent).toBe(`→ ${HANDLER_LABEL} (inferred, 1 ambiguous)`);
 
-    // Any inferred record marks the relationship, in the grid and on the canvas.
-    expect(partialChip.classList.contains('dg-is-ambiguous')).toBe(true);
-    expect(wholeChip.classList.contains('dg-is-ambiguous')).toBe(true);
+    // Any ambiguous record marks the relationship ambiguous — the warning
+    // tone, a dashed curve — in the grid and on the canvas, and ambiguous
+    // supersedes inferred rather than joining it.
+    for (const chip of [partialChip, wholeChip]) {
+      expect(chip.classList.contains('dg-is-ambiguous')).toBe(true);
+      expect(chip.classList.contains('dg-is-inferred')).toBe(false);
+      expect(chip.classList.contains('dg-badge--warning')).toBe(true);
+    }
     expect(
       edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
     ).toHaveLength(2);
+    expect(edgeCurves().filter((curve) => curve.classList.contains('dg-is-inferred'))).toHaveLength(
+      0,
+    );
   });
 
   it('uses no lineage whose shares do not nest inside the relationship, and says so', async () => {
@@ -2432,10 +3263,14 @@ describe('DependencyGraph relationships', () => {
       }
       expect(chip.textContent).toBe(text);
       expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
+      expect(chip.classList.contains('dg-is-inferred')).toBe(false);
     }
 
     expect(
-      edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
+      edgeCurves().filter(
+        (curve) =>
+          curve.classList.contains('dg-is-ambiguous') || curve.classList.contains('dg-is-inferred'),
+      ),
     ).toHaveLength(0);
 
     // Dropped, but never silently: the count of inconsistent declarations is
@@ -2443,8 +3278,26 @@ describe('DependencyGraph relationships', () => {
     const note = await screen.findByText(/inconsistent inferred or ambiguous counts/i);
     expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
     expect(note.textContent).toBe(
-      '4 relationship(s) declared inconsistent inferred or ambiguous counts, which are not shown.',
+      '4 relationships declared inconsistent inferred or ambiguous counts, which are not shown.',
     );
+  });
+
+  it('states a single relationship with inconsistent lineage in the singular', async () => {
+    // The relationship stays drawn; what is withheld is its declared counts, so
+    // the relative clause agrees with those counts and stays plural.
+    const overstated = makeEdge(INTERACTION.id, HANDLER.id, { inferredCount: 5 });
+    const stub = resolvingProvider(
+      makeGraph({ nodes: [INTERACTION, HANDLER], edges: [overstated] }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const note = await screen.findByText(/inconsistent inferred or ambiguous counts/i);
+    expect(note.textContent).toBe(
+      '1 relationship declared inconsistent inferred or ambiguous counts, which are not shown.',
+    );
+    expect(edgeCurves()).toHaveLength(1);
   });
 
   it('accepts a zero share as the share the aggregate omits', async () => {
@@ -2464,6 +3317,7 @@ describe('DependencyGraph relationships', () => {
     const [chip] = relationshipChips(rowNamed(INTERACTION_LABEL));
     expect(chip?.textContent).toBe(`→ ${HANDLER_LABEL}`);
     expect(chip?.classList.contains('dg-is-ambiguous')).toBe(false);
+    expect(chip?.classList.contains('dg-is-inferred')).toBe(false);
     expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
   });
 
@@ -2499,6 +3353,41 @@ describe('DependencyGraph relationships', () => {
     expect(single.textContent).not.toContain('×');
   });
 
+  it('names a long called participant in full on its chip, which wraps instead', async () => {
+    // A generic module path and symbol, far longer than any one-line chip: the
+    // kind of label a server function collapses to.
+    const longLabel =
+      'src/example/deeply/nested/module/path/example-service.ts runExampleOperation';
+    const callee = makeParticipant({
+      id: 'dep:function|server|example.long-callee',
+      kind: 'function',
+      label: longLabel,
+      tier: 'server',
+      spanIds: [spanIdFor(9)],
+      layer: 1,
+    });
+    const stub = resolvingProvider(
+      makeGraph({
+        nodes: [INTERACTION, callee],
+        edges: [makeEdge(INTERACTION.id, callee.id)],
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const [chip] = relationshipChips(rowNamed(INTERACTION_LABEL));
+    if (chip === undefined) {
+      throw new Error('the page event rendered no relationship chip');
+    }
+
+    // The chip is the relationship's only text form in the grid, so its target
+    // is never shortened there: the chip's own class lets it wrap in its cell.
+    expect(chip.textContent).toBe(`→ ${longLabel}`);
+    expect(chip.textContent).not.toContain('…');
+    expect(chip.classList.contains('dg-dependency-graph__relationship')).toBe(true);
+  });
+
   it('counts a relationship naming a participant it does not contain, instead of drawing it', async () => {
     const stub = resolvingProvider(
       makeGraph({
@@ -2519,11 +3408,36 @@ describe('DependencyGraph relationships', () => {
     // graph is missing".
     const note = await screen.findByText(/named a participant this graph does not contain/i);
     expect(note.closest('.dg-dependency-graph__note')).not.toBeNull();
-    expect(note.textContent).toContain('1');
+    // One relationship: its noun and its verb in the singular.
+    expect(note.textContent).toBe(
+      '1 relationship named a participant this graph does not contain and is not drawn.',
+    );
 
     expect(edgeCurves()).toHaveLength(1);
     expect(relationshipChips(rowNamed(HANDLER_LABEL))).toHaveLength(0);
     expect(screen.queryByText(/unlisted/i)).toBeNull();
+  });
+
+  it('counts several relationships naming participants it does not contain in the plural', async () => {
+    const stub = resolvingProvider(
+      makeGraph({
+        nodes: [INTERACTION, HANDLER],
+        edges: [
+          makeEdge(INTERACTION.id, HANDLER.id),
+          makeEdge(HANDLER.id, 'dep:database|db|example.unlisted'),
+          makeEdge(HANDLER.id, 'dep:external|server|example.unlisted'),
+        ],
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const note = await screen.findByText(/named a participant this graph does not contain/i);
+    expect(note.textContent).toBe(
+      '2 relationships named a participant this graph does not contain and are not drawn.',
+    );
+    expect(edgeCurves()).toHaveLength(1);
   });
 });
 
@@ -2620,27 +3534,713 @@ describe('DependencyGraph aggregate contract', () => {
       traceId: request.traceId,
     });
 
-    // The continuation-attributed relationship is chipped inferred and its
-    // curve dashed; the nested ones beside it are neither.
+    // The continuation-attributed relationship is chipped and drawn inferred.
+    // Its one attribution had a single candidate — the event declares no
+    // `lineageAmbiguous` — so it is NOT ambiguous: no curve is dashed. The
+    // nested ones beside it are neither.
     const [inferredChip] = relationshipChips(rowNamed('GET /example/resource'));
     if (inferredChip === undefined) {
       throw new Error('the request participant rendered no relationship chip');
     }
     expect(inferredChip.textContent).toBe('→ example.view (inferred)');
-    expect(inferredChip.classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(inferredChip.classList.contains('dg-is-inferred')).toBe(true);
+    expect(inferredChip.classList.contains('dg-is-ambiguous')).toBe(false);
 
     for (const chip of relationshipChips(rowNamed('example.press'))) {
+      expect(chip.classList.contains('dg-is-inferred')).toBe(false);
       expect(chip.classList.contains('dg-is-ambiguous')).toBe(false);
       expect(chip.textContent).not.toContain('inferred');
     }
 
-    const dashed = edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous'));
-    expect(dashed).toHaveLength(1);
+    const inferredCurves = edgeCurves().filter((curve) =>
+      curve.classList.contains('dg-is-inferred'),
+    );
+    expect(inferredCurves).toHaveLength(1);
+    expect(
+      edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
+    ).toHaveLength(0);
     expect(edgeCurves()).toHaveLength(graph.edges.length);
 
     // Everything the real aggregate declared passes the component's validation:
     // nothing is reported as inconsistent.
-    expect(screen.queryByText(/does not match their records/i)).toBeNull();
+    expect(screen.queryByText(INCONSISTENT_COORDINATES_NOTE)).toBeNull();
     expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
+  });
+
+  it('dashes exactly the relationship the real aggregate counted as ambiguous', async () => {
+    // Two parallel requests from one page event, and a view update attributed
+    // to the second through an asynchronous continuation while the first still
+    // had an open window: the producer flags the attribution ambiguous and
+    // names the other candidate (AAP 0.4.2).
+    const press = capturedEvent({ kind: 'interaction', name: 'example.press' });
+    const first = capturedEvent({
+      kind: 'fetch',
+      name: 'GET /example/first',
+      parentSpanId: press.spanId,
+    });
+    const second = capturedEvent({
+      kind: 'fetch',
+      name: 'GET /example/second',
+      parentSpanId: press.spanId,
+    });
+    const update = capturedEvent({
+      kind: 'render',
+      name: 'example.view',
+      parentSpanId: second.spanId,
+      attributes: {
+        lineage: 'async-continuation',
+        lineageAmbiguous: true,
+        lineageCandidates: [first.spanId],
+      },
+    });
+
+    const graph = buildDependencyGraph([press, first, second, update]);
+    const stub = resolvingProvider(graph);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    const [ambiguousChip] = relationshipChips(rowNamed('GET /example/second'));
+    if (ambiguousChip === undefined) {
+      throw new Error('the chosen request rendered no relationship chip');
+    }
+    expect(ambiguousChip.textContent).toBe('→ example.view (inferred, 1 ambiguous)');
+    expect(ambiguousChip.classList.contains('dg-is-ambiguous')).toBe(true);
+    expect(ambiguousChip.classList.contains('dg-is-inferred')).toBe(false);
+    expect(ambiguousChip.classList.contains('dg-badge--warning')).toBe(true);
+
+    // One ambiguous curve, and no merely inferred one: the attribution's
+    // ambiguity is the whole of how that relationship was known.
+    expect(
+      edgeCurves().filter((curve) => curve.classList.contains('dg-is-ambiguous')),
+    ).toHaveLength(1);
+    expect(edgeCurves().filter((curve) => curve.classList.contains('dg-is-inferred'))).toHaveLength(
+      0,
+    );
+    expect(screen.queryByText(/inconsistent inferred or ambiguous counts/i)).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The lineage states and the relationship chip, as the stylesheet paints them
+ *
+ * The cases above pin the classes the component writes; these pin what the
+ * stylesheet does with them, because the distinction the classes carry — an
+ * inferred relationship solid, an ambiguous one dashed, a chip that wraps —
+ * exists only once a rule implements it, and happy-dom applies no stylesheet.
+ * ---------------------------------------------------------------------------
+ */
+
+describe('DependencyGraph lineage styling', () => {
+  /**
+   * The component stylesheet, read from disk with the `import.meta.url`
+   * convention `../tokens/tokens.test.ts` documents. Joined with `node:path`
+   * rather than resolved with `new URL(…)`: under happy-dom the global `URL` is
+   * the DOM's, which Node's `fileURLToPath` rejects.
+   */
+  const stylesheet = readFileSync(
+    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+    'utf8',
+  ).replace(/\/\*[\s\S]*?\*\//gu, '');
+
+  /**
+   * Every declaration the stylesheet makes for one exact selector, in source
+   * order, gathered from each rule whose selector list names it — so a grouped
+   * rule and a rule of its own both count.
+   *
+   * @param selector One compound selector, exactly as written.
+   * @returns Its declarations, normalised to `property: value`.
+   */
+  function declarationsOf(selector: string): string[] {
+    const declarations: string[] = [];
+    for (const [, selectors = '', body = ''] of stylesheet.matchAll(/([^{}]+)\{([^{}]*)\}/gu)) {
+      if (selectors.split(',').some((part) => part.trim() === selector)) {
+        declarations.push(
+          ...body
+            .split(';')
+            .map((declaration) => declaration.replace(/\s+/gu, ' ').trim())
+            .filter((declaration) => declaration !== ''),
+        );
+      }
+    }
+
+    return declarations;
+  }
+
+  it('draws an inferred curve solid in the info tone and an ambiguous one dashed in the warning tone', () => {
+    const inferred = declarationsOf('.dg-dependency-graph__edge.dg-is-inferred');
+    expect(inferred).toContain('stroke: var(--dg-info)');
+    expect(inferred.some((declaration) => declaration.startsWith('stroke-dasharray'))).toBe(false);
+
+    const ambiguous = declarationsOf('.dg-dependency-graph__edge.dg-is-ambiguous');
+    expect(ambiguous).toContain('stroke: var(--dg-warning)');
+    expect(ambiguous).toContain('stroke-dasharray: 4 3');
+
+    // The measured curve keeps the connector token alone, which the token
+    // suite measures in every theme.
+    expect(
+      declarationsOf('.dg-dependency-graph__edge').filter((declaration) =>
+        declaration.startsWith('stroke:'),
+      ),
+    ).toEqual(['stroke: var(--dg-graph-edge)']);
+  });
+
+  it('lets a relationship chip wrap inside its cell, and dashes an ambiguous one', () => {
+    const chip = declarationsOf('.dg-dependency-graph__relationship');
+    expect(chip).toContain('white-space: normal');
+    expect(chip).toContain('overflow-wrap: anywhere');
+    expect(chip).toContain('min-inline-size: 0');
+
+    expect(declarationsOf('.dg-dependency-graph__relationship.dg-is-ambiguous')).toContain(
+      'border-style: dashed',
+    );
+
+    // Declared after the shared chip rule, whose `white-space: nowrap` it has
+    // to override at equal specificity.
+    expect(stylesheet.indexOf('\n.dg-dependency-graph__relationship {')).toBeGreaterThan(
+      stylesheet.indexOf('\n.dg-badge,'),
+    );
+  });
+
+  it('wraps a participant label anywhere rather than truncating it', () => {
+    const label = declarationsOf('.dg-dependency-graph__participant-label');
+    expect(label).toContain('overflow-wrap: anywhere');
+    expect(label).toContain('min-inline-size: 0');
+    expect(label.some((declaration) => declaration.startsWith('white-space'))).toBe(false);
+    expect(label.some((declaration) => declaration.startsWith('text-overflow'))).toBe(false);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shared selection
+ *
+ * Under a panel host the selected participant is resolved from the host's one
+ * selection: the participant whose validated coordinate matches it is marked,
+ * and a participant with no coordinate is highlighted locally only until that
+ * selection changes. The last case mounts a flame chart over the same capture
+ * beside the graph, under the smallest host that records each report as the
+ * selection, so the two charts can be seen to agree.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The host contexts around `children`, the selection context included.
+ *
+ * @param children The views to mount.
+ * @param selection The selection the host provides.
+ * @param context The provider to resolve queries and the actions to report to.
+ * @returns The element tree to render.
+ */
+function hostedTree(
+  children: ReactNode,
+  selection: PanelSelectionState,
+  context: { readonly provider: DataProvider; readonly actions: PanelActions },
+): ReactElement {
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <PanelSelectionContext.Provider value={selection}>
+            {children}
+          </PanelSelectionContext.Provider>
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
+/** The props of {@link SelectionHost}. */
+interface SelectionHostProps {
+  /** The provider that resolves every view's query. */
+  readonly provider: DataProvider;
+  /** The spies each report is forwarded to after it is recorded. */
+  readonly spies: ActionSpies;
+  /** The views sharing the selection. */
+  readonly children: ReactNode;
+}
+
+/**
+ * The smallest host that shares a selection: it records every reported event
+ * as the current selection and provides it back to every view beneath — the
+ * wiring `PanelHost` performs around a panel's layout.
+ *
+ * @param props See {@link SelectionHostProps}.
+ * @returns The hosted views.
+ */
+function SelectionHost(props: SelectionHostProps): ReactElement {
+  const { provider, spies, children } = props;
+  const [selection, setSelection] = useState<PanelSelection | undefined>(undefined);
+
+  const actions = useMemo<PanelActions>(
+    () => ({
+      onSelectEvent: (ref: PanelEventRef) => {
+        setSelection(ref);
+        spies.onSelectEvent(ref);
+      },
+      onOpenSource: spies.onOpenSource,
+    }),
+    [spies],
+  );
+  const state = useMemo<PanelSelectionState>(() => ({ selection }), [selection]);
+
+  return hostedTree(children, state, { provider, actions });
+}
+
+/** The labels of the grid rows carrying `aria-selected="true"`, in document order. */
+function selectedRowLabels(): string[] {
+  return dataRows()
+    .filter((row) => row.getAttribute('aria-selected') === 'true')
+    .map(participantLabelOf);
+}
+
+/** The labels drawn in the canvas shapes carrying the selected state, in document order. */
+function selectedShapeLabels(scope: HTMLElement): string[] {
+  const picture = within(scope).getByRole('img');
+  const labels = Array.from(picture.querySelectorAll('text.dg-dependency-graph__node-label'));
+
+  return Array.from(picture.querySelectorAll('rect.dg-dependency-graph__node')).flatMap(
+    (shape, index) =>
+      shape.classList.contains('dg-is-selected') ? [labels[index]?.textContent ?? ''] : [],
+  );
+}
+
+/** A rendered block by its documented class, failing when it is not on the page. */
+function blockOf(className: string): HTMLElement {
+  const block = document.querySelector<HTMLElement>(`.${className}`);
+
+  if (block === null) {
+    throw new Error(`no .${className} block is rendered`);
+  }
+
+  return block;
+}
+
+describe('DependencyGraph shared selection', () => {
+  /** The handler, declaring the coordinate of the one record it collapsed. */
+  const ENRICHED_HANDLER = makeParticipant({ ...HANDLER, eventId: EVENT_ID, traceId: TRACE_ID });
+
+  /** Three participants: one with an event coordinate between two without. */
+  function mixedGraph(): DependencyGraphData {
+    return makeGraph({
+      nodes: [INTERACTION, ENRICHED_HANDLER, REQUEST],
+      edges: [makeEdge(INTERACTION.id, HANDLER.id), makeEdge(HANDLER.id, REQUEST.id)],
+    });
+  }
+
+  it('marks the participant whose coordinate the panel selection names, and nothing else', async () => {
+    const stub = resolvingProvider(mixedGraph());
+    const context = { provider: stub.provider, actions: makeActions().actions };
+
+    const { rerender, container } = render(
+      hostedTree(
+        <DependencyGraph node={makeNode()} />,
+        { selection: { eventId: EVENT_ID } },
+        context,
+      ),
+    );
+    await screen.findByRole('grid');
+
+    expect(selectedRowLabels()).toEqual([HANDLER_LABEL]);
+    expect(selectedShapeLabels(container)).toEqual([HANDLER_LABEL]);
+
+    // Another record's id naming the participant's trace and its one span still
+    // lands on it: that pair is the span's identity across tiers.
+    rerender(
+      hostedTree(
+        <DependencyGraph node={makeNode()} />,
+        {
+          selection: {
+            eventId: 'event-example-elsewhere',
+            traceId: TRACE_ID,
+            spanId: spanIdFor(2),
+          },
+        },
+        context,
+      ),
+    );
+    expect(selectedRowLabels()).toEqual([HANDLER_LABEL]);
+
+    // An event this graph draws no participant for marks nothing here.
+    rerender(
+      hostedTree(
+        <DependencyGraph node={makeNode()} />,
+        { selection: { eventId: 'event-example-elsewhere' } },
+        context,
+      ),
+    );
+    expect(selectedRowLabels()).toEqual([]);
+    expect(selectedShapeLabels(container)).toEqual([]);
+  });
+
+  it('highlights a participant with no event locally, and gives way the moment the panel selection changes', async () => {
+    const stub = resolvingProvider(mixedGraph());
+    const spies = makeActions();
+    const context = { provider: stub.provider, actions: spies.actions };
+    const user = userEvent.setup();
+    const graph = <DependencyGraph node={makeNode()} />;
+
+    const { rerender, container } = render(hostedTree(graph, { selection: undefined }, context));
+    await screen.findByRole('grid');
+
+    // No coordinate, so nothing is reported, yet the reader sees where they aimed.
+    await user.click(rowNamed(REQUEST_LABEL));
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(selectedRowLabels()).toEqual([REQUEST_LABEL]);
+    expect(selectedShapeLabels(container)).toEqual([REQUEST_LABEL]);
+
+    // A re-rendered host holding the same selection is not a change.
+    rerender(hostedTree(graph, { selection: undefined }, context));
+    expect(selectedRowLabels()).toEqual([REQUEST_LABEL]);
+
+    // Another view selects the handler's event: the local highlight yields.
+    const handlerSelected: PanelSelectionState = { selection: { eventId: EVENT_ID } };
+    rerender(hostedTree(graph, handlerSelected, context));
+    expect(selectedRowLabels()).toEqual([HANDLER_LABEL]);
+    expect(selectedShapeLabels(container)).toEqual([HANDLER_LABEL]);
+
+    // Highlighted again, then another view selects an event this graph does not
+    // draw: nothing is left marked, rather than a participant the other charts
+    // have moved on from.
+    await user.click(rowNamed(REQUEST_LABEL));
+    expect(selectedRowLabels()).toEqual([REQUEST_LABEL]);
+
+    rerender(hostedTree(graph, { selection: { eventId: 'event-example-elsewhere' } }, context));
+    expect(selectedRowLabels()).toEqual([]);
+
+    // Activating the participant that carries a coordinate drops the local
+    // highlight even when its event is the one already selected.
+    rerender(hostedTree(graph, handlerSelected, context));
+    await user.click(rowNamed(REQUEST_LABEL));
+    expect(selectedRowLabels()).toEqual([REQUEST_LABEL]);
+
+    await user.click(rowNamed(HANDLER_LABEL));
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: EVENT_ID,
+      spanId: spanIdFor(2),
+      traceId: TRACE_ID,
+    });
+    expect(selectedRowLabels()).toEqual([HANDLER_LABEL]);
+  });
+
+  it('mirrors a selection made in the graph or a flame chart over the same capture, under one host', async () => {
+    // One interaction that issued a request and ran one function twice, as the
+    // capture records them; both charts are derived from these same events by
+    // the real aggregate and the real correlator.
+    const base = {
+      traceId: TRACE_ID,
+      tier: 'browser',
+      attributes: {},
+      status: 'ok',
+      producerId: 'producer-example',
+      sessionId: 'session-example',
+      captureId: 'capture-example',
+    } as const;
+    const press: TelemetryEvent = {
+      ...base,
+      id: 'event-example-0201',
+      spanId: spanIdFor(0x201),
+      kind: 'interaction',
+      name: 'example.press',
+      startTime: 1_700_000_000_000,
+      duration: 90,
+      seq: 1,
+      ingestSeq: 1,
+    };
+    const request: TelemetryEvent = {
+      ...base,
+      id: 'event-example-0202',
+      spanId: spanIdFor(0x202),
+      parentSpanId: press.spanId,
+      kind: 'fetch',
+      name: 'GET /example/resource',
+      startTime: 1_700_000_000_004,
+      duration: 60,
+      seq: 2,
+      ingestSeq: 2,
+    };
+    const work = [3, 4].map<TelemetryEvent>((ordinal) => ({
+      ...base,
+      id: `event-example-020${String(ordinal)}`,
+      spanId: spanIdFor(0x200 + ordinal),
+      parentSpanId: press.spanId,
+      kind: 'function',
+      name: 'example.work',
+      startTime: 1_700_000_000_000 + ordinal * 10,
+      duration: 5,
+      seq: ordinal,
+      ingestSeq: ordinal,
+    }));
+    const events = [press, request, ...work];
+
+    const tree = correlateTrace(events, TRACE_ID);
+    if (tree === undefined) {
+      throw new Error('the correlator produced no trace for the fixture events');
+    }
+    const graph = buildDependencyGraph(events);
+
+    const stub = recordingProvider((query) =>
+      Promise.resolve<DataQueryResponse>(
+        query.source === 'graph'
+          ? { source: 'graph', data: graph }
+          : { source: 'trace', data: tree },
+      ),
+    );
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const flame: FlameNode = {
+      type: 'flame',
+      id: 'layout.1.flame',
+      query: { source: 'trace', filter: { traceId: TRACE_ID } },
+    };
+
+    render(
+      <SelectionHost provider={stub.provider} spies={spies}>
+        <DependencyGraph node={makeNode()} />
+        <FlameChart node={flame} />
+      </SelectionHost>,
+    );
+
+    expect(await screen.findAllByRole('img')).toHaveLength(2);
+    await screen.findByRole('grid');
+    await screen.findByRole('tree');
+
+    const flameBlock = blockOf('dg-flame');
+    const flameRow = (name: string): HTMLElement => {
+      const row = within(flameBlock)
+        .getAllByRole('treeitem')
+        .find((candidate) => within(candidate).queryByRole('button', { name }) !== null);
+      if (row === undefined) {
+        throw new Error(`the flame chart lists no frame named "${name}"`);
+      }
+      return row;
+    };
+    const graphBlock = blockOf('dg-dependency-graph');
+
+    // A frame selected in the flame chart marks the participant that stands for
+    // that one record, in the grid and on the canvas.
+    await user.click(within(flameRow(request.name)).getByRole('button', { name: request.name }));
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: request.id,
+      spanId: request.spanId,
+      traceId: request.traceId,
+    });
+    expect(selectedRowLabels()).toEqual([request.name]);
+    expect(selectedShapeLabels(graphBlock)).toEqual([request.name]);
+
+    // A participant selected in the graph marks its frame in the flame chart.
+    await user.click(rowNamed(press.name));
+
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: press.id,
+      spanId: press.spanId,
+      traceId: press.traceId,
+    });
+    expect(flameRow(press.name).classList.contains('dg-is-selected')).toBe(true);
+    expect(flameRow(request.name).classList.contains('dg-is-selected')).toBe(false);
+    expect(selectedRowLabels()).toEqual([press.name]);
+
+    // The collapse of two records is highlighted in the graph alone, and gives
+    // way as soon as the flame chart selects another span.
+    await user.click(rowNamed('example.work'));
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+    expect(selectedRowLabels()).toEqual(['example.work']);
+
+    await user.click(within(flameRow(request.name)).getByRole('button', { name: request.name }));
+    expect(selectedRowLabels()).toEqual([request.name]);
+    expect(selectedShapeLabels(graphBlock)).toEqual([request.name]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The hover highlight, focus, and their dismissal (WCAG 1.4.13)
+ *
+ * A box's SVG title is the user agent's tooltip, so nothing it says may be
+ * reachable by hover alone: every grid row shows its participant's full detail
+ * in one form, whatever holds focus or the pointer (see the participant detail
+ * cases). Neither hovering a box nor focusing a row therefore reveals anything
+ * in the grid. The one preview is the hovered box's own highlight on the
+ * canvas: Escape dismisses it without moving the pointer or focus, and leaves
+ * the selection and every row alone.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The chain's labels in the order {@link CHAIN_PARTICIPANTS} lists them. */
+const CHAIN_PARTICIPANT_LABELS: readonly string[] = CHAIN_PARTICIPANTS.map((node) => node.label);
+
+/**
+ * The label element of a row whose participant cell carries the detail — the
+ * label outside any tooltip, with the tier and the metrics after it — or
+ * `null` when the cell does not.
+ *
+ * @param row A row obtained by role.
+ * @param node The participant it stands for.
+ */
+function inlineDetailLabelOf(row: HTMLElement, node: DependencyGraphNode): HTMLElement | null {
+  const label = participantLabelElementOf(row);
+  const header = within(row).getByRole('rowheader');
+  const tier = node.tier === undefined ? '' : `${formatTierLabel(node.tier)} · `;
+  const text = header.textContent ?? '';
+  const detail = `${tier}Records ${String(node.count)}`;
+  const carriesDetail =
+    label.closest('.dg-tooltip') === null &&
+    text.startsWith(node.label) &&
+    text.slice(node.label.length).replace(/^ · /, '').startsWith(detail);
+
+  return carriesDetail ? label : null;
+}
+
+/**
+ * Whether a row shows its participant's detail inline, in the cell's one form:
+ * the label untruncated — neither itself nor any run around it ellipsizes —
+ * with the detail after it.
+ *
+ * @param row A row obtained by role.
+ * @param node The participant it stands for.
+ */
+function showsInlineDetail(row: HTMLElement, node: DependencyGraphNode): boolean {
+  const label = inlineDetailLabelOf(row, node);
+
+  return label !== null && label.closest('.dg-text--truncate') === null;
+}
+
+/** The labels of the rows showing their detail inline, among the chain's participants. */
+function inlineDetailLabels(): string[] {
+  return CHAIN_PARTICIPANTS.filter((node) => showsInlineDetail(rowNamed(node.label), node)).map(
+    (node) => node.label,
+  );
+}
+
+/**
+ * Every data row's participant cell, as its markup, in document order: the
+ * cell a focus- or hover-driven form would change, read so that a changed
+ * element, class, attribute or text anywhere in it fails the comparison.
+ */
+function participantCellMarkup(): string[] {
+  return dataRows().map((row) => within(row).getByRole('rowheader').innerHTML);
+}
+
+/** The labels of the canvas shapes carrying the hovered state, in document order. */
+function hoveredShapeLabels(): string[] {
+  const labels = canvasLabels();
+
+  return nodeShapes().flatMap((shape, index) =>
+    shape.classList.contains('dg-is-hovered') ? [labels[index] ?? ''] : [],
+  );
+}
+
+describe('DependencyGraph hover and focus detail dismissal', () => {
+  it('highlights a hovered box on the canvas alone, and Escape dismisses it without moving the pointer', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    // At rest every row already carries its detail, and nothing is hovered.
+    const before = participantCellMarkup();
+    expect(inlineDetailLabels()).toEqual(CHAIN_PARTICIPANT_LABELS);
+    expect(hoveredShapeLabels()).toEqual([]);
+
+    // The box under the pointer is marked; the grid does not answer the
+    // pointer, so no row changes form or size.
+    await user.hover(shapeNamed(ROUTE_LABEL));
+    expect(shapeNamed(ROUTE_LABEL).classList.contains('dg-is-hovered')).toBe(true);
+    expect(hoveredShapeLabels()).toEqual([ROUTE_LABEL]);
+    expect(participantCellMarkup()).toEqual(before);
+
+    // The pointer moves no focus, so the key arrives at the page body. It
+    // dismisses the box's hover state, changes no row, and is not consumed.
+    expect(document.activeElement).toBe(document.body);
+    expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
+    expect(shapeNamed(ROUTE_LABEL).classList.contains('dg-is-hovered')).toBe(false);
+    expect(hoveredShapeLabels()).toEqual([]);
+    expect(participantCellMarkup()).toEqual(before);
+
+    // The next box the pointer enters is marked, and leaving ends it.
+    await user.hover(shapeNamed(REQUEST_LABEL));
+    expect(hoveredShapeLabels()).toEqual([REQUEST_LABEL]);
+
+    await user.unhover(shapeNamed(REQUEST_LABEL));
+    expect(hoveredShapeLabels()).toEqual([]);
+    expect(nodeShapes().filter((shape) => shape.classList.contains('dg-is-hovered'))).toHaveLength(
+      0,
+    );
+    expect(participantCellMarkup()).toEqual(before);
+  });
+
+  it('leaves a focused row and the selection alone on Escape, and dismisses only a hovered box', async () => {
+    const stub = resolvingProvider(chainGraph());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    await user.tab();
+    const [first, second] = dataRows();
+    if (first === undefined || second === undefined) {
+      throw new Error('the grid rendered fewer than two data rows');
+    }
+
+    expect(document.activeElement).toBe(first);
+    const before = participantCellMarkup();
+    expect(inlineDetailLabels()).toEqual(CHAIN_PARTICIPANT_LABELS);
+
+    // Focus previews nothing, so an Escape on the row has nothing of this
+    // view's to dismiss: it is left unconsumed, focus stays on the row and the
+    // row keeps its detail.
+    expect(fireEvent.keyDown(first, { key: 'Escape' })).toBe(true);
+    expect(document.activeElement).toBe(first);
+    expect(participantCellMarkup()).toEqual(before);
+
+    // Focus moving on changes no row either.
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(second);
+    expect(participantCellMarkup()).toEqual(before);
+
+    // A selection made from the keyboard, then a box hovered while the row
+    // keeps focus: Escape on the row dismisses the highlight and nothing else.
+    await user.keyboard('{Enter}');
+    expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
+
+    await user.hover(shapeNamed(ROUTE_LABEL));
+    expect(hoveredShapeLabels()).toEqual([ROUTE_LABEL]);
+
+    expect(fireEvent.keyDown(second, { key: 'Escape' })).toBe(true);
+    expect(hoveredShapeLabels()).toEqual([]);
+    expect(document.activeElement).toBe(second);
+    expect(participantCellMarkup()).toEqual(before);
+    expect(rowNamed(HANDLER_LABEL).getAttribute('aria-selected')).toBe('true');
+    expect(shapeNamed(HANDLER_LABEL).classList.contains('dg-is-selected')).toBe(true);
+  });
+
+  it("keeps the focused row's full form when the pointer rests on that row's box", async () => {
+    const stub = resolvingProvider(chainGraph());
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('grid');
+
+    await user.tab();
+    expect(document.activeElement).toBe(dataRows()[0]);
+    const before = participantCellMarkup();
+    expect(inlineDetailLabels()).toEqual(CHAIN_PARTICIPANT_LABELS);
+
+    // The keyboard user's form is never taken away by a pointer: the box under
+    // the pointer is marked, its row keeps its form.
+    await user.hover(shapeNamed(INTERACTION_LABEL));
+    expect(shapeNamed(INTERACTION_LABEL).classList.contains('dg-is-hovered')).toBe(true);
+    expect(participantCellMarkup()).toEqual(before);
+
+    // Another box under the pointer leaves every row, the focused one included,
+    // exactly as it was.
+    await user.hover(shapeNamed(ROUTE_LABEL));
+    expect(hoveredShapeLabels()).toEqual([ROUTE_LABEL]);
+    expect(inlineDetailLabels()).toEqual(CHAIN_PARTICIPANT_LABELS);
+    expect(participantCellMarkup()).toEqual(before);
   });
 });

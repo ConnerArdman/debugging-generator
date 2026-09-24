@@ -394,10 +394,14 @@ function panelNodeChildren(node: PanelNode): readonly PanelNode[] {
  * node with the path that reaches it.
  *
  * This is the traversal `./validate.ts` uses to check catalog membership, node
- * id uniqueness and per-type data-source allowance, the one `./semantic.ts` uses
- * to resolve evidence references and trace filters against the capture, and the
- * one the normaliser's tests use to assert an exact expected document. It exists
- * once, here, so that all of them agree on order and on paths.
+ * id uniqueness and per-type data-source allowance, and the one the
+ * normaliser's tests use to assert an exact expected document. It exists once,
+ * here, so that all of them agree on order and on paths. `./semantic.ts` walks a
+ * layout in the same pre-order with the same paths, but through its own
+ * defensive reproduction of this walk: it must keep going past a node this
+ * function would stop at (an unknown type ends here in `assertNever`), because
+ * a document handed to semantic validation may have been asserted rather than
+ * parsed.
  *
  * **Order.** A node is visited before its children (pre-order), and siblings in
  * the order they appear, so the sequence of visits is the order a developer

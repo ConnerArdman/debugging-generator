@@ -1068,7 +1068,7 @@ function resolutionRejection(
     case 'symbol-not-addressable':
       return {
         code: 'unsupported-declaration',
-        reason: `'${reportable(file)}' declares '${reportable(action.symbol)}' only as ${nonAddressableClause(details['position'])}, whose body no timing wrapper can replace`,
+        reason: notWrappableReason(file, action.symbol, nonAddressableClause(details['position'])),
         hint:
           resolverHint ??
           `Time the function that contains this declaration instead. ${RUNTIME_ALTERNATIVE}`,
@@ -1155,15 +1155,38 @@ function generatorRejection(
  *
  * @param action The action under test.
  * @param file The normalised project-relative path.
- * @param clause What was found, completing "declares ‹symbol› as …".
+ * @param clause What was found, completing "…: it is …".
  * @returns The rejection.
  */
 function unsupportedShape(action: InstrumentationAction, file: string, clause: string): Rejection {
   return {
     code: 'unsupported-declaration',
-    reason: `'${reportable(file)}' declares '${reportable(action.symbol)}' as ${clause}, whose body no timing wrapper can replace`,
+    reason: notWrappableReason(file, action.symbol, clause),
     hint: `Time a function declaration, a function-valued variable or a class method instead. ${RUNTIME_ALTERNATIVE}`,
   };
+}
+
+/**
+ * The `reason` of a declaration the file holds but no timing wrapper can
+ * replace, in the words the patcher's own refusal uses ("…but not as a function
+ * this transform can wrap: it is ‹clause›").
+ *
+ * The clause says what the declaration *is* and stands on its own after the
+ * colon, so it is never followed by a verdict about "its body": several
+ * clauses — a class, whose body runs field initialisers; a constructor; a
+ * declaration with no function body at all — already describe the body, or its
+ * absence, and a second clause about it would repeat or contradict the first.
+ * One fragment on one line, which is how it reads after "Could not enable
+ * ‹signal›: " (AAP §0.5.5).
+ *
+ * @param file The normalised project-relative path.
+ * @param symbol The symbol as the plan spelled it.
+ * @param clause What the declaration is: a `NON_ADDRESSABLE_CLAUSES` value or a
+ * shape such as "a constructor".
+ * @returns The reason fragment.
+ */
+function notWrappableReason(file: string, symbol: string, clause: string): string {
+  return `'${reportable(file)}' declares '${reportable(symbol)}', but not as a function a timing wrapper can replace: it is ${clause}`;
 }
 
 /**

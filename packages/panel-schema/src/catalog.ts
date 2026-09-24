@@ -8,12 +8,16 @@
  * on the set of node types and on what each one is allowed to ask for. This
  * module is where that agreement is written down once:
  *
- * 1. **The validator** (`./validate.ts`, and the capture-aware pass in
- *    `./semantic.ts`). A node type absent from the catalog is a *validation
- *    failure* rather than a crash or a blank region — {@link
- *    isKnownPanelNodeType} is the check that makes it one — and a node whose
- *    `query.source` is not listed for its type is rejected by {@link
- *    isSourceAllowedForNode}. The `telemetryKinds` and `requiredReads` of an
+ * 1. **The validators** (the authoring schema in `./input.ts`, `./validate.ts`,
+ *    and the capture-aware pass in `./semantic.ts`). A node type absent from
+ *    the catalog is a *validation failure* rather than a crash or a blank
+ *    region — {@link isKnownPanelNodeType} is the check that makes it one — and
+ *    a node whose `query.source` is not listed for its type is rejected by
+ *    {@link isSourceAllowedForNode}. The authoring schema builds each
+ *    query-backed node type's `source` enumeration, and its rule for when a
+ *    source must be written, from the entry's `sources`, `defaultSource` and
+ *    `requiresQuery`, so the model is refused and told the readable sources at
+ *    the step it can still repair. The `telemetryKinds` and `requiredReads` of an
  *    entry are what let the semantic pass ask whether the capture in hand can
  *    actually substantiate the node: the kinds say whether the capture holds
  *    the node's records at all, and the required attribute keys say whether
@@ -219,7 +223,9 @@ export interface PanelNodeCatalogEntry {
    * the source the node was designed around and the rest are the alternatives
    * whose prepared result its component can also consume; a source whose result
    * shape the component cannot render is absent, which is what makes {@link
-   * isSourceAllowedForNode} a real check rather than a formality.
+   * isSourceAllowedForNode} a real check rather than a formality. The authoring
+   * schema in `./input.ts` renders this list as the node type's `source`
+   * enumeration, so the model is shown exactly the sources the type can read.
    */
   readonly sources: readonly DataQuerySource[];
 
@@ -246,7 +252,10 @@ export interface PanelNodeCatalogEntry {
    * containers and for the source-link leaf. The normalized node schemas in
    * `./nodes/viz.ts` already require the field of the twelve; this flag is what
    * states the same rule for the *authoring* form, where the query may still be
-   * spread across flat fields, and for a stored panel being read back.
+   * spread across flat fields, and for a stored panel being read back. The
+   * authoring schema in `./input.ts` reads it with {@link defaultSource}: a
+   * type that requires a query and has no default must name its source, flat
+   * or inside its `query` object, before normalisation is reached.
    */
   readonly requiresQuery: boolean;
 

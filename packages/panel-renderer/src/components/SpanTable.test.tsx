@@ -11,12 +11,21 @@
  * that contract rather than tests of pixels:
  *
  *   - **order preserved** renders a deliberately unsorted page and asserts the
- *     rows appear in the provider's own order, so a local `.sort()` added to
- *     the component later fails here;
- *   - **sort is a re-query** activates a sortable header and asserts a *new*
- *     provider call carrying the mapped `DataQuerySort`, with the rows then
- *     following the second response — not a client-side re-ordering of the
- *     first.
+ *     rows appear in the provider's own order, so a local `.sort()` of a
+ *     service-ordered page added to the component later fails here;
+ *   - **a service order is a re-query** activates a sortable header and
+ *     asserts a *new* provider call carrying the mapped `DataQuerySort`, with
+ *     the rows then following the second response — not a client-side
+ *     re-ordering of the first.
+ *
+ * The ordering cases hold the rest of that contract. The data layer orders a
+ * span list only by longest duration and by earliest start, so every other
+ * column and direction is a *view order*: the loaded rows are arranged in the
+ * component, stably, with no query, the header reports that order, and while
+ * the loaded rows are not the whole result the footer says the order covers
+ * only them. Re-activating the sorted Duration header therefore flips the
+ * order rather than doing nothing, and the header control the reader activated
+ * keeps its element and its focus across the re-query a service order causes.
  *
  * The paging case holds the other half of the same contract: a page is a page,
  * the footer says how much of the result is on screen, and "Load more" advances
@@ -82,7 +91,7 @@ import type { DataQuery, DataQuerySort, TableNode } from '@debuggen/panel-schema
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
 import type { RenderResult } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
@@ -91,8 +100,9 @@ import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { Button } from '../primitives/Button';
 import { kindColorVar, tierColorVar } from '../utils/color';
 import {
   formatCount,
@@ -171,15 +181,45 @@ const SLOWEST_FIRST: DataQuerySort = 'duration_desc';
 const EARLIEST_FIRST: DataQuerySort = 'start_asc';
 
 /**
- * The accessible names of the two sortable header controls, taken from the
- * component's `headerLabel` copy.
+ * The accessible names of the five sortable header controls: each column's
+ * own name, and for Start the reference point its relative values are taken
+ * from. None names a direction — every column sorts both ways and the
+ * direction in force is the header cell's `aria-sort`.
  *
  * Spelled out here rather than derived, so this suite pins the names the
  * controls announce instead of restating whatever the component currently
  * passes.
  */
-const DURATION_SORT_NAME = 'Duration, longest first';
+const OPERATION_SORT_NAME = 'Operation';
+const KIND_SORT_NAME = 'Kind';
+const TIER_SORT_NAME = 'Tier';
+const DURATION_SORT_NAME = 'Duration';
 const START_SORT_NAME = 'Start, relative to the earliest listed operation';
+
+/**
+ * The sentence the footer adds while a view order arranges rows that are not
+ * the whole result, for a given count of loaded rows. Spelled out, like the
+ * header names above, so this suite pins the copy.
+ *
+ * @param loaded How many rows are loaded.
+ * @returns The scope sentence.
+ */
+function viewOrderScopeSentence(loaded: number): string {
+  return `This order covers only the ${formatCount(loaded)} loaded ${
+    loaded === 1 ? 'span' : 'spans'
+  }; the service orders the full result only by longest duration or earliest start.`;
+}
+
+/**
+ * The sentence the footer adds while a further page is offered or loading: the
+ * page size each "Load more" asks for. Spelled out to pin the copy.
+ *
+ * @param limit The page size the node's query requests.
+ * @returns The page-size sentence.
+ */
+function pageSizeSentence(limit: number): string {
+  return `Each page holds up to ${formatCount(limit)} ${limit === 1 ? 'span' : 'spans'}.`;
+}
 
 /** The footer control that asks for the next page. */
 const LOAD_MORE_NAME = 'Load more';
@@ -199,11 +239,42 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
 /** The sentence reserved for a query that matched nothing at all. */
 const EMPTY_CAPTURE_MESSAGE = 'No spans matched this query.';
 
+/** The short title above that sentence, the empty capture's alone. */
+const NOTHING_CAPTURED_TITLE = 'No spans';
+
 /** The error state's retry control. */
 const RETRY_NAME = 'Retry';
 
+/**
+ * The two controls the keyboard cases place around the table, so a Tab can be
+ * pressed from just before the grid and seen to land just after it.
+ */
+const BEFORE_TABLE = 'Before the table';
+const AFTER_TABLE = 'After the table';
+
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
+
+/**
+ * The shared error-state contract every query-backed node renders a failure
+ * with, spelled out rather than read back from the host's constants, so this
+ * suite pins the words a reader actually sees: the title and generic lead of a
+ * failed view and of a failed next page, and the focus key the host's node
+ * frame uses to restore focus to the retry control after a remount.
+ */
+const QUERY_FAILURE_TITLE = 'Could not load this view';
+const QUERY_FAILURE_LEAD = 'The data for this view could not be loaded.';
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+const PAGE_FAILURE_LEAD =
+  'The next page of this view could not be loaded. The rows already shown are unaffected.';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/** A provider's cause and hint for the shared-contract cases. */
+const PROVIDER_CAUSE = 'The channel to the service is closed.';
+const PROVIDER_HINT = 'Start the Debug Generator service, then retry.';
+
+/** What the first page's loading state announces. */
+const LOADING_LABEL = 'Loading captured spans…';
 
 /*
  * ---------------------------------------------------------------------------
@@ -603,6 +674,70 @@ function rerenderComponent(view: RenderResult, node: TableNode, context: HostCon
 }
 
 /**
+ * Renders the component between two ordinary controls, for the keyboard cases:
+ * the Tab order is only observable against something before and after it.
+ *
+ * @param node The node to draw.
+ * @param context The provider, actions and session to render it inside.
+ * @returns The render result.
+ */
+function renderBetweenControls(node: TableNode, context: HostContext): RenderResult {
+  return render(
+    <>
+      <Button>{BEFORE_TABLE}</Button>
+      {hostTree(node, context)}
+      <Button>{AFTER_TABLE}</Button>
+    </>,
+  );
+}
+
+/**
+ * Moves focus to an element directly, as a reader's previous Tab would have.
+ *
+ * @param element The element to focus.
+ */
+function focusDirectly(element: HTMLElement): void {
+  act(() => {
+    element.focus();
+  });
+}
+
+/**
+ * Every element inside the grid that is in the page's Tab order.
+ *
+ * Read off the DOM property rather than the attribute, so a button that
+ * carries no `tabindex` attribute — and is therefore a Tab stop by default —
+ * counts, exactly as a browser would count it.
+ *
+ * @param grid The grid.
+ * @returns Its Tab stops, in document order.
+ */
+function tabStopsIn(grid: HTMLElement): HTMLElement[] {
+  return Array.from(
+    grid.querySelectorAll<HTMLElement>('a[href], button, input, select, textarea, [tabindex]'),
+  ).filter((element) => element.tabIndex >= 0);
+}
+
+/**
+ * The tooltip bubble a trigger names among its `aria-describedby` tokens.
+ *
+ * @param trigger The trigger.
+ * @returns The bubble.
+ */
+function bubbleOf(trigger: HTMLElement): HTMLElement {
+  const tokens = (trigger.getAttribute('aria-describedby') ?? '').split(/\s+/);
+  const bubble = tokens
+    .map((token) => document.getElementById(token))
+    .find((element) => element?.getAttribute('role') === 'tooltip');
+
+  if (bubble === undefined || bubble === null) {
+    throw new Error('the trigger names no tooltip bubble');
+  }
+
+  return bubble;
+}
+
+/**
  * The grid's data rows, in document order.
  *
  * Obtained by role and then narrowed by the attribute the primitive writes on
@@ -678,6 +813,34 @@ function queryOfCall(stub: StubProvider, call: number): DataQuery {
   return query;
 }
 
+/**
+ * What the header cell holding the named sort control reports as `aria-sort`.
+ *
+ * Read off the cell, never the control: the primitive reports an ordering on
+ * the `columnheader`, which is where a reader asks for it.
+ *
+ * @param name The accessible name of the column's sort control.
+ * @returns The cell's `aria-sort`, or `null` when it carries none.
+ */
+function sortStateOf(name: string): string | null {
+  const cell = screen.getByRole('button', { name }).closest('[role="columnheader"]');
+
+  if (cell === null) {
+    throw new Error(`the "${name}" sort control sits in no column header`);
+  }
+
+  return cell.getAttribute('aria-sort');
+}
+
+/**
+ * The footer's text, found by the coverage sentence every footer opens with.
+ *
+ * @returns The footer text, or `null` when no footer is rendered.
+ */
+function footerText(): string | null {
+  return screen.queryByText(/^Showing /)?.textContent ?? null;
+}
+
 // Explicit, per the harness note above: automatic cleanup belongs to the
 // runner's configuration, this guarantee belongs to the suite. Restoring spies
 // in the same place keeps one case's mock out of the next.
@@ -744,6 +907,32 @@ const REQUEST_ROW = makeEvent({
 const PROVIDER_ORDER: readonly TelemetryEvent[] = [FUNCTION_ROW, QUERY_ROW, REQUEST_ROW];
 
 /**
+ * A browser-tier fetch span, for the view-order cases: with it the page spans
+ * all three tiers, and its name, kind label, start and duration each fall
+ * strictly between two of the other rows'.
+ */
+const FETCH_ROW = makeEvent({
+  id: 'event-example-0004',
+  spanId: spanIdFor(4),
+  name: 'example.fetch',
+  kind: 'fetch',
+  tier: 'browser',
+  startTime: BASE_START_MS + 16,
+  duration: 300,
+  seq: 3,
+  ingestSeq: 4,
+});
+
+/**
+ * Four rows in an order matching none of the view orders the cases ask for —
+ * by name, kind label, tier, start or duration, in either direction — so every
+ * arrangement asserted below can only have been produced by the component.
+ * The two server-tier rows are not adjacent, which is what lets the Tier cases
+ * prove the tie-break is the provider's position in both directions.
+ */
+const MIXED_ORDER: readonly TelemetryEvent[] = [REQUEST_ROW, QUERY_ROW, FETCH_ROW, FUNCTION_ROW];
+
+/**
  * A page of `count` distinct server-tier function spans, for the paging cases
  * whose assertion depends on how many rows arrived rather than on which.
  *
@@ -787,6 +976,9 @@ describe('SpanTable states', () => {
     expect(busy.getAttribute('aria-live')).toBe('polite');
     expect(busy.classList.contains('dg-span-table__loading')).toBe(true);
 
+    // Labelled with what is resolving, not the bare default.
+    expect(busy.textContent).toBe(LOADING_LABEL);
+
     // Nothing is drawn yet: no grid, therefore no rows, and above all no empty
     // state — an unsettled query is not an answer (AAP 0.5.5).
     expect(screen.queryByRole('grid')).toBeNull();
@@ -817,7 +1009,7 @@ describe('SpanTable states', () => {
     // An empty page is a success, so it is drawn as an absence and not as a
     // failure, and there is no grid to hold rows.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
   });
 
@@ -857,6 +1049,39 @@ describe('SpanTable states', () => {
 
     // No rows were invented behind the failure.
     expect(screen.queryAllByRole('row')).toHaveLength(0);
+  });
+
+  it('renders a provider rejection through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', PROVIDER_CAUSE, { hint: PROVIDER_HINT }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // A lone failure is the assertive announcement.
+    const alert = await screen.findByRole('alert');
+
+    // The one title every failed view carries, and a message that opens with the
+    // generic lead and keeps the provider's own cause after it.
+    expect(within(alert).getByText(QUERY_FAILURE_TITLE)).toBeDefined();
+
+    const message = alert.querySelector('.dg-error-state__message');
+    expect(message?.textContent?.startsWith(QUERY_FAILURE_LEAD)).toBe(true);
+    expect(message?.textContent).toContain(PROVIDER_CAUSE);
+
+    // The hint stands on its own line, and the code is a chip rather than prose.
+    expect(within(alert).getByText(PROVIDER_HINT).classList).toContain('dg-error-state__message');
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').closest('.dg-badge')).not.toBeNull();
+
+    // The query block holds exactly the query that was asked. `<details>` is a
+    // group too, so the block is always looked up by its name.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the host's node frame restores focus by.
+    expect(
+      within(alert).getByRole('button', { name: RETRY_NAME }).getAttribute('data-dg-focus-key'),
+    ).toBe(RETRY_FOCUS_KEY);
   });
 
   it('reports a node whose query names a source it cannot draw, and asks for nothing', async () => {
@@ -1041,21 +1266,321 @@ describe('SpanTable ordering', () => {
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
   });
 
-  it('does not re-query when the activated column is already the applied order', async () => {
+  it('flips the applied Duration order over the loaded rows, and flips it back, without a query', async () => {
+    // The node asks for `duration_desc` and the service applied it, so the page
+    // is drawn as the service ranked it; no total is reported, so the loaded
+    // rows cannot be known to be the whole result.
     const stub = resolvingProvider('spans', PROVIDER_ORDER);
     const spies = makeActions();
     const user = userEvent.setup();
 
-    // The node already asks for `duration_desc`, and the data layer offers one
-    // direction per column, so a second activation has nothing to request.
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
     await screen.findByRole('grid');
+    expect(sortStateOf(DURATION_SORT_NAME)).toBe('descending');
+
     await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
 
+    // Shortest first is not an ordering the data layer offers, so it is a view
+    // order: no query, the loaded rows arranged by duration, and the header
+    // reporting the order that is on screen rather than staying descending.
     expect(stub.resolve).toHaveBeenCalledTimes(1);
-    expect(spies.onFilterChange).not.toHaveBeenCalled();
+    expect(sortStateOf(DURATION_SORT_NAME)).toBe('ascending');
+    expect(renderedNames()).toEqual([REQUEST_ROW.name, FUNCTION_ROW.name, QUERY_ROW.name]);
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(1);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'duration_asc' });
+
+    // The order covers only what is loaded, and the footer says so.
+    expect(footerText()).toBe(
+      `Showing ${formatCount(3)} spans. The total for this query was not reported. ${viewOrderScopeSentence(3)}`,
+    );
+
+    await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
+
+    // Longest first is the order the service already applied: returning to it
+    // clears the view order with no re-query, and the rows are the service's
+    // own again, in its order.
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(sortStateOf(DURATION_SORT_NAME)).toBe('descending');
     expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'duration_desc' });
+    expect(screen.queryByText(/This order covers only/)).toBeNull();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      column: 'Operation, by name',
+      control: OPERATION_SORT_NAME,
+      report: 'name',
+      ascending: [FETCH_ROW, FUNCTION_ROW, QUERY_ROW, REQUEST_ROW],
+      descending: [REQUEST_ROW, QUERY_ROW, FUNCTION_ROW, FETCH_ROW],
+    },
+    {
+      column: 'Kind, by the label its chip displays',
+      control: KIND_SORT_NAME,
+      report: 'kind',
+      ascending: [QUERY_ROW, FETCH_ROW, FUNCTION_ROW, REQUEST_ROW],
+      descending: [REQUEST_ROW, FUNCTION_ROW, FETCH_ROW, QUERY_ROW],
+    },
+    {
+      // Pipeline order, then its reverse. The two server rows keep the
+      // provider's relative order in BOTH directions: the tie-break is the
+      // service's position, never reversed with the order.
+      column: 'Tier, in pipeline order',
+      control: TIER_SORT_NAME,
+      report: 'tier',
+      ascending: [FETCH_ROW, REQUEST_ROW, FUNCTION_ROW, QUERY_ROW],
+      descending: [QUERY_ROW, REQUEST_ROW, FUNCTION_ROW, FETCH_ROW],
+    },
+  ])(
+    'orders $column both ways over the loaded rows, without a query',
+    async ({ control, report, ascending, descending }) => {
+      // The whole result is on the one page: four of four, and no further page.
+      const stub = resolvingProvider('spans', MIXED_ORDER, {
+        total: MIXED_ORDER.length,
+        nextOffset: null,
+      });
+      const spies = makeActions();
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+      await screen.findByRole('grid');
+      expect(sortStateOf(control)).toBe('none');
+
+      await user.click(screen.getByRole('button', { name: control }));
+
+      expect(sortStateOf(control)).toBe('ascending');
+      expect(sortStateOf(DURATION_SORT_NAME)).toBe('none');
+      expect(renderedNames()).toEqual(ascending.map((event) => event.name));
+      expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: `${report}_asc` });
+
+      await user.click(screen.getByRole('button', { name: control }));
+
+      expect(sortStateOf(control)).toBe('descending');
+      expect(renderedNames()).toEqual(descending.map((event) => event.name));
+      expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: `${report}_desc` });
+      expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+
+      // Neither arrangement asked the service for anything, and — every row the
+      // query matched being loaded — neither needed a word about its scope.
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+      expect(footerText()).toBe(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
+      expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    },
+  );
+
+  it('orders Start earliest first through the service, and latest first over the loaded rows', async () => {
+    const earliestFirst: readonly TelemetryEvent[] = [
+      REQUEST_ROW,
+      FUNCTION_ROW,
+      FETCH_ROW,
+      QUERY_ROW,
+    ];
+    const stub = pagingProvider('spans', [
+      { data: MIXED_ORDER, total: MIXED_ORDER.length, nextOffset: null },
+      { data: earliestFirst, total: earliestFirst.length, nextOffset: null },
+    ]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: START_SORT_NAME }));
+
+    // Earliest first is the service's `start_asc`: a re-query, reported under
+    // exactly the data layer's name, with the rows following its response.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(EARLIEST_FIRST);
+    expect(queryOfCall(stub, 2).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(earliestFirst.map((event) => event.name));
+    });
+    expect(sortStateOf(START_SORT_NAME)).toBe('ascending');
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'start_asc' });
+
+    await user.click(screen.getByRole('button', { name: START_SORT_NAME }));
+
+    // Latest first is a view order over those rows: no further query.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(sortStateOf(START_SORT_NAME)).toBe('descending');
+    expect(renderedNames()).toEqual(
+      [QUERY_ROW, FETCH_ROW, FUNCTION_ROW, REQUEST_ROW].map((event) => event.name),
+    );
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, { sort: 'start_desc' });
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+  });
+
+  it('compares operation names with their digit runs read as numbers', async () => {
+    // A character-by-character comparison would put `…10` between `…1` and `…2`.
+    const page = [...makePage(1, 10), ...makePage(1, 2), ...makePage(1, 1)];
+    const stub = resolvingProvider('spans', page, { total: page.length, nextOffset: null });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: OPERATION_SORT_NAME }));
+
+    expect(renderedNames()).toEqual([
+      'example.page.operation.1',
+      'example.page.operation.2',
+      'example.page.operation.10',
+    ]);
+  });
+
+  it('keeps the activated header control, and its focus, while a service re-query loads', async () => {
+    // The first call answers at once; the re-query waits until the case
+    // releases it, so the in-flight state can be observed without a timer.
+    const releases: ((response: DataQueryResponse) => void)[] = [];
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({ source: 'spans', data: PROVIDER_ORDER })
+        : new Promise<DataQueryResponse>((resolve) => {
+            releases.push(resolve);
+          }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const control = screen.getByRole('button', { name: START_SORT_NAME });
+
+    await user.click(control);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(EARLIEST_FIRST);
+
+    // The grid and its header stay mounted while the re-query is in flight: the
+    // loading state sits in the grid's empty slot, outside its rows, and no row
+    // of the previous order is drawn under the new indicator. The control the
+    // reader activated is the very same element, and it still holds focus.
+    const grid = screen.getByRole('grid');
+    const busy = screen.getByRole('status');
+    expect(busy.classList.contains('dg-span-table__loading')).toBe(true);
+    expect(within(grid).queryByRole('status')).toBeNull();
+    expect(dataRows()).toHaveLength(0);
+    expect(sortStateOf(START_SORT_NAME)).toBe('ascending');
+    expect(screen.getByRole('button', { name: START_SORT_NAME })).toBe(control);
+    expect(document.activeElement).toBe(control);
+
+    const release = releases[0];
+    if (release === undefined) {
+      throw new Error('the re-query was never issued');
+    }
+
+    const earliestFirst: readonly TelemetryEvent[] = [REQUEST_ROW, FUNCTION_ROW, QUERY_ROW];
+    release({ source: 'spans', data: earliestFirst });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(earliestFirst.map((event) => event.name));
+    });
+    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.getByRole('grid')).toBe(grid);
+    expect(screen.getByRole('button', { name: START_SORT_NAME })).toBe(control);
+    expect(document.activeElement).toBe(control);
+  });
+
+  it('keeps the header on screen when a service re-query fails, and retries it', async () => {
+    const stub = recordingProvider((_query, call) =>
+      call === 2
+        ? Promise.reject(
+            new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.'),
+          )
+        : Promise.resolve<DataQueryResponse>({ source: 'spans', data: PROVIDER_ORDER }),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const control = screen.getByRole('button', { name: START_SORT_NAME });
+
+    await user.click(control);
+
+    // The failure is stated in the grid's empty slot, with the query that failed
+    // and a retry; the header — and the reader's focus on it — stays put.
+    const alert = await screen.findByRole('alert');
+    expect(alert.classList.contains('dg-span-table__error')).toBe(true);
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    expect(
+      JSON.parse(within(alert).getByRole('group', { name: FAILING_QUERY_NAME }).textContent ?? ''),
+    ).toEqual({
+      source: 'spans',
+      sort: EARLIEST_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    });
+    expect(within(screen.getByRole('grid')).queryByRole('alert')).toBeNull();
+    expect(dataRows()).toHaveLength(0);
+    expect(screen.getByRole('button', { name: START_SORT_NAME })).toBe(control);
+    expect(document.activeElement).toBe(control);
+
+    await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3)).toEqual(queryOfCall(stub, 2));
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([...PROVIDER_ORDER_NAMES]);
+    });
+    expect(screen.queryByRole('alert')).toBeNull();
+  });
+
+  it('says a view order covers only the loaded rows, and keeps it across Load more', async () => {
+    // A four-row result in two pages, each in the service's `duration_desc`
+    // order as the node asks.
+    const stub = pagingProvider('spans', [
+      { data: [QUERY_ROW, FUNCTION_ROW], total: 4, nextOffset: 2 },
+      { data: [FETCH_ROW, REQUEST_ROW], total: 4, nextOffset: null },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // The service's own order ranks the whole result: nothing to qualify.
+    expect(screen.queryByText(/This order covers only/)).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: OPERATION_SORT_NAME }));
+
+    // Two of four rows are loaded, so the arrangement is of those two only, and
+    // the footer says so rather than letting them pass for the whole ranking.
+    expect(renderedNames()).toEqual([FUNCTION_ROW.name, QUERY_ROW.name]);
+    expect(footerText()).toBe(
+      `Showing ${formatCount(2)} of ${formatCount(4)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)} ${viewOrderScopeSentence(2)}`,
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The next page is requested in the SERVICE's order from the offset it
+    // named: a view order never reaches the query.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual({
+      source: 'spans',
+      sort: SLOWEST_FIRST,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+      offset: 2,
+    });
+
+    // And the view order is re-applied to every accumulated row.
+    await waitFor(() => {
+      expect(renderedNames()).toEqual(
+        [FETCH_ROW, FUNCTION_ROW, QUERY_ROW, REQUEST_ROW].map((event) => event.name),
+      );
+    });
+    expect(sortStateOf(OPERATION_SORT_NAME)).toBe('ascending');
+
+    // Every row the query matched is loaded now, so the order covers all of it
+    // and the footer is the count alone.
+    expect(screen.queryByText(/This order covers only/)).toBeNull();
+    expect(footerText()).toBe(`Showing ${formatCount(4)} of ${formatCount(4)} spans.`);
   });
 });
 
@@ -1162,6 +1687,151 @@ describe('SpanTable interactions', () => {
   });
 });
 
+describe('SpanTable keyboard (B2-F19)', () => {
+  it('is one Tab stop, entered on the active row and left by the next Tab', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderBetweenControls(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const chip = within(grid).getByRole('button', { name: SOURCE_CHIP_NAME });
+    const [firstRow, secondRow] = dataRows();
+    if (firstRow === undefined || secondRow === undefined) {
+      throw new Error('the grid rendered fewer than two data rows');
+    }
+
+    // The chip stays a real, focusable button, and leaves the Tab order.
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    // Before focus: one stop in the whole grid, and it is the active row.
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
+    await user.tab();
+    expect(document.activeElement).toBe(firstRow);
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    // The next Tab leaves the grid, past the chip and the header's sort controls.
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: AFTER_TABLE }));
+
+    // Moving the roving stop keeps exactly one of it, and Tab returns to it.
+    await user.tab({ shift: true });
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(secondRow);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(tabStopsIn(grid)).toEqual([secondRow]);
+  });
+
+  it('reaches the source chip with ArrowRight and returns with ArrowLeft and Escape', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderBetweenControls(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const grid = await screen.findByRole('grid');
+    const chip = within(grid).getByRole('button', { name: SOURCE_CHIP_NAME });
+    const firstRow = rowNamed(FUNCTION_ROW.name);
+
+    focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
+    await user.tab();
+    expect(document.activeElement).toBe(firstRow);
+
+    // Into the row: the chip takes focus, and its full location opens with it.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(chip);
+    expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(true);
+
+    // A focused control moves no Tab stop onto itself.
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(firstRow);
+
+    // Escape takes two presses: the open description first, then back to the row.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Escape}');
+    expect(bubbleOf(chip).classList.contains('dg-is-open')).toBe(false);
+    expect(document.activeElement).toBe(chip);
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(firstRow);
+
+    // Moving through a row is not acting on it.
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('opens source exactly once from a focused chip, and selects nothing', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderBetweenControls(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
+    await user.tab();
+
+    // Enter on a control is the control's own key, never the row's.
+    await user.keyboard('{ArrowRight}{Enter}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).toHaveBeenCalledWith(BASE_SOURCE);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(rowNamed(FUNCTION_ROW.name).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('moves between rows with the arrow, Home and End keys, and selects with Enter and Space', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderBetweenControls(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    focusDirectly(screen.getByRole('button', { name: BEFORE_TABLE }));
+    await user.tab();
+
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(rowNamed(QUERY_ROW.name));
+
+    // Enter on the row selects it: the host hears the record, the row shows it.
+    await user.keyboard('{Enter}');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: QUERY_ROW.id,
+      spanId: QUERY_ROW.spanId,
+      traceId: QUERY_ROW.traceId,
+    });
+    expect(rowNamed(QUERY_ROW.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed(QUERY_ROW.name).classList.contains('dg-is-selected')).toBe(true);
+
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(rowNamed(REQUEST_ROW.name));
+
+    // Space selects too, and the selection moves rather than accumulating.
+    await user.keyboard(' ');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: REQUEST_ROW.id,
+      spanId: REQUEST_ROW.spanId,
+      traceId: REQUEST_ROW.traceId,
+    });
+    expect(rowNamed(REQUEST_ROW.name).classList.contains('dg-is-selected')).toBe(true);
+    expect(rowNamed(QUERY_ROW.name).classList.contains('dg-is-selected')).toBe(false);
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(rowNamed(FUNCTION_ROW.name));
+    expect(tabStopsIn(screen.getByRole('grid'))).toEqual([rowNamed(FUNCTION_ROW.name)]);
+
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+  });
+});
+
 describe('SpanTable paging', () => {
   it('says how much of the result is on screen and appends the next page', async () => {
     // `nextOffset` deliberately differs from the length of the page: the
@@ -1175,8 +1845,11 @@ describe('SpanTable paging', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // One row of forty-two, said plainly rather than implied by a bare count.
-    await screen.findByText(`Showing ${formatCount(1)} of ${formatCount(42)} spans.`);
+    // One row of forty-two, said plainly rather than implied by a bare count,
+    // with the page size each further page is requested at.
+    await screen.findByText(
+      `Showing ${formatCount(1)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+    );
     expect(dataRows()).toHaveLength(1);
 
     const first = soleQuery(stub);
@@ -1201,8 +1874,42 @@ describe('SpanTable paging', () => {
       expect(renderedNames()).toEqual([FUNCTION_ROW.name, QUERY_ROW.name]);
     });
     expect(
-      screen.getByText(`Showing ${formatCount(2)} of ${formatCount(42)} spans.`),
+      screen.getByText(
+        `Showing ${formatCount(2)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+      ),
     ).toBeDefined();
+  });
+
+  it('announces the footer count politely as each page arrives (B2-F10)', async () => {
+    const stub = pagingProvider('spans', [
+      { data: [FUNCTION_ROW], total: 42, nextOffset: 5 },
+      { data: [QUERY_ROW], total: 42, nextOffset: 6 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // The coverage sentence is its own polite region, and not a `status` role:
+    // the loading state keeps that one. While a further page is offered the
+    // same region also names the page size, so the reader hears both together.
+    const coverage = await screen.findByText(
+      `Showing ${formatCount(1)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+    );
+    expect(coverage.getAttribute('aria-live')).toBe('polite');
+    expect(coverage.getAttribute('aria-atomic')).toBe('true');
+    expect(coverage.getAttribute('role')).toBeNull();
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The same region, still mounted, now carries the new count — which is
+    // what makes a reader hear it rather than nothing.
+    await waitFor(() => {
+      expect(coverage.textContent).toBe(
+        `Showing ${formatCount(2)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+      );
+    });
+    expect(coverage.isConnected).toBe(true);
+    expect(coverage.getAttribute('aria-live')).toBe('polite');
   });
 
   it('says the total is unknown rather than implying the page is the whole result', async () => {
@@ -1214,6 +1921,67 @@ describe('SpanTable paging', () => {
     // more rows exist, and saying so is the only truthful option (AAP 0.4.2).
     const coverage = await screen.findByText(/^Showing 1 span\./);
     expect(coverage.textContent).toContain('not reported');
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+  });
+
+  it('keeps the count footer when every row the query matched is loaded', async () => {
+    // The whole result on one page: three of three, and the last page.
+    const stub = resolvingProvider('spans', PROVIDER_ORDER, {
+      total: PROVIDER_ORDER.length,
+      nextOffset: null,
+    });
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // The count is how a reader knows the table is complete, so it is stated
+    // here too — with nothing about pages, because no further page exists.
+    expect(footerText()).toBe(`Showing ${formatCount(3)} of ${formatCount(3)} spans.`);
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('treats an authored limit as the page size, says so, and loads past it', async () => {
+    // A node authored with `limit: 2` over a three-row result: two rows first,
+    // then the one the service's next page holds.
+    const authoredLimit = 2;
+    const stub = pagingProvider('spans', [
+      { data: [QUERY_ROW, FUNCTION_ROW], total: 3, nextOffset: 2 },
+      { data: [REQUEST_ROW], total: 3, nextOffset: null },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(
+      makeNode({ query: { source: 'spans', sort: SLOWEST_FIRST, limit: authoredLimit } }),
+      { provider: stub.provider, actions: makeActions().actions },
+    );
+
+    await screen.findByRole('grid');
+    expect(soleQuery(stub).limit).toBe(authoredLimit);
+
+    // The footer counts the page against the total and names the page size, so
+    // two of three does not read as a table the panel meant to stop at two.
+    expect(footerText()).toBe(
+      `Showing ${formatCount(2)} of ${formatCount(3)} spans. ${pageSizeSentence(authoredLimit)}`,
+    );
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    // The limit is the size of each page, not a cap on the table: the next page
+    // is requested at that size from the offset the service named.
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2)).toEqual({
+      source: 'spans',
+      sort: SLOWEST_FIRST,
+      limit: authoredLimit,
+      offset: 2,
+    });
+
+    await waitFor(() => {
+      expect(renderedNames()).toEqual([QUERY_ROW.name, FUNCTION_ROW.name, REQUEST_ROW.name]);
+    });
+    expect(footerText()).toBe(`Showing ${formatCount(3)} of ${formatCount(3)} spans.`);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
 
@@ -1233,7 +2001,7 @@ describe('SpanTable paging', () => {
     );
 
     await screen.findByText(
-      `Showing ${formatCount(1)} of ${formatCount(42)} spans, from position ${formatCount(21)}.`,
+      `Showing ${formatCount(1)} of ${formatCount(42)} spans, from position ${formatCount(21)}. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
     );
     expect(soleQuery(stub).offset).toBe(20);
   });
@@ -1251,7 +2019,9 @@ describe('SpanTable paging', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByText(`Showing ${formatCount(5)} of ${formatCount(42)} spans.`);
+    await screen.findByText(
+      `Showing ${formatCount(5)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+    );
     expect(soleQuery(stub).offset).toBe(DATA_QUERY_DEFAULT_OFFSET);
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
@@ -1365,9 +2135,46 @@ describe('SpanTable paging', () => {
     expect(inFlight.hasAttribute('disabled')).toBe(true);
     expect(renderedNames()).toEqual([FUNCTION_ROW.name]);
     expect(
-      screen.getByText(`Showing ${formatCount(1)} of ${formatCount(42)} spans.`),
+      screen.getByText(
+        `Showing ${formatCount(1)} of ${formatCount(42)} spans. ${pageSizeSentence(DATA_QUERY_DEFAULT_LIMIT)}`,
+      ),
     ).toBeDefined();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
+  });
+
+  it('reports a failed next page below the rows it keeps, scoped to that page', async () => {
+    // The first call answers with a forward page; the second rejects, so the
+    // failure arrives behind rows the reader is already reading.
+    const stub = recordingProvider((_query, call) =>
+      call === 1
+        ? Promise.resolve<DataQueryResponse>({
+            source: 'spans',
+            data: [FUNCTION_ROW],
+            total: 42,
+            nextOffset: 5,
+          })
+        : Promise.reject(new DebuggenError('TRANSPORT_DISCONNECTED', PROVIDER_CAUSE)),
+    );
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await user.click(await screen.findByRole('button', { name: LOAD_MORE_NAME }));
+
+    const alert = await screen.findByRole('alert');
+
+    // The rows stay, and the failure says so: the page title and lead, then the
+    // provider's own cause.
+    expect(renderedNames()).toEqual([FUNCTION_ROW.name]);
+    expect(within(alert).getByText(PAGE_FAILURE_TITLE)).toBeDefined();
+    expect(alert.querySelector('.dg-error-state__message')?.textContent).toBe(
+      `${PAGE_FAILURE_LEAD} ${PROVIDER_CAUSE}`,
+    );
+
+    // The query shown is the page that failed, at the offset the service named.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(queryOfCall(stub, 2));
+    expect(queryOfCall(stub, 2).offset).toBe(5);
   });
 });
 
@@ -1415,9 +2222,16 @@ describe('SpanTable empty pages', () => {
     expect(block).not.toBeNull();
     expect(block?.querySelector('.dg-empty-state__title')?.textContent).toBe(title);
 
+    // Only the empty capture carries the view's decorative glyph; every
+    // settled empty state is the polite status rather than the busy one.
+    expect(block?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden') ?? null).toBe(
+      message === EMPTY_CAPTURE_MESSAGE ? 'true' : null,
+    );
+    expect(screen.getByRole('status')).toBe(block);
+
     expect(screen.queryByRole('grid')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
   }
 
   it.each([
@@ -1427,7 +2241,7 @@ describe('SpanTable empty pages', () => {
   ])('keeps the empty-capture sentence for $label', async ({ offset, total }) => {
     const stub = renderEmptyPage(offset, { total, nextOffset: null });
 
-    await expectEmptyState(undefined, EMPTY_CAPTURE_MESSAGE);
+    await expectEmptyState(NOTHING_CAPTURED_TITLE, EMPTY_CAPTURE_MESSAGE);
     expect(screen.queryAllByRole('button')).toHaveLength(0);
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
@@ -1789,5 +2603,206 @@ describe('SpanTable query bounds', () => {
     await screen.findByRole('grid');
 
     expect(soleQuery(stub).filter).toEqual({ traceId: TRACE_ID, minDuration: 5 });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The panel's shared selection (B2-F21)
+ *
+ * Under the panel host the selected row is the panel's one selection — the
+ * event any view or evidence chip last selected — rather than a state of this
+ * table (AAP 0.7.3: evidence chips "select the underlying events"). These cases
+ * provide that selection directly through `PanelSelectionContext`, which is
+ * exactly what the host mounts, and re-render with another value to move it.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The component inside every host context, the panel's selection included.
+ *
+ * @param node The node to draw.
+ * @param context The provider and actions to render it inside.
+ * @param selection The panel's selection, or `undefined` for none.
+ * @returns The element tree.
+ */
+function selectionTree(
+  node: TableNode,
+  context: HostContext,
+  selection: PanelSelection | undefined,
+): ReactElement {
+  return (
+    <PanelSelectionContext.Provider value={{ selection }}>
+      {hostTree(node, context)}
+    </PanelSelectionContext.Provider>
+  );
+}
+
+describe('SpanTable shared selection', () => {
+  it('marks the row whose event the panel selection names, and no other', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+
+    render(
+      selectionTree(
+        makeNode(),
+        { provider: stub.provider, actions: makeActions().actions },
+        { eventId: QUERY_ROW.id },
+      ),
+    );
+
+    await screen.findByRole('grid');
+
+    const selected = rowNamed(QUERY_ROW.name);
+    expect(selected.getAttribute('aria-selected')).toBe('true');
+    expect(selected.classList.contains('dg-is-selected')).toBe(true);
+    expect(rowNamed(FUNCTION_ROW.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(REQUEST_ROW.name).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('marks a row a selection names by its trace and span alone', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+
+    // Another record's id, but this row's own span in its own trace: the pair
+    // is the span's identity across tiers, so it names this row.
+    render(
+      selectionTree(
+        makeNode(),
+        { provider: stub.provider, actions: makeActions().actions },
+        { eventId: 'event-example-elsewhere', traceId: TRACE_ID, spanId: REQUEST_ROW.spanId },
+      ),
+    );
+
+    await screen.findByRole('grid');
+
+    expect(rowNamed(REQUEST_ROW.name).getAttribute('aria-selected')).toBe('true');
+    expect(rowNamed(QUERY_ROW.name).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('follows the panel selection instead of keeping one of its own', async () => {
+    const stub = resolvingProvider('spans', PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const context: HostContext = { provider: stub.provider, actions: spies.actions };
+
+    const view = render(selectionTree(makeNode(), context, undefined));
+
+    await screen.findByRole('grid');
+    await user.click(rowNamed(FUNCTION_ROW.name));
+
+    // The activation is reported with the row's own event, exactly as outside
+    // a host...
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: FUNCTION_ROW.id,
+      spanId: FUNCTION_ROW.spanId,
+      traceId: FUNCTION_ROW.traceId,
+    });
+
+    // ...but the mark is the host's to move: until the panel's selection names
+    // the event, no row claims to be selected.
+    expect(rowNamed(FUNCTION_ROW.name).getAttribute('aria-selected')).toBe('false');
+
+    view.rerender(selectionTree(makeNode(), context, { eventId: FUNCTION_ROW.id }));
+    expect(rowNamed(FUNCTION_ROW.name).getAttribute('aria-selected')).toBe('true');
+
+    // A selection made in another view moves the mark here as well.
+    view.rerender(selectionTree(makeNode(), context, { eventId: QUERY_ROW.id }));
+    expect(rowNamed(FUNCTION_ROW.name).getAttribute('aria-selected')).toBe('false');
+    expect(rowNamed(QUERY_ROW.name).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('marks a selected event it had not loaded once a page brings it', async () => {
+    const later = makeEvent({
+      id: 'event-example-0099',
+      spanId: spanIdFor(99),
+      name: 'example.later',
+      startTime: BASE_START_MS + 64,
+      duration: 4,
+      seq: 3,
+      ingestSeq: 4,
+    });
+    const stub = pagingProvider('spans', [
+      { data: PROVIDER_ORDER, total: 4, nextOffset: 3 },
+      { data: [later], total: 4 },
+    ]);
+    const user = userEvent.setup();
+
+    render(
+      selectionTree(
+        makeNode(),
+        { provider: stub.provider, actions: makeActions().actions },
+        { eventId: later.id },
+      ),
+    );
+
+    await screen.findByRole('grid');
+
+    // Nothing on screen stands for it, so nothing is marked in its place.
+    expect(dataRows().every((row) => row.getAttribute('aria-selected') === 'false')).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    await waitFor(() => {
+      expect(renderedNames()).toContain(later.name);
+    });
+    expect(rowNamed(later.name).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('keeps the selected event marked, on the same record, wherever a view order places it', async () => {
+    // A second record of FETCH_ROW's own span — same trace, same span id — and
+    // shorter, so the service ranks it after FETCH_ROW and "shortest first"
+    // places it before.
+    const twin = makeEvent({
+      id: 'event-example-0005',
+      spanId: FETCH_ROW.spanId,
+      name: 'example.fetch.response',
+      kind: 'fetch',
+      tier: 'browser',
+      startTime: BASE_START_MS + 20,
+      duration: 20,
+      seq: 4,
+      ingestSeq: 5,
+    });
+    const page: readonly TelemetryEvent[] = [...MIXED_ORDER, twin];
+    const stub = resolvingProvider('spans', page, { total: page.length, nextOffset: null });
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    // The selection names the span alone, so both records stand for it; the
+    // first the service returned carries the mark.
+    render(
+      selectionTree(
+        makeNode(),
+        { provider: stub.provider, actions: spies.actions },
+        { eventId: 'event-example-elsewhere', traceId: TRACE_ID, spanId: FETCH_ROW.spanId },
+      ),
+    );
+
+    await screen.findByRole('grid');
+
+    const selectedNames = (): string[] =>
+      dataRows()
+        .filter((row) => row.getAttribute('aria-selected') === 'true')
+        .map(
+          (row) =>
+            within(row).getByRole('rowheader').querySelector('.dg-span-table__name-cell')
+              ?.textContent ?? '',
+        );
+
+    expect(selectedNames()).toEqual([FETCH_ROW.name]);
+
+    // Shortest first puts the twin ahead of FETCH_ROW. A view order changes the
+    // arrangement only: the mark stays on the record it was on.
+    await user.click(screen.getByRole('button', { name: DURATION_SORT_NAME }));
+
+    expect(sortStateOf(DURATION_SORT_NAME)).toBe('ascending');
+    expect(renderedNames().indexOf(twin.name)).toBeLessThan(
+      renderedNames().indexOf(FETCH_ROW.name),
+    );
+    expect(selectedNames()).toEqual([FETCH_ROW.name]);
+    expect(rowNamed(FETCH_ROW.name).classList.contains('dg-is-selected')).toBe(true);
+
+    // Re-arranging is not selecting: nothing was reported and nothing re-queried.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
 });

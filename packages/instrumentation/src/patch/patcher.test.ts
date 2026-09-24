@@ -2826,6 +2826,122 @@ describe('a chain of plan versions over one file', () => {
     ]);
     expectFileBytes(pristine.path, drifted);
   });
+
+  it("records every layered record's position in the developer's own text", async () => {
+    // A1-F01. Each later patch of a file is computed against bytes that already
+    // carry the alias and the earlier wrappers, so a position read from them
+    // lands below the line the developer — and the code graph — sees. The
+    // position must be the one in the chain root's backup: the developer's
+    // original.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, TARGET_FILE);
+    const developerText = pristine.bytes.toString('utf8');
+    const journal = openFileJournal(journalPathFor(sandbox));
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+    const patchVersion = async (planVersion: number, symbol: string): Promise<PatchOutcome> =>
+      appliedOutcome(
+        await createPatcher({
+          projectRoot: sandbox.projectRoot,
+          sessionId: sandbox.sessionId,
+          planVersion,
+          backups,
+          journal,
+        }).patchTarget({ file: TARGET_FILE, symbol }),
+      );
+
+    const symbols = [TARGET_SYMBOL, 'findConeProfile', OTHER_SYMBOL] as const;
+    const outcomes: PatchOutcome[] = [];
+
+    for (const [index, symbol] of symbols.entries()) {
+      outcomes.push(await patchVersion(index + 1, symbol));
+    }
+
+    expect(journal.rows().map((row) => row.previousRecordId)).toEqual([
+      undefined,
+      outcomes[0]?.record.id,
+      outcomes[1]?.record.id,
+    ]);
+
+    for (const [index, symbol] of symbols.entries()) {
+      const outcome = outcomes[index];
+      const declaration = new RegExp(`^export function ${symbol}\\(`, 'mu').exec(developerText);
+
+      expect(declaration, symbol).not.toBeNull();
+
+      const nameOffset = (declaration?.index ?? 0) + 'export function '.length;
+      const before = developerText.slice(0, nameOffset);
+
+      expect({ line: outcome?.location.line, column: outcome?.location.column }, symbol).toEqual({
+        line: before.split('\n').length,
+        column: nameOffset - before.lastIndexOf('\n'),
+      });
+
+      // The literal in the file carries the same numbers, which is what the
+      // span a capture records — and the panel's source link — is built from.
+      expect(readFileSync(pristine.path, 'utf8'), symbol).toContain(
+        `line: ${String(outcome?.location.line)}, column: ${String(outcome?.location.column)}, symbol: "${symbol}"`,
+      );
+    }
+
+    // Reading the position from the root's backup changed nothing about the
+    // bytes: the chain still unwinds to the developer's file exactly.
+    const pass = await reconcileSandbox(sandbox, pristine.path);
+
+    expect(pass.outcome.status).toBe('clean');
+    expect(pass.outcome.restored).toHaveLength(3);
+    expectFileBytes(pristine.path, pristine.bytes);
+  });
+
+  it('refuses a layered patch whose chain root can no longer be read, writing nothing', async () => {
+    // Three links, because with two the parent *is* the root and its backup is
+    // checked first by the baseline check. Here the parent's backup is intact
+    // and the root's — the developer's original, the only text the position
+    // can be read from — is gone.
+    const sandbox = makeSandbox();
+    const pristine = pristineFile(sandbox, TARGET_FILE);
+    const journal = openFileJournal(journalPathFor(sandbox));
+    const backups = createBackupStore({
+      debuggenHome: sandbox.debuggenHome,
+      sessionId: sandbox.sessionId,
+    });
+    const patcherFor = (planVersion: number, files?: PatchFileSystem): Patcher =>
+      createPatcher({
+        projectRoot: sandbox.projectRoot,
+        sessionId: sandbox.sessionId,
+        planVersion,
+        backups,
+        journal,
+        ...(files !== undefined ? { files } : {}),
+      });
+
+    const first = appliedOutcome(
+      await patcherFor(1).patchTarget({ file: TARGET_FILE, symbol: TARGET_SYMBOL }),
+    );
+
+    appliedOutcome(
+      await patcherFor(2).patchTarget({ file: TARGET_FILE, symbol: 'findConeProfile' }),
+    );
+
+    const beforeThird = readFileSync(pristine.path);
+
+    rmSync(join(sandbox.debuggenHome, 'backups', sandbox.sessionId, first.originalHash));
+
+    const { files, log } = recordingFileSystem();
+    const error = refusalOf(
+      await patcherFor(3, files).patchTarget({ file: TARGET_FILE, symbol: OTHER_SYMBOL }),
+    );
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.reason).toBe('chain-root-unreadable');
+    expect(error.details?.cause).toBe('backup-unreadable');
+    expect(typeof error.hint).toBe('string');
+    expect(log.writes).toEqual([]);
+    expect(journal.rows()).toHaveLength(2);
+    expectFileBytes(pristine.path, beforeThird);
+  });
 });
 
 /*

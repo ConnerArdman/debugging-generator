@@ -64,7 +64,7 @@
  *
  * // after
  * export async function handle(request: Request): Promise<Response> {
- *   async function __orig() {
+ *   async function __orig(): Promise<Response> {
  *   return respond(await load(request));
  * }
  *   // Debug Generator: temporary instrumentation, removed when the session ends.
@@ -85,19 +85,44 @@
  * transform whose stated purpose is to change nothing about what a function
  * does cannot afford to rewrite its strings to look tidier.
  *
+ * ## The patched file must still type-check
+ *
+ * AAP §0.5.1 requires a strict target project to keep type-checking with no
+ * new dependency, and a strict project reads more than a function's runtime
+ * behaviour: its **signature** — what callers and every type derived from the
+ * function see — and the **contextual types** its `return` statements and
+ * parameters were checked against. Moving a body into an inner function keeps
+ * the first for free in the `'arguments'` style (the outer keeps its own
+ * parameter list and return type) and loses the second unless it is restated:
+ * the inner function therefore declares the outer's return type (a type
+ * predicate as `boolean`, an assertion signature as `void`), so a literal
+ * returned against a declared union does not widen into a `TS2322` the
+ * developer's build reports and a single-file check cannot see when the
+ * declared type is imported.
+ *
  * ## Arrow functions take the other template
  *
  * An arrow function binds no `arguments`, so forwarding through `arguments`
  * would be a syntax error inside it. Arrow targets therefore use the template's
  * `'rest'` call style: the **wrapper stays an arrow**, takes a rest parameter,
  * and forwards it to an inner arrow that holds the original head — modifiers,
- * type parameters, parameter list, return type — verbatim. Keeping the wrapper
- * an arrow is what preserves lexical `this` and what keeps a callback that was
- * passed *by reference* to `Array.prototype.map` or `Array.prototype.sort`
- * behaving identically, positional arguments and all. An expression body is
- * normalised to a `return` of that expression inside the inner arrow, wrapped
- * in parentheses so no comma expression, object literal or automatic semicolon
+ * parameter list, return type — verbatim. Keeping the wrapper an arrow is what
+ * preserves lexical `this` and what keeps a callback that was passed *by
+ * reference* to `Array.prototype.map` or `Array.prototype.sort` behaving
+ * identically, positional arguments and all. An expression body is normalised
+ * to a `return` of that expression inside the inner arrow, wrapped in
+ * parentheses so no comma expression, object literal or automatic semicolon
  * insertion can change its meaning.
+ *
+ * Three restatements keep an arrow's types what they were. The rest parameter
+ * is annotated with the arrow's own parameter list as a labelled tuple, so the
+ * exported signature — and `Parameters<typeof fn>` in every consumer — is
+ * unchanged. The type-parameter list stays on the outer arrow only, so the
+ * inner arrow's types refer to the outer's and the forwarded call returns the
+ * original's type rather than a generic erased to `unknown`. And an arrow
+ * contextually typed by its binding (`const handler: Handler = (request) =>
+ * …`) has that context restated on the inner arrow with `satisfies`, so its
+ * parameters and returned literals are typed exactly as before.
  *
  * ## The position is recorded here, before anything moves
  *
@@ -109,6 +134,13 @@
  * product with `resolvedBy: 'patch'` without resolving anything at run time.
  * Reading them afterwards would yield lines shifted by the wrapper, and nothing
  * anywhere would fail — the developer would simply be sent to the wrong line.
+ *
+ * The same holds across patches. A second symbol in a file this session already
+ * patched, and a follow-up plan version over such a file, are computed against
+ * text that already carries the helper alias and earlier wrappers, so its lines
+ * are not the developer's. The caller then passes the developer's own text as
+ * {@link FunctionTimingRequest.locationText} — `./patcher.ts` reads it from the
+ * backup at the root of the file's chain — and the position is resolved there.
  *
  * The coordinates are the **name identifier's** 1-based line and column, and
  * `endLine` is the last line of the whole declaration. That is not an arbitrary
@@ -135,6 +167,7 @@
 
 import { Node, Project, ScriptKind, SyntaxKind, ts } from 'ts-morph';
 import type {
+  ArrowFunction,
   ClassDeclaration,
   ClassExpression,
   CommentRange,
@@ -145,6 +178,7 @@ import type {
   PropertyDeclaration,
   SourceFile,
   Statement,
+  TypeNode,
 } from 'ts-morph';
 
 import {
@@ -256,6 +290,13 @@ const VERIFY_ROOT = '/__debuggen_verify__';
 
 /** The directory the receiver-typing pre-flight's copies are created under. */
 const TYPE_VERIFY_ROOT = '/__debuggen_typecheck__';
+
+/**
+ * The directory the parse of {@link FunctionTimingRequest.locationText} — the
+ * developer's own text, when the text being patched is already layered — is
+ * created under, so it never replaces the parse the rewrite is reading.
+ */
+const LOCATION_ROOT = '/__debuggen_location__';
 
 /**
  * The compiler options the private in-memory project is built with.
@@ -406,9 +447,18 @@ export interface FunctionTimingPatcherOptions {
    * precisely so that it stays cheap. This check builds a second, lib-loaded
    * in-memory project and compares *every* semantic diagnostic of the original
    * text against those of the patched text under the same configuration,
-   * refusing on any difference. It never alters the patch, so the emitted
-   * bytes — and therefore `instrumentedHash` — are identical whether it runs or
-   * not.
+   * refusing on any diagnostic the patch adds — with one allowance: a further
+   * occurrence of a name the original text *already* failed to resolve (a DOM
+   * or runtime global this library-only project does not load) is the wrapper
+   * restating a declared type, not a new problem, so it is not counted. It
+   * never alters the patch, so the emitted bytes — and therefore
+   * `instrumentedHash` — are identical whether it runs or not.
+   *
+   * It is a single-file check with no import resolved, so it cannot prove the
+   * patched file type-checks in the developer's project — which is why the
+   * transform itself restates every declared type the moved code was checked
+   * against (the inner function's return type, an arrow's parameter tuple and
+   * contextual type) rather than relying on this check to catch their loss.
    *
    * Costs one type-check of one file per patch, twice (20–110 ms per program as
    * measured on this product's own fixtures), which is why it is a flag: turn it
@@ -460,8 +510,37 @@ export interface FunctionTimingRequest {
    * helper type alias is inserted at most once per file, so patching a second
    * symbol in an already-patched file adds no duplicate. Patching the **same**
    * symbol twice is refused instead — see this module's rejection reasons.
+   *
+   * Text that already carries an earlier patch is also text whose line numbers
+   * are no longer the developer's: the helper type alias and every earlier
+   * wrapper above the target shift it. Pass the developer's own text as
+   * {@link FunctionTimingRequest.locationText} alongside it, so the recorded
+   * position describes the file the developer has rather than the one this
+   * session made.
    */
   readonly text?: string | undefined;
+
+  /**
+   * The developer's own text of the file — the bytes before **any** patch of
+   * this session — when {@link FunctionTimingRequest.text} already carries one
+   * or more earlier patches.
+   *
+   * The rewrite is always computed against `text`, because those are the bytes
+   * being replaced. The recorded position — `meta.line`/`meta.column` in the
+   * emitted call and {@link FunctionTimingPatch.location} — is resolved against
+   * this text instead, because it is what the click-to-source route of AAP
+   * §0.4.2 sends the developer to and what the code graph indexed: resolving it
+   * against layered text would shift every symbol below an earlier wrapper by
+   * that wrapper's lines, and the first symbol of a file by the helper alias.
+   *
+   * `./patcher.ts` supplies it for every chained patch, from the backup at the
+   * root of the file's chain. Omitted, or equal to `text`, the position is read
+   * from `text`, which is then the developer's own. The target is resolved in
+   * both texts with the same spelling and must resolve to the same name, shape
+   * and container in each; a target this text does not declare is refused
+   * rather than given a position from the layered text.
+   */
+  readonly locationText?: string | undefined;
 
   /**
    * The plan action this patch installs, for provenance.
@@ -977,16 +1056,32 @@ export class FunctionTimingPatcher {
       );
     }
 
-    // Read from the PRE-rewrite tree. Reading after the edits would report the
-    // wrapper's shifted lines, and nothing downstream could tell.
-    const position = sourceFile.getLineAndColumnAtPos(target.nameNode.getStart());
-    const endLine = target.declaration.getEndLineNumber();
+    // Read from the PRE-rewrite tree — and, for text an earlier patch already
+    // layered, from the developer's own text. Reading after the edits, or from
+    // layered text, would report shifted lines, and nothing downstream could
+    // tell.
+    const anchored = this.#anchor(input, target);
+
+    if (!anchored.ok) {
+      return anchored;
+    }
+
+    const position = anchored.value;
+    const endLine = position.endLine;
     const meta: PatchSpanMeta = {
       file,
       line: position.line,
       column: position.column,
       symbol: target.declaredName,
     };
+
+    // The arrow's own parameter list, restated as the rest parameter's tuple so
+    // the wrapper's signature is the one the developer published. TypeScript
+    // only: a JavaScript wrapper carries no annotation at all.
+    const restParameterType =
+      callStyle === 'rest' && language === 'typescript' && Node.isArrowFunction(target.fn)
+        ? restParameterTupleFor(target.fn)
+        : undefined;
 
     const spanName = request.spanName ?? target.declaredName;
     const built = buildWrapperBody({
@@ -998,6 +1093,7 @@ export class FunctionTimingPatcher {
       innerIdentifier: identifiers.value.inner,
       helperIdentifier: identifiers.value.helper,
       restIdentifier: identifiers.value.rest,
+      restParameterType,
       generator: false,
     });
 
@@ -1105,6 +1201,97 @@ export class FunctionTimingPatcher {
   }
 
   /**
+   * The position the patch records for its target: the name identifier's
+   * 1-based line and column and the declaration's last line, in the
+   * **developer's own** text.
+   *
+   * For a request with no {@link FunctionTimingRequest.locationText}, or one
+   * whose location text is the text being patched, that is the parse the
+   * rewrite is reading. Otherwise the text being patched already carries an
+   * earlier patch of this session — a second symbol in the same file, or a
+   * follow-up plan version over a file an earlier version instrumented — and its
+   * lines are shifted by the helper alias and every wrapper above the target.
+   * The location text is then parsed on its own, the same spelling is resolved
+   * in it, and the position is read there: that is the line the code graph
+   * indexed and the line a click on the span must open.
+   *
+   * The two resolutions must describe the same declaration — same bare name,
+   * same shape, same container — or the request is refused. A target the
+   * developer's text does not declare, or declares differently, would otherwise
+   * be given a position that points at something else, which is exactly the
+   * silent failure this method exists to prevent.
+   *
+   * @param input The parsed text being patched and everything resolved about
+   * the request.
+   * @param target The target as resolved in the text being patched.
+   * @returns The anchor, or a `PATCH_TARGET_NOT_FOUND` refusal with reason
+   * `'location-unresolved'`.
+   */
+  #anchor(input: RewriteInput, target: ResolvedTarget): Result<PatchAnchor> {
+    const { file, originalText, request, sourceFile, spelling } = input;
+    const locationText = request.locationText;
+
+    if (locationText === undefined || locationText === originalText) {
+      return ok(anchorOf(sourceFile, target));
+    }
+
+    const scratch = this.#scratchProject();
+    const locationFile = scratch.createSourceFile(joinPosix(LOCATION_ROOT, file), locationText, {
+      overwrite: true,
+      scriptKind: scriptKindFor(file),
+    });
+
+    try {
+      const resolved = resolveTarget(locationFile, spelling, file);
+
+      if (!resolved.ok) {
+        return err(
+          refusal(
+            'PATCH_TARGET_NOT_FOUND',
+            'location-unresolved',
+            "The target resolves in the file's current text but not in the developer's own text, so no position the developer can open could be recorded for it.",
+            {
+              file,
+              symbol: target.declaredName,
+              cause: resolved.error.details?.['reason'],
+            },
+            'Reconcile the earlier modifications of this file, then plan the target again.',
+          ),
+        );
+      }
+
+      const pristine = resolved.value;
+
+      if (
+        pristine.declaredName !== target.declaredName ||
+        pristine.shape !== target.shape ||
+        pristine.container !== target.container
+      ) {
+        return err(
+          refusal(
+            'PATCH_TARGET_NOT_FOUND',
+            'location-unresolved',
+            "The target resolves to a different declaration in the developer's own text than in the file's current text, so the position to record is ambiguous.",
+            {
+              file,
+              symbol: target.declaredName,
+              shape: target.shape,
+              locationShape: pristine.shape,
+            },
+            'Name the target with its qualified spelling, or reconcile the earlier modifications of this file first.',
+          ),
+        );
+      }
+
+      return ok(anchorOf(locationFile, pristine));
+    } finally {
+      // Removed before returning, like every other parse this patcher makes:
+      // the private project holds no text one patch could leave for another.
+      scratch.removeSourceFile(locationFile);
+    }
+  }
+
+  /**
    * Re-parses the emitted text and returns a refusal when the parse reports a
    * syntax error.
    *
@@ -1188,7 +1375,11 @@ export class FunctionTimingPatcher {
    * `TS7023` for the inner function and `TS7024` beside it — two more build
    * errors in the developer's project, under codes no receiver-typing list would
    * hold. Since the subtraction already removes what the file brought with it,
-   * the honest comparison is over everything the compiler says.
+   * the honest comparison is over everything the compiler says — except a
+   * further occurrence of a name the original already could not resolve, which
+   * is compared by presence (see `introducedDiagnostics`): the wrapper restates
+   * declared types on purpose, and a global this library-only project does not
+   * load is unresolved wherever it is named.
    *
    * The two texts are checked **one at a time at the same path**, so neither can
    * see the other: two copies of one module in one program would redeclare
@@ -1259,6 +1450,44 @@ interface RewriteInput {
 
   /** The parsed `symbol` spelling. */
   readonly spelling: SymbolSpelling;
+}
+
+/**
+ * Where a patched symbol is, as the patch records it: the coordinates the
+ * emitted `meta` literal and {@link FunctionTimingPatch.location} carry.
+ */
+interface PatchAnchor {
+  /** The name identifier's 1-based line. */
+  readonly line: number;
+
+  /** The name identifier's 1-based column. */
+  readonly column: number;
+
+  /** The whole declaration's last 1-based line. */
+  readonly endLine: number;
+}
+
+/**
+ * Reads a target's anchor off the tree it was resolved in.
+ *
+ * The **name identifier's** position rather than the declaration's start, which
+ * is character-for-character the anchor `@debuggen/code-analysis` records for
+ * the same declaration — see this module's overview. `getLineAndColumnAtPos`
+ * answers 1-based on both axes, which is the convention `SourceLocation`
+ * requires.
+ *
+ * @param sourceFile The parse the target was resolved in.
+ * @param target The resolved target.
+ * @returns Its anchor in that parse.
+ */
+function anchorOf(sourceFile: SourceFile, target: ResolvedTarget): PatchAnchor {
+  const position = sourceFile.getLineAndColumnAtPos(target.nameNode.getStart());
+
+  return {
+    line: position.line,
+    column: position.column,
+    endLine: target.declaration.getEndLineNumber(),
+  };
 }
 
 /**
@@ -1338,6 +1567,46 @@ function semanticDiagnosticKeys(
 }
 
 /**
+ * The diagnostic codes that report a **name the check project cannot
+ * resolve**, rather than a type that does not fit.
+ *
+ * The pre-flight's project loads the ES library alone and resolves no import,
+ * so a global the target's real project declares — `Request` and `Response`
+ * from the DOM library, a `NodeJS` namespace, a test runner's globals — is
+ * reported unresolved at **every** place the file names it. The wrapper names
+ * some of them once more, and on purpose: the inner function restates the
+ * outer's declared return type, the rest parameter restates an arrow's
+ * parameter types, and a `satisfies` restates a binding's type, each so the
+ * patched file keeps type-checking in the real project. The restated text is
+ * resolved in the same scope as the text it restates, so it resolves exactly
+ * when the original does, and an extra occurrence of a name the original
+ * already failed to resolve is an artefact of the check, not a diagnostic the
+ * patch adds. A name the original text resolves everywhere and the patched text
+ * does not is still reported, because its key never appears before the patch.
+ *
+ * - `2304` / `2552` — cannot find name (with a spelling suggestion).
+ * - `2503` — cannot find namespace.
+ * - `2305` / `2694` / `2724` — a module or namespace has no such exported
+ *   member.
+ * - `2307` — cannot find module.
+ * - `2580`–`2584`, `2591`–`2593` — cannot find name, with the advice to
+ *   install type definitions or change the target library.
+ */
+const UNRESOLVED_NAME_DIAGNOSTIC_CODES: ReadonlySet<number> = new Set([
+  2304, 2305, 2307, 2503, 2552, 2580, 2581, 2582, 2583, 2584, 2591, 2592, 2593, 2694, 2724,
+]);
+
+/**
+ * The diagnostic code a key from {@link semanticDiagnosticKeys} carries.
+ *
+ * @param key A `'<code>: <message>'` key.
+ * @returns The code, or `NaN` for a key of any other form.
+ */
+function diagnosticCodeOf(key: string): number {
+  return Number(key.slice(0, key.indexOf(':')));
+}
+
+/**
  * The diagnostics present after the patch that were not present before it,
  * comparing multiplicities.
  *
@@ -1345,6 +1614,11 @@ function semanticDiagnosticKeys(
  * not hide a second one the patch introduced, and it must not be blamed for the
  * first. Each `after` entry cancels at most one identical `before` entry, and
  * what is left over is what the patch added.
+ *
+ * The one exception is an unresolved name — see
+ * {@link UNRESOLVED_NAME_DIAGNOSTIC_CODES} — which is compared by presence: an
+ * extra occurrence of exactly a key the original text already reported is the
+ * wrapper restating a type the check project cannot see, never a new problem.
  *
  * @param before The keys from the original text.
  * @param after The keys from the patched text.
@@ -1360,6 +1634,7 @@ function introducedDiagnostics(
     unmatched.set(entry, (unmatched.get(entry) ?? 0) + 1);
   }
 
+  const reportedBefore = new Set(before);
   const introduced: string[] = [];
 
   for (const entry of after) {
@@ -1367,6 +1642,13 @@ function introducedDiagnostics(
 
     if (remaining > 0) {
       unmatched.set(entry, remaining - 1);
+      continue;
+    }
+
+    if (
+      UNRESOLVED_NAME_DIAGNOSTIC_CODES.has(diagnosticCodeOf(entry)) &&
+      reportedBefore.has(entry)
+    ) {
       continue;
     }
 
@@ -2675,8 +2957,12 @@ function buildBodyEdit(
   // `await`, and it stays on the outer one because that is the signature the
   // module published. The wrapper returns the inner call unchanged either way:
   // it never awaits, so a promise stays a promise and a synchronous throw stays
-  // synchronous.
-  const innerDeclaration = `${asyncPrefix}function ${wrapper.innerIdentifier}(${thisParameter.value}) ${originalText.slice(start, end)}`;
+  // synchronous. The declared return type is carried for the reason
+  // `innerReturnTypeAnnotation` gives: without it the moved `return`
+  // statements are typed with no contextual type, and a literal the developer
+  // returned against a declared union widens into a build error.
+  const returnType = innerReturnTypeAnnotation(fn, wrapper.language);
+  const innerDeclaration = `${asyncPrefix}function ${wrapper.innerIdentifier}(${thisParameter.value})${returnType} ${originalText.slice(start, end)}`;
 
   return ok({
     start,
@@ -2689,6 +2975,66 @@ function buildBodyEdit(
     ].join(newline),
     purpose: 'function-body',
   });
+}
+
+/**
+ * The return-type annotation the inner function of an `'arguments'`-style
+ * wrapper declares — `': T'`, or the empty string when none applies.
+ *
+ * The moved body's `return` statements were written against the outer
+ * function's declared return type, and that declaration is what types them
+ * *contextually*: `return { outcome: 'placed' }` in a function declared to
+ * return a type whose `outcome` is a string-literal union keeps `'placed'` as a
+ * literal. Moved into an inner function with no annotation, the same statement
+ * is typed with no contextual type at all, the literal widens to `string`, and
+ * the wrapper's `return __orig.apply(…)` then fails the outer declaration with
+ * `TS2322` — a build error in the developer's project that a single-file check
+ * cannot see whenever the declared type is imported. A `never` function breaks
+ * the same way: an inner function declaration that only throws is inferred as
+ * `void`. So the inner function states the outer's declared return type, which
+ * is exactly the type its `return` statements were checked against before the
+ * patch.
+ *
+ * The annotation text is copied verbatim and resolves identically: the inner
+ * function is declared at the top of the outer body, where the outer's type
+ * parameters and parameters are in scope and nothing the original body
+ * declared is (those declarations moved into the inner body with it). Two
+ * forms cannot be copied, because they name the *outer* function's own
+ * parameter:
+ *
+ * - A type predicate, `value is T`, becomes `boolean` — the type of the value
+ *   such a function returns. The outer keeps the predicate, and a `boolean` is
+ *   what it returns.
+ * - An assertion signature, `asserts value is T` or `asserts value`, becomes
+ *   `void` — an assertion function returns nothing, and the outer keeps the
+ *   assertion for its callers' narrowing.
+ *
+ * TypeScript only: a JavaScript target carries no annotations, and one there
+ * would be a syntax error. A target with no declared return type needs none
+ * either, since the inner function then infers exactly what the outer would
+ * have. A polymorphic `this` return type never reaches here — the receiver
+ * rules refuse it first.
+ *
+ * @param fn The target function.
+ * @param language The syntax being emitted.
+ * @returns `': T'` with a leading colon, or `''`.
+ */
+function innerReturnTypeAnnotation(fn: PatchableFunctionNode, language: PatchLanguage): string {
+  if (language !== 'typescript') {
+    return '';
+  }
+
+  const returnType = fn.getReturnTypeNode();
+
+  if (returnType === undefined) {
+    return '';
+  }
+
+  if (Node.isTypePredicate(returnType)) {
+    return returnType.hasAssertsModifier() ? ': void' : ': boolean';
+  }
+
+  return `: ${returnType.getText()}`;
 }
 
 /**
@@ -3396,7 +3742,11 @@ function polymorphicThisRefusal(
  * re-emitted: everything before the parameter list (the `async` modifier and any
  * type parameters), everything between the parameter list and the `=>` (the
  * return-type annotation), and — for the inner arrow — the whole head as
- * written.
+ * written, less its type-parameter list (see {@link innerArrowHead}). The rest
+ * parameter carries the arrow's parameter list as a tuple type (see
+ * {@link restParameterTupleFor}), and an arrow contextually typed by its
+ * binding keeps that context through a `satisfies` on the inner arrow (see
+ * {@link contextualTypeTextOf}).
  *
  * An expression body is normalised to a `return` of that expression, wrapped in
  * parentheses: a comma expression, an object literal and a multi-line
@@ -3476,11 +3826,17 @@ function buildArrowEdit(
   const innerIndent = isBlockBody
     ? innerIndentFor(originalText, body.getStart(), body.getEnd(), declarationIndent)
     : `${declarationIndent}${DEFAULT_INDENT}`;
-  const head = originalText.slice(start, arrowEnd);
+  const head = innerArrowHead(fn, originalText, start, arrowEnd);
   const bodyRegion = originalText.slice(arrowEnd, body.getEnd());
   const innerArrow = isBlockBody
     ? `${head}${bodyRegion}`
     : `${head} { return (${bodyRegion.trim()}); }`;
+  const contextualType =
+    wrapper.language === 'typescript' && fn.getTypeParameters().length === 0
+      ? contextualTypeTextOf(fn)
+      : undefined;
+  const innerInitializer =
+    contextualType === undefined ? innerArrow : `(${innerArrow}) satisfies ${contextualType}`;
   const outerHead = `${originalText.slice(start, parameters.start)}(${restParameter})${originalText.slice(
     parameters.end,
     arrowEnd,
@@ -3491,12 +3847,350 @@ function buildArrowEdit(
     end,
     replacement: [
       `${outerHead} {`,
-      `${innerIndent}const ${wrapper.innerIdentifier} = ${innerArrow};`,
+      `${innerIndent}const ${wrapper.innerIdentifier} = ${innerInitializer};`,
       indentLines(wrapper.text, innerIndent, newline),
       `${declarationIndent}}`,
     ].join(newline),
     purpose: 'function-declaration',
   });
+}
+
+/**
+ * The inner arrow's head: the original head verbatim — `async`, parameter
+ * list, return type and `=>` — **without** its type-parameter list.
+ *
+ * The outer wrapper keeps the arrow's type parameters, because they are part of
+ * the signature the module published. Left on the inner arrow as well they
+ * would declare a *second*, shadowing set, and `__orig.apply(…)` over a generic
+ * function erases those to `unknown`, so the wrapper of `<T>(items: T[]) => T`
+ * would return `unknown` — a build error against its own declared `T`, and a
+ * silently widened return type for every caller when no return type is
+ * declared. Without the list, every `T` in the inner head and body resolves to
+ * the outer's `T`, which has the same constraint and default because it *is*
+ * the declaration the developer wrote, and the forwarded call returns exactly
+ * the type the original did — the same arrangement a function declaration's
+ * inner function has.
+ *
+ * @param fn The arrow being wrapped.
+ * @param originalText The text the patch is computed against.
+ * @param start The arrow's start offset.
+ * @param arrowEnd The offset just past its `=>`.
+ * @returns The head text to give the inner arrow.
+ */
+function innerArrowHead(
+  fn: ArrowFunction,
+  originalText: string,
+  start: number,
+  arrowEnd: number,
+): string {
+  if (fn.getTypeParameters().length === 0) {
+    return originalText.slice(start, arrowEnd);
+  }
+
+  // The list's own angle brackets are direct children of the arrow; those of a
+  // parameter or return type sit inside that type's node and cannot be
+  // mistaken for them.
+  const open = fn.getFirstChildByKind(SyntaxKind.LessThanToken);
+  const close = fn.getFirstChildByKind(SyntaxKind.GreaterThanToken);
+
+  if (open === undefined || close === undefined || close.getEnd() > arrowEnd) {
+    return originalText.slice(start, arrowEnd);
+  }
+
+  return `${originalText.slice(start, open.getStart())}${originalText.slice(close.getEnd(), arrowEnd)}`;
+}
+
+/**
+ * The type an arrow is contextually typed by **syntactically**: the annotation
+ * of the variable or class property it initialises, or the type a `satisfies`
+ * around it names — or `undefined` when there is none.
+ *
+ * An arrow bound as `const handler: Handler = (request) => …` takes its
+ * parameter types and the contextual type of its return value from `Handler`.
+ * The wrapper replaces the arrow in that position, so the *outer* arrow is still
+ * typed by it; the inner arrow holding the original head is not, and without a
+ * context its unannotated parameters become implicit `any` and a literal it
+ * returns widens — a build error in the developer's project that a single-file
+ * check cannot see when `Handler` is imported. The caller restores the context
+ * with `satisfies`, which types the inner arrow contextually exactly as the
+ * original position did, checks the same assignability the original binding
+ * checked, and — unlike an annotation — leaves the inner arrow's own type as
+ * the one the forwarded call returns.
+ *
+ * Parentheses between the arrow and its binding are looked through. A type
+ * assertion (`as T`) is deliberately not: it checks comparability rather than
+ * assignability, so restating it as `satisfies` could reject what the
+ * developer's assertion accepted.
+ *
+ * @param fn The arrow being wrapped.
+ * @returns The contextual type's text, or `undefined`.
+ */
+function contextualTypeTextOf(fn: ArrowFunction): string | undefined {
+  let current: Node = fn;
+  let parent = fn.getParent();
+
+  while (Node.isParenthesizedExpression(parent)) {
+    current = parent;
+    parent = parent.getParent();
+  }
+
+  if (Node.isSatisfiesExpression(parent) && parent.getExpression() === current) {
+    return parent.getTypeNode()?.getText();
+  }
+
+  if (
+    (Node.isVariableDeclaration(parent) || Node.isPropertyDeclaration(parent)) &&
+    parent.getInitializer() === current
+  ) {
+    return parent.getTypeNode()?.getText();
+  }
+
+  return undefined;
+}
+
+/**
+ * The wrapped arrow's parameter list, restated as the tuple type the wrapper's
+ * rest parameter is annotated with.
+ *
+ * The rest parameter replaces the arrow's parameter list, and for an arrow bound
+ * to an unannotated variable that list is the exported signature: every call
+ * site's argument checking and every `Parameters<typeof fn>` a consumer derives
+ * read it. Restating it as a labelled tuple keeps it exactly what it was —
+ * `(width: number, label: string)` becomes `(...__args: [width: number, label:
+ * string])`, which TypeScript treats as the same signature — where `unknown[]`
+ * would widen every parameter and break consumers in files no single-file check
+ * can see.
+ *
+ * Each parameter becomes one element, by these rules:
+ *
+ * - **Label**: the parameter's name, or `argN` (its 1-based position,
+ *   disambiguated) for a destructuring pattern, because a tuple's elements are
+ *   either all labelled or none are.
+ * - **Type**: its annotation verbatim. Without one, the widened primitive of a
+ *   literal initializer (`scale = 2` → `number`), the asserted type of an
+ *   initializer written `value as T`, and otherwise `any` — the type the
+ *   compiler itself gives an unannotated parameter that has no contextual type,
+ *   and one that, being assignable both ways, never rejects a caller. An
+ *   unannotated rest parameter is `any[]` for the same reason. (When a
+ *   contextual type exists, it — not this tuple — is the binding's declared
+ *   type, and `any` keeps the wrapper assignable to it.)
+ * - **Optionality**: a parameter with `?` or an initializer is an optional
+ *   element when every parameter after it is optional too, and a required
+ *   element otherwise — the compiler's own rule for such a parameter's position
+ *   in the signature. Either way its type gains `| undefined`, exactly as
+ *   `Parameters<>` reports it, so a caller passing `undefined` explicitly is
+ *   still accepted under `exactOptionalPropertyTypes`, where a bare optional
+ *   tuple element would reject it.
+ * - **Rest**: `...name: T`, a variadic element.
+ *
+ * @param fn The arrow being wrapped.
+ * @returns The tuple type's text, `[]` for an arrow with no parameters.
+ */
+function restParameterTupleFor(fn: ArrowFunction): string {
+  const parameters = fn.getParameters();
+  const labels = tupleLabelsFor(parameters);
+
+  // Scanned from the end: a parameter may be an optional element only when
+  // every parameter after it is optional or the rest parameter.
+  const optionalFrom = new Array<boolean>(parameters.length).fill(false);
+  let tailIsOptional = true;
+
+  for (let index = parameters.length - 1; index >= 0; index -= 1) {
+    const parameter = parameters[index];
+
+    if (parameter === undefined) {
+      continue;
+    }
+
+    const omissible =
+      parameter.isRestParameter() || parameter.hasQuestionToken() || parameter.hasInitializer();
+
+    tailIsOptional = tailIsOptional && omissible;
+    optionalFrom[index] = tailIsOptional;
+  }
+
+  const elements = parameters.map((parameter, index) => {
+    const label = labels[index] ?? `arg${String(index + 1)}`;
+    const annotation = parameter.getTypeNode();
+
+    if (parameter.isRestParameter()) {
+      return `...${label}: ${annotation?.getText() ?? 'any[]'}`;
+    }
+
+    const type =
+      annotation === undefined
+        ? inferredParameterType(parameter)
+        : { text: annotation.getText(), node: annotation };
+    const omissible = parameter.hasQuestionToken() || parameter.hasInitializer();
+
+    if (!omissible) {
+      return `${label}: ${type.text}`;
+    }
+
+    const withUndefined = unionWithUndefined(type.text, type.node);
+
+    return optionalFrom[index] === true
+      ? `${label}?: ${withUndefined}`
+      : `${label}: ${withUndefined}`;
+  });
+
+  return `[${elements.join(', ')}]`;
+}
+
+/**
+ * One tuple label per parameter: its name when it is an identifier, `argN`
+ * otherwise, with `N` its 1-based position and a trailing `_` appended until
+ * the label collides with no other.
+ *
+ * @param parameters The arrow's parameters.
+ * @returns The labels, in parameter order.
+ */
+function tupleLabelsFor(parameters: readonly ParameterDeclaration[]): readonly string[] {
+  const named = parameters.map((parameter) => {
+    const name = parameter.getNameNode();
+
+    return Node.isIdentifier(name) ? name.getText() : undefined;
+  });
+  const taken = new Set(named.filter((label): label is string => label !== undefined));
+
+  return named.map((label, index) => {
+    if (label !== undefined) {
+      return label;
+    }
+
+    let candidate = `arg${String(index + 1)}`;
+
+    while (taken.has(candidate)) {
+      candidate = `${candidate}_`;
+    }
+
+    taken.add(candidate);
+
+    return candidate;
+  });
+}
+
+/**
+ * The type of an unannotated, non-rest parameter, as far as its syntax states
+ * it: the widened primitive of a literal initializer, the type an `as T`
+ * initializer asserts, and `any` otherwise.
+ *
+ * Syntax only, on purpose: the patch is computed from one parsed file with no
+ * import resolved, so anything the compiler would have to *infer* — an
+ * imported constant, an object or array literal — is given `any`, which is what
+ * the compiler gives an unannotated parameter with no contextual type and which
+ * never rejects a caller.
+ *
+ * @param parameter The parameter.
+ * @returns The type's text, and the type node it was copied from when there is
+ * one — which decides whether a union with `undefined` must parenthesise it.
+ */
+function inferredParameterType(parameter: ParameterDeclaration): ElementType {
+  let initializer = parameter.getInitializer();
+
+  while (Node.isParenthesizedExpression(initializer)) {
+    initializer = initializer.getExpression();
+  }
+
+  if (initializer === undefined) {
+    return UNTYPED_ELEMENT;
+  }
+
+  if (Node.isPrefixUnaryExpression(initializer)) {
+    const operator = initializer.getOperatorToken();
+    const operand = initializer.getOperand();
+
+    if (Node.isNumericLiteral(operand)) {
+      if (operator === SyntaxKind.MinusToken || operator === SyntaxKind.PlusToken) {
+        return primitiveElement('number');
+      }
+    }
+
+    if (Node.isBigIntLiteral(operand) && operator === SyntaxKind.MinusToken) {
+      return primitiveElement('bigint');
+    }
+
+    return UNTYPED_ELEMENT;
+  }
+
+  if (Node.isNumericLiteral(initializer)) {
+    return primitiveElement('number');
+  }
+
+  if (Node.isBigIntLiteral(initializer)) {
+    return primitiveElement('bigint');
+  }
+
+  if (
+    Node.isStringLiteral(initializer) ||
+    Node.isNoSubstitutionTemplateLiteral(initializer) ||
+    Node.isTemplateExpression(initializer)
+  ) {
+    return primitiveElement('string');
+  }
+
+  if (Node.isTrueLiteral(initializer) || Node.isFalseLiteral(initializer)) {
+    return primitiveElement('boolean');
+  }
+
+  if (Node.isAsExpression(initializer)) {
+    const asserted = initializer.getTypeNode();
+
+    // `as const` asserts no type that could be written down here.
+    if (asserted !== undefined && asserted.getText() !== 'const') {
+      return { text: asserted.getText(), node: asserted };
+    }
+  }
+
+  return UNTYPED_ELEMENT;
+}
+
+/** A tuple element's type: its text, and the node it was copied from. */
+interface ElementType {
+  /** The type as it is emitted. */
+  readonly text: string;
+
+  /** The annotation the text was copied from, `undefined` for a derived one. */
+  readonly node: TypeNode | undefined;
+}
+
+/** The element type of a parameter whose syntax states no type. */
+const UNTYPED_ELEMENT: ElementType = Object.freeze({ text: 'any', node: undefined });
+
+/**
+ * A primitive element type derived from a literal initializer.
+ *
+ * @param text The primitive's keyword.
+ * @returns The element type.
+ */
+function primitiveElement(text: 'bigint' | 'boolean' | 'number' | 'string'): ElementType {
+  return { text, node: undefined };
+}
+
+/**
+ * `T | undefined`, parenthesising `T` where the union would otherwise bind
+ * inside it.
+ *
+ * A function type, a constructor type and a conditional type all extend to the
+ * right, so `() => void | undefined` is a function returning `void |
+ * undefined`, not an optional function. `any` and `unknown` already contain
+ * `undefined` and are returned unchanged, as the compiler prints them.
+ *
+ * @param type The element type's text.
+ * @param annotation Its type node, when the text came from one.
+ * @returns The union's text.
+ */
+function unionWithUndefined(type: string, annotation: TypeNode | undefined): string {
+  if (type === 'any' || type === 'unknown') {
+    return type;
+  }
+
+  const extendsRight =
+    Node.isFunctionTypeNode(annotation) ||
+    Node.isConstructorTypeNode(annotation) ||
+    Node.isConditionalTypeNode(annotation);
+
+  return extendsRight ? `(${type}) | undefined` : `${type} | undefined`;
 }
 
 /**

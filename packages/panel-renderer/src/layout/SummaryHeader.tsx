@@ -17,8 +17,9 @@
  * | `summary.likelyCauses` | the validated analysis       | the `Likely cause` region: a confidence badge, the statement, its evidence chips and an optional source chip |
  *
  * **This component invents, derives and filters nothing.** Every string it
- * renders is either a field of `summary` or one of the two region labels AAP
- * 0.8.4 mandates by name. It computes no statistic, drops no evidence
+ * renders is either a field of `summary`, one of the two region labels AAP
+ * 0.8.4 mandates by name, or the one sentence that states an empty observed
+ * register ({@link NO_FACTS_TEXT}). It computes no statistic, drops no evidence
  * reference, deduplicates nothing, re-words nothing and reorders nothing — the
  * single exception is {@link SummaryHeaderProps.sortByConfidence}, which sorts
  * a *copy* of the hypothesis list with the schema package's own comparator and
@@ -58,12 +59,18 @@
  *
  * Block `dg-summary-header`; elements `__title`, `__headline`, `__region`,
  * `__region-heading`, `__facts`, `__fact`, `__statement`, `__evidence`,
- * `__chip`, `__confidence`, `__location`; variants `__region--observed` and
- * `__region--causes`.
+ * `__chip`, `__confidence`, `__location`, `__none`; variants
+ * `__region--observed` and `__region--causes`.
+ *
+ * `__none` is the muted sentence the observed region holds when the summary
+ * lists no facts: it sits where the list would, on the same measured edge, so
+ * "nothing was observed" reads as the register's answer rather than as a fact.
  *
  * `__chip` marks a *selectable* evidence chip only. A citation rendered with no
  * selection handler is a plain outline `Badge` and carries no element class of
- * this block, so no rule here can give it a control's hover feedback.
+ * this block, so no rule here can give it a control's hover feedback. A
+ * selectable chip citing the panel's selected event also carries the shared
+ * `dg-is-selected` state class, always beside `aria-pressed="true"`.
  *
  * `__headline` must read as summary prose and must stay visually
  * distinguishable from `__statement`: that visual separation is the on-screen
@@ -83,6 +90,7 @@
  *   title={spec.title}
  *   summary={spec.summary}
  *   selectEvent={hostActions.selectEvent}
+ *   selectedEventId={selection?.eventId}
  *   openSource={hostActions.openSource}
  * />
  * ```
@@ -103,6 +111,7 @@
 import { useId } from 'react';
 import type { ReactElement } from 'react';
 import clsx from 'clsx';
+import { SignalHigh, SignalLow, SignalMedium } from 'lucide-react';
 
 import { compareConfidence } from '@debuggen/panel-schema';
 import type {
@@ -125,17 +134,30 @@ import { Text } from '../primitives/Text';
 /**
  * The label of the region that lists what the capture shows.
  *
- * One of exactly two user-facing strings this module owns. Both are product
- * copy the specification fixes by name — AAP 0.8.4 requires that likely causes
- * are "rendered under a separate 'Likely cause' heading by `SummaryHeader`",
- * and AAP 0.7.3 names the observed region "**Observed**" — so they are declared
- * here as constants rather than written twice, and no other caption or hint is
- * invented anywhere in this file.
+ * One of the two region labels this module owns. Both are product copy the
+ * specification fixes by name — AAP 0.8.4 requires that likely causes are
+ * "rendered under a separate 'Likely cause' heading by `SummaryHeader`", and
+ * AAP 0.7.3 names the observed region "**Observed**" — so they are declared
+ * here as constants rather than written twice. The only other string this file
+ * owns is {@link NO_FACTS_TEXT}; no other caption or hint is invented here.
  */
 const OBSERVED_LABEL = 'Observed';
 
 /** The label of the region that lists what the analysis infers (AAP 0.8.4). */
 const LIKELY_CAUSE_LABEL = 'Likely cause';
+
+/**
+ * What the observed region says when the summary lists no facts.
+ *
+ * The head states it rather than omitting the region: a panel whose head shows
+ * only a title reads exactly like one whose analysis failed to reach it, and
+ * "nothing was observed" is itself an answer the reader needs before the views
+ * below — the shape a deterministic fallback panel over an empty capture
+ * takes. It is a statement about the register, not a fact: it names no event,
+ * carries no evidence chip and is never a list item. Generic product wording,
+ * naming nothing of an inspected project (AAP 0.5.4).
+ */
+const NO_FACTS_TEXT = 'No facts were observed.';
 
 /**
  * The deepest heading level the document outline has, and the ceiling the
@@ -158,7 +180,8 @@ const DEFAULT_HEADING_LEVEL: HeadingLevel = 2;
  * developer something the analysis never said. The scale runs neutral →
  * informational → accent instead, which reads as increasing emphasis without
  * borrowing a status colour. The level word is always rendered as the badge's
- * text, so the ranking is never carried by colour alone (AAP 0.6.3, 0.6.4).
+ * text and every level has a glyph of its own shape ({@link CONFIDENCE_ICON}),
+ * so the ranking is never carried by colour alone (AAP 0.6.3, 0.6.4).
  *
  * Typed as a `Record` over the closed union rather than derived from the
  * schema's runtime vocabulary, matching how `../utils/color.ts` types its kind
@@ -168,6 +191,26 @@ const CONFIDENCE_TONE: Record<ConfidenceLevel, BadgeTone> = {
   low: 'neutral',
   medium: 'info',
   high: 'accent',
+};
+
+/**
+ * The glyph per confidence level — total by type for the same reason as
+ * {@link CONFIDENCE_TONE}.
+ *
+ * A signal-strength scale whose bar count rises with the level, so the three
+ * badges differ by **shape** as well as by tone: two tones that a reader cannot
+ * tell apart (a colour-vision deficiency, a monochrome screen, the
+ * high-contrast theme) still leave the levels distinguishable at a glance,
+ * beside the level word that names them (AAP 0.6.4). The glyph is decorative —
+ * `Badge` keeps its box `aria-hidden` — because the word already is the
+ * accessible text. Each is rendered with the global `dg-icon` class, which
+ * sizes it to the badge's type role and paints it in `currentColor`, so the
+ * glyph never carries a colour or a size of its own.
+ */
+const CONFIDENCE_ICON: Record<ConfidenceLevel, ReactElement> = {
+  low: <SignalLow className="dg-icon" />,
+  medium: <SignalMedium className="dg-icon" />,
+  high: <SignalHigh className="dg-icon" />,
 };
 
 /**
@@ -271,6 +314,13 @@ interface EvidenceChipsProps {
    * {@link SummaryHeaderProps.selectEvent}, handed down unchanged.
    */
   selectEvent?: SummaryHeaderProps['selectEvent'];
+
+  /**
+   * The id of the event the panel currently has selected, or `undefined` when
+   * nothing is. The head's own {@link SummaryHeaderProps.selectedEventId},
+   * handed down unchanged.
+   */
+  selectedEventId?: string | undefined;
 }
 
 /**
@@ -296,6 +346,16 @@ interface EvidenceChipsProps {
  *   this head with no event selection at all). The outline variant keeps it
  *   visually apart from the soft confidence badge beside it.
  *
+ * **The selected state.** A selectable chip is a toggle-like control over "is
+ * this the panel's selected event", so it always carries `aria-pressed`: `true`
+ * on every chip whose citation names the selected event, `false` on the rest.
+ * A pressed chip also carries the design system's one selected-state class,
+ * `dg-is-selected`, so the state is drawn as well as announced — the attribute
+ * and the class come from one comparison and cannot drift. Matching is by
+ * `eventId` alone, the one coordinate every citation has; a chip citing the
+ * same event twice is pressed twice. An inert citation carries neither: it is
+ * not a control, so it has no pressed state to report.
+ *
  * `../components/SourceLink.tsx` is the only sibling rendered by this module's
  * exported component, and this internal one renders nothing but primitives.
  *
@@ -303,37 +363,42 @@ interface EvidenceChipsProps {
  * @returns The chip list.
  */
 function EvidenceChips(props: EvidenceChipsProps): ReactElement {
-  const { evidence, selectEvent } = props;
+  const { evidence, selectEvent, selectedEventId } = props;
 
   return (
     <ul className="dg-summary-header__evidence">
-      {evidence.map((ref, index) => (
-        // `eventId` is not guaranteed unique inside one evidence list — a fact
-        // may legitimately cite the same event twice through two coordinates —
-        // so the index joins the key rather than standing in for it.
-        <li key={`${ref.eventId}#${String(index)}`}>
-          {selectEvent === undefined ? (
-            <Badge tone="accent" variant="outline" data-event-id={ref.eventId}>
-              {evidenceChipLabel(ref)}
-            </Badge>
-          ) : (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="dg-summary-header__chip"
-              data-event-id={ref.eventId}
-              onClick={() => {
-                // The schema's `eventId` is what the host resolves; the trace
-                // and span the citation recorded travel beside it, so the host
-                // can scope a trace-filtered view without a lookup.
-                selectEvent(ref.eventId, citationCoordinates(ref));
-              }}
-            >
-              {evidenceChipLabel(ref)}
-            </Button>
-          )}
-        </li>
-      ))}
+      {evidence.map((ref, index) => {
+        const selected = selectedEventId !== undefined && ref.eventId === selectedEventId;
+
+        return (
+          // `eventId` is not guaranteed unique inside one evidence list — a fact
+          // may legitimately cite the same event twice through two coordinates —
+          // so the index joins the key rather than standing in for it.
+          <li key={`${ref.eventId}#${String(index)}`}>
+            {selectEvent === undefined ? (
+              <Badge tone="accent" variant="outline" data-event-id={ref.eventId}>
+                {evidenceChipLabel(ref)}
+              </Badge>
+            ) : (
+              <Button
+                variant="ghost"
+                size="sm"
+                className={clsx('dg-summary-header__chip', selected && 'dg-is-selected')}
+                aria-pressed={selected}
+                data-event-id={ref.eventId}
+                onClick={() => {
+                  // The schema's `eventId` is what the host resolves; the trace
+                  // and span the citation recorded travel beside it, so the host
+                  // can scope a trace-filtered view without a lookup.
+                  selectEvent(ref.eventId, citationCoordinates(ref));
+                }}
+              >
+                {evidenceChipLabel(ref)}
+              </Button>
+            )}
+          </li>
+        );
+      })}
     </ul>
   );
 }
@@ -380,6 +445,23 @@ export interface SummaryHeaderProps {
     | undefined;
 
   /**
+   * The `EventRef.eventId` of the event the panel currently has selected, or
+   * `undefined` while nothing is.
+   *
+   * Every selectable evidence chip citing that event is drawn pressed —
+   * `aria-pressed="true"` and the `dg-is-selected` state class — and every
+   * other selectable chip reports `aria-pressed="false"`, so the chip a reader
+   * activated, and the chips of every other statement citing the same event,
+   * stay marked for as long as that event is the selection. A plain string
+   * rather than the host's selection object, because this component imports
+   * nothing from the host tier: the panel host passes the id of its shared
+   * selection, and a surface without one passes nothing. Has no effect on a
+   * head rendered without {@link SummaryHeaderProps.selectEvent}, whose
+   * citations are inert text.
+   */
+  selectedEventId?: string | undefined;
+
+  /**
    * Called with the exact {@link SourceLocation} a hypothesis suggested when
    * its source chip is activated — the host form's `openSource`. Passed
    * explicitly to `SourceLink`'s `onOpenSource` rather than left to that
@@ -405,11 +487,13 @@ export interface SummaryHeaderProps {
  * Renders a panel's title, its non-evidentiary headline, its observed facts and
  * its likely causes.
  *
- * Neither region is rendered when its list is empty: a labelled region with no
- * items announces a heading that introduces nothing, and an empty state is the
- * business of the visualization tier rather than of the head. A summary with
+ * The observed region is always rendered. With no facts it holds a single
+ * muted sentence, {@link NO_FACTS_TEXT}, instead of a list, so a summary with
  * neither facts nor causes — the shape a deterministic fallback panel can take
- * — therefore renders as a title and, if one was authored, a headline.
+ * — still says what the capture showed rather than rendering as a bare title.
+ * The likely-cause region is rendered only when there is a cause to list: an
+ * absent inference is not a finding, and a labelled region stating that the
+ * analysis guessed nothing would announce a heading that introduces nothing.
  *
  * @param props See {@link SummaryHeaderProps}.
  * @returns The panel head.
@@ -420,6 +504,7 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
     summary,
     headingLevel = DEFAULT_HEADING_LEVEL,
     selectEvent,
+    selectedEventId,
     openSource,
     sortByConfidence = false,
     className,
@@ -468,20 +553,26 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
         </Text>
       ) : null}
 
-      {facts.length > 0 ? (
-        <section
-          className="dg-summary-header__region dg-summary-header__region--observed"
-          aria-labelledby={observedHeadingId}
+      <section
+        className="dg-summary-header__region dg-summary-header__region--observed"
+        aria-labelledby={observedHeadingId}
+      >
+        <Heading
+          level={regionLevel}
+          size="sm"
+          tone="muted"
+          id={observedHeadingId}
+          className="dg-summary-header__region-heading"
         >
-          <Heading
-            level={regionLevel}
-            size="sm"
-            tone="muted"
-            id={observedHeadingId}
-            className="dg-summary-header__region-heading"
-          >
-            {OBSERVED_LABEL}
-          </Heading>
+          {OBSERVED_LABEL}
+        </Heading>
+        {facts.length === 0 ? (
+          // The register's own answer, not a fact: no list item, no evidence
+          // chips, and muted so it cannot be read as a measured statement.
+          <Text as="p" tone="muted" className="dg-summary-header__none">
+            {NO_FACTS_TEXT}
+          </Text>
+        ) : (
           <ul className="dg-summary-header__facts">
             {facts.map((fact, index) => (
               <li key={`${fact.statement}#${String(index)}`} className="dg-summary-header__fact">
@@ -494,12 +585,16 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
                 {/* `Fact.evidence` holds at least one reference by schema
                     construction, so there is no empty-evidence branch to write
                     and no reference to filter. */}
-                <EvidenceChips evidence={fact.evidence} selectEvent={selectEvent} />
+                <EvidenceChips
+                  evidence={fact.evidence}
+                  selectEvent={selectEvent}
+                  selectedEventId={selectedEventId}
+                />
               </li>
             ))}
           </ul>
-        </section>
-      ) : null}
+        )}
+      </section>
 
       {causes.length > 0 ? (
         // A second, sibling region with its own heading and its own
@@ -526,8 +621,13 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
                 key={`${hypothesis.statement}#${String(index)}`}
                 className="dg-summary-header__fact"
               >
+                {/* The level word is the badge's text and its accessible name;
+                    the tone and the per-level glyph are two further, visual-only
+                    signals of the same level, so no single one of them — and
+                    never colour alone — carries the ranking. */}
                 <Badge
                   tone={CONFIDENCE_TONE[hypothesis.confidence]}
+                  icon={CONFIDENCE_ICON[hypothesis.confidence]}
                   className="dg-summary-header__confidence"
                 >
                   {hypothesis.confidence}
@@ -535,7 +635,11 @@ export function SummaryHeader(props: SummaryHeaderProps): ReactElement {
                 <Text as="p" className="dg-summary-header__statement">
                   {hypothesis.statement}
                 </Text>
-                <EvidenceChips evidence={hypothesis.evidence} selectEvent={selectEvent} />
+                <EvidenceChips
+                  evidence={hypothesis.evidence}
+                  selectEvent={selectEvent}
+                  selectedEventId={selectedEventId}
+                />
                 {hypothesis.suggestedLocation === undefined ? null : (
                   // The location object is handed on by reference, never
                   // rebuilt field by field, so activation emits exactly what

@@ -25,6 +25,13 @@
  *   a table that looks sorted and is not, which is worse than one that plainly is not. The current
  *   order is reported to assistive technology through `aria-sort` on the header cell.
  *
+ *   The word that matters there is SILENTLY. A caller whose data layer cannot apply an order a
+ *   reader asked for may arrange the rows it already holds itself - `components/SpanTable` does,
+ *   for every column and direction outside the data layer's vocabulary - provided it passes the
+ *   arranged rows and that order as `sort`, and says in its own copy how much of the result the
+ *   order covers. The decision and the disclosure stay with the component that owns the data;
+ *   this primitive still renders `rows` exactly as given and never re-orders them itself.
+ *
  *   Virtualized with `@tanstack/react-virtual`. This is the only module in the package that
  *   imports it. Long lists render a window of rows inside the shared
  *   `dg-virtual-viewport`/`dg-virtual-canvas`/`dg-virtual-row` triplet, and real measured heights
@@ -32,11 +39,12 @@
  *   both why virtualization here buys smoothness rather than survival and why the state before the
  *   first measurement is bounded rather than whole - see the section on it below.
  *
- *   Keyboard-navigable. A roving `tabIndex` makes the body a single tab stop; Arrow keys, Home,
- *   End, PageUp/PageDown move the active row, Enter and Space activate it, and Arrow Right/Left
- *   expand and collapse it when the caller supplied both an expansion renderer and a toggle
- *   handler. The header's sort controls stay ordinary tab stops, because a reader must be able to
- *   reach them without entering the body.
+ *   Keyboard-navigable. A roving `tabIndex` makes the whole grid a single Tab stop - the active
+ *   row - and the keyboard reaches everything else from there: Arrow keys, Home, End and
+ *   PageUp/PageDown move the active row, Enter and Space activate it, Arrow Right/Left expand and
+ *   collapse it, and the same keys move focus onto the controls inside a row, its open detail and
+ *   the header. See the keyboard section below for the full key map and the one obligation it
+ *   places on every caller.
  *
  * ## The ARIA structure, and why it is shaped this way
  *
@@ -49,9 +57,12 @@
  *             div[role=columnheader]         aria-colindex, aria-sort, one per column
  *         div[role=rowgroup].dg-virtual-canvas
  *           div[role=presentation].dg-virtual-row   the POSITIONING wrapper, data-index
- *             div[role=row]                         the data row, aria-rowindex, tabIndex
+ *             div[role=row]                         the data row: aria-rowindex, tabIndex,
+ *                                                   data-row-index - and never aria-expanded
  *               div[role=rowheader|gridcell]        aria-colindex, one per column
- *             div[role=row].__expanded              the detail row, when open
+ *             div[role=row].__expanded              the detail row, when open: an id (what
+ *                                                   the toggle's aria-controls names) and
+ *                                                   data-detail-row-index (its data row)
  *               div[role=gridcell]                  aria-colspan = column count
  *       (the empty content, when there are no rows, OUTSIDE the grid)
  *
@@ -67,6 +78,85 @@
  * index, and summing `aria-rowcount = 1 + rows.length + expandedCount`. An expanded detail row
  * occupies a row index of its own, so the count a reader is told matches the rows a reader can
  * reach.
+ *
+ * ## Where the expanded state lives, and why it is not on the row
+ *
+ * `aria-expanded` is not a supported state of a `row` inside a `grid`: ARIA allows it on rows of
+ * a `treegrid` only, and an accessibility audit reports every such row as a conditional-attribute
+ * failure. Switching the role to `treegrid` is not the answer either. A treegrid describes a
+ * HIERARCHY of rows, and a detail row here is not a child row of the same kind - it is a
+ * disclosure of one row's evidence - so the role would promise a reader nesting levels,
+ * `aria-level` and child rows that do not exist. The state therefore lives where the APG
+ * disclosure pattern puts it: on the control that toggles it. Each cell receives a
+ * {@link DataTableCellMeta}, and the caller's expand toggle carries
+ * `aria-expanded={meta.expanded}` and `aria-controls={meta.detailRowId}`. `detailRowId` is the id
+ * of the detail row this component renders, and it is defined only while that row is actually in
+ * the DOM, so `aria-controls` never names a missing element. The row keeps the `dg-is-expanded`
+ * class, which is appearance rather than semantics.
+ *
+ * ## The keyboard model: one Tab stop, and the arrow keys for everything inside
+ *
+ * This is the APG grid pattern. Tab enters the grid on ONE element and the next Tab leaves it;
+ * that element is the active row (`tabIndex={0}`, every other row `-1`). A grid whose cells each
+ * add Tab stops of their own makes a reader press Tab through every chip, badge and toggle of
+ * every rendered row just to get past one table.
+ *
+ * THE CALLER'S OBLIGATION: every focusable control a `cell` or `renderExpandedRow` renders carries
+ * `tabIndex={-1}`. It stays focusable - by pointer, and by the keys below - and it leaves the Tab
+ * order. The header's sort controls follow the same rule, applied here: they are `tabIndex={-1}`
+ * whenever at least one data row renders, because ArrowUp from the first row reaches them, and
+ * they keep their default while the result is empty, when there is no row to arrive through.
+ *
+ * On a data row:
+ *
+ *   ArrowDown / ArrowUp        the next / previous row. ArrowUp on the first row moves to the
+ *                              header's first control when the header has one.
+ *   Home / End                 the first / last row.
+ *   PageDown / PageUp          ten rows down / up.
+ *   Enter / Space              activate the row (`onRowActivate`). With no `onRowActivate`, Enter
+ *                              moves into the row instead and Space keeps its native meaning.
+ *   F2                         move into the row: focus its first control.
+ *   ArrowRight                 expand a collapsed expandable row; otherwise move into the row.
+ *   ArrowLeft                  collapse an expanded row; otherwise nothing.
+ *
+ * On a control inside a row's cells or its open detail row - one scope, in document order:
+ *
+ *   ArrowRight / ArrowLeft     the next / previous control. ArrowLeft from the first control
+ *                              returns to the row; ArrowRight on the last stays put.
+ *   Home / End                 the first / last control of the scope.
+ *   ArrowDown / ArrowUp        the next / previous row, or ten rows for PageDown / PageUp,
+ *   PageDown / PageUp          counted from the row the control belongs to.
+ *   Escape                     back to the row. A key something inside already consumed is not
+ *                              answered, so the first Escape on an open `Tooltip` trigger closes
+ *                              the bubble and only the second returns to the row.
+ *   Enter, Space, Tab, others  the control's own. A key pressed on a control never activates the
+ *                              row.
+ *
+ *   Two kinds of control keep their keys. A text or choice widget - `input`, `textarea`, `select`,
+ *   a contenteditable host, `role` textbox, combobox, slider or spinbutton - uses the arrows and
+ *   Home/End itself and gets only Escape from the grid. An element that actually scrolls along a
+ *   key's axis - a focusable code block whose content overflows it - keeps that axis's keys, so it
+ *   still scrolls. A key a control has already `preventDefault`-ed is left to that control.
+ *
+ * On a header control:
+ *
+ *   ArrowRight / ArrowLeft     the next / previous header control.
+ *   Home / End                 the first / last header control.
+ *   ArrowDown / Escape         back to the active row.
+ *   Enter / Space              native, so a sort control still sorts.
+ *
+ * Shift+Tab from a control inside the active row lands on that row, which precedes it in document
+ * order. That is the documented behaviour rather than a trap: the next Shift+Tab leaves the grid.
+ * Focus landing on a control by any route - an arrow key or a pointer click - moves the roving
+ * stop to that control's row, so Tab back into the grid returns to where the reader last was.
+ *
+ * A control is reachable when it matches `a[href], button, input, select, textarea, [tabindex]`,
+ * is not disabled, and does not sit inside `[hidden]`, `[inert]` or `[aria-hidden="true"]`. That
+ * is decided from the DOM alone and never from layout, so it holds identically in a browser and in
+ * an environment that measures nothing. A grid nested inside a cell answers its own keys: this
+ * table ignores every event whose nearest grid is not its own and never moves focus into another
+ * grid's rows. `preventDefault` is called only for a key actually handled, so every other key
+ * keeps its meaning.
  *
  * The empty content renders OUTSIDE the grid's rowgroup. A message row inside the body would be
  * announced as data ("row 2 of 2"), and the header stays mounted so column context and the sort
@@ -145,7 +235,7 @@
  * writes `aria-sort` on the cell and nothing about sorting into a class: the state has exactly one
  * representation.
  *
- * Four component-scoped custom properties carry the values only this module can know - computed
+ * Six component-scoped custom properties carry the values only this module can know - computed
  * geometry, which `../styles/base.css` sanctions inline for exactly this purpose - and they are
  * the only thing any `style` attribute here contains:
  *
@@ -155,15 +245,30 @@
  *                         cannot share a parent's tracks - so a track only lines a header up with
  *                         its column if it resolves to the same width in every row; see
  *                         {@link DataTableColumn.width}.
+ *   --dgc-min-inline      the sum of the tracks' MINIMUMS (`calc(22ch + 9ch + …)`), and
+ *   --dgc-column-count    the number of tracks, which together give the grid its floor:
+ *                         `min-inline-size: max(100%, <minimums> + <gaps> + <row edge>)`. A table
+ *                         narrower than that floor keeps every column at its readable minimum and
+ *                         SCROLLS HORIZONTALLY inside its viewport, instead of squeezing tracks to
+ *                         nothing and painting one cell's content over the next. See
+ *                         {@link resolveTrackMinimum} for which tracks contribute a minimum.
  *   --dgc-virtual-total   the canvas height as a UNITLESS number, consumed as
  *                         `block-size: calc(var(--dgc-virtual-total, 0) * 1px)`
  *   --dgc-virtual-start   a row's offset as a UNITLESS number, consumed as
- *                         `transform: translateY(calc(var(--dgc-virtual-start, 0) * 1px))`
+ *                         `inset-block-start: calc(var(--dgc-virtual-start, 0) * 1px)`. An inset,
+ *                         not a transform: a transformed ancestor is the containing block of every
+ *                         fixed-position descendant, and it would trap the `./Tooltip` bubbles of
+ *                         a positioned row inside the scroll container they must escape.
  *   --dgc-align           a cell's alignment keyword, consumed as `text-align: var(--dgc-align, start)`
  *
  * The two virtualization properties are unitless on purpose: a bare number is the same kind of
  * value as the unitless SVG geometry base.css permits, and it keeps every length unit in the
  * stylesheet where the token system can see it.
+ *
+ * A newly expanded row is scrolled into view once its detail row has rendered: the detail opens
+ * BELOW the row inside a viewport capped at a fixed height, so without it a toggle on one of the
+ * last visible rows would open content the reader cannot see. The scroll keeps the toggled row
+ * itself below the sticky header - see {@link revealExpandedRow}.
  *
  * ## Boundaries
  *
@@ -180,11 +285,15 @@
  * ## Building on this
  *
  * A table component supplies `columns` (key, header, alignment, optional grid track, cell
- * renderer), `rows` exactly as the data source ordered them, `rowKey`, a `caption`, the controlled
+ * renderer), `rows` exactly as the data source ordered them (or as the caller itself arranged
+ * them, under the disclosure rule above), `rowKey`, a `caption`, the controlled
  * `sort` plus `onSortChange`, and - when rows have detail - `expandedRowKeys`, `onRowToggle` and
- * `renderExpandedRow`. It renders its own expand affordance as a `Button` inside a cell; a click
- * on any interactive descendant is not treated as a row activation, so the two never fire
- * together. It does not sort, page, virtualize or handle keys itself.
+ * `renderExpandedRow`. It renders its own expand affordance as a `Button` inside a cell, and that
+ * toggle carries `aria-expanded={meta.expanded}` and `aria-controls={meta.detailRowId}` from the
+ * {@link DataTableCellMeta} its cell receives - the row itself never reports the state (see the
+ * section on where the expanded state lives). A click on any interactive descendant is not
+ * treated as a row activation, so the two never fire together. It does not sort, page,
+ * virtualize or handle keys itself.
  */
 
 import { useVirtualizer } from '@tanstack/react-virtual';
@@ -228,6 +337,48 @@ export interface DataTableSort {
 }
 
 /**
+ * What a cell renderer is told about its row beyond the row itself: the row's expansion state, and
+ * the id of the detail row that state reveals.
+ *
+ * It exists because the expanded state cannot live on the row (see this module's header: a
+ * `grid` row does not support `aria-expanded`), so it has to reach the control that toggles it -
+ * and that control is the caller's, rendered inside a cell. The toggle wires it as
+ *
+ * ```tsx
+ * <Button
+ *   tabIndex={-1}
+ *   aria-expanded={meta.expanded}
+ *   aria-controls={meta.detailRowId}
+ *   onClick={() => { toggle(row.id); }}
+ * >
+ *   {meta.expanded ? 'Hide detail' : 'Show detail'}
+ * </Button>
+ * ```
+ *
+ * The same object is handed to every cell of one row, and a new one is built on every render, so
+ * a cell must read it rather than hold on to it.
+ */
+export interface DataTableCellMeta {
+  /**
+   * Whether the row's detail row is open. Always `false` when the table was given no
+   * {@link DataTableProps.renderExpandedRow}: a table with nothing to reveal has no expanded rows,
+   * whatever {@link DataTableProps.expandedRowKeys} says.
+   */
+  readonly expanded: boolean;
+
+  /**
+   * The `id` of the row's detail row, for the toggle's `aria-controls`.
+   *
+   * Defined ONLY while that detail row is actually rendered - the row is expanded and a
+   * `renderExpandedRow` was supplied - and `undefined` otherwise, so `aria-controls` never names
+   * an element that is not in the document. It is a single id token with no whitespace, built from
+   * this table instance's `useId()` base and the row's index, so it is unique in the document and
+   * two tables never collide.
+   */
+  readonly detailRowId: string | undefined;
+}
+
+/**
  * One column: its identity, its header, its geometry and how it renders a cell.
  *
  * @typeParam Row The row type, inferred at the call site from {@link DataTableProps.rows}.
@@ -248,6 +399,11 @@ export interface DataTableColumn<Row> {
    *
    * When it is not plain text, name the column with {@link DataTableColumn.headerLabel} as well:
    * that string, not the node, becomes the accessible name of the sort control.
+   *
+   * A focusable control inside a header node - a `Tooltip` trigger explaining the column - is
+   * reached by the header's arrow keys like the sort controls are (see this module's header), and
+   * follows the same Tab rule: `tabIndex={-1}` while the table has rows, so the grid stays one Tab
+   * stop.
    */
   header: ReactNode;
 
@@ -274,18 +430,29 @@ export interface DataTableColumn<Row> {
   /**
    * The column's CSS **grid track**, joined with its siblings into `--dgc-columns`.
    *
-   * Relational and intrinsic forms only - `minmax(0, 1fr)`, `2fr`, `max-content`, `min-content`,
+   * Relational and intrinsic forms only - `minmax(12ch, 2fr)`, `9ch`, `2fr`, `max-content`,
    * `fit-content(30ch)`, `auto`, a `var(--dg-space-*)`-based length, a `ch` measure tied to the
    * content. A literal `px` or `rem` track is a hardcoded value and AAP 0.6.4 forbids it; review
-   * rejects one. Omitted, the column takes `minmax(0, 1fr)`, which shares the free space and
-   * allows its content to shrink rather than forcing the row wider.
+   * rejects one. Omitted, the column takes {@link DEFAULT_COLUMN_TRACK}, `minmax(10ch, 1fr)`: an
+   * equal share of the free space that never drops below a readable minimum.
    *
-   * PREFER A TRACK THAT RESOLVES IDENTICALLY IN EVERY ROW - a ratio (`minmax(0, 1fr)`, `2fr`), a
-   * `ch` measure, or a token-based length. The header row and each data row are separate grid
-   * containers (see this module's header), so an INTRINSIC track sizes itself from one row's own
-   * content: a `max-content` column whose values vary in width lands at a different offset in
-   * every row and stops sitting under its own header. Reserve the intrinsic forms for columns
-   * whose content is uniformly wide - a two-letter kind chip, a fixed-width badge, an icon.
+   * GIVE EVERY COLUMN A NON-ZERO MINIMUM - `minmax(<n>ch, <m>fr)` for a column that should share
+   * spare width, a bare `<n>ch` for a numeric column whose values have a known widest form. The
+   * minimum is what the grid scrolls against: the table sums every track's minimum into its own
+   * floor (`--dgc-min-inline`, see this module's header), so a surface narrower than the sum
+   * scrolls horizontally with every column still readable. A `minmax(0, …)` track has no floor at
+   * all - it collapses to its padding in a narrow panel and its content paints over the next cell
+   * - so it is reserved for a column whose content is designed to disappear, which no column in
+   * this package is. Size the minimum for the column's CONTENT plus the cell's inline padding, in
+   * `ch` of the table's own type, which is also what every row resolves `ch` against.
+   *
+   * PREFER A TRACK THAT RESOLVES IDENTICALLY IN EVERY ROW - a ratio, a `ch` measure, or a
+   * token-based length. The header row and each data row are separate grid containers (see this
+   * module's header), so an INTRINSIC track sizes itself from one row's own content: a
+   * `max-content` column whose values vary in width lands at a different offset in every row and
+   * stops sitting under its own header. Reserve the intrinsic forms for columns whose content is
+   * uniformly wide - a two-letter kind chip, a fixed-width badge, an icon - and remember that an
+   * intrinsic track contributes nothing to the grid's floor.
    */
   width?: string | undefined;
 
@@ -325,11 +492,26 @@ export interface DataTableColumn<Row> {
    * `SourceLink`, `Button`) rather than raw HTML (AAP 0.6.4). It is called during render, so it
    * must be pure: no fetching, no state, no mutation of the row.
    *
+   * EVERY FOCUSABLE CONTROL A CELL RENDERS CARRIES `tabIndex={-1}` - a `Button`, a `SourceLink`
+   * (through its `tabIndex` prop), a `Tooltip` trigger, a focusable `Code` block. The grid body is
+   * one Tab stop, the active row, and this component's arrow keys are what reach the controls
+   * inside it (see this module's header for the keys). A control left at its default is an extra
+   * Tab stop in every rendered row, which is exactly the tab sequence the grid pattern exists to
+   * avoid.
+   *
+   * An expand toggle in a cell also carries `aria-expanded={meta.expanded}` and
+   * `aria-controls={meta.detailRowId}`; see {@link DataTableCellMeta}.
+   *
+   * A two-parameter renderer is still a valid `cell`: a column that has no use for `meta` simply
+   * does not declare it.
+   *
    * @param row The row, typed exactly as the caller's `rows` element type.
    * @param rowIndex The row's index in `rows` - the caller's own ordering, unchanged by this
    *   component.
+   * @param meta The row's expansion state and the id of its detail row; the same object for every
+   *   cell of one row.
    */
-  cell: (row: Row, rowIndex: number) => ReactNode;
+  cell: (row: Row, rowIndex: number, meta: DataTableCellMeta) => ReactNode;
 }
 
 /**
@@ -457,6 +639,18 @@ export interface DataTableProps<Row> {
    * because a grid whose rows all report `aria-selected="false"` tells a reader that selection
    * exists when it does not. The selected row is also where the roving tab stop starts, until the
    * reader navigates.
+   *
+   * A HOST-DRIVEN selection is brought into view: when the key changes to a row the reader did not
+   * just activate in this table - a selection made in another view, or by the host surface - and
+   * that row lies outside the viewport (or outside the virtualizer's window), this table's own
+   * scroll container is scrolled just far enough to show it. Once per change of key, never the
+   * page, and never focus: see the reveal effect in the component for the four rules.
+   *
+   * The selected row is filled with `--dg-accent-muted`, and the stylesheet's selected-surface rule
+   * draws every cell's text on it in `--dg-text-primary`, whatever colour the cell renderer's
+   * content carries elsewhere; only content that paints a fill of its own (a soft or solid badge, a
+   * primary or destructive button) keeps its colours. A cell therefore needs no selected variant of
+   * its own to stay above the 4.5:1 text bar.
    */
   selectedRowKey?: string | null | undefined;
 
@@ -478,9 +672,11 @@ export interface DataTableProps<Row> {
   expandedRowKeys?: readonly string[] | undefined;
 
   /**
-   * Raised when a row's expansion is toggled from the keyboard (Arrow Right opens, Arrow Left
-   * closes). Mouse toggling belongs to the caller's own affordance inside a cell, which keeps the
-   * visible control, its icon and its accessible name in the table component that owns the data.
+   * Raised when a row's expansion is toggled from the keyboard (Arrow Right on a collapsed row
+   * opens it, Arrow Left on an open row closes it). Mouse toggling belongs to the caller's own
+   * affordance inside a cell, which keeps the visible control, its icon, its accessible name and
+   * its `aria-expanded`/`aria-controls` (see {@link DataTableCellMeta}) in the table component
+   * that owns the data.
    *
    * Only wired when `renderExpandedRow` is also supplied: a row with nothing to reveal must not
    * answer an expand key.
@@ -490,8 +686,17 @@ export interface DataTableProps<Row> {
   /**
    * Renders the detail of an expanded row into a single full-width cell.
    *
-   * Supplying it is what gives the rows `aria-expanded` and what enables the expand keys; omitting
-   * it leaves both off, so a table without detail never claims to have any.
+   * Supplying it is what enables expansion at all: the detail row, the expand keys, and a
+   * {@link DataTableCellMeta} whose `expanded` can be `true` and whose `detailRowId` names the
+   * rendered detail row. Omitting it leaves all three off, so a table without detail never claims
+   * to have any. The expanded state is NOT reported on the row - `aria-expanded` is not valid on a
+   * `grid` row - so the caller's expand toggle must carry `aria-expanded={meta.expanded}` and
+   * `aria-controls={meta.detailRowId}`.
+   *
+   * Like a cell, every focusable control the detail renders carries `tabIndex={-1}`. The detail
+   * row belongs to its data row for keyboard purposes: once the row is open, the arrow keys that
+   * move across the data row's controls continue into the detail's, and Escape from any of them
+   * returns to the data row.
    *
    * @param row The expanded row.
    * @param index Its index in `rows`.
@@ -570,10 +775,107 @@ const FIRST_DATA_ARIA_ROW_INDEX = 2;
 
 /**
  * The grid track a column without {@link DataTableColumn.width} takes: an equal share of the free
- * space that is still allowed to shrink below its content, so one long value cannot widen the row
- * past the viewport and force a horizontal scroll on every other column.
+ * space with a floor of ten characters - room for a short label, a formatted duration or a status
+ * chip plus the cell's padding. The floor is what makes a narrow table scroll rather than squeeze:
+ * a `minmax(0, 1fr)` default let every unsized column collapse to its padding in a narrow panel,
+ * where one cell's content then painted over its neighbour's. A long value still cannot widen the
+ * row, because the maximum stays a share of the free space rather than the content's width.
  */
-const DEFAULT_COLUMN_TRACK = 'minmax(0, 1fr)';
+const DEFAULT_COLUMN_TRACK = 'minmax(10ch, 1fr)';
+
+/**
+ * A font-relative length a column minimum may be written in, with a strictly positive magnitude.
+ * `px` is deliberately absent: a literal pixel track is a hardcoded value AAP 0.6.4 forbids, so it
+ * is not given a floor that would make it look sanctioned. `%` is absent too - a percentage track
+ * resolves against the grid's own width, and summing it into that width is circular.
+ */
+const TRACK_MINIMUM_LENGTH_PATTERN = /^(?:\d+\.?\d*|\.\d+)(?:ch|em|rem|ex|lh|cap|ic)$/u;
+
+/**
+ * A CSS function whose result is a length a column minimum may be written as: a token reference
+ * (`var(--dg-space-5)`) or a computed length (`calc(…)`, `min(…)`, `max(…)`, `clamp(…)`).
+ */
+const TRACK_MINIMUM_FUNCTION_PATTERN = /^(?:var|calc|min|max|clamp)\(/u;
+
+/**
+ * Splits the argument list of a CSS function at its top-level commas, so a nested function's own
+ * commas (`minmax(max(9ch, var(--dg-space-7)), 1fr)`) stay inside the argument they belong to.
+ *
+ * @param argumentList The text between a function's outer parentheses.
+ * @returns The trimmed arguments, in order.
+ */
+function splitTopLevelArguments(argumentList: string): string[] {
+  const parts: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const character of argumentList) {
+    if (character === ',' && depth === 0) {
+      parts.push(current.trim());
+      current = '';
+      continue;
+    }
+    if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth = Math.max(0, depth - 1);
+    }
+    current += character;
+  }
+  parts.push(current.trim());
+
+  return parts;
+}
+
+/**
+ * The part of one grid track that is a guaranteed MINIMUM width, or `undefined` when it has none
+ * the grid can count on.
+ *
+ *   minmax(<min>, <max>)   the `<min>` argument, when it is itself a length (below)
+ *   <length>               a positive font-relative length (`9ch`) or a length-valued function
+ *                          (`var(--dg-space-5)`, `calc(…)`) is its own minimum
+ *   anything else          no minimum: `0`, a flexible `fr` track, `auto`, `min-content`,
+ *                          `max-content` and `fit-content(…)` all size from content or free space,
+ *                          which only the browser can resolve and which is not known here
+ *
+ * Only the minimums that are known without layout are summed into `--dgc-min-inline`. The grid's
+ * floor is therefore a LOWER bound - a track the sum leaves out still sizes itself as CSS says - so
+ * it can never force a table wider than its columns need.
+ *
+ * @param track One column's grid track, as {@link DataTableColumn.width} documents it.
+ * @returns The track's minimum as a CSS length, or `undefined`.
+ */
+function resolveTrackMinimum(track: string): string | undefined {
+  const trimmed = track.trim();
+  const minmax = /^minmax\((.*)\)$/su.exec(trimmed);
+
+  if (minmax !== null) {
+    const [minimum] = splitTopLevelArguments(minmax[1] ?? '');
+
+    return minimum === undefined ? undefined : resolveLengthMinimum(minimum);
+  }
+
+  return resolveLengthMinimum(trimmed);
+}
+
+/**
+ * A track component that is a length the grid can count on, or `undefined`.
+ *
+ * @param value One track, or the first argument of one `minmax()`.
+ * @returns The value unchanged when it is a positive font-relative length or a length-valued
+ *   function, else `undefined`.
+ */
+function resolveLengthMinimum(value: string): string | undefined {
+  const trimmed = value.trim();
+
+  if (TRACK_MINIMUM_FUNCTION_PATTERN.test(trimmed)) {
+    return trimmed;
+  }
+
+  return TRACK_MINIMUM_LENGTH_PATTERN.test(trimmed) && Number.parseFloat(trimmed) > 0
+    ? trimmed
+    : undefined;
+}
 
 /** The alignment a column without {@link DataTableColumn.align} takes. */
 const DEFAULT_COLUMN_ALIGN = 'start';
@@ -651,6 +953,75 @@ const INTERACTIVE_DESCENDANT_SELECTOR = 'a, button, input, select, textarea, [ro
  * single `getAttribute` rather than a tree walk.
  */
 const ROW_INDEX_ATTRIBUTE = 'data-row-index';
+
+/**
+ * The attribute a DETAIL row carries its data row's index in.
+ *
+ * A separate name rather than a second `data-row-index`, because that attribute means "this
+ * element is a data row" to the key handlers, the focus effect and every suite that counts rows by
+ * it. This one links a detail row back to the row it discloses, so a key pressed or focus landing
+ * on a control inside the detail resolves to the data row's index (see `resolveBodyScope`).
+ */
+const DETAIL_ROW_INDEX_ATTRIBUTE = 'data-detail-row-index';
+
+/**
+ * Finds the grid element of any table - this one, or one nested inside a cell. Comparing a
+ * target's nearest match with this table's own grid element is how the handlers leave a nested
+ * grid's keys and focus to that grid.
+ */
+const GRID_SELECTOR = '[role="grid"]';
+
+/**
+ * The elements the keyboard model can move focus onto inside a row, its open detail or the header.
+ *
+ * Everything focusable, whatever its `tabIndex`: the in-cell controls are `tabIndex={-1}` by
+ * contract (see this module's header), so a Tab-order query would find none of them.
+ */
+const NAVIGABLE_DESCENDANT_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
+
+/**
+ * Ancestors - the element itself included - that put a control out of reach: removed from
+ * rendering, made inert, or hidden from assistive technology, where focusing it would land the
+ * reader on something they cannot perceive.
+ */
+const UNREACHABLE_ANCESTOR_SELECTOR = '[hidden], [inert], [aria-hidden="true"]';
+
+/**
+ * Text and choice widgets. They answer the arrow keys and Home/End themselves - moving a caret, a
+ * selection or a value - so the grid gives them only Escape. A contenteditable host is the one
+ * member a selector cannot express faithfully, since the state is inherited, so
+ * `isContentEditable` covers it in `isTextEntry`.
+ */
+const TEXT_ENTRY_SELECTOR =
+  'input, textarea, select, [role="textbox"], [role="combobox"], [role="slider"], [role="spinbutton"]';
+
+/**
+ * The `overflow-x`/`overflow-y` values under which an element scrolls its own content, and so
+ * under which a keyboard scroll is the arrow key's native meaning. `hidden` and `clip` are absent
+ * on purpose: a truncated label clips its overflow without scrolling it, and a truncated tooltip
+ * trigger must still move on with the arrow keys.
+ */
+const SCROLLING_OVERFLOW_VALUES: ReadonlySet<string> = new Set(['auto', 'scroll', 'overlay']);
+
+/** The keys that move along the inline axis, which a horizontally scrolling element keeps. */
+const INLINE_AXIS_KEYS: ReadonlySet<string> = new Set(['ArrowLeft', 'ArrowRight', 'Home', 'End']);
+
+/** The keys that move along the block axis, which a vertically scrolling element keeps. */
+const BLOCK_AXIS_KEYS: ReadonlySet<string> = new Set([
+  'ArrowUp',
+  'ArrowDown',
+  'PageUp',
+  'PageDown',
+]);
+
+/**
+ * The fixed middle of a detail row's `id`: `<useId base><infix><row index>`.
+ *
+ * The base is unique per table instance and the index is unique per row within it, so the id is
+ * unique in the document; neither part contains whitespace, so the id is a single token that
+ * `aria-controls` can name.
+ */
+const DETAIL_ROW_ID_INFIX = '-detail-';
 
 /** The generic copy an unqualified empty table shows. Names nothing from any inspected project. */
 const DEFAULT_EMPTY_MESSAGE = 'No rows to display.';
@@ -823,12 +1194,12 @@ function nextSortFor<Row>(column: DataTableColumn<Row>, sort: DataTableSort | nu
 /**
  * The index a row element carries, or `undefined` when the element is not a data row.
  *
- * Reading the attribute off the element ITSELF rather than walking ancestors is the guard that
- * keeps keyboard handling honest: a key pressed on a sort control in the header, or on a button
- * inside a cell, reaches the grid's handler by bubbling, and neither of those elements carries the
- * attribute, so neither is mistaken for a row.
+ * It reads the attribute off the element ITSELF and never walks ancestors: `resolveBodyScope` is
+ * what walks from a control up to the row it sits in, and the handlers compare the two to tell "a
+ * key pressed ON a row" from "a key pressed on a control INSIDE a row", which answer different
+ * key maps (see this module's header).
  *
- * @param element The event target.
+ * @param element The element to read.
  * @returns The row index, or `undefined`.
  */
 function readRowIndex(element: Element): number | undefined {
@@ -851,6 +1222,279 @@ function readRowIndex(element: Element): number | undefined {
  */
 function rowSelector(index: number): string {
   return `[${ROW_INDEX_ATTRIBUTE}="${String(index)}"]`;
+}
+
+/**
+ * One of THIS table's data rows by index, skipping any row of a grid nested inside a cell that
+ * happens to carry the same index earlier in document order.
+ *
+ * @param grid This table's grid element.
+ * @param index The row index to find.
+ * @returns The row element, or `undefined` when it is not rendered.
+ */
+function findDataRow(grid: Element, index: number): HTMLElement | undefined {
+  for (const candidate of grid.querySelectorAll(rowSelector(index))) {
+    if (candidate instanceof HTMLElement && candidate.closest(GRID_SELECTOR) === grid) {
+      return candidate;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * A data row as the keyboard model sees it: the row, plus its open detail row, which belongs to it.
+ *
+ * `row` and `detail` together are the SCOPE the arrow keys move across once focus is inside the
+ * row; see this module's header.
+ */
+interface BodyScope {
+  /** The data row's index in `rows`, read off its `data-row-index`. */
+  readonly index: number;
+
+  /** The data row element. */
+  readonly row: HTMLElement;
+
+  /** Its detail row, while open. */
+  readonly detail: HTMLElement | undefined;
+}
+
+/**
+ * The data row an element belongs to: the row itself, a control in one of its cells, or a control
+ * in its open detail row.
+ *
+ * Resolved through the DOM rather than through state, because a focus or key event names only its
+ * target. The nearest element carrying either row attribute is the row or the detail row; both
+ * are children of one positioning wrapper, so the wrapper's children yield the pair. An owner
+ * outside `grid` is refused: when this table sits inside another table's cell, a control in this
+ * table's header would otherwise resolve to the OUTER table's row.
+ *
+ * @param target The element a focus or key event reached.
+ * @param grid This table's grid element.
+ * @returns The scope, or `undefined` when `target` is not inside one of this table's data rows.
+ */
+function resolveBodyScope(target: Element, grid: Element): BodyScope | undefined {
+  const owner = target.closest(`[${ROW_INDEX_ATTRIBUTE}], [${DETAIL_ROW_INDEX_ATTRIBUTE}]`);
+
+  if (owner === null || !grid.contains(owner)) {
+    return undefined;
+  }
+
+  const wrapper = owner.parentElement;
+
+  if (wrapper === null) {
+    return undefined;
+  }
+
+  let row: HTMLElement | undefined;
+  let detail: HTMLElement | undefined;
+
+  for (const child of wrapper.children) {
+    if (!(child instanceof HTMLElement)) {
+      continue;
+    }
+
+    if (child.hasAttribute(ROW_INDEX_ATTRIBUTE)) {
+      row = child;
+    } else if (child.hasAttribute(DETAIL_ROW_INDEX_ATTRIBUTE)) {
+      detail = child;
+    }
+  }
+
+  if (row === undefined) {
+    return undefined;
+  }
+
+  const index = readRowIndex(row);
+
+  return index === undefined ? undefined : { index, row, detail };
+}
+
+/**
+ * Whether the keyboard model may move focus onto an element that matched
+ * {@link NAVIGABLE_DESCENDANT_SELECTOR}.
+ *
+ * DOM-only on purpose - no `getClientRects`, no `offsetParent` - so it answers the same in a
+ * browser and in an environment with no layout at all.
+ *
+ * @param element The candidate.
+ * @param grid This table's grid element.
+ * @returns `true` when it is an enabled, perceivable control of this table rather than of a grid
+ *   nested inside it.
+ */
+function isNavigable(element: HTMLElement, grid: Element): boolean {
+  return (
+    !element.matches(':disabled') &&
+    element.closest(UNREACHABLE_ANCESTOR_SELECTOR) === null &&
+    element.closest(GRID_SELECTOR) === grid
+  );
+}
+
+/**
+ * Every navigable control inside the given scope elements, in document order. The scope elements
+ * themselves are never included - a row is not a control inside itself.
+ *
+ * @param scopes The elements to search, in document order; `undefined` entries are skipped, which
+ *   is how a closed detail row is passed.
+ * @param grid This table's grid element.
+ * @returns The controls.
+ */
+function navigablesIn(scopes: readonly (Element | undefined)[], grid: Element): HTMLElement[] {
+  const found: HTMLElement[] = [];
+
+  for (const scope of scopes) {
+    if (scope === undefined) {
+      continue;
+    }
+
+    for (const candidate of scope.querySelectorAll(NAVIGABLE_DESCENDANT_SELECTOR)) {
+      if (candidate instanceof HTMLElement && isNavigable(candidate, grid)) {
+        found.push(candidate);
+      }
+    }
+  }
+
+  return found;
+}
+
+/**
+ * The first control after `from` in document order. Positional rather than an index lookup, so it
+ * also answers for a focused element that is not in the list itself (one focusable by some other
+ * means than the selector).
+ *
+ * @param controls The scope's controls, in document order.
+ * @param from The focused element.
+ * @returns The next control, or `undefined` at the end of the scope.
+ */
+function nextControl(controls: readonly HTMLElement[], from: Element): HTMLElement | undefined {
+  return controls.find(
+    (control) => (from.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_FOLLOWING) !== 0,
+  );
+}
+
+/**
+ * The last control before `from` in document order; see {@link nextControl}.
+ *
+ * @param controls The scope's controls, in document order.
+ * @param from The focused element.
+ * @returns The previous control, or `undefined` at the start of the scope.
+ */
+function previousControl(controls: readonly HTMLElement[], from: Element): HTMLElement | undefined {
+  return controls.findLast(
+    (control) => (from.compareDocumentPosition(control) & Node.DOCUMENT_POSITION_PRECEDING) !== 0,
+  );
+}
+
+/**
+ * Whether an element is a text or choice widget, which keeps its own arrow keys and Home/End.
+ *
+ * @param element The focused element.
+ * @returns `true` for the members of {@link TEXT_ENTRY_SELECTOR} and for a contenteditable host.
+ */
+function isTextEntry(element: Element): boolean {
+  return (
+    element.matches(TEXT_ENTRY_SELECTOR) ||
+    (element instanceof HTMLElement && element.isContentEditable)
+  );
+}
+
+/**
+ * Whether an element actually scrolls along the axis a key moves on, so the key's native meaning -
+ * scrolling it - has to win over grid navigation.
+ *
+ * Both halves are required. The overflow value says the element scrolls rather than clips (a
+ * truncated label also reports `scrollWidth > clientWidth`, but pressing an arrow on it scrolls
+ * nothing), and the size comparison says there is something to scroll. Under an environment with
+ * no layout every size is zero, so nothing counts as scrollable there.
+ *
+ * @param element The focused element.
+ * @param key The key pressed.
+ * @returns `true` when the element scrolls along that key's axis.
+ */
+function scrollsAlong(element: Element, key: string): boolean {
+  const inline = INLINE_AXIS_KEYS.has(key);
+
+  if (!(element instanceof HTMLElement) || (!inline && !BLOCK_AXIS_KEYS.has(key))) {
+    return false;
+  }
+
+  const style = element.ownerDocument.defaultView?.getComputedStyle(element);
+
+  if (style === undefined) {
+    return false;
+  }
+
+  return inline
+    ? SCROLLING_OVERFLOW_VALUES.has(style.overflowX) && element.scrollWidth > element.clientWidth
+    : SCROLLING_OVERFLOW_VALUES.has(style.overflowY) && element.scrollHeight > element.clientHeight;
+}
+
+/**
+ * The key a toggle has just opened: the LAST key of `current` that `previous` did not hold, so a
+ * caller that opens a row by appending its key names the row the reader acted on.
+ *
+ * @param current The expanded keys after the change, in the caller's order.
+ * @param previous The expanded keys before it.
+ * @returns The newly expanded key, or `undefined` when the change opened nothing.
+ */
+function findNewlyExpandedKey(
+  current: readonly string[],
+  previous: ReadonlySet<string>,
+): string | undefined {
+  let opened: string | undefined;
+
+  for (const key of current) {
+    if (!previous.has(key)) {
+      opened = key;
+    }
+  }
+
+  return opened;
+}
+
+/**
+ * Scrolls a just-expanded row's detail into the table viewport, keeping the row itself visible.
+ *
+ * The viewport is capped in height and its header is sticky, so two edges bound what a reader can
+ * see: the header's lower edge above, the viewport's lower edge below. The row and its detail are
+ * treated as one block, `row` from its top edge to the detail's bottom edge:
+ *
+ *   - a block that ends below the lower edge is scrolled up by the overflow, but never so far that
+ *     the row's top edge passes under the header - a detail taller than the viewport therefore
+ *     leaves the toggled row pinned just under the header with as much detail as fits below it;
+ *   - a block that starts above the header (a row scrolled half out of view) is scrolled down to
+ *     it.
+ *
+ * Then the viewport itself is brought into view in every scrolling ancestor with
+ * `scrollIntoView({ block: 'nearest' })`, which moves nothing when the table is already on screen.
+ * A browser API that is missing - `scrollIntoView` in a DOM that does not implement it - is simply
+ * skipped: the reveal is a convenience, never a precondition for the expansion.
+ *
+ * @param viewport The table's scroll container.
+ * @param row The toggled `role="row"` element.
+ */
+function revealExpandedRow(viewport: HTMLElement, row: HTMLElement): void {
+  const detail = row.nextElementSibling;
+  const blockEnd = detail instanceof HTMLElement ? detail : row;
+  const header = viewport.querySelector('.dg-data-table__head');
+  const viewportRect = viewport.getBoundingClientRect();
+  const visibleTop =
+    viewportRect.top +
+    viewport.clientTop +
+    (header instanceof HTMLElement ? header.getBoundingClientRect().height : 0);
+  const visibleBottom = viewportRect.top + viewport.clientTop + viewport.clientHeight;
+  const top = row.getBoundingClientRect().top;
+  const bottom = blockEnd.getBoundingClientRect().bottom;
+
+  if (top < visibleTop) {
+    viewport.scrollTop -= visibleTop - top;
+  } else if (bottom > visibleBottom) {
+    viewport.scrollTop += Math.min(bottom - visibleBottom, top - visibleTop);
+  }
+
+  if (typeof viewport.scrollIntoView === 'function') {
+    viewport.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+  }
 }
 
 /**
@@ -946,6 +1590,89 @@ function resolveFlowRowRange(
 }
 
 /**
+ * Where one row sits against the scroll container, in the container's own scroll coordinates -
+ * the input to {@link revealOffsetFor}. Every field is a measurement read off the live layout (or
+ * the virtualizer's own row measurements), never a style value.
+ */
+interface RevealGeometry {
+  /** The row's leading edge, measured from the start of the scrollable content. */
+  readonly rowStart: number;
+
+  /** The row's trailing edge, on the same axis. */
+  readonly rowEnd: number;
+
+  /** How far the container is currently scrolled. */
+  readonly scrollOffset: number;
+
+  /** The block size of the container's visible area. */
+  readonly viewportSize: number;
+
+  /**
+   * The block size of the sticky header, which covers the leading edge of the visible area (see
+   * `.dg-data-table__head` in `../styles/components.css`), so a row under it is not visible.
+   */
+  readonly headerSize: number;
+}
+
+/**
+ * The scroll offset that brings a row fully into the visible area of its table's own scroll
+ * container, moving it as little as possible, or `undefined` when it is already fully visible.
+ *
+ * "Nearest" semantics, as `scrollIntoView({ block: 'nearest' })` would give, but confined to the
+ * table's viewport: a row above the visible band is brought to just under the sticky header, a row
+ * below it to the trailing edge - and never so far that its leading edge slides under the header,
+ * which is what a row taller than the band would otherwise do. The page itself is never scrolled,
+ * because two tables revealing one selection would otherwise fight over it.
+ *
+ * A container with no visible band beyond its header - nothing measured yet, or an environment
+ * that measures nothing - yields `undefined`: there is no position that would reveal the row.
+ *
+ * @param geometry The row and container measurements.
+ * @returns The offset to scroll the container to, or `undefined` to leave it where it is.
+ */
+function revealOffsetFor(geometry: RevealGeometry): number | undefined {
+  const { rowStart, rowEnd, scrollOffset, viewportSize, headerSize } = geometry;
+
+  if (viewportSize <= headerSize) {
+    return undefined;
+  }
+
+  const bandStart = scrollOffset + headerSize;
+  const bandEnd = scrollOffset + viewportSize;
+  const leadingTarget = Math.max(rowStart - headerSize, 0);
+
+  if (rowStart < bandStart) {
+    return leadingTarget;
+  }
+
+  if (rowEnd > bandEnd) {
+    return Math.min(Math.max(rowEnd - viewportSize, 0), leadingTarget);
+  }
+
+  return undefined;
+}
+
+/**
+ * The leading edge of an element in a scroll container's own scroll coordinates.
+ *
+ * Read from the two boxes on screen rather than from `offsetTop`, so it holds whichever ancestor
+ * is positioned: the distance between the element and the container's padding edge, plus how far
+ * the container is scrolled.
+ *
+ * @param element The element inside the container.
+ * @param viewport The scroll container.
+ * @returns The element's leading edge, measured from the start of the scrollable content.
+ */
+function scrollStartOf(element: Element, viewport: HTMLElement): number {
+  return (
+    element.getBoundingClientRect().top -
+    viewport.getBoundingClientRect().top -
+    viewport.clientTop +
+    viewport.scrollTop
+  );
+}
+
+/**
  * The generic data grid of the design system.
  *
  * See this module's header for the four pillars of AAP 0.6.2, the exact ARIA structure, the class
@@ -1001,6 +1728,30 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   const captionId = `${id ?? generatedId}-caption`;
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
+
+  // The grid element and its header row, read only from handlers and effects: the grid is where a
+  // row is looked up for focus, and the header row is the scope of the header's key map.
+  const gridRef = useRef<HTMLDivElement | null>(null);
+  const headerRowRef = useRef<HTMLDivElement | null>(null);
+
+  // The sticky header rowgroup and the body rowgroup, read only by the selection reveal below to
+  // place a row against the visible band of the viewport.
+  const headRef = useRef<HTMLDivElement | null>(null);
+  const canvasRef = useRef<HTMLDivElement | null>(null);
+
+  // The key of the row the reader activated in THIS table, written by `activateRow` and spent by
+  // the reveal effect: a selection that follows the reader's own click or Enter lands on a row
+  // they are already looking at, so it must not scroll the table under them.
+  const activatedKeyRef = useRef<string | null>(null);
+
+  // The selection the reveal effect last saw, and whether revealing it is still outstanding. Held
+  // in a ref because it is bookkeeping about a side effect, not rendered output: a re-render for
+  // any other reason - new rows, a new sort, a parent's state - finds the reveal already spent and
+  // scrolls nothing.
+  const revealRef = useRef<{ key: string | null | undefined; pending: boolean }>({
+    key: undefined,
+    pending: false,
+  });
 
   // Whether the reader has asked for focus to follow the active row. Held in a ref rather than in
   // state because it is intent, not rendered output: it is written by the key handlers and cleared
@@ -1058,12 +1809,22 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     };
   }, [rows, rowKey, expandedRowKeys, canExpand]);
 
-  // The grid track template, inherited by every row through `--dgc-columns`. Relational tracks
-  // only: a column's `width` is a grid track, never a literal length (AAP 0.6.4).
-  const columnTemplate = useMemo(
-    () => columns.map((column) => column.width ?? DEFAULT_COLUMN_TRACK).join(' '),
-    [columns],
-  );
+  // The grid track template, inherited by every row through `--dgc-columns`, and the floor the grid
+  // may not shrink below, `--dgc-min-inline`: the sum of every track's known minimum. Relational
+  // tracks only: a column's `width` is a grid track, never a literal length (AAP 0.6.4).
+  const { columnTemplate, minimumInlineSize } = useMemo(() => {
+    const tracks = columns.map((column) => column.width ?? DEFAULT_COLUMN_TRACK);
+    const minimums = tracks.flatMap((track) => {
+      const minimum = resolveTrackMinimum(track);
+
+      return minimum === undefined ? [] : [minimum];
+    });
+
+    return {
+      columnTemplate: tracks.join(' '),
+      minimumInlineSize: minimums.length === 0 ? undefined : `calc(${minimums.join(' + ')})`,
+    };
+  }, [columns]);
 
   const virtualization = useMemo(
     () => resolveVirtualization(virtualize, rowCount),
@@ -1178,6 +1939,24 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
 
       const clamped = Math.min(Math.max(target, 0), rowCount - 1);
 
+      // Already the active row, and rendered: nothing the focus effect depends on will change, so
+      // the effect would not run again and a pending request would outlive this key - to be
+      // honoured by some later, unrelated commit (a re-page, a scroll back into the window) that
+      // pulls focus into the table from wherever the reader has gone. Focus the row here instead.
+      // This is the path a vertical key takes from a control inside the first or last row, and an
+      // ArrowUp or ArrowDown on either of those rows themselves.
+      if (clamped === activeIndex && activeIsRendered) {
+        focusPendingRef.current = false;
+        // Still recorded, so a navigated row keeps precedence over the selection exactly as on
+        // the path below; when it is already the value, React skips the render.
+        setNavigatedIndex(clamped);
+
+        const grid = gridRef.current;
+
+        (grid === null ? undefined : findDataRow(grid, clamped))?.focus();
+        return;
+      }
+
       focusPendingRef.current = true;
       setNavigatedIndex(clamped);
 
@@ -1187,7 +1966,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
         virtualizer.scrollToIndex(clamped);
       }
     },
-    [isVirtualized, rowCount, virtualizer],
+    [activeIndex, activeIsRendered, isVirtualized, rowCount, virtualizer],
   );
 
   const activateRow = useCallback(
@@ -1202,6 +1981,9 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
         return;
       }
 
+      // Noted before the caller hears of it, because the caller's answer - a new `selectedRowKey`
+      // - may arrive in the very commit this activation causes.
+      activatedKeyRef.current = model.key;
       onRowActivate(model.row, index);
     },
     [models, onRowActivate],
@@ -1254,52 +2036,75 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
   // nominated. Without this, the row a reader is standing on can lose the active state (and with
   // it the design system's focus ring, which `components.css` couples to `dg-is-active`) to
   // whichever row the roving fallback above happens to name after a scroll.
+  //
+  // Focus on a control INSIDE a row - a chip in a cell, a control in the open detail - counts as
+  // focus on that row, so the roving stop, which is the row Tab returns to, follows an arrow key
+  // or a pointer click into a cell as well. The row's own `tabIndex` is left alone meanwhile, which
+  // is what makes Shift+Tab from the control land on its row. Focus in the header, or inside a
+  // grid nested in a cell, changes nothing.
   const handleFocus = useCallback((event: ReactFocusEvent<HTMLDivElement>): void => {
     const target = event.target;
+    const grid = event.currentTarget;
 
-    if (!(target instanceof Element)) {
+    if (!(target instanceof Element) || target.closest(GRID_SELECTOR) !== grid) {
       return;
     }
 
-    const originIndex = readRowIndex(target);
+    const scope = resolveBodyScope(target, grid);
 
-    if (originIndex === undefined) {
+    if (scope === undefined) {
       return;
     }
 
     // Focus has arrived where it belongs, so any outstanding programmatic request is satisfied.
     focusPendingRef.current = false;
-    setNavigatedIndex(originIndex);
+    setNavigatedIndex(scope.index);
   }, []);
 
-  const handleKeyDown = useCallback(
-    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
-      const target = event.target;
+  // Keys pressed ON a data row. See this module's header for the map; `preventDefault` is called
+  // only for the keys actually handled, so Tab still leaves the body and every unhandled key keeps
+  // its meaning.
+  const handleRowKey = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>, scope: BodyScope, grid: Element): void => {
+      const originIndex = scope.index;
 
-      if (!(target instanceof Element)) {
-        return;
-      }
+      // Moves focus onto the first control of the row and its open detail - what Enter (on a row
+      // with no activation), F2, and ArrowRight (on a row with nothing to expand) do. A row with
+      // no control leaves the key unhandled.
+      const enterRow = (): void => {
+        const first = navigablesIn([scope.row, scope.detail], grid)[0];
 
-      // Only keys pressed on a data row itself are the table's to handle. A header sort control
-      // and a control inside a cell both bubble through this handler, and neither carries the row
-      // index attribute, so Enter on a sort button sorts without also activating a row.
-      const originIndex = readRowIndex(target);
+        if (first !== undefined) {
+          event.preventDefault();
+          first.focus();
+        }
+      };
 
-      if (originIndex === undefined) {
-        return;
-      }
-
-      // `preventDefault` is called only for the keys actually handled below, so Escape still
-      // closes a `Tooltip`, Tab still leaves the body and every unhandled key keeps its meaning.
       switch (event.key) {
         case 'ArrowDown':
           event.preventDefault();
           moveActiveRow(originIndex + 1);
           return;
-        case 'ArrowUp':
+        case 'ArrowUp': {
+          // Above the first row is the header, whose sort controls leave the Tab order while rows
+          // exist - this key is how a keyboard reader reaches them. A header with no control keeps
+          // the clamp at the first row.
+          const headerRow = headerRowRef.current;
+          const headerControl =
+            originIndex === 0 && headerRow !== null
+              ? navigablesIn([headerRow], grid)[0]
+              : undefined;
+
           event.preventDefault();
-          moveActiveRow(originIndex - 1);
+
+          if (headerControl === undefined) {
+            moveActiveRow(originIndex - 1);
+          } else {
+            headerControl.focus();
+          }
+
           return;
+        }
         case 'Home':
           event.preventDefault();
           moveActiveRow(0);
@@ -1316,7 +2121,17 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           event.preventDefault();
           moveActiveRow(originIndex - PAGE_JUMP_ROWS);
           return;
-        case 'Enter':
+        case 'Enter': {
+          // With nothing to activate, Enter is the conventional way into the row's cells.
+          if (onRowActivate === undefined) {
+            enterRow();
+            return;
+          }
+
+          event.preventDefault();
+          activateRow(originIndex);
+          return;
+        }
         case ' ': {
           if (onRowActivate === undefined) {
             return;
@@ -1327,26 +2142,30 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           activateRow(originIndex);
           return;
         }
-        case 'ArrowRight':
+        case 'F2':
+          // Always a way in, including on a row where Enter activates.
+          enterRow();
+          return;
+        case 'ArrowRight': {
+          // A collapsed expandable row opens first; the next ArrowRight - or this one, on a row
+          // that is open or has nothing to reveal - moves into the row.
+          if (canToggle && models[originIndex]?.expanded === false) {
+            event.preventDefault();
+            toggleRow(originIndex);
+            return;
+          }
+
+          enterRow();
+          return;
+        }
         case 'ArrowLeft': {
-          if (!canToggle) {
-            return;
+          // Left closes an open row and does nothing else: it never repeats the state the row is
+          // already in, and a row has no control before itself to move to.
+          if (canToggle && models[originIndex]?.expanded === true) {
+            event.preventDefault();
+            toggleRow(originIndex);
           }
 
-          const model = models[originIndex];
-
-          if (model === undefined) {
-            return;
-          }
-
-          // Right opens, Left closes, and neither repeats the state the row is already in - an
-          // Arrow Right on an open row keeps its default meaning instead of collapsing it.
-          if (model.expanded === (event.key === 'ArrowRight')) {
-            return;
-          }
-
-          event.preventDefault();
-          toggleRow(originIndex);
           return;
         }
         default:
@@ -1354,6 +2173,176 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       }
     },
     [activateRow, canToggle, models, moveActiveRow, onRowActivate, rowCount, toggleRow],
+  );
+
+  // Keys pressed on a control inside a data row's cells or its open detail row - one scope, in
+  // document order. See this module's header for the map and for the two kinds of control that
+  // keep their own keys.
+  const handleDescendantKey = useCallback(
+    (
+      event: ReactKeyboardEvent<HTMLDivElement>,
+      target: Element,
+      scope: BodyScope,
+      grid: Element,
+    ): void => {
+      // Escape first: it is the one key every control answers to the grid, text fields included.
+      // A control that consumed it - an open `Tooltip` closing its bubble - never reaches here,
+      // because the dispatcher below leaves a prevented key alone.
+      if (event.key === 'Escape') {
+        event.preventDefault();
+        scope.row.focus();
+        return;
+      }
+
+      if (isTextEntry(target) || scrollsAlong(target, event.key)) {
+        return;
+      }
+
+      const controls = navigablesIn([scope.row, scope.detail], grid);
+
+      // Handled even when there is nowhere to go - ArrowRight on the last control stays put - so
+      // the key does not fall through to scroll the viewport under the reader.
+      const moveTo = (control: HTMLElement | undefined): void => {
+        event.preventDefault();
+        control?.focus();
+      };
+
+      switch (event.key) {
+        case 'ArrowRight':
+          moveTo(nextControl(controls, target));
+          return;
+        case 'ArrowLeft':
+          moveTo(previousControl(controls, target) ?? scope.row);
+          return;
+        case 'Home':
+          moveTo(controls[0]);
+          return;
+        case 'End':
+          moveTo(controls.at(-1));
+          return;
+        // The vertical keys leave the control for another row, counted from the row the control
+        // belongs to, through the same path - and the same virtualization scroll - as from a row.
+        case 'ArrowDown':
+          event.preventDefault();
+          moveActiveRow(scope.index + 1);
+          return;
+        case 'ArrowUp':
+          event.preventDefault();
+          moveActiveRow(scope.index - 1);
+          return;
+        case 'PageDown':
+          event.preventDefault();
+          moveActiveRow(scope.index + PAGE_JUMP_ROWS);
+          return;
+        case 'PageUp':
+          event.preventDefault();
+          moveActiveRow(scope.index - PAGE_JUMP_ROWS);
+          return;
+        // Enter, Space, Tab and every other key are the control's own: a key pressed on a control
+        // never activates the row.
+        default:
+          return;
+      }
+    },
+    [moveActiveRow],
+  );
+
+  // Keys pressed on a control in the header row: the sort controls, and anything a column's
+  // `header` node renders. Enter and Space are left native, so a sort control still sorts.
+  const handleHeaderKey = useCallback(
+    (
+      event: ReactKeyboardEvent<HTMLDivElement>,
+      target: Element,
+      headerRow: Element,
+      grid: Element,
+    ): void => {
+      // Back into the body on the row that holds the roving stop - the row Tab would enter on.
+      // With no rows there is nowhere to go, and the key is left unhandled.
+      const returnToBody = (): void => {
+        const row = findDataRow(grid, tabStopIndex);
+
+        if (row !== undefined) {
+          event.preventDefault();
+          row.focus();
+        }
+      };
+
+      if (event.key === 'Escape') {
+        returnToBody();
+        return;
+      }
+
+      if (isTextEntry(target) || scrollsAlong(target, event.key)) {
+        return;
+      }
+
+      const controls = navigablesIn([headerRow], grid);
+      const moveTo = (control: HTMLElement | undefined): void => {
+        event.preventDefault();
+        control?.focus();
+      };
+
+      switch (event.key) {
+        case 'ArrowDown':
+          returnToBody();
+          return;
+        case 'ArrowRight':
+          moveTo(nextControl(controls, target));
+          return;
+        case 'ArrowLeft':
+          moveTo(previousControl(controls, target));
+          return;
+        case 'Home':
+          moveTo(controls[0]);
+          return;
+        case 'End':
+          moveTo(controls.at(-1));
+          return;
+        default:
+          return;
+      }
+    },
+    [tabStopIndex],
+  );
+
+  // The one key handler on the grid, dispatching on WHERE the key was pressed: on a data row, on
+  // a control inside one (or inside its open detail), or in the header.
+  const handleKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLDivElement>): void => {
+      const target = event.target;
+      const grid = event.currentTarget;
+
+      // A key pressed inside a grid nested in a cell belongs to that grid. It still bubbles
+      // through this handler, and is left alone here.
+      if (!(target instanceof Element) || target.closest(GRID_SELECTOR) !== grid) {
+        return;
+      }
+
+      const scope = resolveBodyScope(target, grid);
+
+      if (scope !== undefined && target === scope.row) {
+        handleRowKey(event, scope, grid);
+        return;
+      }
+
+      // A control that already handled the key owns it: the first Escape an open `Tooltip`
+      // consumes, an arrow a composite widget in a cell answers itself.
+      if (event.defaultPrevented) {
+        return;
+      }
+
+      if (scope !== undefined) {
+        handleDescendantKey(event, target, scope, grid);
+        return;
+      }
+
+      const headerRow = headerRowRef.current;
+
+      if (headerRow !== null && headerRow.contains(target)) {
+        handleHeaderKey(event, target, headerRow, grid);
+      }
+    },
+    [handleDescendantKey, handleHeaderKey, handleRowKey],
   );
 
   // Focus follows the active row, but only when a key handler asked for it. The row is resolved
@@ -1367,15 +2356,17 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       return;
     }
 
-    const viewport = viewportRef.current;
+    const grid = gridRef.current;
 
-    if (viewport === null) {
+    if (grid === null) {
       return;
     }
 
-    const candidate = viewport.querySelector(rowSelector(activeIndex));
+    // `findDataRow` rather than a bare `querySelector`, so a grid nested in an earlier row's cell
+    // cannot answer for this table's row.
+    const candidate = findDataRow(grid, activeIndex);
 
-    if (!(candidate instanceof HTMLElement)) {
+    if (candidate === undefined) {
       return;
     }
 
@@ -1383,7 +2374,158 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
     candidate.focus();
   }, [activeIndex, activeIsRendered]);
 
-  const gridStyle: CssVariableStyle = { '--dgc-columns': columnTemplate };
+  // Reveal a row the reader has just expanded. The keys seen by the previous run are held in a ref:
+  // the first run - the mount, including the second mount React's StrictMode performs - only
+  // records them, so a table that ARRIVES with rows expanded (a reopened session) never scrolls
+  // on its own, and only a change that opens a row the table was not already showing acts. The
+  // reveal waits one animation frame, until the detail row has been laid out and, on the windowed
+  // path, measured; a later change cancels a frame that has not fired yet.
+  const previousExpandedRef = useRef<ReadonlySet<string> | null>(null);
+
+  useEffect(() => {
+    const current = canExpand ? (expandedRowKeys ?? []) : [];
+    const previous = previousExpandedRef.current;
+
+    previousExpandedRef.current = new Set(current);
+
+    if (previous === null) {
+      return undefined;
+    }
+
+    const opened = findNewlyExpandedKey(current, previous);
+    const openedIndex = opened === undefined ? undefined : indexByKey.get(opened);
+
+    if (openedIndex === undefined || typeof requestAnimationFrame !== 'function') {
+      return undefined;
+    }
+
+    const frame = requestAnimationFrame(() => {
+      const viewport = viewportRef.current;
+      const grid = gridRef.current;
+      // `findDataRow`, so a grid nested in an earlier row's cell cannot answer for this table's row.
+      const row = grid === null ? undefined : findDataRow(grid, openedIndex);
+
+      if (viewport instanceof HTMLElement && row !== undefined) {
+        revealExpandedRow(viewport, row);
+      }
+    });
+
+    return () => {
+      cancelAnimationFrame(frame);
+    };
+  }, [canExpand, expandedRowKeys, indexByKey]);
+
+  // The selected row is brought into the viewport when the SELECTION moves to it from elsewhere -
+  // another view, an evidence chip, a host surface driving `selectedRowKey` - so a reader who
+  // selected an event somewhere else sees it here without hunting through a long table. Four
+  // rules keep that from ever being a scroll the reader did not ask for:
+  //
+  //   Once per selection. The reveal is armed when `selectedRowKey` changes (the first commit
+  //   counts, so a table that mounts with a selection opens on it) and spent when it is done;
+  //   re-renders for any other reason find nothing armed.
+  //
+  //   Never for the reader's own activation. A row clicked or confirmed here is one the reader is
+  //   already looking at, so `activateRow`'s note disarms the reveal for that key.
+  //
+  //   Only a loaded row. A key that names no row in `rows` stays armed and is revealed when a
+  //   page that holds it arrives; under the flow path a row outside the rendered range waits the
+  //   same way, for the commit that renders it.
+  //
+  //   Never focus, never the page. Only this table's own viewport scrolls (see
+  //   `revealOffsetFor`), and focus stays wherever the reader has it; the roving tab stop is not
+  //   moved either, because it follows the reader's navigation first and the selection only
+  //   until then (see `resolveActiveIndex`).
+  //
+  // A row already fully visible is left where it is.
+  useEffect(() => {
+    const reveal = revealRef.current;
+
+    if (reveal.key !== selectedRowKey) {
+      const activatedHere =
+        selectedRowKey !== null &&
+        selectedRowKey !== undefined &&
+        activatedKeyRef.current === selectedRowKey;
+
+      reveal.key = selectedRowKey;
+      reveal.pending = selectedRowKey !== null && selectedRowKey !== undefined && !activatedHere;
+      activatedKeyRef.current = null;
+    }
+
+    if (!reveal.pending || selectedIndex === undefined) {
+      return;
+    }
+
+    const viewport = viewportRef.current;
+    const canvas = canvasRef.current;
+
+    if (viewport === null || canvas === null) {
+      return;
+    }
+
+    const headerSize = headRef.current?.getBoundingClientRect().height ?? 0;
+    const scrollOffset = viewport.scrollTop;
+    const viewportSize = viewport.clientHeight;
+
+    if (isVirtualized) {
+      // The row may be far outside the rendered window, so it is placed from the virtualizer's own
+      // measurement of it (an estimate until it has been rendered once), offset by where the
+      // canvas those measurements are relative to begins.
+      const item = virtualizer.measurementsCache[selectedIndex];
+      reveal.pending = false;
+
+      if (item === undefined) {
+        virtualizer.scrollToIndex(selectedIndex);
+        return;
+      }
+
+      const canvasStart = scrollStartOf(canvas, viewport);
+      const target = revealOffsetFor({
+        rowStart: canvasStart + item.start,
+        rowEnd: canvasStart + item.end,
+        scrollOffset,
+        viewportSize,
+        headerSize,
+      });
+
+      if (target !== undefined) {
+        virtualizer.scrollToOffset(target);
+      }
+
+      return;
+    }
+
+    // `findDataRow`, so a grid nested in an earlier row's cell cannot answer for this table's row.
+    const grid = gridRef.current;
+    const row = grid === null ? undefined : findDataRow(grid, selectedIndex);
+
+    if (row === undefined) {
+      return;
+    }
+
+    reveal.pending = false;
+
+    const rowStart = scrollStartOf(row, viewport);
+    const target = revealOffsetFor({
+      rowStart,
+      rowEnd: rowStart + row.getBoundingClientRect().height,
+      scrollOffset,
+      viewportSize,
+      headerSize,
+    });
+
+    if (target !== undefined) {
+      viewport.scrollTop = target;
+    }
+  }, [isVirtualized, selectedIndex, selectedRowKey, virtualizer]);
+
+  // The grid carries the track template every row inherits and, when any track states a minimum,
+  // the floor that turns a too-narrow surface into a horizontal scroll (`../styles/components.css`
+  // adds the gaps between tracks and the row's inline-start edge to it).
+  const gridStyle: CssVariableStyle = {
+    '--dgc-columns': columnTemplate,
+    '--dgc-column-count': String(columnCount),
+    ...(minimumInlineSize === undefined ? {} : { '--dgc-min-inline': minimumInlineSize }),
+  };
 
   // The canvas carries the scroll range of the WHOLE result, and it has to do so from the first
   // paint: while the flow range is a window, the rows in the DOM describe only their own share of
@@ -1421,6 +2563,17 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
       ? { '--dgc-virtual-start': String(offset) }
       : undefined;
 
+    // The detail row renders exactly when this is true, and its id exists exactly then too, so the
+    // `aria-controls` a caller's toggle takes from `meta` can never name a missing element.
+    const detailRendered = model.expanded && renderExpandedRow !== undefined;
+    const detailRowId = detailRendered
+      ? `${generatedId}${DETAIL_ROW_ID_INFIX}${String(index)}`
+      : undefined;
+
+    // One object per row, shared by all of its cells: the state lives on the caller's toggle
+    // rather than on the row, which a `grid` does not allow to report it (see the module header).
+    const meta: DataTableCellMeta = { expanded: model.expanded, detailRowId };
+
     return (
       <div
         key={model.key}
@@ -1439,12 +2592,16 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           role="row"
           aria-rowindex={model.ariaRowIndex}
           aria-selected={selectionInUse ? isSelected : undefined}
-          aria-expanded={canExpand ? model.expanded : undefined}
-          // The roving tab stop: one row in the body is tabbable, and the header's sort controls
-          // stay reachable in their own right.
+          // No `aria-expanded` here: a `grid` row does not support it (only a `treegrid` row
+          // does), so the expanded state reaches the caller's toggle through `meta` instead, and
+          // the row reports it only visually, through `dg-is-expanded` below.
+          //
+          // The roving tab stop: one row in the body is tabbable, and it is the body's ONLY Tab
+          // stop - the controls in its cells are `tabIndex={-1}` and reached by the arrow keys.
           tabIndex={isActive ? 0 : -1}
           // Written literally so the attribute is visible where the row is; ROW_INDEX_ATTRIBUTE
-          // is the same name, and `readRowIndex`/`rowSelector` are the only readers of it.
+          // is the same name, and `readRowIndex`, `rowSelector` and `resolveBodyScope` are the
+          // only readers of it.
           data-row-index={index}
           className={clsx(
             'dg-data-table__row',
@@ -1471,15 +2628,20 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
                 className="dg-data-table__cell"
                 style={cellStyle}
               >
-                {column.cell(model.row, index)}
+                {column.cell(model.row, index, meta)}
               </div>
             );
           })}
         </div>
-        {model.expanded && renderExpandedRow !== undefined ? (
+        {detailRendered ? (
           <div
             role="row"
+            id={detailRowId}
             aria-rowindex={model.detailAriaRowIndex}
+            // Links the detail back to its data row by index. A separate name from
+            // `data-row-index`, which marks an element as a DATA row to the key handlers, the
+            // focus effect and every suite that counts rows by it.
+            data-detail-row-index={index}
             className="dg-data-table__expanded"
           >
             <div role="gridcell" aria-colindex={1} aria-colspan={columnCount}>
@@ -1506,6 +2668,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
         {/* The grid, and nothing between it and the rowgroups: `grid` accepts only `row` and
             `rowgroup` children, which is why the scroll container above carries no role. */}
         <div
+          ref={gridRef}
           role="grid"
           aria-labelledby={captionId}
           aria-rowcount={ariaRowCount}
@@ -1514,8 +2677,8 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
           onFocus={handleFocus}
           onKeyDown={handleKeyDown}
         >
-          <div role="rowgroup" className="dg-data-table__head">
-            <div role="row" aria-rowindex={HEADER_ARIA_ROW_INDEX}>
+          <div role="rowgroup" className="dg-data-table__head" ref={headRef}>
+            <div ref={headerRowRef} role="row" aria-rowindex={HEADER_ARIA_ROW_INDEX}>
               {columns.map((column, columnIndex) => {
                 const headerStyle: CssVariableStyle = {
                   '--dgc-align': column.align ?? DEFAULT_COLUMN_ALIGN,
@@ -1541,6 +2704,11 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
                         // The header node names the control; `headerLabel` overrides it when that
                         // node is a glyph or an abbreviation a reader could not read out.
                         aria-label={column.headerLabel}
+                        // Out of the Tab order while rows exist, so the whole grid stays one Tab
+                        // stop: ArrowUp from the first row reaches it, and ArrowLeft/ArrowRight
+                        // move along the header. With no rows there is no row to arrive through,
+                        // so it keeps its default and stays reachable by Tab.
+                        tabIndex={rowCount > 0 ? -1 : undefined}
                         onClick={() => {
                           handleSortActivate(column);
                         }}
@@ -1558,7 +2726,7 @@ export function DataTable<Row>(props: DataTableProps<Row>): ReactElement {
             </div>
           </div>
           {rowCount === 0 ? null : (
-            <div role="rowgroup" className="dg-virtual-canvas" style={canvasStyle}>
+            <div role="rowgroup" className="dg-virtual-canvas" style={canvasStyle} ref={canvasRef}>
               {isVirtualized
                 ? virtualItems.map((item) => {
                     const model = models[item.index];

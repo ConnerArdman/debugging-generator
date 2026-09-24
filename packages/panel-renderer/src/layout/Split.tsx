@@ -37,6 +37,15 @@
  * a viewport width written into a rule would be a hardcoded value with no
  * token behind it (AAP 0.6.3, 0.6.4).
  *
+ * That basis is the narrowest a pane may be while it shares a line — twenty
+ * units of the largest space token, 480 px — because what a pane holds is a
+ * table, a timeline or a waterfall whose columns need that room. Two equal
+ * panes therefore sit side by side only in a division at least 972 px wide
+ * (two bases and the default gap), and below it the division is one column of
+ * full-width panes. The threshold is the stylesheet's alone: nothing in this
+ * file measures a width or names a number, so moving it is a one-rule change
+ * in `../styles/components.css`.
+ *
  * Three implementations are deliberately absent, and their absence is the
  * design. There is no `ResizeObserver`, no width held in state and no
  * `matchMedia` listener: any of them would make a presentational container

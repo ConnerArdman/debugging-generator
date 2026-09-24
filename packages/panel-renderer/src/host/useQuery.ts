@@ -45,15 +45,21 @@
  * rather than an accident of its shape:
  *
  * - a rejected call becomes `status: "error"` with the rejection preserved as a
- *   {@link DebuggenError}, never `status: "success"` with an empty page;
+ *   {@link DebuggenError}, never `status: "success"` with an empty page — and
+ *   with a faithful code: a provider's own `DebuggenError` keeps the one it
+ *   chose, an HTTP failure is mapped by its status (a `503` is
+ *   `TRANSPORT_DISCONNECTED`, never `INTERNAL`), and a timeout, network or
+ *   foreign abort error is `TRANSPORT_DISCONNECTED` (see {@link toQueryError});
  * - an empty page is a success, because "the capture holds nothing for this
  *   query" is a real answer, and the component's empty state is how it is shown;
  * - an error clears `data`, so no component can render rows from an earlier page
  *   underneath an error banner;
  * - a missing provider, or a missing session to address the query to, is an
- *   error with a code and a hint rather than an empty result — a query-backed
- *   node mounted outside a host that provides both is a defect in that host
- *   surface, and it is reported where a developer sees it;
+ *   error with a code and a remedy in its details rather than an empty result —
+ *   a query-backed node mounted outside a host that provides both is a defect
+ *   in that host surface, and it is reported where a developer sees it, behind
+ *   the error state's technical details rather than on the hint line a panel
+ *   user reads;
  * - a request that was aborted, because the node unmounted or because its query
  *   changed, reports nothing at all: no state is written on behalf of a component
  *   that has gone, and a superseded answer never overwrites a newer one.
@@ -84,13 +90,55 @@
  * serialisation of the query's *contents* — and never on the object. Keying on
  * identity would refetch on every render; keying on the value refetches exactly
  * when a sort, a filter, a limit or an offset actually changed.
+ *
+ * ## One failure contract for every node
+ *
+ * Twelve components render a failed query, and before this module owned the
+ * wording each one wrote its own: three title wordings, three query formats,
+ * generic text in some nodes and the provider's cause in others (B1-F16,
+ * B2-F14). The failure's presentation is therefore composed here, once, by
+ * pure helpers a component spreads onto `primitives/ErrorState`:
+ *
+ * - {@link queryFailureProps} turns a failed result and its query into the
+ *   error state's props — a title per {@link QueryFailureScope}, a generic lead
+ *   followed by the provider's cause, the error's hint, its code, the query
+ *   serialised by {@link formatDataQuery}, the error's details as
+ *   pretty-printed JSON for the closed "Technical details" disclosure, the
+ *   announcement politeness and the retry;
+ * - {@link unsupportedQueryProps} is the same for a node whose query names a
+ *   source its component cannot draw, worded from the node catalog;
+ * - {@link formatDataQuery} is the one serialisation of a query any error
+ *   block shows.
+ *
+ * ## One alert per burst
+ *
+ * When the service goes away, every query-backed node of a panel fails within
+ * a few milliseconds, and twelve simultaneous `role="alert"` regions interrupt
+ * one another until a screen-reader user hears none of them (B2-F14). Each
+ * error settlement therefore carries an {@link UseQueryResult.announcement},
+ * decided once when the query settles — never during render, where the answer
+ * would depend on render order and on how often React chose to render:
+ *
+ * - a module-private registry holds the failures currently on screen, each
+ *   with the time it settled;
+ * - a new failure is `"assertive"` unless another active failure settled
+ *   within the last {@link FAILURE_BURST_WINDOW_MS}, in which case it is
+ *   `"polite"` — so a burst is announced assertively once and politely for the
+ *   rest, while an unrelated failure seconds later alerts again;
+ * - a failure leaves the registry the moment its settlement stops being the
+ *   reported one — a retry, a new query, provider or session, disabling, or an
+ *   unmount — and entries older than the window are pruned on every claim, so
+ *   a failure whose release was somehow missed can never silence a later one.
  */
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 
-import type { DataQuery, DataQuerySource } from '@debuggen/panel-schema';
+import { PANEL_NODE_CATALOG, catalogEntryFor } from '@debuggen/panel-schema';
+import type { DataQuery, DataQuerySource, PanelNodeType } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
+import type { DebuggenErrorCode } from '@debuggen/shared';
 
+import type { ErrorStateProps } from '../primitives/ErrorState';
 import {
   checkDataQueryResponse,
   isAddressableSessionId,
@@ -242,19 +290,22 @@ function isUnknownArray(value: object): value is readonly unknown[] {
  * `"error"` can never arrive with rows attached (see {@link useQuery} for the
  * state design that guarantees it):
  *
- * - `"loading"` — nothing is settled yet. `data`, `error` and the four paging
- *   counters are all `undefined`. This is also the status of a query that is
- *   disabled or absent; see the note on {@link UseQueryOptions.enabled}.
+ * - `"loading"` — nothing is settled yet. `data`, `error`, `announcement` and
+ *   the four paging counters are all `undefined`. This is also the status of a
+ *   query that is disabled or absent; see the note on
+ *   {@link UseQueryOptions.enabled}.
  * - `"success"` — `data` holds the page, exactly as the provider ordered and
  *   paged it, and `error` is `undefined`. An **empty** page is a success: the
  *   capture legitimately holds nothing for this query, which a component renders
  *   as its empty state. So is a `null` trace or component tree, the wire's
  *   "nothing matched".
- * - `"error"` — `error` holds the failure and `data` is `undefined`, so no
- *   component can draw a stale page beneath an error banner. The component
- *   renders its error state and offers {@link UseQueryResult.retry}. A provider
- *   whose answer failed the response check (see the module documentation) lands
- *   here too, with a `PROTOCOL_INVALID_MESSAGE` error.
+ * - `"error"` — `error` holds the failure, `announcement` how urgently to
+ *   announce it, and `data` is `undefined`, so no component can draw a stale
+ *   page beneath an error banner. The component renders its error state —
+ *   through {@link queryFailureProps} — and offers
+ *   {@link UseQueryResult.retry}. A provider whose answer failed the response
+ *   check (see the module documentation) lands here too, with a
+ *   `PROTOCOL_INVALID_MESSAGE` error.
  *
  * @typeParam T - The result type of the query's source.
  */
@@ -279,9 +330,25 @@ export interface UseQueryResult<T> {
    * Always a `DebuggenError`, whatever the provider rejected with: a code and,
    * where the provider supplied one, a hint an error state can act on. A
    * provider that rejected with its own `DebuggenError` is preserved unchanged,
-   * code and all.
+   * code and all; any other rejection is mapped as faithfully as it allows —
+   * an HTTP status to the code it means, a timeout or network failure to
+   * `TRANSPORT_DISCONNECTED` — and only a rejection that says nothing about
+   * itself becomes `INTERNAL`.
    */
   error: DebuggenError | undefined;
+
+  /**
+   * How urgently this failure should be announced, present only on
+   * `"error"`.
+   *
+   * `"assertive"` for a failure that stands alone, `"polite"` for one that
+   * settled within {@link FAILURE_BURST_WINDOW_MS} of another failure still on
+   * screen — see "One alert per burst" in this module's documentation. Decided
+   * once, when the query settled, and stable for as long as this failure is
+   * reported. An error state receives it as its `announce` prop, which
+   * {@link queryFailureProps} forwards.
+   */
+  announcement: 'assertive' | 'polite' | undefined;
 
   /**
    * How many items the source holds in total after the query's filter, before
@@ -420,6 +487,15 @@ interface QuerySettlement<Data> {
   /** The failure, on error. */
   readonly error: DebuggenError | undefined;
 
+  /** The failure's announcement politeness, on error; see {@link FailureClaim}. */
+  readonly announcement: FailureAnnouncement | undefined;
+
+  /**
+   * The failure's entry in the active-failure registry, on error — the token
+   * the effects release when this settlement stops being reported.
+   */
+  readonly claim: FailureClaim | undefined;
+
   /** The provider's reported total, when it reported one. */
   readonly total: number | undefined;
 
@@ -474,9 +550,12 @@ function describesCurrentRequest<Data>(
  * outcome AAP 0.5.5 rules out. `INTERNAL` is the code for it: the closed
  * vocabulary of `DebuggenError` has no member for a renderer host that was
  * assembled wrongly, and `INTERNAL` is the documented default when nothing more
- * specific fits. The hint names the fix, and the details name the source that
- * went unanswered — a member of a closed vocabulary, so nothing sensitive
- * travels with it.
+ * specific fits. The details name the source that went unanswered — a member
+ * of a closed vocabulary, so nothing sensitive travels with it — and, as
+ * `remedy`, the fix. The fix is an instruction to whoever assembled the host,
+ * so it is deliberately not the error's `hint`: the hint is the line a panel
+ * user reads first, while the details sit behind the error state's closed
+ * "Technical details" disclosure (B1-F16).
  *
  * @param source - The source of the query that could not be resolved.
  * @returns A fresh error, so its stack points at the render that needed data.
@@ -486,8 +565,11 @@ function missingProviderError(source: DataQuerySource): DebuggenError {
     'INTERNAL',
     `No data provider is available to resolve the "${source}" query this view is built from.`,
     {
-      hint: 'Render this view inside a panel host that provides a DataProvider through DataProviderContext.',
-      details: { source },
+      details: {
+        source,
+        remedy:
+          'Render this view inside a panel host that provides a DataProvider through DataProviderContext.',
+      },
     },
   );
 }
@@ -502,8 +584,10 @@ function missingProviderError(source: DataQuerySource): DebuggenError {
  * session it last served — would draw another capture's evidence under this
  * panel's title. `PanelHost` always provides its specification's `sessionId`,
  * so reaching this means a surface mounted query-backed views on its own and
- * provided only half of the data contract. The details name the source only;
- * the unusable value itself is not echoed.
+ * provided only half of the data contract. The details name the source and,
+ * as `remedy`, the integration fix — kept off the hint line for the reason
+ * {@link missingProviderError} records; the unusable value itself is not
+ * echoed.
  *
  * @param source - The source of the query that could not be addressed.
  * @returns A fresh error, so its stack points at the render that needed data.
@@ -513,10 +597,348 @@ function missingSessionError(source: DataQuerySource): DebuggenError {
     'INTERNAL',
     `No session is available to address the "${source}" query this view is built from.`,
     {
-      hint: "Render this view inside a panel host, which provides its specification's sessionId through PanelSessionContext.",
-      details: { source },
+      details: {
+        source,
+        remedy:
+          "Render this view inside a panel host, which provides its specification's sessionId through PanelSessionContext.",
+      },
     },
   );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Rejections: a faithful code for whatever a provider rejected with
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The own-property brand `@debuggen/shared` puts on every `DebuggenError`,
+ * spelled through the class's own key so a rename fails to compile here.
+ */
+const DEBUGGEN_ERROR_BRAND = '__isDebuggenError__' satisfies keyof DebuggenError;
+
+/**
+ * The `name`s of the standard errors a transport raises when the connection,
+ * rather than the request, failed: a `fetch` or `AbortSignal.timeout` timeout,
+ * a network failure, and an abort this hook did not cause. The hook's own
+ * abort never reaches {@link toQueryError} — its settlement is discarded by the
+ * cancellation guard first — so an `AbortError` arriving here was raised by
+ * something below the provider giving up on the request.
+ */
+const TRANSPORT_ERROR_NAMES: ReadonlySet<string> = new Set([
+  'TimeoutError',
+  'NetworkError',
+  'AbortError',
+]);
+
+/** The lowest HTTP status that reports a failure. */
+const HTTP_FAILURE_STATUS_MIN = 400;
+
+/** The highest HTTP status this mapping recognises. */
+const HTTP_FAILURE_STATUS_MAX = 599;
+
+/** The lowest server-side HTTP failure status. */
+const HTTP_SERVER_FAILURE_STATUS_MIN = 500;
+
+/**
+ * One member of a value of unknown shape, read without letting it throw.
+ *
+ * A rejection can be anything — a proxy, an object with a throwing getter —
+ * and this runs inside a promise callback, where an exception would leave the
+ * node loading forever instead of showing its error state. `Reflect.get` is
+ * used rather than an index expression so no type assertion is needed to read
+ * a member off an `object`.
+ *
+ * @param value - The object to read.
+ * @param name - The member's name.
+ * @returns The member's value, or `undefined` when it is absent or reading it threw.
+ */
+function readMember(value: object, name: string): unknown {
+  try {
+    const member: unknown = Reflect.get(value, name);
+    return member;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Whether a value is an HTTP status in the failure range this mapping knows.
+ *
+ * @param value - A candidate status.
+ * @returns `true` for a whole number from 400 to 599.
+ */
+function isHttpFailureStatus(value: unknown): value is number {
+  return (
+    typeof value === 'number' &&
+    Number.isInteger(value) &&
+    value >= HTTP_FAILURE_STATUS_MIN &&
+    value <= HTTP_FAILURE_STATUS_MAX
+  );
+}
+
+/**
+ * The HTTP failure status a rejection carries, wherever the common client
+ * libraries put it: `status` (the `fetch` `Response` and most wrappers),
+ * `statusCode` (Node's `http` family), or `response.status` (clients that
+ * attach the response to the error they throw).
+ *
+ * @param cause - The rejection, known to be an object.
+ * @returns The status, or `undefined` when none of the three holds one.
+ */
+function httpFailureStatusOf(cause: object): number | undefined {
+  const status = readMember(cause, 'status');
+  if (isHttpFailureStatus(status)) {
+    return status;
+  }
+
+  const statusCode = readMember(cause, 'statusCode');
+  if (isHttpFailureStatus(statusCode)) {
+    return statusCode;
+  }
+
+  const response = readMember(cause, 'response');
+  if (typeof response === 'object' && response !== null) {
+    const responseStatus = readMember(response, 'status');
+    if (isHttpFailureStatus(responseStatus)) {
+      return responseStatus;
+    }
+  }
+
+  return undefined;
+}
+
+/**
+ * The error code an HTTP failure status means, in the closed vocabulary of
+ * `@debuggen/shared`.
+ *
+ * Mirrors how the service itself answers the panel-data route: `401`/`403`
+ * are a credential it refused, `404` a session it does not hold, `409` a
+ * session in a state that cannot answer, `429` a rate limit, `501` a route it
+ * does not implement, and `502`/`503`/`504` a service that could not be
+ * reached through whatever sits in front of it — a transport failure, which
+ * retrying may cure. Any other server status is `INTERNAL`, and any other
+ * client status is a request the far side refused as malformed.
+ *
+ * @param status - An HTTP failure status, 400–599.
+ * @returns The code to report it with.
+ */
+function codeForHttpStatus(status: number): DebuggenErrorCode {
+  switch (status) {
+    case 401:
+    case 403:
+      return 'UNAUTHORIZED';
+    case 404:
+      return 'SESSION_NOT_FOUND';
+    case 409:
+      return 'SESSION_INVALID_STATE';
+    case 429:
+      return 'RATE_LIMITED';
+    case 501:
+      return 'NOT_IMPLEMENTED';
+    case 502:
+    case 503:
+    case 504:
+      return 'TRANSPORT_DISCONNECTED';
+    default:
+      return status >= HTTP_SERVER_FAILURE_STATUS_MIN ? 'INTERNAL' : 'PROTOCOL_INVALID_MESSAGE';
+  }
+}
+
+/**
+ * A rejection's own message, when it has one worth showing.
+ *
+ * @param cause - The rejection, known to be an object.
+ * @returns Its trimmed `message` when that is a non-blank string, else `undefined`.
+ */
+function ownMessageOf(cause: object): string | undefined {
+  const message = readMember(cause, 'message');
+  if (typeof message !== 'string') {
+    return undefined;
+  }
+
+  const trimmed = message.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/**
+ * Normalise whatever a provider rejected with into the `DebuggenError` a node
+ * reports, with the most faithful code the rejection allows.
+ *
+ * `DebuggenError.from` alone wraps every non-`DebuggenError` as `INTERNAL`,
+ * which is how a `503` from a service behind a proxy reached a panel as
+ * "internal error" (B2-F14). So, in order:
+ *
+ * 1. **A `DebuggenError`, or a value carrying its brand** — including one from
+ *    another bundle, or a revived one — goes through `DebuggenError.from`
+ *    unchanged: the provider chose that code, hint and details deliberately.
+ * 2. **An object carrying an HTTP failure status** (see
+ *    {@link httpFailureStatusOf}) becomes a new error with the code that status
+ *    means ({@link codeForHttpStatus}), the rejection's own message when it
+ *    has a non-blank one and a sentence naming the status when it does not,
+ *    `{ status }` as its details, and the rejection as its `cause`.
+ * 3. **An error named `TimeoutError`, `NetworkError` or `AbortError`** becomes
+ *    `TRANSPORT_DISCONNECTED`, keeping its message, with its name in the
+ *    details and itself as the cause.
+ * 4. **Anything else** goes through `DebuggenError.from`, which is `INTERNAL`
+ *    with the value preserved as the cause.
+ *
+ * Total: every read is guarded, and a rejection so hostile that normalising it
+ * throws still produces an `INTERNAL` error rather than an exception inside a
+ * promise callback, where it would leave the node loading forever.
+ *
+ * @param cause - The provider's rejection reason, as caught.
+ * @returns The error to settle the query with.
+ */
+function toQueryError(cause: unknown): DebuggenError {
+  try {
+    if (typeof cause !== 'object' || cause === null) {
+      return DebuggenError.from(cause);
+    }
+
+    if (DebuggenError.is(cause) || readMember(cause, DEBUGGEN_ERROR_BRAND) === true) {
+      return DebuggenError.from(cause);
+    }
+
+    const status = httpFailureStatusOf(cause);
+    if (status !== undefined) {
+      return new DebuggenError(
+        codeForHttpStatus(status),
+        ownMessageOf(cause) ??
+          `The request for this view's data failed with HTTP ${String(status)}.`,
+        { details: { status }, cause },
+      );
+    }
+
+    const name = readMember(cause, 'name');
+    if (typeof name === 'string' && TRANSPORT_ERROR_NAMES.has(name)) {
+      return new DebuggenError(
+        'TRANSPORT_DISCONNECTED',
+        ownMessageOf(cause) ?? `The connection carrying this view's data failed (${name}).`,
+        { details: { name }, cause },
+      );
+    }
+
+    return DebuggenError.from(cause);
+  } catch {
+    return new DebuggenError('INTERNAL', "The request for this view's data failed.", { cause });
+  }
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Announcements: one alert per burst of failures
+ * ---------------------------------------------------------------------------
+ */
+
+/** The two politenesses an error state announces with, read off its own prop. */
+type FailureAnnouncement = NonNullable<ErrorStateProps['announce']>;
+
+/**
+ * How close together two failures must settle to count as one burst, in
+ * milliseconds.
+ *
+ * A panel whose service went away sees every node fail within a few
+ * milliseconds of the first — each node's request was already in flight — so
+ * one second covers the whole burst with a wide margin, while a failure a
+ * reader causes by acting on the panel afterwards (a retry, a new filter)
+ * almost always falls outside it and alerts again.
+ */
+const FAILURE_BURST_WINDOW_MS = 1000;
+
+/**
+ * One failure's place in the active-failure registry: the politeness it was
+ * given and the time it settled.
+ *
+ * The object itself is the registry key, so the claim is its own token: a
+ * settlement carries it, and releasing it needs nothing else.
+ */
+interface FailureClaim {
+  /** The politeness decided for this failure when it settled. */
+  readonly announcement: FailureAnnouncement;
+
+  /** When it settled, on the clock {@link currentTime} reads. */
+  readonly settledAt: number;
+}
+
+/**
+ * The failures currently reported by some mounted `useQuery`, each with the
+ * time it settled.
+ *
+ * Module state, deliberately: the question "did another node just fail?" is
+ * about every node on the page, which no single hook instance can see, and
+ * threading a coordinator through context would make every query-backed
+ * component depend on a provider that exists only to answer it. It is written
+ * only from effects and promise callbacks — never during render — so a render
+ * React discards or repeats cannot change it.
+ */
+const activeFailures = new Map<FailureClaim, number>();
+
+/**
+ * A monotonic millisecond clock: `performance.now()` where the runtime has it,
+ * which every browser and supported Node does, and `Date.now()` otherwise.
+ *
+ * @returns The current time, in milliseconds on one consistent clock.
+ */
+function currentTime(): number {
+  return typeof globalThis.performance === 'object' ? globalThis.performance.now() : Date.now();
+}
+
+/**
+ * Register a failure that has just settled and decide how it is announced.
+ *
+ * Entries older than {@link FAILURE_BURST_WINDOW_MS} are pruned first, so a
+ * failure whose release never ran — a settlement superseded before it was
+ * ever reported, say — can only suppress announcements for one window. Of
+ * what remains, any entry at all means a burst is in progress and this
+ * failure is `"polite"`; an empty registry means it stands alone and is
+ * `"assertive"`.
+ *
+ * @returns The new claim, already registered.
+ */
+function claimFailureAnnouncement(): FailureClaim {
+  const settledAt = currentTime();
+  let burstInProgress = false;
+
+  // Deleting the entry being visited is safe during `Map` iteration.
+  for (const [held, heldAt] of activeFailures) {
+    if (settledAt - heldAt >= FAILURE_BURST_WINDOW_MS) {
+      activeFailures.delete(held);
+    } else {
+      burstInProgress = true;
+    }
+  }
+
+  const claim: FailureClaim = {
+    announcement: burstInProgress ? 'polite' : 'assertive',
+    settledAt,
+  };
+  activeFailures.set(claim, settledAt);
+
+  return claim;
+}
+
+/**
+ * Re-register a claim that is being reported. Idempotent, with the claim's
+ * original settle time, so an effect that is torn down and set up again —
+ * StrictMode's development double mount, or a subtree hidden and shown again
+ * — leaves the registry exactly as it found it.
+ *
+ * @param claim - The claim of the settlement now on screen.
+ */
+function holdFailureClaim(claim: FailureClaim): void {
+  activeFailures.set(claim, claim.settledAt);
+}
+
+/**
+ * Remove a claim from the registry. Idempotent: releasing a claim that was
+ * already released, or pruned, does nothing.
+ *
+ * @param claim - The claim of a settlement that is no longer reported.
+ */
+function releaseFailureClaim(claim: FailureClaim): void {
+  activeFailures.delete(claim);
 }
 
 /*
@@ -558,7 +980,9 @@ function missingSessionError(source: DataQuerySource): DebuggenError {
  *    request it answered, so {@link UseQueryResult.retry} asks the provider the
  *    same query again.
  * 5. Reports the outcome as one of the three states of {@link UseQueryResult},
- *    with the provider's `null` end-of-data marker folded into `undefined`.
+ *    with the provider's `null` end-of-data marker folded into `undefined` and,
+ *    for a failure, the announcement politeness decided when it settled (see
+ *    "One alert per burst" above).
  *
  * ## States
  *
@@ -641,21 +1065,47 @@ export function useQuery<S extends DataQuerySource>(
       return undefined;
     }
 
-    if (provider === undefined) {
+    // The failure this run of the effect reports, if its request fails. Every
+    // error settlement written below is stamped with exactly this effect's
+    // dependencies — provider, session, key, attempt — and is reported only
+    // while it is enabled, so the settlement stops being the reported one at
+    // precisely the moment this effect is cleaned up. The cleanup is therefore
+    // where the claim is released, which also covers a settlement that was
+    // written but superseded before any render reported it.
+    let claim: FailureClaim | undefined;
+
+    const releaseClaim = (): void => {
+      if (claim !== undefined) {
+        releaseFailureClaim(claim);
+        claim = undefined;
+      }
+    };
+
+    // Every failure settles through here, so every one of them — rejection,
+    // refused response, missing provider, missing session — is announced by
+    // the same policy, decided once, at settle time.
+    const settleFailure = (error: DebuggenError, answeredBy: DataProvider | undefined): void => {
+      claim = claimFailureAnnouncement();
       setSettlement({
-        provider: undefined,
+        provider: answeredBy,
         sessionId,
         key,
         attempt,
         status: 'error',
         data: undefined,
-        error: missingProviderError(pending.source),
+        error,
+        announcement: claim.announcement,
+        claim,
         total: undefined,
         limit: undefined,
         offset: undefined,
         nextOffset: undefined,
       });
-      return undefined;
+    };
+
+    if (provider === undefined) {
+      settleFailure(missingProviderError(pending.source), undefined);
+      return releaseClaim;
     }
 
     if (!isAddressableSessionId(sessionId)) {
@@ -664,20 +1114,8 @@ export function useQuery<S extends DataQuerySource>(
       // after a transport hop, and a query must never go out addressed to a
       // session this panel does not name. Stamped with the unusable value that
       // is in context, so providing a real session afterwards supersedes it.
-      setSettlement({
-        provider,
-        sessionId,
-        key,
-        attempt,
-        status: 'error',
-        data: undefined,
-        error: missingSessionError(pending.source),
-        total: undefined,
-        limit: undefined,
-        offset: undefined,
-        nextOffset: undefined,
-      });
-      return undefined;
+      settleFailure(missingSessionError(pending.source), provider);
+      return releaseClaim;
     }
 
     // Flipped by the cleanup below. Every settlement is written through this
@@ -712,19 +1150,7 @@ export function useQuery<S extends DataQuerySource>(
         // query, and a later correct answer supersedes it like any other.
         const problem = checkDataQueryResponse(pending, response);
         if (problem !== undefined) {
-          setSettlement({
-            provider,
-            sessionId,
-            key,
-            attempt,
-            status: 'error',
-            data: undefined,
-            error: problem,
-            total: undefined,
-            limit: undefined,
-            offset: undefined,
-            nextOffset: undefined,
-          });
+          settleFailure(problem, provider);
           return;
         }
 
@@ -742,6 +1168,8 @@ export function useQuery<S extends DataQuerySource>(
           status: 'success',
           data: response.data,
           error: undefined,
+          announcement: undefined,
+          claim: undefined,
           total: response.total,
           limit: response.limit,
           offset: response.offset,
@@ -755,30 +1183,20 @@ export function useQuery<S extends DataQuerySource>(
           return;
         }
 
-        // `from` returns a provider's own `DebuggenError` unchanged — preserving
-        // the code and hint it chose, even across a bundle boundary — and wraps
-        // anything else, so a component always has a typed error to render
-        // (AAP 0.5.5). `data` is cleared with it, so an error state can never be
-        // drawn over rows from an earlier answer.
-        setSettlement({
-          provider,
-          sessionId,
-          key,
-          attempt,
-          status: 'error',
-          data: undefined,
-          error: DebuggenError.from(cause),
-          total: undefined,
-          limit: undefined,
-          offset: undefined,
-          nextOffset: undefined,
-        });
+        // `toQueryError` returns a provider's own `DebuggenError` unchanged —
+        // preserving the code and hint it chose, even across a bundle boundary
+        // — and maps anything else to the most faithful code it allows, so a
+        // component always has a typed error to render (AAP 0.5.5). `data` is
+        // cleared with it, so an error state can never be drawn over rows from
+        // an earlier answer.
+        settleFailure(toQueryError(cause), provider);
       },
     );
 
     return () => {
       cancelled = true;
       controller.abort();
+      releaseClaim();
     };
   }, [provider, sessionId, key, enabled, attempt]);
 
@@ -796,6 +1214,27 @@ export function useQuery<S extends DataQuerySource>(
       ? settlement
       : undefined;
 
+  // The failure on screen, if any, holds its place in the active-failure
+  // registry for exactly as long as it is reported. Set up idempotently with
+  // the claim's own settle time, so an effect torn down and set up again
+  // without its settlement changing — StrictMode's development remount, a
+  // subtree hidden and shown again — re-registers the failure still on screen
+  // rather than leaving it out; torn down, it releases the claim, which the
+  // fetch effect's cleanup also does for the same settlement.
+  const reportedClaim = settled?.claim;
+
+  useEffect(() => {
+    if (reportedClaim === undefined) {
+      return undefined;
+    }
+
+    holdFailureClaim(reportedClaim);
+
+    return () => {
+      releaseFailureClaim(reportedClaim);
+    };
+  }, [reportedClaim]);
+
   // Memoized because twelve components read this inside render and some of them
   // pass it, or its `retry`, into memoized children. Both dependencies are
   // stable: `settled` changes only when the settlement or the request it answers
@@ -805,6 +1244,7 @@ export function useQuery<S extends DataQuerySource>(
       status: settled === undefined ? 'loading' : settled.status,
       data: settled?.data,
       error: settled?.error,
+      announcement: settled?.announcement,
       total: settled?.total,
       limit: settled?.limit,
       offset: settled?.offset,
@@ -813,4 +1253,426 @@ export function useQuery<S extends DataQuerySource>(
     }),
     [settled, retry],
   );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * Failure presentation: the one error-state contract every node spreads
+ *
+ * Pure, module-level functions rather than part of the hook, so a component
+ * can call them only in its error branch, with the query it actually asked,
+ * and so they can be tested without rendering anything.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The title of a node whose own data could not be loaded. */
+export const QUERY_FAILURE_TITLE = 'Could not load this view';
+
+/**
+ * The title of a failed next page, for a view that keeps the rows it already
+ * shows and reports the page below them.
+ */
+export const PAGE_FAILURE_TITLE = 'Could not load the next page';
+
+/** The title of a node whose query names a source its component cannot draw. */
+export const UNSUPPORTED_QUERY_TITLE = 'This view cannot draw the requested data';
+
+/**
+ * What failed: the view's own data (`"view"`, the default), or the next page
+ * of a view that already shows earlier rows (`"page"`).
+ */
+export type QueryFailureScope = 'view' | 'page';
+
+/**
+ * The error-state props {@link queryFailureProps} composes: every member of
+ * `primitives/ErrorState`'s props that describes a failed query, and nothing
+ * else, so spreading it leaves a component free to add only layout.
+ */
+export interface QueryFailureProps {
+  /** The first line, by scope: {@link QUERY_FAILURE_TITLE} or {@link PAGE_FAILURE_TITLE}. */
+  title: string;
+
+  /** The generic lead for the scope, followed by the provider's own cause. */
+  message: string;
+
+  /** What the reader can do, when the error carries a non-blank hint. */
+  hint: string | undefined;
+
+  /** The error's machine code; `INTERNAL` when no error was supplied. */
+  code: string;
+
+  /** The failing query, serialised by {@link formatDataQuery}. */
+  query: string;
+
+  /** The error's details as pretty-printed JSON, when it has any. */
+  details: string | undefined;
+
+  /** The announcement politeness the query settled with. */
+  announce: 'assertive' | 'polite';
+
+  /** The hook's retry, which asks the provider the same query again. */
+  onRetry: () => void;
+}
+
+/** The copy that differs between the two failure scopes. */
+interface FailureScopeCopy {
+  /** The error state's first line. */
+  readonly title: string;
+
+  /** The sentence the message opens with, before the provider's cause. */
+  readonly lead: string;
+}
+
+/**
+ * The title and lead of each scope. A total lookup, so a third scope cannot be
+ * added without its wording.
+ *
+ * The leads say what failed in reader terms and nothing about why — the why is
+ * the provider's cause, appended after the lead — and the page lead also says
+ * what did not fail, because a reader looking at a table with an error beneath
+ * it needs to know whether the rows above are still true.
+ */
+const FAILURE_SCOPE_COPY: Readonly<Record<QueryFailureScope, FailureScopeCopy>> = {
+  view: {
+    title: QUERY_FAILURE_TITLE,
+    lead: 'The data for this view could not be loaded.',
+  },
+  page: {
+    title: PAGE_FAILURE_TITLE,
+    lead: 'The next page of this view could not be loaded. The rows already shown are unaffected.',
+  },
+};
+
+/** The code reported when a caller composes failure props with no error at all. */
+const UNKNOWN_FAILURE_CODE: DebuggenErrorCode = 'INTERNAL';
+
+/** The indentation every serialised block uses: two spaces, as `JSON.stringify` counts it. */
+const JSON_INDENT = 2;
+
+/**
+ * The members of a `DataQuery`, in the order a reader scans them: what is
+ * read, how it is narrowed, how it is ordered, how much of it, from where.
+ */
+const DATA_QUERY_MEMBER_ORDER: readonly string[] = ['source', 'filter', 'sort', 'limit', 'offset'];
+
+/**
+ * A sentence that already ends in terminal punctuation, allowing for a closing
+ * quotation mark or bracket after it.
+ */
+const TERMINAL_PUNCTUATION = /[.!?…]["'”’)\]]*$/u;
+
+/**
+ * Whether a value is a plain, non-array object, narrowing it to a record whose
+ * every member stays `unknown`.
+ *
+ * @param value - Any value.
+ * @returns `true` for a non-null object that is not an array.
+ */
+function isPlainRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * A record's defined members as entries, keys sorted by UTF-16 code unit.
+ *
+ * @param record - The record to read.
+ * @returns `[key, value]` pairs, sorted, with `undefined` members omitted.
+ */
+function sortedDefinedEntries(record: Readonly<Record<string, unknown>>): [string, unknown][] {
+  return Object.keys(record)
+    .sort()
+    .filter((name) => record[name] !== undefined)
+    .map((name): [string, unknown] => [name, record[name]]);
+}
+
+/**
+ * The canonical shape of a query: its members in {@link DATA_QUERY_MEMBER_ORDER}
+ * followed by any other member in key order, the filter's members in key
+ * order, and every `undefined` member omitted.
+ *
+ * Built with `Object.fromEntries`, which defines each member as an own data
+ * property, so a member named like a prototype accessor cannot reach the
+ * result's prototype.
+ *
+ * @param query - The query to reshape.
+ * @returns A fresh object with the same contents, in canonical order.
+ */
+function canonicalQueryShape(query: DataQuery): Readonly<Record<string, unknown>> {
+  const record: Readonly<Record<string, unknown>> = query;
+  const entries: [string, unknown][] = [];
+
+  for (const name of DATA_QUERY_MEMBER_ORDER) {
+    const value = record[name];
+    if (value !== undefined) {
+      entries.push([
+        name,
+        name === 'filter' && isPlainRecord(value)
+          ? Object.fromEntries(sortedDefinedEntries(value))
+          : value,
+      ]);
+    }
+  }
+
+  for (const entry of sortedDefinedEntries(record)) {
+    if (!DATA_QUERY_MEMBER_ORDER.includes(entry[0])) {
+      entries.push(entry);
+    }
+  }
+
+  return Object.fromEntries(entries);
+}
+
+/**
+ * Serialise a query into the one form every error block in this package shows
+ * it in.
+ *
+ * Pretty-printed JSON with a two-space indent, so a reader can check a
+ * request member by member, and canonical, so two nodes that asked for the
+ * same thing print the same text: `source`, `filter`, `sort`, `limit`,
+ * `offset` in that order, then any other member in key order; the filter's
+ * members in key order; `undefined` members omitted, so an explicitly absent
+ * field reads the same as an omitted one; array order preserved, because the
+ * order of a list inside a filter is part of what it asks for.
+ *
+ * Never throws: this runs inside an error branch, where an exception would
+ * replace the failure being reported with a crash. A query that cannot be
+ * serialised — a value no validated query holds, such as a `bigint` or a cycle
+ * — is shown by its source alone.
+ *
+ * @example
+ * ```ts
+ * formatDataQuery({ limit: 50, source: 'spans', filter: { tier: 'server', kind: 'db.query' } });
+ * // {
+ * //   "source": "spans",
+ * //   "filter": {
+ * //     "kind": "db.query",
+ * //     "tier": "server"
+ * //   },
+ * //   "limit": 50
+ * // }
+ * ```
+ *
+ * @param query - The query to serialise.
+ * @returns The query's canonical pretty-printed JSON form.
+ */
+export function formatDataQuery(query: DataQuery): string {
+  try {
+    return JSON.stringify(canonicalQueryShape(query), null, JSON_INDENT);
+  } catch {
+    return formatQuerySource(query);
+  }
+}
+
+/**
+ * The last-resort form of {@link formatDataQuery}: the query's source alone,
+ * in the same JSON layout.
+ *
+ * @param query - The query that could not be serialised in full.
+ * @returns `{ "source": … }`, or `{}` when even the source cannot be read.
+ */
+function formatQuerySource(query: DataQuery): string {
+  try {
+    return JSON.stringify({ source: query.source }, null, JSON_INDENT);
+  } catch {
+    return '{}';
+  }
+}
+
+/**
+ * A sentence ending in terminal punctuation: the text as given when it already
+ * ends in some, and with a full stop appended when it does not.
+ *
+ * @param sentence - A trimmed, non-blank sentence.
+ * @returns The sentence, terminated.
+ */
+function asSentence(sentence: string): string {
+  return TERMINAL_PUNCTUATION.test(sentence) ? sentence : `${sentence}.`;
+}
+
+/**
+ * The message of a failure: the scope's generic lead, then the provider's own
+ * cause as a sentence of its own.
+ *
+ * The lead is what every reader needs and the cause is what makes this failure
+ * this one, so both are kept: the lead alone hides the cause, and the cause
+ * alone reads differently from node to node (B2-F14). A blank cause, or one
+ * identical to the lead, adds nothing and is omitted.
+ *
+ * @param lead - The scope's lead sentence.
+ * @param cause - The error's message, if any.
+ * @returns The composed message.
+ */
+function composeFailureMessage(lead: string, cause: string | undefined): string {
+  const trimmed = cause?.trim() ?? '';
+  if (trimmed === '' || trimmed === lead) {
+    return lead;
+  }
+
+  return `${lead} ${asSentence(trimmed)}`;
+}
+
+/**
+ * A hint worth a line of its own.
+ *
+ * @param hint - The error's hint, if any.
+ * @returns The trimmed hint, or `undefined` when it is absent or blank.
+ */
+function nonBlankHint(hint: string | undefined): string | undefined {
+  const trimmed = hint?.trim() ?? '';
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/**
+ * An error's diagnostic details, serialised for the error state's closed
+ * "Technical details" disclosure.
+ *
+ * Pretty-printed with the same indent as the query block. The details of a
+ * `DebuggenError` are restricted by `@debuggen/shared` to values that are safe
+ * to show, and they arrive already redacted, so nothing is filtered here —
+ * but the serialisation is guarded, because a provider's details can hold a
+ * value `JSON.stringify` refuses, and an error branch must not throw.
+ *
+ * @param details - The error's details, if any.
+ * @returns The JSON text, or `undefined` for absent, empty or unserialisable details.
+ */
+function formatErrorDetails(
+  details: Readonly<Record<string, unknown>> | undefined,
+): string | undefined {
+  if (details === undefined || Object.keys(details).length === 0) {
+    return undefined;
+  }
+
+  try {
+    return JSON.stringify(details, null, JSON_INDENT);
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * Compose the error-state props of a failed query — the one contract every
+ * query-backed node renders its failure with.
+ *
+ * - `title` — {@link QUERY_FAILURE_TITLE}, or {@link PAGE_FAILURE_TITLE} for
+ *   `scope: "page"`;
+ * - `message` — the scope's generic lead ("The data for this view could not be
+ *   loaded.") followed by the error's own message as a sentence of its own,
+ *   omitted when blank or identical to the lead;
+ * - `hint` — the error's hint, when non-blank;
+ * - `code` — the error's code, `INTERNAL` when no error was supplied;
+ * - `query` — the query as {@link formatDataQuery} prints it;
+ * - `details` — the error's details as pretty-printed JSON, when it has any;
+ * - `announce` — the politeness the query settled with (`"assertive"` when the
+ *   result carries none);
+ * - `onRetry` — the hook's retry.
+ *
+ * Pure: it reads its arguments and returns a fresh object, so calling it in
+ * render is free of effects.
+ *
+ * @example
+ * ```tsx
+ * const result = useQuery(query);
+ * if (result.status === 'error') {
+ *   return <ErrorState {...queryFailureProps(result, query)} />;
+ * }
+ * // A failed next page below rows that are still shown:
+ * <ErrorState {...queryFailureProps(pageResult, pageQuery, { scope: 'page' })} />
+ * ```
+ *
+ * @param result - The hook's result, or the three members of it that describe a failure.
+ * @param query - The query that failed, exactly as it was asked.
+ * @param options - `scope`: what failed, `"view"` by default.
+ * @returns The props to spread onto `ErrorState`.
+ */
+export function queryFailureProps(
+  result: Pick<UseQueryResult<unknown>, 'error' | 'announcement' | 'retry'>,
+  query: DataQuery,
+  options?: { readonly scope?: QueryFailureScope | undefined },
+): QueryFailureProps {
+  const { error, announcement, retry } = result;
+  const copy = FAILURE_SCOPE_COPY[options?.scope ?? 'view'];
+
+  return {
+    title: copy.title,
+    message: composeFailureMessage(copy.lead, error?.message),
+    hint: nonBlankHint(error?.hint),
+    code: error?.code ?? UNKNOWN_FAILURE_CODE,
+    query: formatDataQuery(query),
+    details: formatErrorDetails(error?.details),
+    announce: announcement ?? 'assertive',
+    onRetry: retry,
+  };
+}
+
+/**
+ * A list of source names in prose: `"a"`, `"a" or "b"`, `"a", "b" or "c"`.
+ *
+ * @param sources - The names to list; at least one.
+ * @returns The quoted, joined list.
+ */
+function quotedAlternatives(sources: readonly string[]): string {
+  const quoted = sources.map((source) => `"${source}"`);
+  const last = quoted.pop();
+
+  if (last === undefined) {
+    return '';
+  }
+
+  return quoted.length === 0 ? last : `${quoted.join(', ')} or ${last}`;
+}
+
+/**
+ * Compose the error-state props of a node whose query names a source its
+ * component cannot draw.
+ *
+ * A defect in the panel rather than a failed request, so there is no retry
+ * and no announcement override: asking again cannot change the answer, and a
+ * lone structural defect warrants the default alert. The message is worded
+ * from the node catalog — the component's `label` and the `sources` it
+ * reads — so it states exactly what the view can draw next to what it was
+ * asked for, and never drifts from the catalog it describes.
+ *
+ * @example
+ * ```ts
+ * unsupportedQueryProps('renderTable', { source: 'spans' }).message;
+ * // 'The Render table view reads "renders" data, but this panel asks it for "spans".'
+ * ```
+ *
+ * @param nodeType - The node type whose component received the query.
+ * @param query - The query it cannot draw.
+ * @returns The props to spread onto `ErrorState`.
+ */
+export function unsupportedQueryProps(
+  nodeType: PanelNodeType,
+  query: DataQuery,
+): { title: string; message: string; code: 'PANEL_INVALID'; query: string } {
+  return {
+    title: UNSUPPORTED_QUERY_TITLE,
+    message: unsupportedQueryMessage(nodeType, query.source),
+    code: 'PANEL_INVALID',
+    query: formatDataQuery(query),
+  };
+}
+
+/**
+ * The sentence {@link unsupportedQueryProps} states.
+ *
+ * The catalog is consulted with an own-property test first: the type admits
+ * only catalogued node types, but this runs in an error branch that exists
+ * because a document reached a component it did not fit, and a lookup that
+ * threw here would replace the failure with a crash.
+ *
+ * @param nodeType - The node type whose component received the query.
+ * @param requested - The source the query names.
+ * @returns The message.
+ */
+function unsupportedQueryMessage(nodeType: PanelNodeType, requested: DataQuerySource): string {
+  if (!Object.hasOwn(PANEL_NODE_CATALOG, nodeType)) {
+    return `This view reads no catalogued data, but this panel asks it for "${requested}".`;
+  }
+
+  const { label, sources } = catalogEntryFor(nodeType);
+  const readable = sources.length === 0 ? 'no query' : quotedAlternatives(sources);
+
+  return `The ${label} view reads ${readable} data, but this panel asks it for "${requested}".`;
 }

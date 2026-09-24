@@ -60,8 +60,10 @@
  * the token test pins (worst dark text pair 5.09:1, worst light text pair
  * 4.82:1, worst status-as-text 4.86:1, worst span-kind fill 3.21:1 with a
  * margin of only 0.21, worst relationship edge 4.82:1 against the 3:1 non-text
- * bar) were computed against these exact values. Re-picking or rounding one is
- * a product-wide accessibility regression.
+ * bar, worst label ink on a span-kind fill 4.67:1 — the light fetch fill —
+ * and primary text on the selected-row fill 7.99:1) were computed against these
+ * exact values. Re-picking or rounding one is a product-wide accessibility
+ * regression.
  *
  * ## Sizes
  *
@@ -123,6 +125,42 @@ const darkTokens = {
   kindFunction: '#f97316',
   kindDb: '#f472b6',
   kindError: '#ef4444',
+  // Two families the seven AAP 0.6.3 values leave unrepresented, so the
+  // dependency graph's six participant classes can each own a colour and
+  // agree with the span views: server-side work behind a request boundary
+  // (the route handler) and a request the server makes onwards to another
+  // system. Supplementary members of the same scale, under the same 3:1 fill
+  // bar; the seven AAP values above are untouched.
+  /** Server-side work behind a request boundary (a route handler). */
+  kindService: '#22d3ee',
+  /** A request the server makes onwards to another system. */
+  kindExternal: '#a3e635',
+
+  // --- Span-kind label ink --------------------------------------------------
+  // The colour of text drawn *on* a span-kind fill — a flame block's label.
+  // One ink per fill, chosen per theme by contrast so every pair clears the
+  // 4.5:1 text bar: a fill cannot carry text in one fixed colour across the
+  // scale, because the light scale spans fills that need light ink and one
+  // (fetch) that needs dark ink. Aliases, never colours of their own, so an
+  // ink stays in step with the surface or text token it names.
+  /** Alias of the base surface: dark ink on every dark-theme fill. */
+  kindInteractionInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindRenderInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindFetchInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindHttpInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindFunctionInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindDbInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindErrorInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindServiceInk: 'var(--dg-surface-base)',
+  /** Alias of the base surface. */
+  kindExternalInk: 'var(--dg-surface-base)',
 
   // --- Duration severity ----------------------------------------------------
   // Real aliases rather than duplicated colour values: each severity step
@@ -311,6 +349,23 @@ const lightTokens: TokenValues = {
   kindFunction: '#c2410c',
   kindDb: '#be185d',
   kindError: '#dc2626',
+  kindService: '#0e7490',
+  kindExternal: '#4d7c0f',
+
+  // --- Span-kind label ink --------------------------------------------------
+  // White (the base surface) clears 4.5:1 on every light fill but one: on the
+  // fetch fill it measures 3.77:1, so fetch labels take the primary text
+  // colour instead (4.67:1). Every other light fill keeps white, which is the
+  // higher-contrast ink for it.
+  kindInteractionInk: 'var(--dg-surface-base)',
+  kindRenderInk: 'var(--dg-surface-base)',
+  kindFetchInk: 'var(--dg-text-primary)',
+  kindHttpInk: 'var(--dg-surface-base)',
+  kindFunctionInk: 'var(--dg-surface-base)',
+  kindDbInk: 'var(--dg-surface-base)',
+  kindErrorInk: 'var(--dg-surface-base)',
+  kindServiceInk: 'var(--dg-surface-base)',
+  kindExternalInk: 'var(--dg-surface-base)',
 
   // --- Duration severity ----------------------------------------------------
   durationFast: 'var(--dg-text-muted)',
@@ -419,6 +474,19 @@ const highContrastTokens: TokenValues = {
   kindFunction: '#f97316',
   kindDb: '#f472b6',
   kindError: '#ef4444',
+  kindService: '#22d3ee',
+  kindExternal: '#a3e635',
+
+  // --- Span-kind label ink (as dark) ----------------------------------------
+  kindInteractionInk: 'var(--dg-surface-base)',
+  kindRenderInk: 'var(--dg-surface-base)',
+  kindFetchInk: 'var(--dg-surface-base)',
+  kindHttpInk: 'var(--dg-surface-base)',
+  kindFunctionInk: 'var(--dg-surface-base)',
+  kindDbInk: 'var(--dg-surface-base)',
+  kindErrorInk: 'var(--dg-surface-base)',
+  kindServiceInk: 'var(--dg-surface-base)',
+  kindExternalInk: 'var(--dg-surface-base)',
 
   // --- Duration severity (as dark) ------------------------------------------
   durationFast: 'var(--dg-text-muted)',

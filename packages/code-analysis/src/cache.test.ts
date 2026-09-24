@@ -102,6 +102,9 @@ const SECURE_DIR_MODE = 0o700;
 /** The mode a state file must carry. */
 const SECURE_FILE_MODE = 0o600;
 
+/** An ordinary, world-readable directory mode: what a loose cache directory carries. */
+const OVER_PERMISSIVE_DIR_MODE = 0o755;
+
 /** A plausible project root for a key input. Never touched on disk. */
 const PROJECT_ROOT = '/home/dev/workspace/target';
 
@@ -703,15 +706,52 @@ describe('save and load', () => {
     await expect(cache.load(key)).resolves.toBeDefined();
   });
 
-  itPosix('tightens a cache directory that was left over-permissive', async () => {
-    mkdirSync(cacheDir, { recursive: true, mode: 0o755 });
-    expect(modeOf(cacheDir)).toBe(0o755);
+  itPosix(
+    'refuses a cache directory left over-permissive, and leaves its mode and contents alone',
+    async () => {
+      // AAP 0.4.2: every directory of the state tree must already be private,
+      // and the write refuses to proceed otherwise. A cache directory another
+      // account could read is refused as it stands, never tightened, because
+      // the developer is the one who has to judge what it may have exposed.
+      // The mode is set with `chmod` so the fixture does not depend on the
+      // process umask.
+      mkdirSync(cacheDir, { recursive: true });
+      chmodSync(cacheDir, OVER_PERMISSIVE_DIR_MODE);
+      expect(modeOf(cacheDir)).toBe(OVER_PERMISSIVE_DIR_MODE);
 
-    const key = computeIndexCacheKey(makeKeyInput());
-    expect(isOk(await cache.save(key, makeIndex()))).toBe(true);
+      const key = computeIndexCacheKey(makeKeyInput());
+      const result = await cache.save(key, makeIndex());
 
-    expect(modeOf(cacheDir)).toBe(SECURE_DIR_MODE);
-  });
+      // A value, not an exception, and the policy code survives the wrapping,
+      // as it does for a directory reached through a link.
+      expect(isErr(result)).toBe(true);
+      if (!isErr(result)) {
+        throw new Error('Expected an Err.');
+      }
+      expect(result.error.code).toBe('FS_UNSAFE_PATH');
+      expect(result.error.details?.reason).toBe('cache-write-failed');
+      expect(result.error.details?.key).toBe(key);
+      // The hint is the refusal's own, naming the exact `chmod` to run.
+      expect(result.error.hint).toContain(`chmod 700 ${cacheDir}`);
+
+      // The finer diagnosis travels as the cause: which directory, why, and
+      // with what mode.
+      const { cause } = result.error;
+      if (!DebuggenError.is(cause)) {
+        throw new Error('Expected the refusal to carry the policy error as its cause.');
+      }
+      expect(cause.code).toBe('FS_UNSAFE_PATH');
+      expect(cause.details?.reason).toBe('group-or-other-permissions');
+      expect(cause.details?.path).toBe(cacheDir);
+      expect(cause.details?.mode).toBe('755');
+
+      // Refused means untouched: the mode is what the fixture set, and no entry
+      // or temporary file was written into the directory.
+      expect(modeOf(cacheDir)).toBe(OVER_PERMISSIVE_DIR_MODE);
+      expect(readdirSync(cacheDir)).toEqual([]);
+      expect(lines.filter((line) => line.level === 'warn')).toHaveLength(1);
+    },
+  );
 
   it('lets the last writer win for one key', async () => {
     const key = computeIndexCacheKey(makeKeyInput());
@@ -1048,11 +1088,13 @@ describe('load misses', () => {
 describe('save failures', () => {
   itUnprivileged('never fails an index for a state root it cannot write into', async () => {
     // `0500` on the parent rather than on the cache directory itself, and the
-    // distinction is the point: `ensureSecureDir` *repairs* an existing
-    // directory whose mode is too loose or too tight, so a `0500` cache
-    // directory would be tightened to `0700` and the save would succeed. What
-    // cannot be repaired is a parent that refuses the `mkdir`. Traversal is
-    // left in place (`0500`, not `0000`) so the sandbox can still be removed.
+    // distinction is the point: this case is about the `mkdir` that creates
+    // the cache directory being refused by the parent. `ensureSecureDir` never
+    // changes the mode of a directory that already exists — an owner-only
+    // `0500` cache directory would be accepted as it stands and the save would
+    // fail later, at its temporary file, which is a different branch. Traversal
+    // is left in place (`0500`, not `0000`) so the sandbox can still be
+    // removed.
     chmodSync(stateRoot, 0o500);
     try {
       const result = await cache.save(computeIndexCacheKey(makeKeyInput()), makeIndex());

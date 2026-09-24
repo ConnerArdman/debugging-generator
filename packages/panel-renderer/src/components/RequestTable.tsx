@@ -71,6 +71,8 @@
  * and are labelled as such wherever they are visible: the disclosure state of a
  * row, and the "duplicates only" toggle, which can only filter the groups
  * loaded so far because the query contract cannot express "duplicates only".
+ * With no group loaded it is disabled (`disabled` and `aria-disabled`), and a
+ * visible note it names as its description says why.
  *
  * ## Colour and spacing
  *
@@ -90,8 +92,8 @@
  */
 
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight, Copy, Hourglass } from 'lucide-react';
-import { useCallback, useMemo, useState } from 'react';
+import { ChevronDown, ChevronRight, Copy, Hourglass, Globe } from 'lucide-react';
+import { useCallback, useId, useMemo, useState } from 'react';
 import type { ReactElement, ReactNode } from 'react';
 
 import {
@@ -116,11 +118,12 @@ import type {
   TelemetryStatus,
 } from '@debuggen/telemetry';
 
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef } from '../host/PanelActions';
+import { queryFailureProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
-import type { ToolbarAction, ToolbarSelect, ToolbarStatus } from '../layout/Toolbar';
+import type { ToolbarSelect, ToolbarStatus } from '../layout/Toolbar';
 import { Badge } from '../primitives/Badge';
 import type { BadgeTone, BadgeVariant } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
@@ -129,7 +132,7 @@ import { DataTable } from '../primitives/DataTable';
 import type { DataTableColumn, DataTableSort } from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
-import { ErrorState } from '../primitives/ErrorState';
+import { ErrorState, FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
@@ -415,6 +418,48 @@ const COLUMN_SORTS: Readonly<Record<string, DataQuerySort | undefined>> = {
   [COLUMN_KEY_COUNT]: 'count_desc',
 };
 
+/**
+ * The grid track of every column, handed to `DataTable` as each column's
+ * `width`.
+ *
+ * Every track has a non-zero MINIMUM, because the minimum is what the grid
+ * scrolls against: `DataTable` sums the minimums into the grid's floor, so a
+ * panel narrower than their sum scrolls horizontally with every column still
+ * readable instead of squeezing the tracks until one cell paints over the next.
+ * The unsized fallback used to be nine equal `minmax(0, 1fr)` tracks, in which
+ * the grouping chip ran across the Status column and read as "Requ200key".
+ *
+ * Each minimum is sized, in `ch` of the table's own type, for the column's
+ * header — the sortable one with its ordering arrow — and its widest ordinary
+ * value, cell padding included:
+ *
+ *   - `request` holds the disclosure toggle, the method badge, the grouping
+ *     chip and a readable run of about twenty characters of the URL, which
+ *     ellipsizes beyond that with the full value in its tooltip;
+ *   - `status` holds two code badges and a failure count on one line;
+ *   - `count` holds its header and the ordering arrow, the widest header;
+ *   - the three durations hold the widest form a duration formats to below a
+ *     thousand seconds (`999.99 ms`, `123.456 s`), and `transferred` its header;
+ *   - `initiators` holds a readable run of the first caller's chip and the
+ *     overflow badge beside it.
+ *
+ * Spare width is shared by ratio, and mostly to the two columns whose values
+ * are text of unbounded length — the request and its callers — so a wide panel
+ * shows URLs and caller chips in full rather than widening columns of figures.
+ * Ratios and `ch` measures only: they resolve identically in the header row
+ * and in every data row, which keeps each column under its own heading, and
+ * neither is a hardcoded length (AAP 0.6.4).
+ */
+const COLUMN_TRACKS = Object.freeze({
+  request: 'minmax(44ch, 5fr)',
+  status: 'minmax(14ch, 1fr)',
+  count: 'minmax(12ch, 1fr)',
+  duplicates: 'minmax(10ch, 1fr)',
+  duration: 'minmax(11ch, 1fr)',
+  transferred: 'minmax(11ch, 1fr)',
+  initiators: 'minmax(24ch, 3fr)',
+});
+
 /*
  * ---------------------------------------------------------------------------
  * Stable empty values
@@ -449,12 +494,11 @@ const GROUP_NOUN_SINGULAR = 'request group';
 const GROUP_NOUN_PLURAL = 'request groups';
 const FILTERED_EMPTY_MESSAGE = 'None of the groups loaded so far has a duplicate occurrence.';
 const LOADING_LABEL = 'Loading requests…';
-const ERROR_TITLE = 'Requests could not be loaded';
-const ERROR_MESSAGE =
-  'The grouped requests for this panel could not be resolved. The capture is unchanged; retrying resolves the same query again.';
 const DUPLICATES_ONLY_LABEL = 'Duplicates only';
 const DUPLICATES_ONLY_SCOPE_NOTE =
   'The duplicates filter applies to the groups loaded so far, not to the whole capture.';
+const DUPLICATES_UNAVAILABLE_NOTE =
+  'No request groups are loaded, so there are no duplicates to filter.';
 const TRANSFER_UNAVAILABLE_NOTE =
   'No transfer size was exposed for this request, so none is shown rather than a misleading zero.';
 const ERROR_COUNT_LABEL = 'Occurrences that failed:';
@@ -470,16 +514,41 @@ const PENDING_SETTLED_ONLY_NOTE =
 const PENDING_OCCURRENCE_NOTE =
   'This request was still in flight when the capture ended, so no response and no status code were observed. The duration shown is the time elapsed until then, a lower bound on how long it took.';
 const LOAD_MORE_LABEL = 'Load more';
-const LOAD_MORE_BUSY_LABEL = 'Loading…';
+const LOAD_MORE_BUSY_LABEL = 'Loading more…';
 const EXPAND_LABEL = 'Show occurrences';
 const COLLAPSE_LABEL = 'Hide occurrences';
 const NO_OCCURRENCES_NOTE = 'No individual occurrences were returned for this group.';
 const SELECT_OCCURRENCE_LABEL = 'Select the occurrence at';
+const OTHER_INITIATORS_LABEL = 'Also initiated by:';
+const OTHER_INITIATORS_SOURCE_NOTE =
+  'Show the occurrences to open the source location recorded for each.';
 const OCCURRENCES_SHOWN_LABEL = 'Occurrences shown:';
 const GROUPS_LOADED_LABEL = 'Groups loaded:';
 const DUPLICATES_MATCHED_LABEL = 'Matching the duplicates filter:';
 const TOOLBAR_LABEL = 'Request ordering and filters';
-const SORT_CONTROL_LABEL = 'Order';
+/**
+ * The ordering select's name. It says what it orders because a panel can hold
+ * several tables with an ordering control each, and a reader moving between
+ * form controls hears the names alone: three controls all called "Order"
+ * cannot be told apart.
+ */
+const SORT_CONTROL_LABEL = 'Order requests';
+
+/**
+ * The attributes that mark the "load more" control as recognisable again after
+ * a remount.
+ *
+ * The control keeps its own element while the page it asked for is in flight
+ * (see the footer in {@link RequestTable}), so focus normally never leaves it.
+ * The key is the fallback for the one path that does replace it — a failure
+ * that swaps the body for the error state, then a retry that brings the rows
+ * back — so the host's node frame can hand focus to the equivalent control
+ * rather than to `<body>` (B2-F12). Keyed by the error state's exported
+ * attribute name, so both halves of that contract spell it once.
+ */
+const LOAD_MORE_FOCUS_ATTRIBUTES = {
+  [FOCUS_KEY_ATTRIBUTE]: 'request-table-load-more',
+} as const;
 
 /*
  * ---------------------------------------------------------------------------
@@ -632,9 +701,11 @@ function describePending(group: RequestGroup, pendingCount: number): string {
  * A presentational lookup inside a single group, and explicitly **not** a
  * grouping pass: the group's membership, its ordering and its counts were all
  * decided upstream and are untouched here. The label set is already distinct
- * and sorted when it arrives, so nothing de-duplicates it either; this only
- * answers "did any occurrence attributed to this caller resolve to a place in
- * the project?", which is what turns the caller column into a link.
+ * and sorted when it arrives; this only answers "did any occurrence attributed
+ * to this caller resolve to a place in the project?", which is what turns the
+ * caller column into a link. Two distinct LABELS can still resolve to one
+ * location - a symbol name and the path it was declared at - and
+ * {@link distinctInitiators} folds those together for display.
  *
  * Returns `undefined` when no occurrence for that label carried a location —
  * including when the occurrence list was truncated below the one that did — and
@@ -652,6 +723,78 @@ function locationForInitiator(group: RequestGroup, initiator: string): SourceLoc
   }
 
   return undefined;
+}
+
+/**
+ * The group's callers as its row presents them: `initiators` in the order
+ * received, less every caller whose resolved source location is one an earlier
+ * caller already names.
+ *
+ * Two labels for one place in the project - `fetchItemList` and
+ * `src/hooks/useItemList.ts:42:18`, attributed by different occurrences - are
+ * one caller to a reader: showing both counted a second initiator that does not
+ * exist and offered the same location twice. The comparison is the location's
+ * file, line and column, the three coordinates the editor opens; a caller with
+ * no resolved location has nothing to compare and is always kept, since the
+ * labels themselves are already distinct. Display only: the group's membership,
+ * counts and the `initiators` array itself are untouched, and every occurrence
+ * still shows its own caller in the detail row (see
+ * {@link renderOccurrenceInitiator}).
+ *
+ * @param group - The group whose callers are listed.
+ * @returns The callers to show, first one first.
+ */
+function distinctInitiators(group: RequestGroup): readonly string[] {
+  const seenLocations = new Set<string>();
+  const kept: string[] = [];
+
+  for (const initiator of group.initiators) {
+    const location = locationForInitiator(group, initiator);
+
+    if (location !== undefined) {
+      const key = `${location.file}:${String(location.line)}:${String(location.column)}`;
+
+      if (seenLocations.has(key)) {
+        continue;
+      }
+      seenLocations.add(key);
+    }
+    kept.push(initiator);
+  }
+
+  return kept;
+}
+
+/**
+ * Whether a caller label only spells the given location: its file alone,
+ * `file:line`, or the full `file:line:column`.
+ *
+ * A producer that could not name a caller may record where it was instead, and
+ * that label beside the chip for the same location printed one place twice.
+ * The comparison is exact, after trimming surrounding whitespace, against the
+ * location's own coordinates: a label that merely looks like a location — a
+ * different file, line or column — is a different claim about the caller, and
+ * is kept and shown. Display only, and within one occurrence: nothing is
+ * compared across requests.
+ *
+ * @example
+ * // location: src/example/widget.tsx:84:9
+ * labelNamesLocation('src/example/widget.tsx:84:9', location); // true
+ * labelNamesLocation('src/example/elsewhere.ts:1:1', location); // false
+ *
+ * @param label - The caller label the occurrence recorded.
+ * @param location - The location the same occurrence resolved to.
+ * @returns `true` when the label names that location and nothing else.
+ */
+function labelNamesLocation(label: string, location: SourceLocation): boolean {
+  const text = label.trim();
+  const fileAndLine = `${location.file}:${String(location.line)}`;
+
+  return (
+    text === location.file ||
+    text === fileAndLine ||
+    text === `${fileAndLine}:${String(location.column)}`
+  );
 }
 
 /**
@@ -732,6 +875,17 @@ interface EmptyPageCopy {
   readonly title: string;
   readonly message: string;
 }
+
+/**
+ * The copy of the empty capture: the one empty page that says nothing was
+ * captured. A single frozen value, so the component recognises the case by
+ * reference — it is the one empty state that carries the view's glyph and the
+ * one drawn without a toolbar no control of which could reach anything.
+ */
+const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
 
 /** The facts that decide which kind of absence an empty settled page is. */
 interface EmptyPageFacts {
@@ -821,7 +975,7 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
     total === 0 ||
     (total === undefined && offset === DATA_QUERY_DEFAULT_OFFSET && !hasNextPage)
   ) {
-    return { title: EMPTY_TITLE, message: EMPTY_MESSAGE };
+    return NOTHING_CAPTURED_COPY;
   }
 
   const position = formatCount(offset + 1);
@@ -860,24 +1014,38 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
  */
 
 /**
- * The tab index every tooltip-only trigger in this file carries.
+ * The tab index of every focusable element this file renders inside the grid:
+ * the disclosure toggle, the tooltip triggers, the caller and occurrence
+ * source chips and the occurrence selection buttons.
  *
- * A `Tooltip` opens on keyboard focus, and a badge, a text run or an inline
- * code element cannot receive focus by itself — so without this a keyboard
- * reader could never reach the full URL, the complete status list, the failure
- * and duplicate explanations, the grouping note, the unavailable-size reason or
- * what "Pending" means (AAP 0.6.2). The stop is a plain tab stop and nothing
- * more: no `role="button"` and no click handler, because nothing happens on
- * activation, and no `aria-label`, because the visible text is the name and the
- * tooltip merges its bubble into the trigger's `aria-describedby`. The focus
+ * The grid is ONE Tab stop — its active row — and `DataTable`'s own keys reach
+ * everything inside a row from there (see `../primitives/DataTable`): Arrow
+ * Right from the row opens a collapsed group and then moves onto its first
+ * control, Arrow Right/Left move across the row's controls and on into its open
+ * occurrence list, Arrow Left from the first control and Escape return to the
+ * row, and Arrow Up/Down leave for the neighbouring row. A control left at `0`
+ * would add a Tab stop per control per rendered row, which is the tab sequence
+ * the grid pattern exists to prevent. `-1` keeps each element focusable — by
+ * those keys and by pointer — while taking it out of the Tab order. It is the
+ * same in every row, whichever row the reader is on: the grid's roving row is
+ * the only thing that moves.
+ *
+ * The tooltip triggers need focusability at all because a `Tooltip` opens on
+ * focus, and a badge, a text run or an inline code element cannot receive focus
+ * by itself: without it a keyboard reader could never reach the full URL, the
+ * complete status list, the failure and duplicate explanations, the grouping
+ * note, the unavailable-size reason, what "Pending" means, the full label of a
+ * caller without a location or the callers a row counts rather than shows
+ * (AAP 0.6.2). Such a trigger is focusable and nothing more: no `role="button"`
+ * and no click handler, because nothing happens on activation, and no
+ * `aria-label`, because the visible text is the name and the tooltip merges its
+ * bubble into the trigger's `aria-describedby`. The first Escape on an open
+ * trigger closes the bubble and the second returns to the row. The focus
  * indicator is the global `:focus-visible` ring from `../styles/base.css`.
  *
- * These stops sit inside `DataTable` rows. The grid's roving focus reads the row
- * index off the focused element itself, so focus on a descendant is never taken
- * for a row, arrow keys pressed there are not consumed, and Escape reaches the
- * tooltip first.
+ * Typed as the literal `-1`, which is what `SourceLink`'s `tabIndex` accepts.
  */
-const TOOLTIP_TRIGGER_TAB_INDEX = 0;
+const GRID_CONTROL_TAB_INDEX = -1;
 
 /**
  * The Pending badge, shared by the group row and the occurrence row so the two
@@ -901,7 +1069,7 @@ function renderPendingBadge(label: string, note: string): ReactNode {
         variant={PENDING_VARIANT}
         className="dg-request-table__status"
         icon={<Hourglass className="dg-icon" />}
-        tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+        tabIndex={GRID_CONTROL_TAB_INDEX}
       >
         {label}
       </Badge>
@@ -974,7 +1142,7 @@ function renderStatusCell(group: RequestGroup): ReactNode {
             tone="neutral"
             variant="soft"
             className="dg-request-table__status"
-            tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+            tabIndex={GRID_CONTROL_TAB_INDEX}
           >
             {`+${formatCount(overflow)}`}
           </Badge>
@@ -992,7 +1160,7 @@ function renderStatusCell(group: RequestGroup): ReactNode {
             group.count,
           )}.`}
         >
-          <Badge tone="danger" variant="soft" tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}>
+          <Badge tone="danger" variant="soft" tabIndex={GRID_CONTROL_TAB_INDEX}>
             {formatCount(group.errorCount)}
           </Badge>
         </Tooltip>
@@ -1027,7 +1195,7 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
             variant="outline"
             className="dg-request-table__duplicate-badge"
             icon={<Copy className="dg-icon" />}
-            tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+            tabIndex={GRID_CONTROL_TAB_INDEX}
           >
             {formatCount(group.duplicateCount)}
           </Badge>
@@ -1055,7 +1223,7 @@ function renderDuplicatesCell(group: RequestGroup): ReactNode {
 function renderTransferredCell(group: RequestGroup): ReactNode {
   return group.transferredBytes === undefined ? (
     <Tooltip content={TRANSFER_UNAVAILABLE_NOTE}>
-      <Text size="sm" tone="muted" tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}>
+      <Text size="sm" tone="muted" tabIndex={GRID_CONTROL_TAB_INDEX}>
         {NOT_AVAILABLE_LABEL}
       </Text>
     </Tooltip>
@@ -1067,48 +1235,163 @@ function renderTransferredCell(group: RequestGroup): ReactNode {
 }
 
 /**
- * The initiators cell: every distinct caller the group recorded, linked to
- * source wherever one of that caller's occurrences resolved to a location.
+ * A caller's label as plain, non-interactive text immediately followed by the
+ * source chip its occurrence resolved to, as ONE slot element.
+ *
+ * One element because both places that show it count their slots: the
+ * initiators cell holds exactly its first caller and the count badge, and an
+ * occurrence row exactly four slots (see {@link renderOccurrence}). The slot is
+ * a plain `Stack` that never wraps, which lets its row shrink with the column
+ * instead of breaking onto a second line: the label composes the shared
+ * single-line utility — a recorded caller string can be as long as a full path,
+ * and without it the label would refuse to shrink below its text — and the
+ * chip keeps the column's slot class, which lets it shrink and truncate its own
+ * path run. The clip is visual only; the whole label stays in the
+ * accessibility tree.
+ *
+ * The label is no control and carries no tab index, so it cannot be mistaken
+ * for the link beside it, and it is never the chip's caption (see
+ * {@link renderInitiatorSlot}).
+ *
+ * @param label - The caller label, already reduced to one line.
+ * @param chip - The source chip for the caller's location.
+ * @returns The slot.
+ */
+function renderCallerBesideChip(label: string, chip: ReactNode): ReactNode {
+  return (
+    <Stack direction="horizontal" gap={1} align="center">
+      <Code size="sm" className="dg-truncate">
+        {label}
+      </Code>
+      {chip}
+    </Stack>
+  );
+}
+
+/**
+ * One caller of a group, as the group row shows it: ONE slot, so the initiators
+ * cell holds exactly this slot and, when the group has further callers, the
+ * badge counting them.
+ *
+ * ## The chip names the place it opens, never the caller's label
+ *
+ * An initiator label is whatever the producer recorded in the request's
+ * `initiator` attribute: a component name, a function name, or any other
+ * string, including one shaped like a path to somewhere else entirely. Used as
+ * the chip's caption it would make the chip say one thing and open another —
+ * a label-in-name failure (WCAG 2.5.3) and, for a label that looks like a
+ * location, a chip that misdirects. So the two are kept apart:
+ *
+ *   - A caller with a location → its label as plain, non-interactive monospace
+ *     text, immediately followed by the source chip in the same slot
+ *     ({@link renderCallerBesideChip}). The chip takes NO `label`: its caption
+ *     is derived by `SourceLink` from the resolved location itself — the
+ *     symbol, then the compacted `file:line` — and its accessible name is that
+ *     caption followed by the full `file:line:column` it opens
+ *     (`sourceLinkAccessibleName`). The location is handed to the chip exactly
+ *     as the occurrence carried it — the same object, unmodified — because it
+ *     is what the click-to-source chain forwards (AAP 0.4.2).
+ *   - A caller without one → its label as a tooltip trigger disclosing the
+ *     caller's full text. The cell truncates it with CSS, which no string
+ *     comparison can detect, so the tooltip is always attached rather than
+ *     only when the text was shortened here.
+ *
+ * The chip and the trigger are `tabIndex={-1}`: the grid's arrow keys reach
+ * them (see {@link GRID_CONTROL_TAB_INDEX}).
+ *
+ * @param group - The group the caller belongs to, searched for its location.
+ * @param initiator - One entry of that group's `initiators`.
+ * @returns The caller's slot.
+ */
+function renderInitiatorSlot(group: RequestGroup, initiator: string): ReactNode {
+  const location = locationForInitiator(group, initiator);
+  const label = oneLinePreview(initiator);
+
+  if (location === undefined) {
+    return (
+      <Tooltip content={initiator}>
+        <Code size="sm" className="dg-truncate" tabIndex={GRID_CONTROL_TAB_INDEX}>
+          {label}
+        </Code>
+      </Tooltip>
+    );
+  }
+
+  return renderCallerBesideChip(
+    label,
+    <SourceLink
+      location={location}
+      showSymbol
+      className="dg-request-table__initiator"
+      tabIndex={GRID_CONTROL_TAB_INDEX}
+    />,
+  );
+}
+
+/**
+ * Describe the callers a group row does not show, for the overflow badge's
+ * tooltip.
+ *
+ * Names them in the order received and, when any of them resolved to a
+ * location, says where that location can be opened: a tooltip holds text only,
+ * and each of those callers is a source chip in the occurrence list.
+ *
+ * @param group - The group whose callers are described.
+ * @param others - The callers after the first, as received.
+ * @returns One or two sentences, safe to show as plain text.
+ */
+function describeOtherInitiators(group: RequestGroup, others: readonly string[]): string {
+  const sentences = [
+    `${OTHER_INITIATORS_LABEL} ${others.map((initiator) => oneLinePreview(initiator)).join(', ')}.`,
+  ];
+
+  if (others.some((initiator) => locationForInitiator(group, initiator) !== undefined)) {
+    sentences.push(OTHER_INITIATORS_SOURCE_NOTE);
+  }
+
+  return sentences.join(' ');
+}
+
+/**
+ * The initiators cell: the first distinct caller the group recorded, and a
+ * count of the others with their names in its tooltip.
  *
  * This is the column that makes the third demonstrated question legible — a
  * duplicate group with *two* callers is a different finding from one caller
- * firing twice — so the labels are never collapsed to the first entry, and a
- * label that has a location is always a link.
+ * firing twice — so the number of callers is always visible: the first as its
+ * slot ({@link renderInitiatorSlot}), and every further one counted by the `+N`
+ * badge beside it. One line per row, never wrapped, so every row keeps the same
+ * height and the first caller keeps a readable width; the full list is the
+ * badge's description, and every caller with a location is a source chip in
+ * the occurrence list.
+ *
+ * The cell's stack therefore holds exactly one item, or two when the badge is
+ * drawn. The badge is a tooltip trigger, `tabIndex={-1}` like every control in
+ * the grid (see {@link GRID_CONTROL_TAB_INDEX}). Callers that resolve to a
+ * location an earlier caller already names are folded into it first
+ * ({@link distinctInitiators}), so no location is shown or counted twice.
  *
  * @param group - The group whose callers are shown.
  * @returns The cell's content.
  */
 function renderInitiatorsCell(group: RequestGroup): ReactNode {
+  const [first, ...others] = distinctInitiators(group);
+
   return (
-    <Stack
-      direction="horizontal"
-      gap={1}
-      align="center"
-      wrap
-      className="dg-request-table__initiators"
-    >
-      {group.initiators.length === 0 ? (
+    <Stack direction="horizontal" gap={1} align="center" className="dg-request-table__initiators">
+      {first === undefined ? (
         <Text size="sm" tone="muted">
           {NOT_AVAILABLE_LABEL}
         </Text>
       ) : (
-        group.initiators.map((initiator) => {
-          const location = locationForInitiator(group, initiator);
-          const label = oneLinePreview(initiator);
-
-          return location === undefined ? (
-            <Code key={initiator} size="sm" className="dg-request-table__initiator">
-              {label}
-            </Code>
-          ) : (
-            <SourceLink
-              key={initiator}
-              location={location}
-              label={label}
-              className="dg-request-table__initiator"
-            />
-          );
-        })
+        renderInitiatorSlot(group, first)
+      )}
+      {others.length === 0 ? null : (
+        <Tooltip content={describeOtherInitiators(group, others)}>
+          <Badge tone="neutral" variant="soft" tabIndex={GRID_CONTROL_TAB_INDEX}>
+            {`+${formatCount(others.length)}`}
+          </Badge>
+        </Tooltip>
       )}
     </Stack>
   );
@@ -1127,6 +1410,12 @@ function renderInitiatorsCell(group: RequestGroup): ReactNode {
  * When no host is available to receive a selection the time renders as text
  * rather than as a control that would do nothing.
  *
+ * The occurrence that is the panel's selected event — reported from this row or
+ * from any other view that draws the same event — carries the design system's
+ * one selected-state class, `dg-is-selected`, on the whole line, and its select
+ * control reports `aria-pressed="true"`, so the mark is an attribute as well as
+ * a colour (AAP 0.6.4). Every other select control reports `false`.
+ *
  * The status slot has three forms. An occurrence the producer flagged as
  * pending shows the Pending badge — the flag is the producer's explicit
  * statement that no response had arrived, so it wins over every other field —
@@ -1135,15 +1424,25 @@ function renderInitiatorsCell(group: RequestGroup): ReactNode {
  * without a code keeps its span status (`Unreported`, `OK` or `Error`), which is
  * never presented as pending.
  *
+ * The row renders EXACTLY FOUR slots, always in this order — the offset, the
+ * duration, the status and the initiator — because the occurrence list is one
+ * grid of four columns that every occurrence adopts as a subgrid (see
+ * `.dg-request-table__occurrences` in `../styles/components.css`). A slot that
+ * was simply left out, as a missing initiator once was, shifted every later
+ * slot one column to the left and made the list ragged. The initiator slot is
+ * therefore always filled, by {@link renderOccurrenceInitiator}.
+ *
  * @param group - The group the occurrence belongs to, for its time origin.
  * @param occurrence - The occurrence to render.
  * @param onSelect - Selection handler, or `undefined` for the inert form.
+ * @param selected - Whether this occurrence is the panel's selected event.
  * @returns One occurrence row.
  */
 function renderOccurrence(
   group: RequestGroup,
   occurrence: RequestOccurrence,
   onSelect: ((occurrence: RequestOccurrence) => void) | undefined,
+  selected: boolean,
 ): ReactNode {
   const offsetText = formatOffset(occurrence.startTime, group.firstStartTime);
   const statusClass =
@@ -1171,14 +1470,16 @@ function renderOccurrence(
     );
   }
 
+  // `gap` is the occurrence grid's own column gap, so the subgrid's gutters are
+  // the parent's and no slot is offset by a difference between the two. No
+  // `wrap`: the slots are columns of a grid, not a line that may break.
   return (
     <Stack
       key={occurrence.id}
       direction="horizontal"
-      gap={2}
+      gap={3}
       align="center"
-      wrap
-      className="dg-request-table__occurrence-row"
+      className={clsx('dg-request-table__occurrence-row', selected && 'dg-is-selected')}
     >
       {onSelect === undefined ? (
         <Code size="sm" numeric>
@@ -1189,6 +1490,8 @@ function renderOccurrence(
           variant="ghost"
           size="sm"
           aria-label={`${SELECT_OCCURRENCE_LABEL} ${offsetText}`}
+          tabIndex={GRID_CONTROL_TAB_INDEX}
+          aria-pressed={selected}
           onClick={() => {
             onSelect(occurrence);
           }}
@@ -1198,13 +1501,68 @@ function renderOccurrence(
       )}
       <DurationCell ms={occurrence.durationMs} severity="auto" size="sm" />
       {statusBadge}
-      {occurrence.initiator === undefined ? null : (
-        <Code size="sm">{oneLinePreview(occurrence.initiator)}</Code>
-      )}
-      {occurrence.source === undefined ? null : (
-        <SourceLink location={occurrence.source} compact className="dg-request-table__initiator" />
-      )}
+      {renderOccurrenceInitiator(occurrence)}
     </Stack>
+  );
+}
+
+/**
+ * The initiator slot of one occurrence: ONE element that says who issued it
+ * and, when the capture resolved it, where.
+ *
+ *   - A source location → the compact source chip. Like the group row's chip
+ *     it takes NO `label`: its caption is the location's own compact
+ *     `file:line`, and its accessible name and tooltip name the location in
+ *     full, so what the chip says is where it goes (WCAG 2.5.3). A caller
+ *     label the occurrence also carries is shown before the chip, as plain
+ *     text in the same slot ({@link renderCallerBesideChip}) — unless that
+ *     label only spells the chip's own location ({@link labelNamesLocation}),
+ *     which the chip already shows, so no occurrence prints its location
+ *     twice. A label naming a DIFFERENT place is always shown, and always as
+ *     text beside the chip rather than as its caption, so it cannot pass for
+ *     the link. The location object is handed to the chip by reference and
+ *     unmodified, because it is what the click-to-source chain forwards.
+ *   - A label and no location → the label as code, truncated to its column.
+ *   - Neither → the unavailable label, muted, so the slot is never empty.
+ *
+ * Whatever the shape, the slot is ONE element: a label and a chip rendered as
+ * two siblings would give the row a fifth slot and push it out of the
+ * occurrence list's four columns (see {@link renderOccurrence}). The chip is
+ * `tabIndex={-1}` (see {@link GRID_CONTROL_TAB_INDEX}).
+ *
+ * @param occurrence - The occurrence whose initiator is shown.
+ * @returns The slot's single element.
+ */
+function renderOccurrenceInitiator(occurrence: RequestOccurrence): ReactNode {
+  const { initiator, source } = occurrence;
+
+  if (source !== undefined) {
+    const chip = (
+      <SourceLink
+        location={source}
+        compact
+        className="dg-request-table__initiator"
+        tabIndex={GRID_CONTROL_TAB_INDEX}
+      />
+    );
+
+    return initiator === undefined || labelNamesLocation(initiator, source)
+      ? chip
+      : renderCallerBesideChip(oneLinePreview(initiator), chip);
+  }
+
+  if (initiator !== undefined) {
+    return (
+      <Code size="sm" className="dg-truncate">
+        {oneLinePreview(initiator)}
+      </Code>
+    );
+  }
+
+  return (
+    <Text size="xs" tone="muted">
+      {NOT_AVAILABLE_LABEL}
+    </Text>
   );
 }
 
@@ -1218,8 +1576,8 @@ function renderOccurrence(
  * Everything this view owns, held as one value so the page it renders, the
  * offset it asked for and the rows it carried forward can never disagree.
  *
- * Four of the five members change what is requested or what is shown, and the
- * fifth — `identity` — is what makes a stale set detectable: a node whose query
+ * Five of the six members change what is requested or what is shown, and the
+ * sixth — `identity` — is what makes a stale set detectable: a node whose query
  * changed under the same node id gets a fresh view rather than an offset into a
  * result that no longer exists.
  */
@@ -1243,6 +1601,16 @@ interface RequestTableView {
    * consistent, so page *n + 1* continues page *n*.
    */
   readonly carried: readonly RequestGroup[];
+
+  /**
+   * The total the service reported for the result the carried pages belong
+   * to, or `undefined` when nothing is carried or no total was reported.
+   *
+   * Recorded when "load more" carries the pages forward, so that while the next
+   * page is in flight the footer keeps stating the same coverage ("2 of 7")
+   * instead of dropping the total the hook cannot report until it settles.
+   */
+  readonly carriedTotal: number | undefined;
 
   /** The ids of the expanded groups. */
   readonly expanded: readonly string[];
@@ -1290,6 +1658,7 @@ function initialView(node: RequestTableNode, identity: string): RequestTableView
     sort: node.query.sort ?? DEFAULT_SORT,
     offset: node.query.offset ?? DATA_QUERY_DEFAULT_OFFSET,
     carried: EMPTY_GROUPS,
+    carriedTotal: undefined,
     expanded: EMPTY_IDS,
     duplicatesOnly: false,
   };
@@ -1333,10 +1702,10 @@ export interface RequestTableProps {
  * it is — a count-only query, a page past the end or inside a positive total, or
  * a capture that really held nothing — and keeps "load more" reachable when the
  * service reported a forward next page (see {@link describeEmptyPage}). A later
- * page that is still resolving keeps the groups already received on screen and
- * disables the paging control, which is neither a stale page nor an invented
- * one — those rows were received, and the footer says how many of the source
- * they cover.
+ * page that is still resolving keeps the groups already received on screen —
+ * neither a stale page nor an invented one: those rows were received, and the
+ * footer says how many of the source they cover — and keeps the paging control
+ * in place, busy and inert, so the focus the reader pressed it with stays on it.
  *
  * @param props - See {@link RequestTableProps}.
  * @returns The node's rendering.
@@ -1346,11 +1715,19 @@ export function RequestTable(props: RequestTableProps): ReactElement {
 
   const actions = usePanelActions();
 
+  // The event the panel has selected — the host's shared selection, or this
+  // view's own last one when no host is mounted. An occurrence is the only item
+  // here that can stand for it, so it is the only item marked.
+  const { selection, markSelected } = useViewSelection();
+
   // Hoisted out of the callbacks below so their dependency lists name the one
   // member each of them uses, rather than the whole host object.
   const selectEvent = actions?.onSelectEvent;
   const reportExpand = actions?.onExpand;
   const reportFilter = actions?.onFilterChange;
+
+  // The id of the note that explains an unavailable duplicates filter.
+  const duplicatesNoteId = useId();
 
   const identity = useMemo(() => viewIdentityOf(node), [node]);
   const [view, setView] = useState<RequestTableView>(() => initialView(node, identity));
@@ -1381,13 +1758,24 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     offset: active.offset,
   };
 
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   // The only offset "load more" may ever request: the service's own next
   // offset, and only when it moves forward from the page it answered. A
   // count-only query and a non-advancing echo both leave it `undefined`, so no
   // paging control is offered that could only re-request the same page.
   const forwardNextOffset = forwardNextOffsetOf(status, limit, active.offset, nextOffset);
+
+  // A page that "load more" asked for is in flight behind groups already on
+  // screen: groups were carried into this request, and it has not settled. The
+  // paging control stays mounted for exactly this window (see the footer).
+  const loadingMore = status === 'loading' && active.carried.length > 0;
+
+  // A page that "load more" asked for failed behind groups already on screen.
+  // Those groups stay drawn and the failure is reported for the page alone, as
+  // every other paged view reports it; its retry re-requests that page, and
+  // the carried groups are still in front of it when it lands.
+  const nextPageFailed = status === 'error' && active.carried.length > 0;
 
   const page = data ?? EMPTY_GROUPS;
 
@@ -1418,6 +1806,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         sort,
         offset: baseOffset,
         carried: EMPTY_GROUPS,
+        carriedTotal: undefined,
         expanded: EMPTY_IDS,
       }));
       reportFilter?.(node.id, { sort, duplicatesOnly: String(active.duplicatesOnly) });
@@ -1462,13 +1851,16 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   const handleLoadMore = useCallback((): void => {
     // Only the forward offset the service reported is ever requested, exactly
     // as reported; an offset derived from the number of rows on screen would
-    // drift the moment a limit was clamped (AAP 0.4.2).
-    if (forwardNextOffset === undefined) {
+    // drift the moment a limit was clamped (AAP 0.4.2). While the page it asked
+    // for is in flight the control is still pressable — it stays enabled so it
+    // keeps focus — and a press then asks for nothing, so no page is requested
+    // twice.
+    if (loadingMore || forwardNextOffset === undefined) {
       return;
     }
 
-    setView({ ...active, carried: loaded, offset: forwardNextOffset });
-  }, [active, forwardNextOffset, loaded]);
+    setView({ ...active, carried: loaded, carriedTotal: total, offset: forwardNextOffset });
+  }, [active, forwardNextOffset, loaded, loadingMore, total]);
 
   const handleRowToggle = useCallback(
     (group: RequestGroup): void => {
@@ -1490,13 +1882,18 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     (occurrence: RequestOccurrence): void => {
       // An occurrence is one captured event, so it can name one. The aggregate
       // row above it is not, and never fabricates a coordinate to stand in.
-      selectEvent?.({
+      const ref: PanelEventRef = {
         eventId: occurrence.eventId,
         spanId: occurrence.spanId,
         traceId: occurrence.traceId,
-      });
+      };
+
+      // Recorded here only when no host is mounted (a no-op under one, whose
+      // own record of the report below is what every view then marks).
+      markSelected(ref);
+      selectEvent?.(ref);
     },
-    [selectEvent],
+    [markSelected, selectEvent],
   );
 
   const columns = useMemo<readonly DataTableColumn<RequestGroup>[]>(
@@ -1507,17 +1904,19 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         // The identity column: a reader hears the row named by its method and
         // path as they move across it.
         rowHeader: true,
-        cell: (group) => {
-          const expanded = active.expanded.includes(group.id);
+        width: COLUMN_TRACKS.request,
+        // The expanded state is the grid's to report and the toggle's to carry:
+        // `aria-expanded` is not valid on a `grid` row, so the row states
+        // nothing and the disclosure button below exposes `meta.expanded`, with
+        // `aria-controls` naming the detail row while — and only while — the
+        // grid has it in the document (see `DataTableCellMeta`).
+        cell: (group, _rowIndex, meta) => {
+          const { expanded, detailRowId } = meta;
           // Display only. The URL arrives redacted — query values replaced per
           // key, path retained — and is shown as it arrived, shortened for the
           // row with the full redacted value in the tooltip. Nothing here
           // parses, rewrites or reconstructs it.
           const displayUrl = oneLinePreview(group.url);
-          // The URL is a tooltip trigger only when the row shortened it; a URL
-          // shown in full has nothing more to disclose, so it stays out of the
-          // tab order rather than adding a stop that opens nothing.
-          const urlAbbreviated = displayUrl !== group.url;
 
           return (
             <Stack
@@ -1542,6 +1941,9 @@ export function RequestTable(props: RequestTableProps): ReactElement {
                   )
                 }
                 aria-label={`${expanded ? COLLAPSE_LABEL : EXPAND_LABEL}: ${group.method} ${group.path}`}
+                aria-expanded={expanded}
+                aria-controls={detailRowId}
+                tabIndex={GRID_CONTROL_TAB_INDEX}
                 onClick={() => {
                   handleRowToggle(group);
                 }}
@@ -1549,11 +1951,14 @@ export function RequestTable(props: RequestTableProps): ReactElement {
               <Badge tone="neutral" variant="outline" className="dg-request-table__method">
                 {group.method}
               </Badge>
-              <Tooltip content={group.url} disabled={!urlAbbreviated}>
-                <Code
-                  className="dg-request-table__url"
-                  tabIndex={urlAbbreviated ? TOOLTIP_TRIGGER_TAB_INDEX : undefined}
-                >
+              {/* Always a tooltip trigger. The column ellipsizes the URL with
+                  CSS at whatever width the panel gives it, which no comparison
+                  of strings can detect, so the full redacted value is always
+                  one hover or one focus away. Focusable in every row but out
+                  of the Tab order (see `GRID_CONTROL_TAB_INDEX`): the grid's
+                  arrow keys reach it, and the body gains no stop per URL. */}
+              <Tooltip content={group.url}>
+                <Code className="dg-request-table__url" tabIndex={GRID_CONTROL_TAB_INDEX}>
                   {displayUrl}
                 </Code>
               </Tooltip>
@@ -1561,7 +1966,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
                 <Badge
                   tone={GROUPING_TONES[group.groupedBy]}
                   variant="soft"
-                  tabIndex={TOOLTIP_TRIGGER_TAB_INDEX}
+                  tabIndex={GRID_CONTROL_TAB_INDEX}
                 >
                   {humanizeLabel(group.groupedBy)}
                 </Badge>
@@ -1573,12 +1978,14 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       {
         key: COLUMN_KEY_STATUS,
         header: 'Status',
+        width: COLUMN_TRACKS.status,
         cell: (group) => renderStatusCell(group),
       },
       {
         key: COLUMN_KEY_COUNT,
         header: 'Occurrences',
         align: 'end',
+        width: COLUMN_TRACKS.count,
         // The one column whose ordering the contract can express.
         sortable: true,
         defaultSortDirection: 'desc',
@@ -1592,39 +1999,45 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         key: COLUMN_KEY_DUPLICATES,
         header: 'Duplicates',
         align: 'end',
+        width: COLUMN_TRACKS.duplicates,
         cell: (group) => renderDuplicatesCell(group),
       },
       {
         key: COLUMN_KEY_AVERAGE,
         header: 'Average',
         align: 'end',
+        width: COLUMN_TRACKS.duration,
         cell: (group) => <DurationCell ms={group.averageDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_SLOWEST,
         header: 'Slowest',
         align: 'end',
+        width: COLUMN_TRACKS.duration,
         cell: (group) => <DurationCell ms={group.maxDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_TOTAL,
         header: 'Total',
         align: 'end',
+        width: COLUMN_TRACKS.duration,
         cell: (group) => <DurationCell ms={group.totalDurationMs} severity="auto" size="sm" />,
       },
       {
         key: COLUMN_KEY_TRANSFERRED,
         header: 'Transferred',
         align: 'end',
+        width: COLUMN_TRACKS.transferred,
         cell: (group) => renderTransferredCell(group),
       },
       {
         key: COLUMN_KEY_INITIATORS,
         header: 'Initiated by',
+        width: COLUMN_TRACKS.initiators,
         cell: (group) => renderInitiatorsCell(group),
       },
     ],
-    [active.expanded, handleRowToggle],
+    [handleRowToggle],
   );
 
   const renderExpandedRow = useCallback(
@@ -1647,12 +2060,15 @@ export function RequestTable(props: RequestTableProps): ReactElement {
               group,
               occurrence,
               selectEvent === undefined ? undefined : handleOccurrenceSelect,
+              // The occurrence carries its own id, trace and span, so it is
+              // matched as it is, with no pointer built per row.
+              matchesPanelSelection(selection, occurrence),
             ),
           )
         )}
       </Stack>
     ),
-    [handleOccurrenceSelect, selectEvent],
+    [handleOccurrenceSelect, selectEvent, selection],
   );
 
   const selects = useMemo<readonly ToolbarSelect[]>(
@@ -1669,19 +2085,38 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     [active.sort, handleSortSelect, node.id],
   );
 
-  const toolbarActions = useMemo<readonly ToolbarAction[]>(
-    () => [
-      {
-        id: `${node.id}:duplicates-only`,
-        label: DUPLICATES_ONLY_LABEL,
-        onSelect: handleDuplicatesToggle,
-        icon: <Copy className="dg-icon" />,
-        variant: 'ghost',
-        pressed: active.duplicatesOnly,
-        disabled: loaded.length === 0,
-      },
-    ],
-    [active.duplicatesOnly, handleDuplicatesToggle, loaded.length, node.id],
+  // The local duplicates filter: a toggle, so it carries `aria-pressed` and the
+  // design system's pressed state together, exactly as a toolbar action chip
+  // does. It is composed here rather than declared as a `ToolbarAction`
+  // because its unavailable state needs two things an action chip cannot
+  // express: `aria-disabled` beside the native attribute, and a description
+  // saying WHY it is unavailable. With no group loaded — while the first page
+  // resolves, after it failed, or when the capture holds none — there is
+  // nothing for it to filter, so it is disabled, and a visible note beside it,
+  // which the control names as its description, says so rather than leaving a
+  // dimmed control to be guessed at.
+  const duplicatesUnavailable = loaded.length === 0;
+  const duplicatesToggle = (
+    <>
+      <Button
+        variant="ghost"
+        size="sm"
+        icon={<Copy className="dg-icon" />}
+        className={active.duplicatesOnly ? 'dg-is-active' : undefined}
+        aria-pressed={active.duplicatesOnly}
+        disabled={duplicatesUnavailable}
+        aria-disabled={duplicatesUnavailable ? true : undefined}
+        aria-describedby={duplicatesUnavailable ? duplicatesNoteId : undefined}
+        onClick={handleDuplicatesToggle}
+      >
+        {DUPLICATES_ONLY_LABEL}
+      </Button>
+      {duplicatesUnavailable ? (
+        <Text as="span" size="xs" tone="muted" id={duplicatesNoteId}>
+          {DUPLICATES_UNAVAILABLE_NOTE}
+        </Text>
+      ) : null}
+    </>
   );
 
   // Page-level honesty about grouping: a fallback-grouped row is coarser than a
@@ -1707,11 +2142,16 @@ export function RequestTable(props: RequestTableProps): ReactElement {
   // Phrased as labelled counts rather than as sentences about "groups", so the
   // wording is correct for one group and for a thousand, and so the footer
   // never implies the whole source when it is describing the pages in hand.
+  // While a further page is in flight, or after it failed, the hook reports no
+  // total, so the footer keeps the total of the pages on screen: the coverage
+  // it states does not change until a page lands.
+  const footerTotal = total ?? (loadingMore || nextPageFailed ? active.carriedTotal : undefined);
+
   const footerNote = useMemo(() => {
     const loadedNote =
-      total === undefined
+      footerTotal === undefined
         ? `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)}.`
-        : `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)} of ${formatCount(total)}.`;
+        : `${GROUPS_LOADED_LABEL} ${formatCount(loaded.length)} of ${formatCount(footerTotal)}.`;
 
     return active.duplicatesOnly
       ? [
@@ -1722,7 +2162,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
           DUPLICATES_ONLY_SCOPE_NOTE,
         ].join(' ')
       : loadedNote;
-  }, [active.duplicatesOnly, loaded.length, rows.length, total]);
+  }, [active.duplicatesOnly, footerTotal, loaded.length, rows.length]);
 
   // What an empty settled page says. An empty page is not necessarily an empty
   // capture, so the copy names the absence the query and the reported counters
@@ -1750,20 +2190,49 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       wrap
       className="dg-request-table__footer"
     >
-      <Text size="xs" tone="muted">
+      {/* A polite live region: the counts change without focus moving — a
+          page appended by "load more", the duplicates filter narrowing the
+          loaded groups — and a screen reader hears the new totals once the
+          reader is idle rather than having to go looking for them. It holds
+          text only, never a control, so an update re-announces nothing
+          interactive. */}
+      <Text size="xs" tone="muted" aria-live="polite" aria-atomic="true">
         {footerNote}
       </Text>
-      {forwardNextOffset === undefined ? null : (
+      {/* Kept mounted, as the same element, while the page it asked for is in
+          flight: a focused control that leaves the document, or turns
+          `disabled`, hands focus to `<body>` (B2-F12). So it is never disabled;
+          it reports the flight through `aria-busy` and its label, and a press
+          meanwhile is a no-op (see `handleLoadMore`). When the page lands it
+          stays for a further page, or leaves after the last one. */}
+      {forwardNextOffset === undefined && !loadingMore ? null : (
         <Button
           variant="secondary"
           size="sm"
-          disabled={status === 'loading'}
+          aria-busy={loadingMore}
           onClick={handleLoadMore}
+          {...LOAD_MORE_FOCUS_ATTRIBUTES}
         >
-          {status === 'loading' ? LOAD_MORE_BUSY_LABEL : LOAD_MORE_LABEL}
+          {loadingMore ? LOAD_MORE_BUSY_LABEL : LOAD_MORE_LABEL}
         </Button>
       )}
     </Stack>
+  );
+
+  // The toolbar is omitted over one state only: the settled empty capture —
+  // the page succeeded, no group is loaded, the service named no forward page
+  // and the copy is the nothing-captured one — with the reader's duplicates-only
+  // narrowing off. Its order control would reorder nothing and its toggle has
+  // nothing to filter, so it would be a row of controls that cannot act. It
+  // stays while a page is in flight or failed, so a re-query raised from it
+  // never removes it, and whenever the reader's own narrowing is in force, so
+  // that narrowing can be undone where it was made.
+  const toolbarShown = !(
+    status === 'success' &&
+    loaded.length === 0 &&
+    forwardNextOffset === undefined &&
+    !active.duplicatesOnly &&
+    emptyCopy === NOTHING_CAPTURED_COPY
   );
 
   let body: ReactNode;
@@ -1772,14 +2241,15 @@ export function RequestTable(props: RequestTableProps): ReactElement {
     body = (
       <LoadingState variant="rows" label={LOADING_LABEL} className="dg-request-table__loading" />
     );
-  } else if (status === 'error') {
+  } else if (status === 'error' && !nextPageFailed) {
+    // The package's one failure contract: title, the generic lead plus the
+    // provider's own cause, its hint and code, the query as `formatDataQuery`
+    // prints it, the settled announcement and the retry (B2-F14, B1-F16). With
+    // nothing carried this failure replaces the whole body, so it is the view's
+    // own; a failed further page is reported below its groups instead.
     body = (
       <ErrorState
-        title={ERROR_TITLE}
-        message={ERROR_MESSAGE}
-        {...(error === undefined ? {} : { code: error.code })}
-        query={JSON.stringify(query)}
-        onRetry={retry}
+        {...queryFailureProps({ error, announcement, retry }, query)}
         className="dg-request-table__error"
       />
     );
@@ -1792,6 +2262,7 @@ export function RequestTable(props: RequestTableProps): ReactElement {
         <EmptyState
           title={emptyCopy.title}
           message={emptyCopy.message}
+          icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Globe className="dg-icon" /> : undefined}
           className="dg-request-table__empty"
         />
         {forwardNextOffset === undefined ? null : footer}
@@ -1802,9 +2273,8 @@ export function RequestTable(props: RequestTableProps): ReactElement {
       <>
         {/* `virtualize` is deliberately omitted: the grid renders a page of
             groups whole and windows a large one on its own policy, and a
-            request table's rows vary in height (wrapped caller chips, an
-            expanded detail row), which is exactly the case its automatic
-            policy is tuned for. */}
+            request table's rows vary in height (an expanded detail row),
+            which is exactly the case its automatic policy is tuned for. */}
         <DataTable
           rows={rows}
           columns={columns}
@@ -1822,21 +2292,33 @@ export function RequestTable(props: RequestTableProps): ReactElement {
           empty={<EmptyState message={FILTERED_EMPTY_MESSAGE} />}
         />
         {footer}
+        {/* The same contract in the page scope: its title and lead say only the
+            next page failed and the groups above are unaffected, and its query
+            is that page's, advanced offset and all. */}
+        {nextPageFailed ? (
+          <ErrorState
+            {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}
+            className="dg-request-table__error"
+          />
+        ) : null}
       </>
     );
   }
 
   return (
     <div className={clsx('dg-request-table', className)}>
-      <Toolbar
-        label={TOOLBAR_LABEL}
-        className="dg-request-table__toolbar"
-        compact
-        wrap
-        selects={selects}
-        actions={toolbarActions}
-        status={groupingStatuses}
-      />
+      {toolbarShown ? (
+        <Toolbar
+          label={TOOLBAR_LABEL}
+          className="dg-request-table__toolbar"
+          compact
+          wrap
+          selects={selects}
+          status={groupingStatuses}
+        >
+          {duplicatesToggle}
+        </Toolbar>
+      ) : null}
       {body}
     </div>
   );

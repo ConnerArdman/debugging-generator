@@ -91,7 +91,12 @@ import { DebuggenError, assertNever, err, ok } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 import { METRIC_IDS, isMetricId } from '@debuggen/telemetry';
 
-import { catalogEntryFor, isKnownPanelNodeType, isSourceAllowedForNode } from './catalog.js';
+import {
+  PANEL_NODE_CATALOG_ENTRIES,
+  catalogEntryFor,
+  isKnownPanelNodeType,
+  isSourceAllowedForNode,
+} from './catalog.js';
 import { isDataQuerySource } from './nodes/query.js';
 import type { DataQuery } from './nodes/query.js';
 import type { MetricCardsNode, QueryBackedNode } from './nodes/viz.js';
@@ -1037,16 +1042,33 @@ const PANEL_SPEC_SCHEMA_NAME = 'panelSpec';
  */
 const INVARIANT_CHECK_NAME = 'invariants';
 
+/** How a closed vocabulary is written in a hint and as an issue's `expected`. */
+const VOCABULARY_SEPARATOR = ' | ';
+
+/**
+ * The catalogued node types, in the vocabulary's order, as one line.
+ *
+ * Read from the catalog's ordered entry list rather than from `./spec.ts`'s
+ * vocabulary, because "catalogued" is what {@link isKnownPanelNodeType} checks
+ * and therefore what a `panel_node_type_unknown` issue means. A closed
+ * vocabulary, never a rejected value, so it is safe in every message, hint and
+ * detail this module builds.
+ */
+const CATALOGUED_NODE_TYPES = PANEL_NODE_CATALOG_ENTRIES.map((entry) => entry.type).join(
+  VOCABULARY_SEPARATOR,
+);
+
 /**
  * The developer-facing recovery instruction attached to a rejection.
  *
  * States the rules rather than the values that broke them, and says plainly what
  * a failure here means — a defect in panel generation, answered with the
  * deterministic fallback panel rather than with another attempt at the model
- * (AAP 0.5.3, AAP 0.5.5). The metric count is derived from the telemetry
- * package's vocabulary so the sentence cannot go stale.
+ * (AAP 0.5.3, AAP 0.5.5). The node types and the metric count are derived from
+ * the catalog and the telemetry package's vocabulary so the sentence cannot go
+ * stale.
  */
-const PANEL_INVARIANT_HINT = `Every node must be a catalogued type; a query-backed node must name a source its type can read, and a container or source link must carry none; only containers carry children, and every node id is unique; metric ids come from the fixed set of ${String(METRIC_IDS.length)}; and a panel that supersedes another is at least version 2. A failure here is a defect in panel generation rather than an unanswerable question: show the deterministic fallback panel for this capture, and use the issue paths in this error's details to locate the nodes at fault.`;
+const PANEL_INVARIANT_HINT = `Every node must be a catalogued type (${CATALOGUED_NODE_TYPES}); a query-backed node must name a source its type can read, and a container or source link must carry none; only containers carry children, and every node id is unique; metric ids come from the fixed set of ${String(METRIC_IDS.length)}; and a panel that supersedes another is at least version 2. A failure here is a defect in panel generation rather than an unanswerable question: show the deterministic fallback panel for this capture, and use the issue paths in this error's details to locate the nodes at fault.`;
 
 /**
  * One reported issue as it appears in an error's `details`.
@@ -1057,6 +1079,9 @@ const PANEL_INVARIANT_HINT = `Every node must be a catalogued type; a query-back
  * produced it. Internal: the type a caller reads back out of `details` is
  * whatever its own logger or store gave it, and
  * {@link PanelValidationIssue} is the typed form this module offers.
+ *
+ * `expected` carries, for the node-vocabulary codes, the closed vocabulary the
+ * node would have been accepted with — see {@link expectedVocabularyFor}.
  */
 interface PanelIssueDetail extends SchemaIssueSummary {
   /** The catalogued type of the node concerned, where the issue is about one. */
@@ -1064,7 +1089,52 @@ interface PanelIssueDetail extends SchemaIssueSummary {
 }
 
 /**
- * Renders issues for an error's `details`: dotted paths, codes and node types.
+ * The closed vocabulary a node-vocabulary issue would have been satisfied by,
+ * as one line, or `undefined` for every other issue.
+ *
+ * - `panel_node_type_unknown` — the catalogued node types;
+ * - the query and source codes — the sources the node's catalogued type can
+ *   read, from its catalog entry.
+ *
+ * Both are closed vocabularies owned by the catalog and never the rejected
+ * value (AAP 0.5.2), which is what makes them safe to log and to show; they are
+ * what turns "this node is wrong" into "this node is wrong, and this is what
+ * would be right".
+ *
+ * @param code The issue's code.
+ * @param nodeType The node's catalogued type, where it has one.
+ * @returns The vocabulary, or `undefined`.
+ */
+function expectedVocabularyFor(
+  code: string,
+  nodeType: PanelNodeType | undefined,
+): string | undefined {
+  if (code === UNKNOWN_NODE_TYPE_CODE) {
+    return CATALOGUED_NODE_TYPES;
+  }
+
+  if (nodeType !== undefined && QUERY_SOURCE_ISSUE_CODES.has(code)) {
+    return catalogEntryFor(nodeType).sources.join(VOCABULARY_SEPARATOR);
+  }
+
+  return undefined;
+}
+
+/**
+ * The codes whose expected vocabulary is the node type's sources: a query that
+ * is missing, and a source that is missing, unknown or not readable by the
+ * type. Not `panel_node_query_forbidden`, whose node type reads no source.
+ */
+const QUERY_SOURCE_ISSUE_CODES: ReadonlySet<string> = new Set<PanelValidationIssueCode>([
+  'panel_node_query_missing',
+  'panel_node_query_source_missing',
+  'panel_node_query_source_unknown',
+  'panel_node_query_source_not_allowed',
+]);
+
+/**
+ * Renders issues for an error's `details`: dotted paths, codes, node types and,
+ * for the node-vocabulary codes, the vocabulary that would have been accepted.
  *
  * @param issues The issues to render.
  * @returns One detail per issue, in the order they were reported.
@@ -1073,9 +1143,14 @@ function describeIssuesForDetails(
   issues: readonly PanelValidationIssue[],
 ): readonly PanelIssueDetail[] {
   return issues.map((issue) => {
-    const described: PanelIssueDetail = { path: joinPath(issue.path), code: issue.code };
+    const expected = expectedVocabularyFor(issue.code, issue.nodeType);
 
-    return issue.nodeType === undefined ? described : { ...described, nodeType: issue.nodeType };
+    return {
+      path: joinPath(issue.path),
+      code: issue.code,
+      ...(expected === undefined ? {} : { expected }),
+      ...(issue.nodeType === undefined ? {} : { nodeType: issue.nodeType }),
+    };
   });
 }
 
@@ -1084,15 +1159,17 @@ function describeIssuesForDetails(
  *
  * Bounded by {@link MAX_REPORTED_ISSUES} with a count of the remainder, because
  * the message is one line in a log and in two user interfaces while the complete
- * list travels in `details`.
+ * list travels in `details`. Reads the rendered details, so the invariant
+ * rejection and the classified schema rejection list their issues alike.
  *
- * @param issues The issues to summarise; never empty when this is called.
+ * @param issues The issues to summarise, with dotted paths; never empty when
+ * this is called.
  * @returns A comma-separated list of `path (code)` pairs, with a tail naming how
  * many were omitted.
  */
-function renderIssueList(issues: readonly PanelValidationIssue[]): string {
+function renderIssueList(issues: readonly SchemaIssueSummary[]): string {
   const rendered = issues.slice(0, MAX_REPORTED_ISSUES).map((issue) => {
-    const joined = joinPath(issue.path);
+    const joined = issue.path;
 
     return `${joined.length === 0 ? ROOT_PATH_LABEL : joined} (${issue.code})`;
   });
@@ -1127,18 +1204,253 @@ function renderIssueList(issues: readonly PanelValidationIssue[]): string {
  */
 function invariantRejection(issues: readonly PanelValidationIssue[]): DebuggenError {
   const checks = issues.length === 1 ? 'check' : 'checks';
+  const details = describeIssuesForDetails(issues);
 
   return new DebuggenError(
     'PANEL_INVALID',
-    `A panel specification failed ${String(issues.length)} validation ${checks}: ${renderIssueList(issues)}.`,
+    `A panel specification failed ${String(issues.length)} validation ${checks}: ${renderIssueList(details)}.`,
     {
       hint: PANEL_INVARIANT_HINT,
       details: {
         schema: PANEL_SPEC_SCHEMA_NAME,
         check: INVARIANT_CHECK_NAME,
         issueCount: issues.length,
-        issues: describeIssuesForDetails(issues),
+        issues: details,
       },
+    },
+  );
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The node vocabulary of a schema rejection
+ *
+ * `panelSpecSchema` rejects the node-vocabulary faults of a document that was
+ * asserted rather than parsed — a node type outside the vocabulary, a
+ * query-backed node with no query, a query with no source or with a value
+ * that is no source — before this module's rules ever see it, and it reports
+ * them in the schema library's own terms: `invalid_union` on the node's
+ * `type`, `invalid_type` on its `query`, `invalid_value` on `query.source`.
+ * Those say nothing about the rule broken, and they are exactly the faults
+ * this module has catalog codes for. So the rejection `validatePanelSpec`
+ * returns for a failed parse reports each such issue with the code
+ * {@link collectPanelSpecIssues} would have reported for the same node — at
+ * the schema's own path, which already names the field at fault — and with
+ * the vocabulary that would have been accepted. Every other issue is reported
+ * exactly as the schema reported it.
+ *
+ * Classifying reads the document at the issue's path, through
+ * {@link ownField}, as every other rule here does. It never reports a value:
+ * the codes are this module's, the vocabularies are the catalog's.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The sentence a classified schema rejection adds to the schema's own hint:
+ * the node vocabulary the classified issues were measured against.
+ */
+const PANEL_NODE_VOCABULARY_HINT = `A node's type is one of the catalogued types (${CATALOGUED_NODE_TYPES}), and every node type that reads captured data carries a query naming a source its type can read.`;
+
+/**
+ * Splits a dotted schema-issue path into the node it is about and the node
+ * field that follows, or answers `undefined` for a path that is not a node's
+ * `type`, `query` or `query.source`.
+ *
+ * A node path is `layout` and an index, then a `children` segment and an index
+ * per container below it — the traversal's own path convention — and array
+ * indices arrive as their decimal spelling, since the path was joined.
+ *
+ * @param path A dotted path, as `describeIssues` renders it.
+ * @returns The node's path as segments, and the field, or `undefined`.
+ */
+function locateNodeField(
+  path: string,
+): { readonly node: readonly string[]; readonly field: string } | undefined {
+  const segments = path.split(PATH_SEPARATOR);
+  const isIndex = (segment: string | undefined): boolean =>
+    segment !== undefined && /^(?:0|[1-9][0-9]*)$/.test(segment);
+
+  if (segments[0] !== PANEL_LAYOUT_FIELD || !isIndex(segments[1])) {
+    return undefined;
+  }
+
+  let end = 2;
+
+  while (segments[end] === PANEL_CHILDREN_FIELD && isIndex(segments[end + 1])) {
+    end += 2;
+  }
+
+  const field = segments.slice(end).join(PATH_SEPARATOR);
+  const nodeFields: readonly string[] = [
+    NODE_TYPE_FIELD,
+    NODE_QUERY_FIELD,
+    `${NODE_QUERY_FIELD}${PATH_SEPARATOR}${QUERY_SOURCE_FIELD}`,
+  ];
+
+  return nodeFields.includes(field) ? { node: segments.slice(0, end), field } : undefined;
+}
+
+/**
+ * Reads the value at a path of own properties, or `undefined` where the path
+ * leaves the document.
+ *
+ * @param root The document.
+ * @param path The keys to follow; array indices in their decimal spelling.
+ * @returns The value there, or `undefined`.
+ */
+function ownFieldAt(root: unknown, path: readonly string[]): unknown {
+  let current = root;
+
+  for (const segment of path) {
+    current =
+      typeof current === 'object' && current !== null ? ownField(current, segment) : undefined;
+  }
+
+  return current;
+}
+
+/**
+ * The catalog code one schema issue is reported with, or `undefined` to report
+ * it as the schema did.
+ *
+ * - `invalid_union` on a node's `type`, when the declared type is not
+ *   catalogued → `panel_node_type_unknown`;
+ * - `invalid_type` on a query-backed node's `query`, when that is not an
+ *   object → `panel_node_query_missing`;
+ * - `invalid_value` on a query-backed node's `query.source` →
+ *   `panel_node_query_source_missing` when there is no source, and
+ *   `panel_node_query_source_unknown` when the value is not a member of the
+ *   closed source vocabulary.
+ *
+ * The same decisions {@link collectNodeIssues} and {@link collectQueryIssues}
+ * make, read off the same fields.
+ *
+ * @param root The document that failed to parse.
+ * @param issue One issue of its rejection.
+ * @returns The classified issue, or `undefined`.
+ */
+function catalogIssueForSchemaIssue(
+  root: unknown,
+  issue: SchemaIssueSummary,
+): PanelIssueDetail | undefined {
+  const located = locateNodeField(issue.path);
+
+  if (located === undefined) {
+    return undefined;
+  }
+
+  const node = ownFieldAt(root, located.node);
+
+  if (typeof node !== 'object' || node === null) {
+    return undefined;
+  }
+
+  const declaredType = ownField(node, NODE_TYPE_FIELD);
+
+  if (located.field === NODE_TYPE_FIELD) {
+    return issue.code === 'invalid_union' && !isKnownPanelNodeType(declaredType)
+      ? { path: issue.path, code: UNKNOWN_NODE_TYPE_CODE, expected: CATALOGUED_NODE_TYPES }
+      : undefined;
+  }
+
+  if (!isKnownPanelNodeType(declaredType) || !catalogEntryFor(declaredType).requiresQuery) {
+    return undefined;
+  }
+
+  const query = ownField(node, NODE_QUERY_FIELD);
+  let code: PanelValidationIssueCode | undefined;
+
+  if (located.field === NODE_QUERY_FIELD) {
+    code =
+      issue.code === 'invalid_type' && (typeof query !== 'object' || query === null)
+        ? 'panel_node_query_missing'
+        : undefined;
+  } else if (issue.code === 'invalid_value' && typeof query === 'object' && query !== null) {
+    const source = ownField(query, QUERY_SOURCE_FIELD);
+
+    if (source === undefined) {
+      code = 'panel_node_query_source_missing';
+    } else if (!isDataQuerySource(source)) {
+      code = 'panel_node_query_source_unknown';
+    }
+  }
+
+  if (code === undefined) {
+    return undefined;
+  }
+
+  const expected = expectedVocabularyFor(code, declaredType);
+
+  return {
+    path: issue.path,
+    code,
+    ...(expected === undefined ? {} : { expected }),
+    nodeType: declaredType,
+  };
+}
+
+/**
+ * Whether a value is one reported schema issue: an object with a string `path`
+ * and a string `code`, as `describeIssues` builds them.
+ *
+ * @param value An entry of a rejection's `details.issues`.
+ * @returns `true` when it has that shape.
+ */
+function isSchemaIssueSummary(value: unknown): value is SchemaIssueSummary {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof ownField(value, 'path') === 'string' &&
+    typeof ownField(value, 'code') === 'string'
+  );
+}
+
+/**
+ * Re-reports the schema's rejection of a document with the node-vocabulary
+ * issues classified (see this section's heading).
+ *
+ * When no issue is classified the schema's rejection is returned as it stands,
+ * the same object. Otherwise a new `PANEL_INVALID` error keeps the schema's
+ * name and every issue in order — classified ones replaced in place — names
+ * the first few by path and code in its message, and adds the catalogued node
+ * types to the schema's hint.
+ *
+ * Classification only ever *reads* the document, through own-property access,
+ * and a document hostile enough to throw while being read keeps the schema's
+ * rejection unchanged: this is a reporting path, and it must not replace the
+ * failure it reports with one of its own.
+ *
+ * @param value The document that failed to parse.
+ * @param rejection The schema's rejection of it.
+ * @returns The rejection to report.
+ */
+function classifySchemaRejection(value: unknown, rejection: DebuggenError): DebuggenError {
+  const reported = rejection.details?.['issues'];
+
+  if (!isUnknownArray(reported) || !reported.every(isSchemaIssueSummary)) {
+    return rejection;
+  }
+
+  let issues: readonly SchemaIssueSummary[];
+
+  try {
+    issues = reported.map((issue) => catalogIssueForSchemaIssue(value, issue) ?? issue);
+  } catch {
+    // Deliberately unbound: the exception came from reading a caller's value
+    // and describes nothing this module reports (see above).
+    return rejection;
+  }
+
+  if (issues.every((issue, index) => issue === reported[index])) {
+    return rejection;
+  }
+
+  return new DebuggenError(
+    'PANEL_INVALID',
+    `A value did not match the ${PANEL_SPEC_SCHEMA_NAME} schema: ${renderIssueList(issues)}.`,
+    {
+      hint: `${rejection.hint ?? ''} ${PANEL_NODE_VOCABULARY_HINT}`.trim(),
+      details: { ...rejection.details, issues },
     },
   );
 }
@@ -1153,7 +1465,10 @@ function invariantRejection(issues: readonly PanelValidationIssue[]): DebuggenEr
  *    `panelSpecSchema` and — on failure — builds the rejection through
  *    `./summary.ts`'s `describeIssues`. Delegating rather than re-running
  *    `safeParse` here is what keeps one implementation of that rejection, its
- *    hint and its privacy rule in the package;
+ *    hint and its privacy rule in the package. A node-vocabulary fault the
+ *    schema rejects first — an uncatalogued node type, a query-backed node
+ *    without a query or a source — is then reported with this module's catalog
+ *    code rather than the schema library's (see {@link classifySchemaRejection});
  * 2. the **rules**, through {@link collectPanelSpecIssues}, reported as one
  *    error carrying every issue found.
  *
@@ -1179,7 +1494,7 @@ export function validatePanelSpec(value: unknown): Result<PanelSpec, DebuggenErr
   const parsed = parsePanelSpec(value);
 
   if (!parsed.ok) {
-    return parsed;
+    return err(classifySchemaRejection(value, parsed.error));
   }
 
   const issues = collectPanelSpecIssues(parsed.value);

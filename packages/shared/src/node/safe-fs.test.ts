@@ -68,8 +68,11 @@
  *   a group bit: under that umask it is the case that fails if the
  *   implementation stops re-applying the mode with `fchmod` after opening.
  *   `process.umask(mask)` is not an option here — it throws inside a worker
- *   thread, which is where Vitest runs these tests — so the chmod-on-existing
- *   behaviour is proven by tightening a directory that was already `0755`.
+ *   thread, which is where Vitest runs these tests — so the mode-after-`mkdir`
+ *   behaviour of `ensureSecureDir` is proven by injecting a `mkdir` whose
+ *   result is narrowed the way a restrictive umask would narrow it, and the
+ *   refusal of an existing over-permissive directory by `chmod`-ing a fixture
+ *   open before the call and asserting its mode afterwards.
  * - **Platform-dependent cases are skipped by capability, never by platform
  *   name.** `it.skipIf` guards on the absence of `process.getuid` (no owner or
  *   permission-bit model) and on the absence of `O_NOFOLLOW`, matching how the
@@ -306,6 +309,24 @@ const PERMISSION_BITS = 0o777;
 /** An ordinary directory mode: what a developer's project directory carries. */
 const PROJECT_DIR_MODE = 0o755;
 
+/** A directory anyone can write into: the loosest state root a refusal must name. */
+const WORLD_WRITABLE_DIR_MODE = 0o777;
+
+/**
+ * A directory readable by its group and by nobody else: the loose mode that a
+ * check against the familiar `0755` alone, or against the other bits alone,
+ * would let through.
+ */
+const GROUP_READABLE_DIR_MODE = 0o750;
+
+/**
+ * What a restrictive umask (`0277`) leaves of `mkdir`'s `0700` request: owner
+ * read and execute, no write. Injected as the result of every `mkdir` in the
+ * case that proves the creator applies its mode explicitly, because the umask
+ * itself cannot be changed inside a worker thread.
+ */
+const UMASK_NARROWED_DIR_MODE = 0o500;
+
 /** An ordinary file mode: what a source file in a project carries. */
 const PROJECT_FILE_MODE = 0o644;
 
@@ -492,7 +513,7 @@ function temporaryLeftoversIn(dirAbs: string): string[] {
  *
  * The outside directory is deliberately left at an ordinary `0755` and given
  * one entry, so two properties can be asserted after a refusal: that its mode
- * was not tightened through the link, and that its contents are exactly what
+ * was not changed through the link, and that its contents are exactly what
  * this fixture put there.
  */
 interface LinkedComponentFixture {
@@ -582,6 +603,24 @@ function unsafePathErrorFrom(run: () => void): DebuggenError {
   const error = debuggenErrorFrom(run);
   expect(error.code).toBe('FS_UNSAFE_PATH');
   return error;
+}
+
+/**
+ * Asserts that a refusal is the one for an existing directory granting group
+ * or other access, and that it names `dirAbs` at `mode`.
+ *
+ * The path is checked in the details, the message and the hint alike: the
+ * developer's next action is a `chmod` of exactly that directory — or a
+ * different state directory — and a refusal that did not say which directory,
+ * or what to run on it, would send them to `ls -l` to find out.
+ */
+function expectLooseDirectoryRefusal(error: DebuggenError, dirAbs: string, mode: number): void {
+  expect(error.details?.reason).toBe('group-or-other-permissions');
+  expect(error.details?.path).toBe(dirAbs);
+  expect(error.details?.mode).toBe(octal(mode));
+  expect(error.details?.expectedMode).toBe(octal(SECURE_DIR_MODE));
+  expect(error.message).toContain(dirAbs);
+  expect(error.hint).toContain(`chmod ${octal(SECURE_DIR_MODE)} ${dirAbs}`);
 }
 
 /**
@@ -1001,20 +1040,191 @@ describe('ensureSecureDir', () => {
   );
 
   it.skipIf(NO_POSIX_IDS)(
-    'tightens a directory that already existed at a wider mode (POSIX permission bits)',
-    () => {
-      // This is the `chmod`-after-`mkdir` behaviour, proven the way it can be
-      // proven inside a worker thread: `process.umask(mask)` throws there, so
-      // an over-permissive directory is created first and the function is
-      // asked to repair it — which is also the real case, a state root a
-      // previous tool or an unpacked archive left at 0755.
-      const root = makeDir(join(sandbox, 'state'), PROJECT_DIR_MODE);
-      const leaf = join(root, 'backups');
+    'applies the secure directory mode to every directory it creates, whatever mkdir granted (POSIX permission bits)',
+    async () => {
+      // The mode-after-`mkdir` behaviour, proven the way it can be proven inside
+      // a worker thread: `process.umask(mask)` throws there, so the narrowing a
+      // restrictive umask (`0277`) would produce is injected instead, and every
+      // directory the call creates starts at `0500`. Only an explicit mode on
+      // the created directory turns that into the documented `0700`.
+      const root = join(sandbox, 'state');
+      const middle = join(root, 'backups');
+      const leaf = join(middle, 'one');
 
-      ensureSecureDir(leaf, { upTo: root });
+      await withInjectedFs(
+        (real) => ({
+          mkdirSync: (...args: Parameters<typeof real.mkdirSync>): string | undefined => {
+            const created = real.mkdirSync(...args);
+            real.chmodSync(args[0], UMASK_NARROWED_DIR_MODE);
+            return created;
+          },
+        }),
+        (injected) => {
+          injected.ensureSecureDir(leaf);
+        },
+      );
 
       expect(permissionsOf(root)).toBe(SECURE_DIR_MODE);
+      expect(permissionsOf(middle)).toBe(SECURE_DIR_MODE);
       expect(permissionsOf(leaf)).toBe(SECURE_DIR_MODE);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS || NO_NOFOLLOW)(
+    'never opens or changes the mode of a directory that already existed (POSIX permission bits and O_NOFOLLOW)',
+    async () => {
+      // The other half of the rule above: only a directory this call created
+      // has its mode applied, through a descriptor opened on it. A directory
+      // that was already there is judged with `lstat` and nothing else, so a
+      // private one is left exactly as it was — not re-`chmod`-ed to the same
+      // value, which would be indistinguishable here but would also have
+      // "repaired" a loose one.
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const leaf = join(root, 'backups');
+      const opened: string[] = [];
+      const chmodded: string[] = [];
+
+      await withInjectedFs(
+        (real) => ({
+          openSync: (...args: Parameters<typeof real.openSync>): number => {
+            opened.push(String(args[0]));
+            return real.openSync(...args);
+          },
+          chmodSync: (...args: Parameters<typeof real.chmodSync>): void => {
+            chmodded.push(String(args[0]));
+            real.chmodSync(...args);
+          },
+        }),
+        (injected) => {
+          injected.ensureSecureDir(leaf, { upTo: root });
+        },
+      );
+
+      expect(opened).toEqual([leaf]);
+      expect(chmodded).toEqual([]);
+      expect(permissionsOf(root)).toBe(SECURE_DIR_MODE);
+      expect(permissionsOf(leaf)).toBe(SECURE_DIR_MODE);
+    },
+  );
+
+  /*
+   * The refusal of an existing over-permissive directory. AAP 0.4.2 requires
+   * every parent to be verified as a real directory owned by this account with
+   * mode `0700`, and the write to *refuse to proceed otherwise*. A directory
+   * that has been readable by another account may already have been read, so
+   * it is refused with its path and mode — never quietly tightened — and each
+   * case asserts the three halves of "refused": the reason and the outermost
+   * offender, the mode left exactly as the fixture set it, and nothing created
+   * beneath it.
+   */
+
+  for (const mode of [PROJECT_DIR_MODE, WORLD_WRITABLE_DIR_MODE, GROUP_READABLE_DIR_MODE]) {
+    it.skipIf(NO_POSIX_IDS)(
+      `refuses a boundary that already existed at mode ${octal(mode)}, changing nothing and creating nothing beneath it (POSIX permission bits)`,
+      () => {
+        const root = makeDir(join(sandbox, 'state'), mode);
+        const leaf = join(root, 'backups', 'one');
+
+        const error = unsafePathErrorFrom(() => {
+          ensureSecureDir(leaf, { upTo: root });
+        });
+
+        expectLooseDirectoryRefusal(error, root, mode);
+        expect(permissionsOf(root)).toBe(mode);
+        expect(entriesIn(root)).toEqual([]);
+      },
+    );
+  }
+
+  it.skipIf(NO_POSIX_IDS)(
+    'refuses an intermediate backups directory that already existed at 0755 under a private boundary (POSIX permission bits)',
+    () => {
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const backups = makeDir(join(root, 'backups'), PROJECT_DIR_MODE);
+      const leaf = join(backups, 'one');
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(leaf, { upTo: root });
+      });
+
+      expectLooseDirectoryRefusal(error, backups, PROJECT_DIR_MODE);
+      expect(permissionsOf(root)).toBe(SECURE_DIR_MODE);
+      expect(permissionsOf(backups)).toBe(PROJECT_DIR_MODE);
+      expect(entriesIn(root)).toEqual(['backups']);
+      expect(entriesIn(backups)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'names the outermost of several over-permissive directories and changes none of them (POSIX permission bits)',
+    () => {
+      // Tightening the outer directory is the developer's first action, so the
+      // outer one is the one named — and the inner one must still carry the mode
+      // it had, because a pass that tightened as it went would have changed it
+      // before it met the refusal.
+      const root = makeDir(join(sandbox, 'state'), PROJECT_DIR_MODE);
+      const backups = makeDir(join(root, 'backups'), WORLD_WRITABLE_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(join(backups, 'one'), { upTo: root });
+      });
+
+      expectLooseDirectoryRefusal(error, root, PROJECT_DIR_MODE);
+      expect(permissionsOf(root)).toBe(PROJECT_DIR_MODE);
+      expect(permissionsOf(backups)).toBe(WORLD_WRITABLE_DIR_MODE);
+      expect(entriesIn(backups)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'refuses the named directory itself when it already existed at 0755 and no boundary is given (POSIX permission bits)',
+    () => {
+      const dir = makeDir(join(sandbox, 'state'), PROJECT_DIR_MODE);
+
+      const error = unsafePathErrorFrom(() => {
+        ensureSecureDir(dir);
+      });
+
+      expectLooseDirectoryRefusal(error, dir, PROJECT_DIR_MODE);
+      expect(permissionsOf(dir)).toBe(PROJECT_DIR_MODE);
+      expect(entriesIn(dir)).toEqual([]);
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'accepts a private directory that already existed and leaves it and its contents as they were (POSIX permission bits)',
+    () => {
+      const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
+      const marker = makeFile(
+        join(root, 'present.txt'),
+        'placed by the fixture\n',
+        SECURE_FILE_MODE,
+      );
+
+      ensureSecureDir(root);
+      ensureSecureDir(join(root, 'backups'), { upTo: root });
+
+      expect(permissionsOf(root)).toBe(SECURE_DIR_MODE);
+      expect(permissionsOf(join(root, 'backups'))).toBe(SECURE_DIR_MODE);
+      expect(entriesIn(root)).toEqual(['backups', 'present.txt']);
+      expectFileBytes(marker, 'placed by the fixture\n');
+    },
+  );
+
+  it.skipIf(NO_POSIX_IDS)(
+    'leaves an ordinary existing parent above the chain unjudged when no boundary is given (POSIX permission bits)',
+    () => {
+      // The state root's own parent is typically a home directory at 0755, which
+      // the product neither owns nor has any say over: without a boundary only
+      // what this call creates is its business, so creating the root inside
+      // that parent succeeds and the parent keeps its mode.
+      const parent = makeDir(join(sandbox, 'home'), PROJECT_DIR_MODE);
+      const root = join(parent, 'state');
+
+      ensureSecureDir(root);
+
+      expect(permissionsOf(parent)).toBe(PROJECT_DIR_MODE);
+      expect(permissionsOf(root)).toBe(SECURE_DIR_MODE);
     },
   );
 
@@ -1078,7 +1288,7 @@ describe('ensureSecureDir', () => {
   });
 
   it.skipIf(!CAN_CREATE_SYMLINKS)(
-    'refuses to tighten a symbolic link in the chain (requires symlink creation)',
+    'refuses a symbolic link standing at the named directory in the chain (requires symlink creation)',
     () => {
       const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
       const outside = makeDir(join(sandbox, 'outside'), PROJECT_DIR_MODE);
@@ -1097,8 +1307,9 @@ describe('ensureSecureDir', () => {
   it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
     'leaves the mode of a link target untouched when it refuses the link (requires symlink creation and POSIX permission bits)',
     () => {
-      // `chmod` follows a link, so tightening one would change the permissions
-      // of a directory the product neither owns nor was asked to touch.
+      // `chmod` follows a link, so a mode applied through one would change the
+      // permissions of a directory the product neither owns nor was asked to
+      // touch.
       const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
       const outside = makeDir(join(sandbox, 'outside'), PROJECT_DIR_MODE);
       symlinkSync(outside, join(root, 'link'));
@@ -1235,10 +1446,11 @@ describe('ensureSecureDir', () => {
     'refuses a link whose target already holds the named directory itself, with no upTo (requires symlink creation)',
     () => {
       // The same shape with nothing left to create: the named directory already
-      // exists behind the link, so the only act left is the tightening pass —
-      // and tightening a directory outside the tree is a permission change the
-      // product was never asked for, which makes the refusal as necessary here
-      // as it is for a creation.
+      // exists behind the link, so the only act left is judging it — and a
+      // directory outside the tree accepted as the state directory would put
+      // everything written later outside it too, which makes the refusal as
+      // necessary here as it is for a creation. The link is what is reported,
+      // not the target's mode: it is the component that redirects the path.
       const { root, link, outside } = plantLinkedComponent();
       makeDir(join(outside, 'existing'), PROJECT_DIR_MODE);
 
@@ -1292,7 +1504,7 @@ describe('ensureSecureDir', () => {
   it.skipIf(!CAN_CREATE_SYMLINKS || NO_POSIX_IDS)(
     'leaves the mode of the directory an intermediate link points at untouched (requires symlink creation and POSIX permission bits)',
     () => {
-      // `chmod` follows a link. A tightening pass that walked *through* the
+      // `chmod` follows a link. A pass that applied a mode *through* the
       // intermediate link would make a directory another account owns
       // owner-only, which is a permission change the product was never asked
       // for and cannot undo.
@@ -1373,11 +1585,11 @@ describe('ensureSecureDir', () => {
   it.skipIf(NO_POSIX_IDS || !CAN_ASSIGN_FOREIGN_OWNER)(
     'refuses an existing component owned by another account and creates nothing beneath it (requires assigning a foreign owner)',
     () => {
-      // The descent checks ownership *before* it tightens or enters a component
-      // that already existed. Both halves of that order matter: a directory
-      // another account owns cannot be `chmod`-ed by us at all, and creating the
-      // product's own subtree inside it would leave that subtree — backups, the
-      // session store — inside a directory its owner can swap out at will.
+      // The descent judges a component that already existed — its owner as well
+      // as its mode — *before* it enters it. A directory another account owns
+      // cannot be made private by us at all, and creating the product's own
+      // subtree inside it would leave that subtree — backups, the session
+      // store — inside a directory its owner can swap out at will.
       const root = makeDir(join(sandbox, 'state'), SECURE_DIR_MODE);
       const handedOver = makeDir(join(root, 'backups'), SECURE_DIR_MODE);
       const leaf = join(handedOver, 'one');

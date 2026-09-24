@@ -28,6 +28,14 @@
  * so the renderer can never present more than the producer was allowed to
  * capture.
  *
+ * A table cell is narrower than most summaries, so a cell clips its summary to
+ * its own track with an ellipsis rather than letting it paint across the next
+ * column. Clipping hides nothing the view does not show elsewhere: a summary
+ * shown whole carries its own displayed text as its `title`, and a row's
+ * expanded detail repeats both displayed summaries unclipped, wrapped across as
+ * many lines as they need. Both repeat exactly the string the row displays —
+ * the bounded preview, never the received string when that was longer.
+ *
  * ## `changed` is reported, and `false` does not mean "no change"
  *
  * `@debuggen/telemetry`'s aggregate is explicit about this: a producer emits a
@@ -118,22 +126,31 @@
  * every value is stamped with the identity it was taken against and a stamp
  * that no longer matches is ignored — so no effect exists to reset it either.
  *
- * ## Every explanation is reachable from the keyboard
+ * ## One Tab stop, and every control and explanation reached by arrow keys
  *
- * A row can carry four tooltips — the bound behind a shortened summary, why a
- * trigger cannot be opened, what "no values reported" does and does not claim,
- * and what a dropped-transitions count is a floor of — and
- * `../primitives/Tooltip` opens on focus. Their triggers are text, code and
- * chip elements, which are not focusable of their own accord, so each is given
- * a tab index. Not in every row, though: `DataTable` makes its body a single
- * roving tab stop, and a stop per trigger per row would bury it under hundreds
- * of them. The triggers join the tab order **only in the row that holds
- * focus** — the view follows focus into the grid, onto a row or anything inside
- * one, and gives that row's triggers `tabIndex={0}` and every other row's none
- * — so Tab from a focused row walks into its explanations, and arrowing to
- * another row moves them with it. Each trigger keeps the `aria-describedby` the
- * tooltip merges onto it, and none sits in a column header, where `DataTable`
- * nests a sortable header inside its sort control.
+ * The grid is ONE stop in the page's Tab order — `DataTable`'s active row — and
+ * Tab from it leaves the grid (the APG grid pattern). Every focusable element a
+ * cell or the expanded detail renders is therefore `tabIndex={-1}`: the
+ * disclosure toggle, the trigger control, both source chips (through
+ * `SourceLink`'s `tabIndex` prop) and the four tooltip triggers — the bound
+ * behind a shortened summary, why a trigger cannot be opened, what "no values
+ * reported" does and does not claim, and what a dropped-transitions count is a
+ * floor of. Those triggers are text, code and chip elements, which are not
+ * focusable of their own accord; `-1` makes them focusable without adding a
+ * stop, so a table of a few hundred rows is still one press of Tab to cross.
+ *
+ * `DataTable` owns the route to them, and this view adds no key or focus
+ * handler of its own: ArrowRight on a collapsed row opens its detail and the
+ * next ArrowRight enters the row (F2 enters directly, since Enter selects the
+ * row); ArrowLeft/ArrowRight then walk the controls of the row and its open
+ * detail in document order, Home/End jump to the first/last of them,
+ * ArrowUp/ArrowDown move to the neighbouring row, and Escape returns to the
+ * row. `../primitives/Tooltip` opens on any focus, so an arrow key landing on a
+ * trigger shows its explanation exactly as a Tab would, and the first Escape
+ * closes that bubble before the second returns to the row. Focus that lands on
+ * a control by any route, a pointer click included, moves the grid's roving
+ * stop to that control's row. Each trigger keeps the `aria-describedby` the
+ * tooltip merges onto it, and none sits in a column header.
  *
  * ## What it never does
  *
@@ -181,7 +198,10 @@
  * `__previous`/`__next`; both are emitted on the same element, so the sheet's
  * existing rules apply and the contract's names are present for a consumer that
  * addresses them. The row's selected state is not written here at all —
- * `DataTable` owns `dg-is-selected` on the row it was told is selected.
+ * `DataTable` owns `dg-is-selected` on the row it was told is selected — and
+ * which row that is comes from the panel's shared selection, so a record
+ * selected in any view or evidence chip marks its transition here, and a
+ * transition activated here marks its record everywhere else (AAP 0.7.3).
  *
  * @see ../host/useQuery for the one-page-at-a-time resolution contract and the
  * `nextOffset` every "Load more" advances to.
@@ -207,17 +227,21 @@ import {
   ChevronDown,
   ChevronRight,
   CircleSlash,
+  GitCompareArrows,
   Scissors,
   Zap,
 } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
-import type { FocusEvent as ReactFocusEvent, ReactElement, ReactNode } from 'react';
+import type { ReactElement, ReactNode } from 'react';
 
 import { useDataProvider } from '../host/DataProvider';
 import type { DataProvider } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
+import type { QueryFailureProps } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
+import type { StackAlign } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarAction, ToolbarSelect, ToolbarStatus } from '../layout/Toolbar';
 import { Badge } from '../primitives/Badge';
@@ -329,6 +353,9 @@ const CATALOG_LABEL = catalogEntryFor(STATE_TRANSITIONS_SOURCE).label;
 /** What the empty state says: a real answer, not a failure (AAP 0.5.5). */
 const EMPTY_MESSAGE = 'No state transitions were captured for this interaction.';
 
+/** The short label above {@link EMPTY_MESSAGE}. */
+const EMPTY_TITLE = 'No transitions';
+
 /** What the empty state says when the reader's own narrowing is what emptied it. */
 const EMPTY_FILTERED_MESSAGE =
   'No transitions in this page match the current filters. Clear them to see the rest of the page.';
@@ -351,16 +378,6 @@ const NOUN_PLURAL = 'state transitions';
 
 /** The loading state's accessible label. */
 const LOADING_LABEL = 'Loading state transitions…';
-
-/** What the error state states: what failed, never what it might mean. */
-const ERROR_MESSAGE = 'The captured state transitions could not be loaded.';
-
-/** What the error state states when the node asks for a source this view cannot draw. */
-const ERROR_SOURCE_MESSAGE =
-  'This view draws state transitions, and the query on this node names a different source.';
-
-/** The code shown beside {@link ERROR_SOURCE_MESSAGE}; a defect in the panel, not the capture. */
-const ERROR_SOURCE_CODE = 'PANEL_NODE_SOURCE_UNSUPPORTED';
 
 /** Column headers, left to right — the "old → trigger → new" reading order. */
 const HEADERS = {
@@ -414,14 +431,33 @@ const TRIGGER_OUT_OF_SLICE_HINT =
 /** The trigger control's label when the attributed record carries neither name nor kind. */
 const TRIGGER_GENERIC_LABEL = 'Triggering record';
 
-/** The labels of the expand affordance, which discloses one row's detail. */
-const DETAIL_SHOW_LABEL = 'Show details';
+/**
+ * The action of the expand affordance, which discloses one row's detail.
+ *
+ * Never a name on its own: {@link detailToggleLabel} completes it with the
+ * row's identity, so a reader listing the grid's controls hears which
+ * transition each toggle opens rather than the same phrase once per row.
+ */
+const DETAIL_SHOW_LABEL = 'Show details of';
 
-/** The collapse label of the same affordance. */
-const DETAIL_HIDE_LABEL = 'Hide details';
+/** The collapse action of the same affordance, completed the same way. */
+const DETAIL_HIDE_LABEL = 'Hide details of';
 
-/** Field captions inside an expanded row. Identifiers and categories, never values. */
+/**
+ * Field captions inside an expanded row.
+ *
+ * The row's identity and its two summaries come first, under the same words
+ * as their column headers, because a cell clips what the detail has room to
+ * show whole: the component and hook names, and each summary exactly as the
+ * row displays it — the bounded preview, never more than the row was given
+ * (AAP 0.5.2). Then the categories and identifiers the columns have no room
+ * for at all.
+ */
 const DETAIL_LABELS = {
+  component: HEADERS.component,
+  hook: HEADERS.hook,
+  previousValue: HEADERS.previous,
+  nextValue: HEADERS.next,
   valueType: 'Value type',
   transitionSource: 'Changed dimension',
   triggerKind: 'Trigger kind',
@@ -438,8 +474,16 @@ const DETAIL_LABELS = {
 /** The toolbar's accessible name, which makes it a labelled group. */
 const TOOLBAR_LABEL = 'State transition filters';
 
-/** The sort control's label. */
-const SORT_LABEL = 'Order';
+/**
+ * The sort control's label: visible, and the control's accessible name.
+ *
+ * It names what it orders because a panel places several tables side by side,
+ * each with an order control of its own, and a reader who lists a page's form
+ * controls — or asks speech input for one by name — must be able to tell them
+ * apart. The visible text is the whole name, so what is on screen is what can
+ * be said (WCAG 2.5.3).
+ */
+const SORT_LABEL = 'Order state transitions';
 
 /** The component filter's label, and the wording of its "everything" option. */
 const COMPONENT_FILTER_LABEL = 'Component';
@@ -470,13 +514,6 @@ const LOAD_MORE_LABEL = 'Load more';
 /** The same control while that page is in flight, when it cannot be pressed again. */
 const LOADING_MORE_LABEL = 'Loading more…';
 
-/**
- * What the footer states when a next page failed: what failed, and that the
- * rows already on screen are untouched by it.
- */
-const PAGE_ERROR_MESSAGE =
-  'The next page of state transitions could not be loaded. The rows already loaded are unchanged.';
-
 /*
  * ---------------------------------------------------------------------------
  * Pure helpers
@@ -491,35 +528,6 @@ const NO_TRANSITIONS: readonly StateTransition[] = Object.freeze([]);
 
 /** No rows expanded, allocated once for the same reason. */
 const NO_KEYS: readonly string[] = Object.freeze([]);
-
-/**
- * The element `DataTable` renders for one data row, found from anything inside
- * it.
- *
- * Both attributes, because the expanded detail beneath a row is a
- * `role="row"` too and carries no index: focus inside a disclosed detail block
- * belongs to no data row and moves no tab stops. `data-row-index` is the
- * primitive's own name for a row's position in the `rows` it was handed.
- */
-const DATA_ROW_SELECTOR = '[role="row"][data-row-index]';
-
-/**
- * The tab index of a tooltip trigger inside a grid row.
- *
- * `0` in the row that holds focus, so Tab from that row reaches the
- * explanation and its tooltip opens on focus; no `tabIndex` at all everywhere
- * else, which keeps every other row's triggers out of the tab order. Not `-1`:
- * that would make a pointer click focus the trigger instead of its row, and
- * `DataTable` answers its arrow keys only on a row element, so the reader would
- * lose row navigation at the point they clicked. See this module's header for
- * why the stop follows the focused row rather than sitting on every trigger.
- *
- * @param tabbable Whether the trigger's row holds focus.
- * @returns The trigger's `tabIndex`, or `undefined` for none.
- */
-function inRowTabIndex(tabbable: boolean): 0 | undefined {
-  return tabbable ? 0 : undefined;
-}
 
 /**
  * Clamp an authored page size into the contract's per-request bounds.
@@ -628,6 +636,19 @@ interface EmptyPageCopy {
 }
 
 /**
+ * The copy of the empty capture: case 2 of {@link emptyPageCopy} with no
+ * narrowing of the reader's in force, the one empty page that says nothing was
+ * captured. A single frozen value, so the component recognises the case by
+ * reference — it is the one empty state that carries the view's glyph, and the
+ * one drawn without the toolbar and the footer, since no control could reach
+ * anything and there is no count to state beyond the sentence itself.
+ */
+const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
+
+/**
  * The noun for a count of state transitions: singular for exactly one.
  *
  * @param count The count the noun follows.
@@ -691,7 +712,7 @@ function emptyPageCopy(context: EmptyPageContext): EmptyPageCopy {
   }
 
   if (total === 0 || (total === undefined && offset === 0 && !morePages)) {
-    return { title: undefined, message: narrowed ? EMPTY_FILTERED_MESSAGE : EMPTY_MESSAGE };
+    return narrowed ? { title: undefined, message: EMPTY_FILTERED_MESSAGE } : NOTHING_CAPTURED_COPY;
   }
 
   const position = formatCount(offset + 1);
@@ -922,6 +943,51 @@ function hookLabelOf(transition: StateTransition): string {
 }
 
 /**
+ * The words that identify a row to a reader who cannot see the grid: the
+ * component, then the hook when the producer identified one.
+ *
+ * Built only from what the row itself displays, through the same two helpers
+ * its row header and hook cell render with, so the name a control announces
+ * matches the text beside it and never guesses: a hook the producer neither
+ * labelled nor indexed contributes nothing rather than a not-available token,
+ * and a component it could not name is announced as not named.
+ *
+ * @example
+ * ```ts
+ * rowIdentityOf({ component: 'ExampleWidget', hookLabel: 'useExampleValue', … });
+ * // 'ExampleWidget useExampleValue'
+ * rowIdentityOf({ component: 'ExampleWidget', hookIndex: 2, … }); // 'ExampleWidget Hook #2'
+ * rowIdentityOf({ … }); // 'Component not named'
+ * ```
+ *
+ * @param transition The row.
+ * @returns The row's identity, as words.
+ */
+function rowIdentityOf(transition: StateTransition): string {
+  const component = componentLabelOf(transition);
+  const hookIdentified = transition.hookLabel !== undefined || transition.hookIndex !== undefined;
+
+  return hookIdentified ? `${component} ${hookLabelOf(transition)}` : component;
+}
+
+/**
+ * The accessible name of a row's disclosure toggle: the action it performs
+ * next, and the row it performs it on.
+ *
+ * The toggle is icon-only, so this name is its only text and there is no
+ * visible label for it to diverge from (WCAG 2.5.3). The open state itself is
+ * not in the name: the toggle reports it through `aria-expanded`, and the
+ * action word is what changes with it.
+ *
+ * @param expanded Whether the row's detail is open.
+ * @param transition The row.
+ * @returns For example `Show details of ExampleWidget useExampleValue`.
+ */
+function detailToggleLabel(expanded: boolean, transition: StateTransition): string {
+  return `${expanded ? DETAIL_HIDE_LABEL : DETAIL_SHOW_LABEL} ${rowIdentityOf(transition)}`;
+}
+
+/**
  * The trigger's label: the attributed record's own name, else its kind's
  * readable form, else a generic caption.
  *
@@ -1014,6 +1080,85 @@ function componentOptionsFor(
   ];
 }
 
+/**
+ * The pointer a transition row stands for: the captured `state` record it
+ * describes, with that record's own span and trace.
+ *
+ * What an activated row reports, and what the row is matched against the
+ * panel's selection by, so the two can never disagree.
+ *
+ * @param transition The row.
+ * @returns The event reference `PanelActions.onSelectEvent` takes.
+ */
+function transitionRefOf(transition: StateTransition): PanelEventRef {
+  return {
+    eventId: transition.eventId,
+    spanId: transition.spanId,
+    traceId: transition.traceId,
+  };
+}
+
+/**
+ * The key of the drawn row that stands for the panel's selected event.
+ *
+ * Read against the rows the grid is handed — after the reader's "changed only"
+ * narrowing and the grouping — because only a drawn row can carry the mark: a
+ * selected record this view has not loaded, or has narrowed away, marks nothing
+ * rather than a neighbour.
+ *
+ * @param rows The rows the grid draws, in display order.
+ * @param selection The panel's selection, or `undefined` for none.
+ * @returns The matching row's key, or `null` when no drawn row stands for it.
+ */
+function selectedTransitionKeyOf(
+  rows: readonly StateTransition[],
+  selection: PanelSelection | undefined,
+): string | null {
+  if (selection === undefined) {
+    return null;
+  }
+
+  const match = rows.find((row) => matchesPanelSelection(selection, transitionRefOf(row)));
+
+  return match === undefined ? null : match.id;
+}
+
+/** The reader's toolbar state, as {@link filterReportOf} reports it. */
+interface ToolbarState {
+  /** The order the next request carries. */
+  readonly sort: DataQuerySort;
+  /** The component narrowed to, or {@link ALL_COMPONENTS}. */
+  readonly component: string;
+  /** Whether the loaded rows are narrowed to rows with reported values. */
+  readonly changedOnly: boolean;
+  /** Whether rows are grouped by component. */
+  readonly grouped: boolean;
+}
+
+/**
+ * The reader's toolbar state as the plain strings `PanelActions.onFilterChange`
+ * carries — the values the toolbar actually holds, and no query shape.
+ *
+ * A whole snapshot rather than the one control that moved, so a host that
+ * remembers a view's filters can restore it from the latest report alone —
+ * which is why every toolbar control reports through this one function: the
+ * order select, the component select and both toggles. The component narrowing
+ * is omitted while every component is shown, which is how the report spells "no
+ * narrowing"; the two toggles are spelled `"true"`/`"false"`, as every boolean a
+ * filter report carries is.
+ *
+ * @param state The toolbar state after the change being reported.
+ * @returns The filter report.
+ */
+function filterReportOf(state: ToolbarState): Record<string, string> {
+  return {
+    sort: state.sort,
+    ...(state.component === ALL_COMPONENTS ? {} : { component: state.component }),
+    changedOnly: String(state.changedOnly),
+    grouped: String(state.grouped),
+  };
+}
+
 /*
  * ---------------------------------------------------------------------------
  * Local view state
@@ -1056,11 +1201,13 @@ interface PageAccumulator {
  *
  * One object rather than six `useState` calls, because the stamp has to reset
  * all of them together: when the node's request changes, the loaded pages, a
- * component filter and a selection taken against the previous request are all
- * meaningless at once. Held as data and compared during render (see
- * {@link viewFor}), which is how the reset happens without an effect — the
- * repository's React Compiler rules forbid writing state from one, and a reset
- * effect would also render one frame of stale rows before it ran.
+ * component filter and a disclosure taken against the previous request are all
+ * meaningless at once. The selected row is deliberately not part of it: it is
+ * the panel's shared selection (see `useViewSelection`), which belongs to the
+ * panel rather than to this view's request. Held as data and compared during
+ * render (see {@link viewFor}), which is how the reset happens without an
+ * effect — the repository's React Compiler rules forbid writing state from one,
+ * and a reset effect would also render one frame of stale rows before it ran.
  */
 interface ViewState {
   /** The {@link nodeRequestKey} this state was taken against. */
@@ -1078,8 +1225,6 @@ interface ViewState {
    * sequence's first page is the one requested. See {@link PageAccumulator}.
    */
   readonly pages: PageAccumulator | undefined;
-  /** The row whose record was last selected, or `null`. */
-  readonly selectedKey: string | null;
   /** The rows whose detail is disclosed. */
   readonly expandedKeys: readonly string[];
 }
@@ -1098,7 +1243,6 @@ function initialView(requestKey: string): ViewState {
     changedOnly: false,
     grouped: true,
     pages: undefined,
-    selectedKey: null,
     expandedKeys: NO_KEYS,
   };
 }
@@ -1161,9 +1305,11 @@ export interface StateTransitionViewerProps {
  * host that rebinds a mounted panel to another session swaps the provider
  * without remounting the node, and the same node id and query can recur in
  * that session's panel; the accumulated pages, the next offset, the chosen
- * order and narrowing and the selected, open and focused rows of the previous
- * provider must not survive into it, so a new provider is a new instance that
- * paints none of them and starts from the authored first page.
+ * order and narrowing and the open and focused rows of the previous provider —
+ * and, outside a panel host, the view's own fallback selection — must not
+ * survive into it, so a new provider is a new instance that paints none of them
+ * and starts from the authored first page. Under a host the selected row is the
+ * panel's shared selection, which the host itself scopes to the panel.
  *
  * @example Inside a panel host that provides a `DataProvider` and `PanelActions`.
  * ```tsx
@@ -1211,7 +1357,8 @@ function useProviderGeneration(): number {
 
 /**
  * The stateful body of {@link StateTransitionViewer}: one provider's pages,
- * order, narrowing, selection and focus for one node.
+ * order, narrowing, selection and disclosure for one node. Focus is not among
+ * them: `DataTable` owns the grid's roving stop and its keyboard route.
  *
  * @param props The props, as documented on {@link StateTransitionViewerProps}.
  * @returns The grid, or the node's loading, empty or error state.
@@ -1220,6 +1367,12 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   const { node, className } = props;
 
   const actions = usePanelActions();
+  // Hoisted so the toolbar handlers' dependency lists name the one member they use.
+  const reportFilter = actions?.onFilterChange;
+  // The panel's one selection, shared with every other view under the host,
+  // and the recorder an activation calls: a no-op under a host, which records
+  // the report itself, and this view's own fallback outside one.
+  const { selection, markSelected } = useViewSelection();
 
   // Hooks first and unconditionally, including for a node this view cannot
   // draw: the unsupported-source branch is a `return` at the end of the
@@ -1227,11 +1380,6 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   const requestKey = nodeRequestKey(node);
   const [heldView, setHeldView] = useState<ViewState>(() => initialView(requestKey));
   const view = viewFor(heldView, requestKey);
-  // The key of the row that last held focus, whose tooltip triggers are the
-  // only in-row ones in the tab order. Held apart from the view state: it
-  // records where focus is, not a choice the reader made, and a key no longer
-  // among the rows simply matches none of them.
-  const [focusedRowKey, setFocusedRowKey] = useState<string | null>(null);
 
   const sourceSupported = node.query.source === STATE_TRANSITIONS_SOURCE;
   // One page size for every request of a sequence, and the offset its first
@@ -1291,7 +1439,7 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
     [offset, sequenceQuery],
   );
 
-  const { status, data, error, total, nextOffset, retry } = useQuery(query);
+  const { status, data, error, announcement, total, nextOffset, retry } = useQuery(query);
 
   const carried = activePages?.rows ?? NO_TRANSITIONS;
   // The page that resolved, or `undefined` while one is in flight or has failed
@@ -1315,6 +1463,9 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
     return view.grouped ? groupByComponent(narrowed) : narrowed;
   }, [loaded, view.changedOnly, view.grouped]);
 
+  /** The drawn row that stands for the panel's selected event, whichever view selected it. */
+  const selectedRowKey = useMemo(() => selectedTransitionKeyOf(rows, selection), [rows, selection]);
+
   const componentOptions = useMemo(
     () => componentOptionsFor(loaded, view.component),
     [loaded, view.component],
@@ -1325,6 +1476,12 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
 
   const chooseOrder = useCallback(
     (next: string): void => {
+      // The order the toolbar is left showing, for the report below: read from
+      // this render's state for the reason the toggles give, and falling back
+      // to the order in force for a value the schema's guard does not accept,
+      // exactly as the updater does.
+      const reportedSort = isDataQuerySort(next) ? next : sort;
+
       setHeldView((held) => {
         const current = viewFor(held, requestKey);
         // Narrowed by the schema's own guard rather than by a local list: the
@@ -1340,12 +1497,20 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
           ...current,
           sort: chosen,
           pages: undefined,
-          selectedKey: null,
           expandedKeys: NO_KEYS,
         };
       });
+      reportFilter?.(
+        node.id,
+        filterReportOf({
+          sort: reportedSort,
+          component: view.component,
+          changedOnly: view.changedOnly,
+          grouped: view.grouped,
+        }),
+      );
     },
-    [requestKey],
+    [node.id, reportFilter, requestKey, sort, view.changedOnly, view.component, view.grouped],
   );
 
   const handleComponentChange = useCallback(
@@ -1358,30 +1523,48 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
           ...current,
           component: next,
           pages: undefined,
-          selectedKey: null,
           expandedKeys: NO_KEYS,
         };
       });
-      actions?.onFilterChange?.(node.id, next === ALL_COMPONENTS ? {} : { component: next });
+      reportFilter?.(
+        node.id,
+        filterReportOf({
+          sort,
+          component: next,
+          changedOnly: view.changedOnly,
+          grouped: view.grouped,
+        }),
+      );
     },
-    [actions, node.id, requestKey],
+    [node.id, reportFilter, requestKey, sort, view.changedOnly, view.grouped],
   );
 
+  // The two toggles are local narrowings — no page is requested for either —
+  // and each reports the toolbar state it leaves behind, as the order and the
+  // component narrowing do, so a host that remembers a developer's filters sees
+  // every one of them. The new state is read from the state in force for THIS
+  // render rather than inside the updater, for the reason `handleRowToggle`
+  // gives: the report must name the state the reader asked for, not the one
+  // before.
   const handleToggleChangedOnly = useCallback((): void => {
-    setHeldView((held) => {
-      const current = viewFor(held, requestKey);
+    const changedOnly = !view.changedOnly;
 
-      return { ...current, changedOnly: !current.changedOnly };
-    });
-  }, [requestKey]);
+    setHeldView((held) => ({ ...viewFor(held, requestKey), changedOnly }));
+    reportFilter?.(
+      node.id,
+      filterReportOf({ sort, component: view.component, changedOnly, grouped: view.grouped }),
+    );
+  }, [node.id, reportFilter, requestKey, sort, view.changedOnly, view.component, view.grouped]);
 
   const handleToggleGrouping = useCallback((): void => {
-    setHeldView((held) => {
-      const current = viewFor(held, requestKey);
+    const grouped = !view.grouped;
 
-      return { ...current, grouped: !current.grouped };
-    });
-  }, [requestKey]);
+    setHeldView((held) => ({ ...viewFor(held, requestKey), grouped }));
+    reportFilter?.(
+      node.id,
+      filterReportOf({ sort, component: view.component, changedOnly: view.changedOnly, grouped }),
+    );
+  }, [node.id, reportFilter, requestKey, sort, view.changedOnly, view.component, view.grouped]);
 
   // The one writer of the accumulator. Everything it records is in hand at the
   // click: the rows on screen become the carried rows, and the offset the
@@ -1404,14 +1587,15 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
 
   const handleRowActivate = useCallback(
     (row: StateTransition): void => {
-      setHeldView((held) => {
-        const current = viewFor(held, requestKey);
+      const ref = transitionRefOf(row);
 
-        return { ...current, selectedKey: row.id };
-      });
-      actions?.onSelectEvent({ eventId: row.eventId, spanId: row.spanId, traceId: row.traceId });
+      // Recorded first, reported second: under the panel host the report is
+      // what moves the shared selection, and outside one the recorder is what
+      // marks the row.
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions, requestKey],
+    [actions, markSelected],
   );
 
   const handleRowToggle = useCallback(
@@ -1460,57 +1644,24 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
    */
   const handleTriggerSelect = useCallback(
     (eventId: string): void => {
-      actions?.onSelectEvent({ eventId });
+      const ref: PanelEventRef = { eventId };
+
+      // The trigger becomes the panel's selection like any other activation;
+      // it marks a row here only if this view also draws that record.
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
-  );
-
-  /**
-   * Follow focus into the grid, so the row being read is the one whose tooltip
-   * triggers are in the tab order (see this module's header).
-   *
-   * React's `onFocus` bubbles, so this one handler on the block sees focus land
-   * on a row — by Tab, by an arrow key through `DataTable`'s roving stop, or by
-   * a click — and on anything inside one. The row is resolved from the DOM
-   * attribute `DataTable` writes and then to its key, never kept as an index:
-   * an appended page or a regrouping moves indices, and the key stays with the
-   * transition. The containment check keeps a row of some enclosing grid, which
-   * `closest` could otherwise reach, from being mistaken for one of these.
-   */
-  const handleFocusWithin = useCallback(
-    (event: ReactFocusEvent<HTMLDivElement>): void => {
-      const target = event.target;
-
-      if (!(target instanceof Element)) {
-        return;
-      }
-
-      const rowElement = target.closest(DATA_ROW_SELECTOR);
-
-      if (rowElement === null || !event.currentTarget.contains(rowElement)) {
-        return;
-      }
-
-      const index = Number.parseInt(rowElement.getAttribute('data-row-index') ?? '', 10);
-      const focused = Number.isInteger(index) ? rows[index] : undefined;
-
-      if (focused !== undefined) {
-        setFocusedRowKey(focused.id);
-      }
-    },
-    [rows],
+    [actions, markSelected],
   );
 
   const columns = useMemo<readonly DataTableColumn<StateTransition>[]>(
     () =>
       buildColumns({
-        expandedKeys: view.expandedKeys,
-        focusedRowKey,
         onToggle: handleRowToggle,
         onTriggerSelect: handleTriggerSelect,
         onOpenSource: actions?.onOpenSource,
       }),
-    [actions?.onOpenSource, focusedRowKey, handleRowToggle, handleTriggerSelect, view.expandedKeys],
+    [actions?.onOpenSource, handleRowToggle, handleTriggerSelect],
   );
 
   const renderDetail = useCallback(
@@ -1524,21 +1675,28 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   // States, in precedence: unsupported source, then loading, error, empty and
   // rows for the BODY. The toolbar stays mounted across all four, so a re-query
   // raised from one of its controls does not make that control disappear
-  // mid-interaction. Loading and error replace the body only for a sequence's
-  // FIRST page — nothing is loaded yet, so there is nothing to keep. A later
-  // page in flight or failed leaves the loaded rows where they are and is
-  // reported by the footer instead, which is rendered whenever a page resolved
-  // or rows are loaded, because its counts are claims about rows that exist.
+  // mid-interaction — with one exception, the settled empty capture reached
+  // with no narrowing of the reader's, where no control could reach anything
+  // (see `nothingCaptured` below). Loading and error replace the body only for
+  // a sequence's FIRST page — nothing is loaded yet, so there is nothing to
+  // keep. A later page in flight or failed leaves the loaded rows where they
+  // are and is reported by the footer instead, which is rendered whenever a
+  // page resolved or rows are loaded, because its counts are claims about rows
+  // that exist — except over that same empty capture, whose sentence already
+  // states everything its zeros would.
   // ---------------------------------------------------------------------------
 
-  if (!sourceSupported) {
+  // `query` is `undefined` exactly when the node's source is not this view's
+  // (see `sequenceQuery`), so testing it rather than the flag also narrows it for
+  // every state below. The mismatch is a defect in the panel, worded from the
+  // node catalog by the package's one contract for it, with the node's own query
+  // and no retry: asking again cannot change the answer.
+  if (query === undefined) {
     return (
       <div className={clsx('dg-state-transitions', className)}>
         <ErrorState
           className="dg-state-transitions__error"
-          message={ERROR_SOURCE_MESSAGE}
-          code={ERROR_SOURCE_CODE}
-          query={JSON.stringify(node.query, null, 2)}
+          {...unsupportedQueryProps(node.type, node.query)}
         />
       </div>
     );
@@ -1590,10 +1748,12 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
   const anyLoaded = loaded.length > 0;
   const firstPageLoading = status === 'loading' && !anyLoaded;
   const firstPageFailed = status === 'error' && !anyLoaded;
-  // Shown with the failure it describes, first page or later: the request that
-  // failed, offset included, is what a developer needs to reproduce it.
-  const failedQuery =
-    status === 'error' && query !== undefined ? JSON.stringify(query, null, 2) : undefined;
+  // A failure, first page or later, is shown through the package's one failure
+  // contract (B2-F14, B1-F16) with the request that failed, offset included —
+  // what a developer needs to reproduce it. A first page's failure is the
+  // view's own; one behind loaded rows is a page failure, whose copy says the
+  // rows above it are unaffected.
+  const failedResult = { error, announcement, retry };
 
   // The footer's paging control, read off the status of the page requested
   // last. Loading and failed reach the footer only behind loaded rows (the
@@ -1602,7 +1762,7 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
     status === 'loading'
       ? { state: 'loading' }
       : status === 'error'
-        ? { state: 'failed', code: error?.code, query: failedQuery, onRetry: retry }
+        ? { state: 'failed', failure: queryFailureProps(failedResult, query, { scope: 'page' }) }
         : nextPageOffset === undefined
           ? { state: 'end' }
           : { state: 'available', onLoadMore: handleLoadMore };
@@ -1624,17 +1784,33 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
         morePages: nextPageOffset !== undefined,
       });
 
+  // The settled empty capture: the first page resolved, nothing is loaded, the
+  // provider named no further page, and the copy is the nothing-captured one —
+  // which `emptyPageCopy` returns only while none of the reader's narrowing is
+  // in force. Every control of the toolbar would then act on an empty result
+  // (an order, a component choice, a narrowing or a grouping of nothing), and
+  // the footer's counts would only restate the sentence as zeros, so both are
+  // omitted. A narrowed empty result keeps both, so the narrowing can be undone
+  // where it was made, and loading and error keep the toolbar as above.
+  const nothingCaptured =
+    status === 'success' &&
+    !anyLoaded &&
+    nextPageOffset === undefined &&
+    emptyCopy === NOTHING_CAPTURED_COPY;
+
   return (
-    <div className={clsx('dg-state-transitions', className)} onFocus={handleFocusWithin}>
-      <Toolbar
-        className="dg-state-transitions__toolbar"
-        label={TOOLBAR_LABEL}
-        compact
-        wrap
-        selects={toolbarSelects}
-        actions={toolbarActions}
-        status={toolbarStatus}
-      />
+    <div className={clsx('dg-state-transitions', className)}>
+      {nothingCaptured ? null : (
+        <Toolbar
+          className="dg-state-transitions__toolbar"
+          label={TOOLBAR_LABEL}
+          compact
+          wrap
+          selects={toolbarSelects}
+          actions={toolbarActions}
+          status={toolbarStatus}
+        />
+      )}
 
       {firstPageLoading ? (
         <LoadingState
@@ -1645,16 +1821,18 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
       ) : firstPageFailed ? (
         <ErrorState
           className="dg-state-transitions__error"
-          message={ERROR_MESSAGE}
-          {...(error === undefined ? {} : { code: error.code })}
-          {...(failedQuery === undefined ? {} : { query: failedQuery })}
-          onRetry={retry}
+          {...queryFailureProps(failedResult, query)}
         />
       ) : rows.length === 0 ? (
         <EmptyState
           className="dg-state-transitions__empty"
           title={emptyCopy.title}
           message={emptyCopy.message}
+          icon={
+            emptyCopy === NOTHING_CAPTURED_COPY ? (
+              <GitCompareArrows className="dg-icon" />
+            ) : undefined
+          }
         />
       ) : (
         <DataTable
@@ -1663,7 +1841,7 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
           rowKey={(row) => row.id}
           caption={node.title ?? CATALOG_LABEL}
           compact
-          selectedRowKey={view.selectedKey}
+          selectedRowKey={selectedRowKey}
           onRowActivate={handleRowActivate}
           expandedRowKeys={view.expandedKeys}
           onRowToggle={handleRowToggle}
@@ -1671,7 +1849,7 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
         />
       )}
 
-      {status === 'success' || anyLoaded ? (
+      {(status === 'success' || anyLoaded) && !nothingCaptured ? (
         <PagingFooter
           drawn={rows.length}
           loaded={loaded.length}
@@ -1694,18 +1872,23 @@ function StateTransitionViewerView(props: StateTransitionViewerProps): ReactElem
  * relational — `DataTable` warns that an intrinsic track sizes itself from one
  * row's own content and so stops lining up with its own header, and these cells
  * hold values of wildly varying width.
+ *
+ * Every track is `minmax(<floor>, <share>)`. The share splits spare width in
+ * the proportions the values need; the floor, in `ch` of the table's type
+ * (never a literal length, AAP 0.6.4), is what the column never shrinks below.
+ * `DataTable` sums the floors into the grid's own minimum width, so a surface
+ * narrower than their sum scrolls the table horizontally with every column
+ * still readable, instead of squeezing each one to its padding and letting a
+ * cell's content paint over its neighbour. Each floor covers its header and
+ * the cell's inline padding, and then: the disclosure control, a readable
+ * excerpt of the name and its source chip; a hook label; a readable excerpt of
+ * a value summary; the trigger control with its kind chip; the widest reported
+ * chip, "Transitions dropped".
  * ---------------------------------------------------------------------------
  */
 
 /** What {@link buildColumns} needs from the component around it. */
 interface ColumnContext {
-  /** The rows whose detail is open, for the expand affordance's label and glyph. */
-  readonly expandedKeys: readonly string[];
-  /**
-   * The row that holds focus, whose tooltip triggers join the tab order, or
-   * `null` before focus has entered the grid. See {@link inRowTabIndex}.
-   */
-  readonly focusedRowKey: string | null;
   /** Discloses or hides one row's detail. */
   readonly onToggle: (transition: StateTransition) => void;
   /** Opens the record a transition is attributed to. */
@@ -1717,9 +1900,11 @@ interface ColumnContext {
 /**
  * Build the column set.
  *
- * A function rather than a constant because the cells need the callbacks, the
- * expansion set and the focused row; it is memoized by the caller on exactly
- * those inputs.
+ * A function rather than a constant because the cells need the callbacks; it
+ * is memoized by the caller on exactly those inputs. The expansion state is not
+ * among them: each cell reads it from the `DataTableCellMeta` the grid hands
+ * it. Neither is focus: every control a cell renders is `tabIndex={-1}` in
+ * every row, and `DataTable`'s arrow keys reach it (see this module's header).
  *
  * @param context See {@link ColumnContext}.
  * @returns The columns, in reading order.
@@ -1730,11 +1915,15 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
       key: 'component',
       header: HEADERS.component,
       rowHeader: true,
-      width: 'minmax(0, 1.3fr)',
-      cell: (row) => (
+      width: 'minmax(30ch, 1.3fr)',
+      // The disclosure state and the id of the detail row it reveals come from
+      // `DataTable` itself, which renders that row: the one source of truth for
+      // both, so the toggle can never report a state the grid is not showing.
+      cell: (row, _rowIndex, meta) => (
         <ComponentCell
           transition={row}
-          expanded={context.expandedKeys.includes(row.id)}
+          expanded={meta.expanded}
+          detailRowId={meta.detailRowId}
           onToggle={context.onToggle}
           onOpenSource={context.onOpenSource}
         />
@@ -1743,50 +1932,32 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
     {
       key: 'hook',
       header: HEADERS.hook,
-      width: 'minmax(0, 0.9fr)',
+      width: 'minmax(18ch, 0.9fr)',
       cell: (row) => <HookCell transition={row} />,
     },
     {
       key: 'previous',
       header: HEADERS.previous,
-      width: 'minmax(0, 1.4fr)',
-      cell: (row) => (
-        <ValueCell
-          summary={row.previousValue}
-          side="previous"
-          tabbable={row.id === context.focusedRowKey}
-        />
-      ),
+      width: 'minmax(20ch, 1.4fr)',
+      cell: (row) => <ValueCell summary={row.previousValue} side="previous" />,
     },
     {
       key: 'trigger',
       header: HEADERS.trigger,
-      width: 'minmax(0, 1.1fr)',
-      cell: (row) => (
-        <TriggerCell
-          transition={row}
-          onSelect={context.onTriggerSelect}
-          tabbable={row.id === context.focusedRowKey}
-        />
-      ),
+      width: 'minmax(28ch, 1.1fr)',
+      cell: (row) => <TriggerCell transition={row} onSelect={context.onTriggerSelect} />,
     },
     {
       key: 'next',
       header: HEADERS.next,
-      width: 'minmax(0, 1.4fr)',
-      cell: (row) => (
-        <ValueCell
-          summary={row.nextValue}
-          side="next"
-          tabbable={row.id === context.focusedRowKey}
-        />
-      ),
+      width: 'minmax(20ch, 1.4fr)',
+      cell: (row) => <ValueCell summary={row.nextValue} side="next" />,
     },
     {
       key: 'changed',
       header: HEADERS.changed,
-      width: 'minmax(0, 0.9fr)',
-      cell: (row) => <ChangedCell transition={row} tabbable={row.id === context.focusedRowKey} />,
+      width: 'minmax(20ch, 0.9fr)',
+      cell: (row) => <ChangedCell transition={row} />,
     },
   ];
 }
@@ -1805,8 +1976,14 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<StateTra
 interface ComponentCellProps {
   /** The row. */
   readonly transition: StateTransition;
-  /** Whether this row's detail is disclosed. */
+  /** Whether this row's detail is disclosed: `DataTableCellMeta.expanded`. */
   readonly expanded: boolean;
+  /**
+   * The id of the detail row the toggle reveals, `DataTableCellMeta.detailRowId`:
+   * defined only while that row is in the document, so `aria-controls` never
+   * names a missing element.
+   */
+  readonly detailRowId: string | undefined;
   /** Discloses or hides it. */
   readonly onToggle: (transition: StateTransition) => void;
   /** Opens a project location, when the host offers that action. */
@@ -1818,15 +1995,30 @@ interface ComponentCellProps {
  * location.
  *
  * The name is the producer's or the package's label for a row that has none —
- * never a guess. `DataTable` puts this cell in `role="rowheader"` and carries
- * the row's `aria-expanded`, so the control here contributes the action and not
- * a second copy of the state.
+ * never a guess. `DataTable` puts this cell in `role="rowheader"`. The track
+ * is narrower than many names, so the name ellipsizes and carries itself whole
+ * as its `title`; the expanded detail shows it whole as well.
+ *
+ * The disclosure state lives on the toggle, not on the row. ARIA supports
+ * `aria-expanded` on a `row` only inside a `treegrid`, and this grid's detail
+ * row is a disclosure of one transition's identifiers rather than a child row,
+ * so the control follows the APG disclosure pattern: `aria-expanded` states
+ * whether the detail is open and `aria-controls` names the detail row
+ * `DataTable` renders for it, both taken from the cell's `DataTableCellMeta`.
+ *
+ * The toggle's name carries the row's identity (see {@link detailToggleLabel}),
+ * so each of a grid's toggles is announced as the transition it opens.
+ *
+ * Both controls — the toggle and the compact source chip — are `tabIndex={-1}`:
+ * the grid's arrow keys reach them, and the row stays the grid's one Tab stop.
  *
  * @param props See {@link ComponentCellProps}.
  * @returns The cell.
  */
 function ComponentCell(props: ComponentCellProps): ReactElement {
-  const { transition, expanded, onToggle, onOpenSource } = props;
+  const { transition, expanded, detailRowId, onToggle, onOpenSource } = props;
+  const toggleLabel = detailToggleLabel(expanded, transition);
+  const name = componentLabelOf(transition);
 
   return (
     <Stack
@@ -1839,7 +2031,10 @@ function ComponentCell(props: ComponentCellProps): ReactElement {
         variant="ghost"
         size="sm"
         iconOnly
-        aria-label={expanded ? DETAIL_HIDE_LABEL : DETAIL_SHOW_LABEL}
+        tabIndex={-1}
+        aria-label={toggleLabel}
+        aria-expanded={expanded}
+        aria-controls={detailRowId}
         icon={
           expanded ? (
             <ChevronDown aria-hidden="true" className="dg-icon" />
@@ -1851,17 +2046,18 @@ function ComponentCell(props: ComponentCellProps): ReactElement {
           onToggle(transition);
         }}
       >
-        {expanded ? DETAIL_HIDE_LABEL : DETAIL_SHOW_LABEL}
+        {toggleLabel}
       </Button>
 
-      <Text size="sm" truncate>
-        {componentLabelOf(transition)}
+      <Text size="sm" truncate title={name}>
+        {name}
       </Text>
 
       {transition.source === undefined ? null : (
         <SourceLink
           location={transition.source}
           compact
+          tabIndex={-1}
           {...(onOpenSource === undefined ? {} : { onOpenSource })}
         />
       )}
@@ -1882,20 +2078,39 @@ interface HookCellProps {
  * hook state, or a context value it consumes — and it is rendered through the
  * shared label humanizer so this file spells none of its members.
  *
+ * The two wrap: in a track too narrow for both, the chip moves onto a line of
+ * its own instead of being squeezed beside the label, and `DataTable` measures
+ * each row, so a taller row is laid out correctly. The label ellipsizes within
+ * its line, and the chip clips at its own border in a track narrower than its
+ * word; each carries itself whole as its `title`.
+ *
  * @param props See {@link HookCellProps}.
  * @returns The cell.
  */
 function HookCell(props: HookCellProps): ReactElement {
   const { transition } = props;
+  const label = hookLabelOf(transition);
+  const dimension =
+    transition.transitionSource === undefined
+      ? undefined
+      : humanizeLabel(transition.transitionSource);
 
   return (
-    <Stack direction="horizontal" gap={1} align="center" className="dg-state-transitions__hook">
-      <Text size="xs" tone="secondary" truncate>
-        {hookLabelOf(transition)}
+    <Stack
+      direction="horizontal"
+      gap={1}
+      align="center"
+      wrap
+      className="dg-state-transitions__hook"
+    >
+      <Text size="xs" tone="secondary" truncate title={label}>
+        {label}
       </Text>
 
-      {transition.transitionSource === undefined ? null : (
-        <Badge variant="outline">{humanizeLabel(transition.transitionSource)}</Badge>
+      {dimension === undefined ? null : (
+        <Badge variant="outline" title={dimension}>
+          {dimension}
+        </Badge>
       )}
     </Stack>
   );
@@ -1907,8 +2122,6 @@ interface ValueCellProps {
   readonly summary: string | undefined;
   /** Which side this cell is, which decides its classes and its direction glyph. */
   readonly side: 'previous' | 'next';
-  /** Whether this row holds focus, which puts a shortened summary in the tab order. */
-  readonly tabbable: boolean;
 }
 
 /**
@@ -1919,14 +2132,23 @@ interface ValueCellProps {
  * side (AAP 0.5.2). When the formatter shortened it, the cell says so through a
  * state class and a tooltip that explains the bound — it does not offer the
  * rest, because there is no rest to offer. That summary is the tooltip's
- * focusable trigger (see {@link inRowTabIndex}); a summary shown whole has no
- * tooltip and so no tab index at all.
+ * trigger, focusable at `tabIndex={-1}` so the grid's arrow keys reach it and
+ * its focus opens the explanation (see this module's header); a summary shown
+ * whole has no tooltip and so no tab index at all.
+ *
+ * The cell is bounded to its grid track by the stylesheet, so a summary wider
+ * than the track ellipsizes inside it. A summary shown whole therefore carries
+ * its displayed text — the same bounded string, never a fuller one — as its
+ * `title`, so the part the cell clips is readable on hover. A shortened one
+ * carries none: its hover already belongs to the tooltip explaining the bound,
+ * and a native bubble stacked on that one would compete with it. Both are shown
+ * whole, wrapped, in the row's expanded detail.
  *
  * @param props See {@link ValueCellProps}.
  * @returns The cell.
  */
 function ValueCell(props: ValueCellProps): ReactElement {
-  const { summary, side, tabbable } = props;
+  const { summary, side } = props;
 
   const preview = previewOf(summary);
   const cellClass = clsx(
@@ -1949,16 +2171,12 @@ function ValueCell(props: ValueCellProps): ReactElement {
         </Text>
       ) : preview.shortened ? (
         <Tooltip content={VALUE_SHORTENED_HINT}>
-          <Code
-            size="sm"
-            className="dg-state-transitions__value dg-is-truncated"
-            tabIndex={inRowTabIndex(tabbable)}
-          >
+          <Code size="sm" className="dg-state-transitions__value dg-is-truncated" tabIndex={-1}>
             {preview.text}
           </Code>
         </Tooltip>
       ) : (
-        <Code size="sm" className="dg-state-transitions__value">
+        <Code size="sm" className="dg-state-transitions__value" title={preview.text}>
           {preview.text}
         </Code>
       )}
@@ -1972,8 +2190,6 @@ interface TriggerCellProps {
   readonly transition: StateTransition;
   /** Opens the attributed record. */
   readonly onSelect: (eventId: string) => void;
-  /** Whether this row holds focus, which puts the label's explanation in the tab order. */
-  readonly tabbable: boolean;
 }
 
 /**
@@ -1985,14 +2201,26 @@ interface TriggerCellProps {
  * payload is the record id alone; see `handleTriggerSelect` in
  * {@link StateTransitionViewer} for why. The plain label is the trigger of the
  * tooltip saying which of the two facts holds, and it is focusable for that
- * reason alone (see {@link inRowTabIndex}): focus on it opens the explanation
- * and activates nothing.
+ * reason alone: focus on it opens the explanation and activates nothing.
+ *
+ * Both forms are `tabIndex={-1}`, reached by the grid's arrow keys rather than
+ * by Tab (see this module's header). The control keeps the browser's own Enter
+ * and Space once focus is on it, because `DataTable` leaves those keys to a
+ * control inside a row.
+ *
+ * The control and its kind chip wrap, so in a track too narrow for both the
+ * chip takes a line of its own instead of being squeezed beside a long label;
+ * `DataTable` measures each row, so the taller row is laid out correctly. The
+ * control's label ellipsizes inside the track and carries itself whole as the
+ * control's `title` — its accessible name is its label either way — and the
+ * chip, which clips at its own border in a track narrower than its word, does
+ * the same.
  *
  * @param props See {@link TriggerCellProps}.
  * @returns The cell.
  */
 function TriggerCell(props: TriggerCellProps): ReactElement {
-  const { transition, onSelect, tabbable } = props;
+  const { transition, onSelect } = props;
   const { triggerEventId, triggerKind } = transition;
 
   if (triggerEventId === undefined) {
@@ -2013,7 +2241,7 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
           tone="muted"
           className="dg-state-transitions__trigger"
           truncate
-          tabIndex={inRowTabIndex(tabbable)}
+          tabIndex={-1}
         >
           {known ? triggerLabelOf(transition) : TRIGGER_UNDETERMINED_LABEL}
         </Text>
@@ -2021,22 +2249,30 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
     );
   }
 
+  const label = triggerLabelOf(transition);
+
   return (
-    <Stack direction="horizontal" gap={1} align="center">
+    <Stack direction="horizontal" gap={1} align="center" wrap>
       <Button
         variant="ghost"
         size="sm"
         className="dg-state-transitions__trigger"
+        tabIndex={-1}
         icon={<Zap aria-hidden="true" className="dg-icon" />}
+        title={label}
         onClick={() => {
           onSelect(triggerEventId);
         }}
       >
-        {triggerLabelOf(transition)}
+        {label}
       </Button>
 
       {triggerKind === undefined || transition.triggerName === undefined ? null : (
-        <Badge variant="outline" color={kindColorVar(triggerKind)}>
+        <Badge
+          variant="outline"
+          color={kindColorVar(triggerKind)}
+          title={formatKindLabel(triggerKind)}
+        >
           {formatKindLabel(triggerKind)}
         </Badge>
       )}
@@ -2048,8 +2284,6 @@ function TriggerCell(props: TriggerCellProps): ReactElement {
 interface ChangedCellProps {
   /** The row. */
   readonly transition: StateTransition;
-  /** Whether this row holds focus, which puts its explained chips in the tab order. */
-  readonly tabbable: boolean;
 }
 
 /**
@@ -2065,19 +2299,20 @@ interface ChangedCellProps {
  *
  * Each chip carries a glyph and a word as well as a tone, so the state is never
  * conveyed by colour alone (AAP 0.6.4). The two chips that carry an
- * explanation are that tooltip's focusable trigger (see {@link inRowTabIndex});
- * the changed chip explains nothing and takes no tab index.
+ * explanation are that tooltip's trigger, focusable at `tabIndex={-1}` so the
+ * grid's arrow keys reach it (see this module's header); the changed chip
+ * explains nothing and takes no tab index. A chip clips at its
+ * own border in a track narrower than its word, so the changed chip carries its
+ * word as its `title`; the other two already open their tooltip on hover.
  *
  * @param props See {@link ChangedCellProps}.
  * @returns The cell.
  */
 function ChangedCell(props: ChangedCellProps): ReactElement {
-  const { transition, tabbable } = props;
+  const { transition } = props;
 
   const disclosure =
-    transition.truncated === true ? (
-      <TruncationChip transition={transition} tabbable={tabbable} />
-    ) : null;
+    transition.truncated === true ? <TruncationChip transition={transition} /> : null;
 
   if (isTruncationDisclosure(transition)) {
     return (
@@ -2105,7 +2340,11 @@ function ChangedCell(props: ChangedCellProps): ReactElement {
       )}
     >
       {transition.changed ? (
-        <Badge tone="info" icon={<Check aria-hidden="true" className="dg-icon" />}>
+        <Badge
+          tone="info"
+          icon={<Check aria-hidden="true" className="dg-icon" />}
+          title={CHANGED_LABEL}
+        >
           {CHANGED_LABEL}
         </Badge>
       ) : (
@@ -2113,7 +2352,7 @@ function ChangedCell(props: ChangedCellProps): ReactElement {
           <Badge
             tone="neutral"
             icon={<CircleSlash aria-hidden="true" className="dg-icon" />}
-            tabIndex={inRowTabIndex(tabbable)}
+            tabIndex={-1}
           >
             {UNREPORTED_LABEL}
           </Badge>
@@ -2128,8 +2367,6 @@ function ChangedCell(props: ChangedCellProps): ReactElement {
 interface TruncationChipProps {
   /** The row carrying the disclosure. */
   readonly transition: StateTransition;
-  /** Whether that row holds focus, which puts the chip in the tab order. */
-  readonly tabbable: boolean;
 }
 
 /**
@@ -2137,14 +2374,14 @@ interface TruncationChipProps {
  *
  * The count is printed only when the producer disclosed one, and the tooltip
  * states that it is a floor rather than a total — which is what the aggregate
- * says it is. The chip is that tooltip's focusable trigger; see
- * {@link inRowTabIndex}.
+ * says it is. The chip is that tooltip's trigger, focusable at `tabIndex={-1}`
+ * and reached by the grid's arrow keys (see this module's header).
  *
  * @param props See {@link TruncationChipProps}.
  * @returns The chip.
  */
 function TruncationChip(props: TruncationChipProps): ReactElement {
-  const { transition, tabbable } = props;
+  const { transition } = props;
   const { droppedTransitions } = transition;
 
   const label =
@@ -2157,7 +2394,7 @@ function TruncationChip(props: TruncationChipProps): ReactElement {
       <Badge
         tone="warning"
         icon={<Scissors aria-hidden="true" className="dg-icon" />}
-        tabIndex={inRowTabIndex(tabbable)}
+        tabIndex={-1}
       >
         {label}
       </Badge>
@@ -2180,15 +2417,28 @@ interface TransitionDetailProps {
 }
 
 /**
- * One row's categories and identifiers, and nothing else.
+ * One row whole: its identity, its two summaries, its categories and its
+ * identifiers.
  *
- * Deliberately no values: the two summaries are already in the row, and this
- * panel holds nothing more of them. What it adds is the vocabulary the columns
- * have no room for — the value's category, the dimension that changed, the
- * trigger's kind — and the identifiers a developer needs to find the same
- * transition in the timeline, the event log or a stored capture. The instance
- * id is what separates two mounted copies of one component, which the component
- * name alone groups together.
+ * First what the row's cells clip to their tracks, shown here unclipped: the
+ * component and hook names, then the value before and the value after, each on
+ * a line of its own across the full width of the detail and wrapped rather
+ * than ellipsized. Each summary is the row's displayed string exactly — the
+ * bounded preview {@link previewOf} produced for the cell — so this block never
+ * shows more of a value than the row was given, and a summary the display
+ * bound shortened appears here shortened too (AAP 0.5.2): there is no rest of
+ * it in this process to show.
+ *
+ * Then the vocabulary the columns have no room for — the value's category, the
+ * dimension that changed, the trigger's kind — and the identifiers a developer
+ * needs to find the same transition in the timeline, the event log or a stored
+ * capture. The instance id is what separates two mounted copies of one
+ * component, which the component name alone groups together.
+ *
+ * The block renders inside `DataTable`'s detail row, which belongs to the same
+ * keyboard scope as its data row: the source chip is `tabIndex={-1}` and is the
+ * last control ArrowRight reaches from that row. Its full form (symbol and
+ * path) is named by `SourceLink` itself, visible text first.
  *
  * @param props See {@link TransitionDetailProps}.
  * @returns The detail block.
@@ -2198,6 +2448,26 @@ function TransitionDetail(props: TransitionDetailProps): ReactElement {
 
   return (
     <Stack direction="vertical" gap={2} className="dg-state-transitions__detail">
+      <Stack direction="horizontal" gap={3} align="center" wrap>
+        <DetailField label={DETAIL_LABELS.component}>
+          <Text size="sm">{componentLabelOf(transition)}</Text>
+        </DetailField>
+        <DetailField label={DETAIL_LABELS.hook}>
+          <Text size="xs" tone="secondary">
+            {hookLabelOf(transition)}
+          </Text>
+        </DetailField>
+      </Stack>
+
+      <Stack direction="vertical" gap={1}>
+        <DetailField label={DETAIL_LABELS.previousValue} align="baseline">
+          <DetailSummary summary={transition.previousValue} />
+        </DetailField>
+        <DetailField label={DETAIL_LABELS.nextValue} align="baseline">
+          <DetailSummary summary={transition.nextValue} />
+        </DetailField>
+      </Stack>
+
       <Stack direction="horizontal" gap={2} align="center" wrap>
         {transition.valueType === undefined ? null : (
           <DetailField label={DETAIL_LABELS.valueType}>
@@ -2258,6 +2528,7 @@ function TransitionDetail(props: TransitionDetailProps): ReactElement {
         <DetailField label={DETAIL_LABELS.source}>
           <SourceLink
             location={transition.source}
+            tabIndex={-1}
             {...(onOpenSource === undefined ? {} : { onOpenSource })}
           />
         </DetailField>
@@ -2270,6 +2541,15 @@ function TransitionDetail(props: TransitionDetailProps): ReactElement {
 interface DetailFieldProps {
   /** The field's caption. */
   readonly label: string;
+  /**
+   * How the caption and the value align across the field's line: `center` for
+   * a one-line value such as a chip or an identifier, `baseline` for a value
+   * that may wrap onto further lines, so the caption sits on its first line
+   * rather than midway down it.
+   *
+   * @default 'center'
+   */
+  readonly align?: StackAlign | undefined;
   /** The field's value, already rendered through a primitive. */
   readonly children: ReactNode;
 }
@@ -2285,13 +2565,53 @@ interface DetailFieldProps {
  * @returns The field.
  */
 function DetailField(props: DetailFieldProps): ReactElement {
+  const { label, align = 'center', children } = props;
+
   return (
-    <Stack direction="horizontal" gap={1} align="center">
+    <Stack direction="horizontal" gap={1} align={align}>
       <Text size="xs" tone="muted">
-        {props.label}
+        {label}
       </Text>
-      {props.children}
+      {children}
     </Stack>
+  );
+}
+
+/** Props of {@link DetailSummary}. */
+interface DetailSummaryProps {
+  /** The producer's preview of one side of the transition, if it reported one. */
+  readonly summary: string | undefined;
+}
+
+/**
+ * One value summary inside an expanded row: the row's displayed string, whole.
+ *
+ * The same {@link previewOf} text the row's cell shows — so never more than
+ * the row was given — wrapped across as many lines as it needs instead of
+ * clipped to a track. It deliberately carries no `dg-state-transitions__value`
+ * class: that class addresses a row's own summary, which the stylesheet clips
+ * to one line, and this copy is the one that is not clipped. A side the
+ * producer did not report reads as the package's not-available label, exactly
+ * as its cell does.
+ *
+ * @param props See {@link DetailSummaryProps}.
+ * @returns The summary, or the not-available label.
+ */
+function DetailSummary(props: DetailSummaryProps): ReactElement {
+  const preview = previewOf(props.summary);
+
+  if (preview === undefined) {
+    return (
+      <Text size="xs" tone="muted">
+        {NOT_AVAILABLE_LABEL}
+      </Text>
+    );
+  }
+
+  return (
+    <Code size="sm" wrap>
+      {preview.text}
+    </Code>
   );
 }
 
@@ -2320,12 +2640,13 @@ type NextPageState =
   | { readonly state: 'loading' }
   | {
       readonly state: 'failed';
-      /** The failure's code, when the provider's error carried one. */
-      readonly code: string | undefined;
-      /** The request that failed, serialised, offset included. */
-      readonly query: string | undefined;
-      /** Requests the same page again. */
-      readonly onRetry: () => void;
+      /**
+       * The failed page in the package's one failure contract, page scope:
+       * title, lead and cause, hint, code, the request that failed (offset
+       * included), the settled announcement and the retry that requests the
+       * same page again.
+       */
+      readonly failure: QueryFailureProps;
     };
 
 /** Props of {@link PagingFooter}. */
@@ -2361,6 +2682,10 @@ interface PagingFooterProps {
  * the page twice; a failed page is reported here as an alert with its retry,
  * beside the counts of the rows it left untouched.
  *
+ * The counts sentence is a polite, atomic live region, so a reader who pressed
+ * "Load more" or toggled a narrowing hears the new counts without moving focus
+ * to find them.
+ *
  * @param props See {@link PagingFooterProps}.
  * @returns The footer.
  */
@@ -2382,7 +2707,15 @@ function PagingFooter(props: PagingFooterProps): ReactElement {
       className="dg-state-transitions__footer"
     >
       <Stack direction="vertical" gap={0}>
-        <Text size="xs" tone="muted" numeric>
+        {/*
+         * A polite live region: the counts change when a page is appended or a
+         * narrowing is toggled, far from where the reader's focus is, and the
+         * change is announced without interrupting them. Atomic, so the whole
+         * sentence is read rather than a changed figure out of context. The
+         * element is present from the first resolved page, which is what lets
+         * assistive technology observe the changes after it.
+         */}
+        <Text size="xs" tone="muted" numeric aria-live="polite" aria-atomic="true">
           {counts}
         </Text>
         {changedOnly ? (
@@ -2406,13 +2739,7 @@ function PagingFooter(props: PagingFooterProps): ReactElement {
           {LOADING_MORE_LABEL}
         </Button>
       ) : next.state === 'failed' ? (
-        <ErrorState
-          className="dg-state-transitions__error"
-          message={PAGE_ERROR_MESSAGE}
-          code={next.code}
-          query={next.query}
-          onRetry={next.onRetry}
-        />
+        <ErrorState className="dg-state-transitions__error" {...next.failure} />
       ) : null}
     </Stack>
   );

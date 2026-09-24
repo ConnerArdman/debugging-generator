@@ -1142,15 +1142,51 @@ describe('HttpClient — replies', () => {
     expect(error.details).toEqual({ operation: 'session.get', status: 404, ref: 'ref_1' });
   });
 
+  /**
+   * A fragment unique to the recovery hint of each unauthorized-family code, so
+   * a case asserts the remedy a refusal carries — and that it carries no other
+   * code's remedy — rather than merely that it carries one.
+   */
+  const FAMILY_HINT_FRAGMENTS = {
+    FORBIDDEN_ORIGIN: 'http: or https: web page',
+    PAIRING_EXPIRED: 'no longer valid',
+    PAIRING_INVALID: 'did not accept this pairing code',
+    RATE_LIMITED: 'rate-limiting',
+    UNAUTHORIZED: 'setToken()',
+  } as const;
+
+  /**
+   * Asserts that a hint is the one for `code`, and names no other family code's
+   * remedy.
+   *
+   * @param hint The hint the failure carried.
+   * @param code The unauthorized-family code it was reported with.
+   */
+  function expectFamilyHint(
+    hint: string | undefined,
+    code: keyof typeof FAMILY_HINT_FRAGMENTS,
+  ): void {
+    expect(hint).toEqual(expect.stringContaining(FAMILY_HINT_FRAGMENTS[code]));
+
+    const others = Object.entries(FAMILY_HINT_FRAGMENTS).filter(([other]) => other !== code);
+
+    for (const [, fragment] of others) {
+      expect(hint).not.toContain(fragment);
+    }
+  }
+
   it.each([
-    [401, { code: 'PAIRING_EXPIRED', message: 'The pairing code expired' }, 'PAIRING_EXPIRED'],
-    [401, { code: 'SESSION_NOT_FOUND', message: 'No such session' }, 'UNAUTHORIZED'],
     [401, '', 'UNAUTHORIZED'],
-    [403, { code: 'FORBIDDEN_ORIGIN', message: 'Web origins are refused' }, 'FORBIDDEN_ORIGIN'],
+    [401, { code: 'SESSION_NOT_FOUND', message: 'No such session' }, 'UNAUTHORIZED'],
+    [401, { code: 'UNAUTHORIZED', message: 'Unknown credential' }, 'UNAUTHORIZED'],
     [403, { code: 'INTERNAL', message: 'Refused' }, 'UNAUTHORIZED'],
     [403, `refused ${MARKER}`, 'UNAUTHORIZED'],
+    [401, { code: 'PAIRING_EXPIRED', message: 'The pairing code expired' }, 'PAIRING_EXPIRED'],
+    [401, { code: 'PAIRING_INVALID', message: 'Not accepted' }, 'PAIRING_INVALID'],
+    [403, { code: 'FORBIDDEN_ORIGIN', message: 'Web origins are refused' }, 'FORBIDDEN_ORIGIN'],
+    [401, { code: 'RATE_LIMITED', message: 'Too many attempts' }, 'RATE_LIMITED'],
   ] as const)(
-    'keeps a %i reply in the unauthorized family (body %j → %s)',
+    'keeps a %i reply in the unauthorized family, with the hint for its code (body %j → %s)',
     async (status, body, code) => {
       const client = new HttpClient({
         baseUrl: ORIGIN,
@@ -1162,7 +1198,7 @@ describe('HttpClient — replies', () => {
 
       expect(error.code).toBe(code);
       expect(error.details).toEqual(expect.objectContaining({ operation: 'session.list', status }));
-      expect(error.hint).toEqual(expect.stringContaining('setToken()'));
+      expectFamilyHint(error.hint, code);
       expect(reachableText(error)).not.toContain(MARKER);
       expect(reachableText(error)).not.toContain(EDITOR_TOKEN);
     },
@@ -1206,6 +1242,104 @@ describe('HttpClient — replies', () => {
     expect(hints[0]).toEqual(expect.stringContaining('rate-limiting'));
     expect(hints[1]).toEqual(expect.stringContaining('log'));
     expect(hints[2]).toBeUndefined();
+  });
+
+  it('explains the origin policy, not re-pairing, when a 403 names FORBIDDEN_ORIGIN', async () => {
+    const client = new HttpClient({
+      baseUrl: ORIGIN,
+      token: EDITOR_TOKEN,
+      fetch: fetchReplying(
+        reply(403, {
+          code: 'FORBIDDEN_ORIGIN',
+          message: 'Debug Generator refuses requests from web origins.',
+        }),
+      ),
+    });
+
+    // The auth-exempt route and a protected one: the service refuses a web
+    // origin before it looks at a credential, so both get the same remedy.
+    const errors = [
+      failureOf(await client.health()),
+      failureOf(await client.request('session.list')),
+    ];
+
+    for (const error of errors) {
+      expect(error.code).toBe('FORBIDDEN_ORIGIN');
+      expectFamilyHint(error.hint, 'FORBIDDEN_ORIGIN');
+      expect(error.hint).toEqual(expect.stringContaining('chrome-extension://'));
+      expect(error.hint).not.toContain('Pair this client again');
+      expect(error.hint).not.toContain('setToken()');
+      expect(reachableText(error)).not.toContain(EDITOR_TOKEN);
+      expect(reachableText(error)).not.toContain(ORIGIN);
+    }
+  });
+
+  it.each([
+    [401, 'PAIRING_EXPIRED', 'The pairing code expired'],
+    [401, 'PAIRING_INVALID', 'The pairing code was not accepted'],
+    [400, 'PAIRING_INVALID', 'The pairing code is malformed'],
+  ] as const)(
+    'asks for a fresh pairing code when pair.complete answers %i %s',
+    async (status, code, message) => {
+      const client = new HttpClient({
+        baseUrl: ORIGIN,
+        fetch: fetchReplying(reply(status, { code, message })),
+      });
+
+      const error = failureOf(await client.pairComplete(PAIRING_CODE));
+
+      expect(error.code).toBe(code);
+      expect(error.details).toEqual({ operation: 'pair.complete', status });
+      expectFamilyHint(error.hint, code);
+      expect(error.hint).toEqual(expect.stringContaining('debuggen.pairChrome'));
+      expect(error.hint).not.toContain('setToken()');
+      expect(reachableText(error)).not.toContain(PAIRING_CODE);
+    },
+  );
+
+  it.each([400, 429, 503])(
+    'gives a RATE_LIMITED code the rate-limit hint when it arrives as a %i',
+    async (status) => {
+      const client = new HttpClient({
+        baseUrl: ORIGIN,
+        fetch: fetchReplying(reply(status, { code: 'RATE_LIMITED', message: 'Too many attempts' })),
+      });
+
+      const error = failureOf(await client.pairComplete(PAIRING_CODE));
+
+      expect(error.code).toBe('RATE_LIMITED');
+      expectFamilyHint(error.hint, 'RATE_LIMITED');
+      expect(error.hint).not.toContain('its log names the stage');
+      expect(reachableText(error)).not.toContain(PAIRING_CODE);
+    },
+  );
+
+  it('falls back to the status family when the resolved code has no hint of its own', async () => {
+    const replies = [
+      reply(429, { code: 'INTERNAL', message: 'Slow down' }),
+      reply(503, { code: 'STORE_ERROR', message: 'The store is locked' }),
+      reply(404, { code: 'SESSION_NOT_FOUND', message: 'No such session' }),
+    ];
+    const failures = await Promise.all(
+      replies.map(async (response) => {
+        const client = new HttpClient({
+          baseUrl: ORIGIN,
+          token: EDITOR_TOKEN,
+          fetch: fetchReplying(response),
+        });
+
+        return failureOf(await client.request('session.get', { params: { id: SESSION_ID } }));
+      }),
+    );
+
+    expect(failures.map((error) => error.code)).toEqual([
+      'INTERNAL',
+      'STORE_ERROR',
+      'SESSION_NOT_FOUND',
+    ]);
+    expect(failures[0]?.hint).toEqual(expect.stringContaining('rate-limiting'));
+    expect(failures[1]?.hint).toEqual(expect.stringContaining('its log names the stage'));
+    expect(failures[2]?.hint).toBeUndefined();
   });
 
   it('names the owning session when capture.start answers 409', async () => {

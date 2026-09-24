@@ -78,14 +78,15 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { DebuggenError } from '@debuggen/shared';
 
-import { PANEL_NODE_CATALOG } from './catalog.js';
-import { parsePanelSpecInput } from './input.js';
+import { PANEL_NODE_CATALOG, isSourceAllowedForNode } from './catalog.js';
+import { panelSpecInputSchema, parsePanelSpecInput } from './input.js';
 import type { PanelNodeInput, PanelSpecInput, StackNodeInput } from './input.js';
 import { normalizePanel } from './normalize.js';
 import type { NormalizeAnalysis, NormalizeContext } from './normalize.js';
-import { PANEL_NODE_ID_MAX_LENGTH } from './nodes/query.js';
-import { PANEL_SPEC_VERSION, parsePanelSpec } from './spec.js';
-import type { PanelNode, PanelSpec } from './spec.js';
+import { DATA_QUERY_SOURCES, PANEL_NODE_ID_MAX_LENGTH } from './nodes/query.js';
+import type { DataQuerySource } from './nodes/query.js';
+import { PANEL_NODE_TYPES, PANEL_SPEC_VERSION, parsePanelSpec } from './spec.js';
+import type { PanelNode, PanelNodeType, PanelSpec } from './spec.js';
 import { MAX_HEADLINE_LENGTH } from './summary.js';
 import type { Fact, Hypothesis } from './summary.js';
 import { PANEL_MAX_NODE_DEPTH, validatePanelSpec } from './validate.js';
@@ -965,19 +966,47 @@ describe('normalizePanel query lifting', () => {
     expect(Object.keys(link)).toEqual(['type', 'id', 'title', 'location']);
   });
 
-  it('emits no query when no source can be resolved, and step 3 rejects that node', () => {
-    // The documented decision: normalisation is not a second validator, so a
-    // query-backed node the authoring schema chose not to reject for having no
-    // source at all is emitted without a query and reported once, at step 3.
-    const input = parseInput(inputWith([{ type: 'eventLog', sort: 'start_asc', limit: 5 }]));
+  it('never receives a parsed node without a source: step 1 refuses it, naming the sources', () => {
+    // The authoring schema requires a source of every query-backed node type
+    // without a catalog default, so the omission is the model's to repair at
+    // step 1 rather than a product bug found at step 3 (AAP 0.5.3).
+    const parsed = parsePanelSpecInput({
+      title: 'Interaction latency',
+      summary: 'One step of the interaction held most of the recorded time.',
+      layout: [{ type: 'eventLog', sort: 'start_asc', limit: 5 }],
+    });
 
-    const spec = normalizePanel(input, ANALYSIS, CONTEXT);
+    expect(parsed.ok).toBe(false);
+
+    if (!parsed.ok) {
+      expect(parsed.error.details?.['issues']).toStrictEqual([
+        {
+          path: 'layout.0.source',
+          code: 'panel_node_query_source_missing',
+          expected: PANEL_NODE_CATALOG.eventLog.sources.join(' | '),
+        },
+      ]);
+    }
+  });
+
+  it('emits no query for a hand-assembled node with no source, and step 3 names the fault', () => {
+    // The documented decision: normalisation is not a second validator. An
+    // input that was assembled rather than parsed can still lack a source; the
+    // node is then emitted without a query, deterministically, and reported
+    // once, at step 3, with the catalog code and the sources its type can read.
+    const handAssembled: unknown = {
+      ...inputWith([]),
+      layout: [{ type: 'eventLog', sort: 'start_asc', limit: 5 }],
+    };
+
+    const spec = normalizePanel(handAssembled as PanelSpecInput, ANALYSIS, CONTEXT);
     const log = nodeOfType(nodeAt(spec, 0), 'eventLog');
 
     expect('query' in log).toBe(false);
     // The sort and limit written beside it are dropped with it rather than
-    // scattered onto the node.
+    // scattered onto the node, and a second call yields the same document.
     expect(Object.keys(log)).toEqual(['type', 'id']);
+    expect(normalizePanel(handAssembled as PanelSpecInput, ANALYSIS, CONTEXT)).toStrictEqual(spec);
 
     const validated = validatePanelSpec(spec);
 
@@ -985,7 +1014,162 @@ describe('normalizePanel query lifting', () => {
 
     if (!validated.ok) {
       expect(validated.error.code).toBe('PANEL_INVALID');
+      expect(validated.error.details?.['issues']).toStrictEqual([
+        {
+          path: 'layout.0.query',
+          code: 'panel_node_query_missing',
+          expected: PANEL_NODE_CATALOG.eventLog.sources.join(' | '),
+          nodeType: 'eventLog',
+        },
+      ]);
     }
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The step-1 → step-3 joint over every node type, source and spelling
+ *
+ * AAP §0.5.3 separates a step-1 failure — repaired by re-prompting — from a
+ * step-2 or step-3 failure, which is a product bug and never retried. So the
+ * authoring schema must accept nothing the normaliser would turn into a
+ * document the internal schema refuses. This sweep states that as a property
+ * over every node type, every declared source and each way a source can be
+ * written — flat on the node, inside `query`, or not at all — and checks, for
+ * each combination, three things:
+ *
+ * - the authoring schema's own `safeParse`, which the model provider's repair
+ *   loop runs, and `parsePanelSpecInput` reach the same verdict;
+ * - the verdict is the catalog's: a source is accepted exactly where the
+ *   node type's entry lists it, and leaving it out is accepted exactly where
+ *   the type reads nothing or its entry implies one;
+ * - an accepted document normalizes into one step 3 accepts, and a refused
+ *   source is reported with the catalog code, at the path it concerns.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The three ways a node's source can be written. */
+const SOURCE_SPELLINGS = ['flat', 'nested', 'absent'] as const;
+
+/** One way a node's source can be written. */
+type SourceSpelling = (typeof SOURCE_SPELLINGS)[number];
+
+/** A valid location for the source-link node of the sweep. */
+const SWEEP_LOCATION = {
+  file: 'src/module/example.ts',
+  line: 12,
+  column: 5,
+  resolvedBy: 'source-map',
+  confidence: 0.4,
+} as const;
+
+/**
+ * The smallest authored node of a type, carrying no source: two event-log
+ * children for a container, a metric for the tile row, a location for the
+ * source link, and nothing else for any other leaf.
+ */
+function sweepBaseNode(type: PanelNodeType): Record<string, unknown> {
+  const child = { type: 'eventLog', source: PANEL_NODE_CATALOG.eventLog.sources[0] };
+
+  if (PANEL_NODE_CATALOG[type].supportsChildren) {
+    return { type, children: [{ ...child }, { ...child }] };
+  }
+
+  if (type === 'metricCards') {
+    return { type, metrics: [EXAMPLE_METRICS[0]] };
+  }
+
+  if (type === 'sourceLink') {
+    return { type, location: { ...SWEEP_LOCATION } };
+  }
+
+  return { type };
+}
+
+/** The node of a type with a source written in one spelling. */
+function sweepNode(
+  type: PanelNodeType,
+  source: DataQuerySource,
+  spelling: SourceSpelling,
+): Record<string, unknown> {
+  const base = sweepBaseNode(type);
+
+  switch (spelling) {
+    case 'flat':
+      return { ...base, source };
+    case 'nested':
+      return { ...base, query: { source } };
+    case 'absent':
+      return base;
+  }
+}
+
+/** Whether the catalog says step 1 must accept a node so written. */
+function catalogAccepts(
+  type: PanelNodeType,
+  source: DataQuerySource,
+  spelling: SourceSpelling,
+): boolean {
+  const entry = PANEL_NODE_CATALOG[type];
+
+  if (spelling === 'absent') {
+    return !entry.requiresQuery || entry.defaultSource !== undefined;
+  }
+
+  return entry.requiresQuery && isSourceAllowedForNode(type, source);
+}
+
+describe('the step-1 to step-3 joint over every node type, source and spelling', () => {
+  it.each(PANEL_NODE_TYPES)('holds for every source and spelling of a %s node', (type) => {
+    const problems: string[] = [];
+
+    for (const source of DATA_QUERY_SOURCES) {
+      for (const spelling of SOURCE_SPELLINGS) {
+        const label = `${type} / ${source} / ${spelling}`;
+        const authored = { ...inputWith([]), layout: [sweepNode(type, source, spelling)] };
+        const parsed = parsePanelSpecInput(authored);
+        const schemaAccepts = panelSpecInputSchema.safeParse(authored).success;
+
+        if (parsed.ok !== schemaAccepts) {
+          problems.push(`${label}: parser ${String(parsed.ok)}, schema ${String(schemaAccepts)}`);
+        }
+
+        if (parsed.ok !== catalogAccepts(type, source, spelling)) {
+          problems.push(`${label}: step 1 ${parsed.ok ? 'accepted' : 'refused'} it`);
+        }
+
+        if (parsed.ok) {
+          const validated = validatePanelSpec(normalizePanel(parsed.value, ANALYSIS, CONTEXT));
+
+          if (!validated.ok) {
+            problems.push(`${label}: step 3 refused it: ${validated.error.message}`);
+          }
+          continue;
+        }
+
+        if (!PANEL_NODE_CATALOG[type].requiresQuery) {
+          continue;
+        }
+
+        // A missing source is reported at the flat path whichever spelling was
+        // meant; a refused one at the path it was written at.
+        const expected = {
+          path: spelling === 'nested' ? 'layout.0.query.source' : 'layout.0.source',
+          code:
+            spelling === 'absent'
+              ? 'panel_node_query_source_missing'
+              : 'panel_node_query_source_not_allowed',
+          expected: PANEL_NODE_CATALOG[type].sources.join(' | '),
+        };
+        const reported = JSON.stringify(parsed.error.details?.['issues']);
+
+        if (reported !== JSON.stringify([expected])) {
+          problems.push(`${label}: reported ${reported}`);
+        }
+      }
+    }
+
+    expect(problems).toEqual([]);
   });
 });
 
@@ -1239,7 +1423,11 @@ describe('normalizePanel on layouts no parse produces', () => {
     for (let level = 40; level >= 1; level -= 1) {
       node =
         level % 2 === 0
-          ? { type: 'split', direction: 'vertical', children: [node, { type: 'table' }] }
+          ? {
+              type: 'split',
+              direction: 'vertical',
+              children: [node, { type: 'table', source: 'spans' }],
+            }
           : { type: 'section', title: 'Level heading', children: [node] };
     }
 
@@ -1256,7 +1444,9 @@ describe('normalizePanel on layouts no parse produces', () => {
             ? 'type,id,direction,children'
             : current.type === 'flame'
               ? 'type,id,title,query'
-              : 'type,id';
+              : current.type === 'table'
+                ? 'type,id,query'
+                : `no node of type ${current.type} was authored`;
 
       if (keys !== expected) {
         unexpected.push(`${current.id}: ${keys}`);
@@ -1299,6 +1489,102 @@ describe('normalizePanel on layouts no parse produces', () => {
       expect(DebuggenError.is(thrown) ? thrown.code : undefined).toBe('INTERNAL');
       expect(DebuggenError.is(thrown) ? thrown.details : undefined).toEqual({ level });
     }
+  });
+
+  it('throws a readable INTERNAL DebuggenError for a node type the vocabulary lacks', () => {
+    // The QA reproduction: step 1 rejects such a node as
+    // `panel_node_type_unknown`, so reaching here is a defect in whatever
+    // assembled the input, and the error must say which node, what it declared
+    // and which types exist — not "object Object { type }".
+    const handAssembled: unknown = {
+      ...inputWith([]),
+      layout: [{ type: 'table', source: 'spans' }, { type: 'gauge' }],
+    };
+    let thrown: unknown;
+
+    try {
+      normalizePanel(handAssembled as PanelSpecInput, ANALYSIS, CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(DebuggenError.is(thrown)).toBe(true);
+
+    if (!DebuggenError.is(thrown)) {
+      return;
+    }
+
+    expect(thrown.code).toBe('INTERNAL');
+    expect(thrown.message).toBe(
+      'The authored panel node at layout.1 declares the type "gauge", which is not a panel node type, so it cannot be normalized.',
+    );
+    expect(thrown.message).not.toContain('object Object');
+    expect(thrown.hint).toContain(PANEL_NODE_TYPES.join(', '));
+    expect(thrown.details).toEqual({ nodeId: 'layout.1', nodeTypes: [...PANEL_NODE_TYPES] });
+  });
+
+  it('describes rather than quotes a declared type that is not shaped like a node type', () => {
+    const cases: readonly { readonly declared: unknown; readonly phrase: string }[] = [
+      { declared: undefined, phrase: 'no type' },
+      { declared: null, phrase: 'a null type' },
+      { declared: 42, phrase: 'a type of the wrong kind (number)' },
+      {
+        declared: 'a sentence that should never be echoed',
+        phrase: 'a type string that is not a node type name',
+      },
+      { declared: 'x'.repeat(33), phrase: 'a type string that is not a node type name' },
+    ];
+
+    for (const { declared, phrase } of cases) {
+      const node: Record<string, unknown> = declared === undefined ? {} : { type: declared };
+      const handAssembled: unknown = { ...inputWith([]), layout: [node] };
+      let thrown: unknown;
+
+      try {
+        normalizePanel(handAssembled as PanelSpecInput, ANALYSIS, CONTEXT);
+      } catch (error) {
+        thrown = error;
+      }
+
+      expect(DebuggenError.is(thrown) ? thrown.code : undefined).toBe('INTERNAL');
+      expect(DebuggenError.is(thrown) ? thrown.message : '').toBe(
+        `The authored panel node at layout.0 declares ${phrase}, which is not a panel node type, so it cannot be normalized.`,
+      );
+    }
+  });
+
+  it('describes a declared type that throws when it is read again, without rethrowing it', () => {
+    // The switch reads `type` once; the description reads it a second time.
+    let reads = 0;
+    const node = {};
+
+    Object.defineProperty(node, 'type', {
+      enumerable: true,
+      get: () => {
+        reads += 1;
+
+        if (reads > 1) {
+          throw new Error('hostile-getter-message');
+        }
+
+        return 'gauge';
+      },
+    });
+
+    const handAssembled: unknown = { ...inputWith([]), layout: [node] };
+    let thrown: unknown;
+
+    try {
+      normalizePanel(handAssembled as PanelSpecInput, ANALYSIS, CONTEXT);
+    } catch (error) {
+      thrown = error;
+    }
+
+    expect(reads).toBe(2);
+    expect(DebuggenError.is(thrown) ? thrown.code : undefined).toBe('INTERNAL');
+    expect(DebuggenError.is(thrown) ? thrown.message : '').toBe(
+      'The authored panel node at layout.0 declares a type that could not be read, which is not a panel node type, so it cannot be normalized.',
+    );
   });
 
   it('normalizes a shared subtree once per position, with path-distinct ids', () => {

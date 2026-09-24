@@ -74,11 +74,15 @@
  *    it.
  * 2. **Private by construction.** The session directory is created `0700` and
  *    every backup file `0600`, through the hardened primitives in
- *    `@debuggen/shared/node` — `ensureSecureDir`, whose mode is
- *    `SECURE_DIR_MODE`, and `createFileExclusive`, which applies
+ *    `@debuggen/shared/node` — `ensureSecureDir`, which creates each missing
+ *    directory at `SECURE_DIR_MODE` and **refuses** (`FS_UNSAFE_PATH`,
+ *    `group-or-other-permissions`) a state root, `backups` directory or session
+ *    directory that already exists with group or other access rather than
+ *    tightening it, and `createFileExclusive`, which applies
  *    {@link SECURE_FILE_MODE} twice so the result does not depend on the
- *    process umask. Nothing here widens either mode, and no octal literal
- *    appears in this file.
+ *    process umask. Such a refusal leaves no backup, so the patcher never
+ *    writes the source file it was meant to protect. Nothing here widens
+ *    either mode, and no octal literal appears in this file.
  * 3. **Durable before it is reported.** `createFileExclusive` writes every byte
  *    (a single `write` may be partial) and `fsync`s the descriptor before it
  *    returns, so a resolved {@link BackupStore.put} means the bytes are on
@@ -1789,11 +1793,13 @@ class FileSystemBackupStore implements BackupStore {
    *
    * Synchronous, and called through {@link onPromiseBoundary}: both primitives
    * are the synchronous, hardened ones from `@debuggen/shared/node`, and the
-   * order matters — `ensureSecureDir` creates every component from the state
-   * root down with a non-recursive `mkdir`, tightens each one to
-   * `SECURE_DIR_MODE` through an `O_NOFOLLOW` descriptor and then *proves* the
-   * result, so the file is created into a directory whose privacy is a verified
-   * fact rather than an assumption.
+   * order matters — `ensureSecureDir` walks every component from the state
+   * root down with a non-recursive `mkdir`, gives each directory it creates
+   * `SECURE_DIR_MODE` through an `O_NOFOLLOW` descriptor, refuses an existing
+   * one that is a link, is owned by another account or grants group or other
+   * access — never changing its mode — and then *proves* the result, so the
+   * file is created into a directory whose privacy is a verified fact rather
+   * than an assumption, and a loose directory leaves nothing written at all.
    *
    * `createFileExclusive` opens `O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW`,
    * re-applies {@link SECURE_FILE_MODE} with `fchmod` on the descriptor it just

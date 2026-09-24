@@ -46,8 +46,11 @@
  * STYLING
  * Class names only. This file chooses no colour, spacing, radius or type size and sets no inline
  * style; `../styles/components.css` implements the classes declared here against the token set of
- * AAP 0.6.3, and the global `:focus-visible` ring and `::placeholder` colour come from
- * `../styles/base.css` and are never overridden or suppressed.
+ * AAP 0.6.3, and the `::placeholder` colour comes from `../styles/base.css`. Keyboard focus is
+ * always indicated by `--dg-focus-ring`: for this field the stylesheet draws the ring on the
+ * `dg-field__control` box - the field's visible edge - instead of on the borderless native control
+ * inside it, which is why the control must stay inside that box. The ring is relocated, never
+ * removed.
  *
  * @see ../styles/base.css for the global `dg-visually-hidden` and `dg-icon` utilities reused here.
  * @see ../tokens/tokens.ts for the token source the classes below resolve against.
@@ -163,7 +166,10 @@ export interface InputProps extends Omit<HTMLAttributes<HTMLElement>, 'children'
    *
    * Sets the NATIVE `disabled` attribute - not `aria-disabled` - so the control is genuinely inert
    * and unfocusable rather than merely announced as unavailable, and adds `dg-is-disabled` to the
-   * wrapper so the label, hint and error dim with it. Defaults to `false`.
+   * wrapper so the label, hint and error dim with it. The stylesheet gives the field the design
+   * system's one disabled treatment, the same as a disabled `Button` and `Select`: the enabled
+   * box's elevated surface, a `--dg-border-subtle` edge, `--dg-text-muted` text and a not-allowed
+   * cursor, never `opacity`. Defaults to `false`.
    */
   disabled?: boolean;
 
@@ -184,6 +190,26 @@ export interface InputProps extends Omit<HTMLAttributes<HTMLElement>, 'children'
 
   /** Native `maxLength`, forwarded unchanged. */
   maxLength?: number;
+
+  /**
+   * Native `min` of a `type="number"` field: the lowest value the spin buttons and the arrow keys
+   * step to, and the lower bound the user agent's constraint validation reports.
+   *
+   * Forwarded to the single-line `<input>` only - a text area has no numeric bounds. The bound
+   * guides entry; it does not clamp what the caller receives: `onValueChange` still hands over
+   * exactly what the field holds, so the caller that knows what the number means decides what an
+   * out-of-range value resolves to.
+   */
+  min?: number;
+
+  /** Native `max` of a `type="number"` field; see {@link min} for how a bound is applied. */
+  max?: number;
+
+  /**
+   * Native `step` of a `type="number"` field: `1` for a whole-number field, `'any'` to accept any
+   * precision. Forwarded to the single-line `<input>` only, like {@link min}.
+   */
+  step?: number | 'any';
 
   /**
    * The current value failed validation.
@@ -302,6 +328,9 @@ export function Input(props: InputProps): ReactElement {
     required = false,
     autoFocus = false,
     maxLength,
+    min,
+    max,
+    step,
     invalid = false,
     hint,
     errorMessage,
@@ -431,6 +460,9 @@ export function Input(props: InputProps): ReactElement {
             required={required}
             autoFocus={autoFocus}
             maxLength={maxLength}
+            min={min}
+            max={max}
+            step={step}
             aria-invalid={ariaInvalid}
             aria-describedby={describedByValue}
             onChange={handleChange}

@@ -84,6 +84,24 @@
  *     selection handler, the head's citations are inert text rather than
  *     focusable controls that do nothing.
  *
+ * The last block pins the failure contract every query-backed node renders
+ * through, because the host tier is where its three halves meet: the query
+ * hook's faithful error codes and one-alert-per-burst announcement policy, the
+ * pure helpers that compose an error state's props (one query format, one
+ * lead-plus-cause message, integration remedies behind the technical details
+ * rather than on the hint line), and the primitive that draws them — with the
+ * focus key on its retry control and the single-ellipsis convention of the
+ * loading label beside it.
+ *
+ * The final block pins the other half of that focus key: the node frame
+ * `NodeRenderer` draws around every node keeps keyboard focus inside the node
+ * while a retry remounts its view. A retry that fails again lands on the new
+ * Retry, one that succeeds leaves focus on the node's heading (or, untitled, on
+ * its frame) with a `tabindex` borrowed only while it is focused, focus stays
+ * in the node while the retry is in flight, and nothing that settles later
+ * pulls back focus the reader moved elsewhere. The unrenderable-node failure
+ * names its block for what it holds — the node's definition, not a query.
+ *
  * ## What this suite deliberately does not do
  *
  * **It never validates a specification before rendering it.** No parser and no
@@ -161,7 +179,8 @@ import type {
 } from '@debuggen/panel-schema';
 import { DebuggenError, formatSourceLocation } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
-import { cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import type { TelemetryEvent } from '@debuggen/telemetry';
+import { cleanup, render, screen, waitFor, within, act, fireEvent } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -170,6 +189,12 @@ import type { Mock } from 'vitest';
 import { MetricCards } from '../components/MetricCards';
 import { SourceLink } from '../components/SourceLink';
 import { SummaryHeader } from '../layout/SummaryHeader';
+import {
+  ERROR_STATE_RETRY_FOCUS_KEY,
+  ErrorState,
+  FOCUS_KEY_ATTRIBUTE,
+} from '../primitives/ErrorState';
+import { LoadingState } from '../primitives/LoadingState';
 import {
   DEFAULT_PANEL_THEME,
   PANEL_THEMES,
@@ -198,15 +223,33 @@ import type {
   PanelDataResult,
 } from './DataProvider';
 import { PanelHost } from './PanelHost';
-import { isPanelHostActions, toPanelHostActions, toPanelViewActions } from './PanelActions';
+import {
+  PanelSelectionContext,
+  isPanelHostActions,
+  matchesPanelSelection,
+  toPanelHostActions,
+  toPanelViewActions,
+  usePanelSelection,
+  useSelectedEventId,
+  useViewSelection,
+} from './PanelActions';
 import type {
   PanelActions,
   PanelEventCoordinates,
   PanelEventRef,
   PanelHostActions,
+  PanelSelection,
   PanelViewActions,
 } from './PanelActions';
-import { useQuery } from './useQuery';
+import {
+  PAGE_FAILURE_TITLE,
+  QUERY_FAILURE_TITLE,
+  UNSUPPORTED_QUERY_TITLE,
+  formatDataQuery,
+  queryFailureProps,
+  unsupportedQueryProps,
+  useQuery,
+} from './useQuery';
 
 /*
  * Two views, each wrapped by a pass-through spy so its renders can be counted.
@@ -230,10 +273,28 @@ vi.mock(import('../components/MetricCards'), async (importOriginal) => {
   return { ...actual, MetricCards: vi.fn(actual.MetricCards) };
 });
 
+/*
+ * The selection every source chip read on its latest render, oldest first.
+ *
+ * The source chip is the one counted view that sits both in the layout and in
+ * the head, so its wrapper is also where the suite observes the panel's shared
+ * selection from inside the host: each render records what
+ * `usePanelSelection()` returned, and the selection cases read the last entry.
+ * Hoisted with the mock that writes it, as a module mock's state must be.
+ */
+const selectionProbe = vi.hoisted(() => ({ seen: [] as unknown[] }));
+
 vi.mock(import('../components/SourceLink'), async (importOriginal) => {
   const actual = await importOriginal();
+  const { usePanelSelection: readSelection } = await import('./PanelActions');
 
-  return { ...actual, SourceLink: vi.fn(actual.SourceLink) };
+  return {
+    ...actual,
+    SourceLink: vi.fn((props: Parameters<typeof actual.SourceLink>[0]) => {
+      selectionProbe.seen.push(readSelection());
+      return actual.SourceLink(props);
+    }),
+  };
 });
 
 /*
@@ -553,7 +614,7 @@ interface SummaryOverrides {
   /** The prose, or `undefined` for a summary that carries none. */
   readonly headline?: string | undefined;
 
-  /** The observed facts; an empty array renders no observed region. */
+  /** The observed facts; an empty array renders the region's "no facts" sentence. */
   readonly observed?: readonly Fact[] | undefined;
 
   /** The likely causes; an empty array renders no causes region. */
@@ -1330,16 +1391,25 @@ function soleArgument<TArgument>(spy: Mock<(value: TArgument) => void>, what: st
  * @param name The control's accessible name.
  * @param scope The element to search inside, or the whole screen when omitted.
  */
-async function clickByName(name: string, scope?: HTMLElement): Promise<void> {
+async function clickByName(name: string | RegExp, scope?: HTMLElement): Promise<void> {
   const user = userEvent.setup();
   const queries = scope === undefined ? screen : within(scope);
 
   await user.click(queries.getByRole('button', { name }));
 }
 
-/** The accessible name of the chip that opens a location. */
-function chipName(location: SourceLocation): string {
-  return `Open ${formatSourceLocation(location)}`;
+/**
+ * The accessible name of the chip that opens a location, as a matcher.
+ *
+ * A chip keeps `Open <target>` when its visible text already sits inside it
+ * (the compact cause chip) and is named `<visible text> — open <target>`
+ * otherwise (the leaf chip showing its symbol); either way the name ends with
+ * the full target, which is what this anchors on, case-insensitively.
+ */
+function chipName(location: SourceLocation): RegExp {
+  const target = formatSourceLocation(location).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+  return new RegExp(`(?:^open | — open )${target}$`, 'i');
 }
 
 /**
@@ -1726,6 +1796,300 @@ describe('the action-form adapters the host relies on', () => {
  * ---------------------------------------------------------------------------
  */
 
+/**
+ * The selection the source chips read on their latest render: what every view
+ * beneath the host currently sees as the panel's selected event.
+ *
+ * @returns The last recorded value, `undefined` when nothing is selected.
+ */
+function latestSeenSelection(): PanelSelection | undefined {
+  expect(selectionProbe.seen.length).toBeGreaterThan(0);
+
+  return selectionProbe.seen.at(-1) as PanelSelection | undefined;
+}
+
+/** What {@link SelectionProbe} prints outside any host. */
+const SELECTION_PROBE_LABEL = 'selection outside a host';
+
+/**
+ * The smallest reader of the selection hooks, rendered outside any host by the
+ * degradation case.
+ *
+ * @returns The two hooks' answers, printed.
+ */
+function SelectionProbe(): ReactElement {
+  const selection = usePanelSelection();
+  const eventId = useSelectedEventId();
+
+  return (
+    <output aria-label={SELECTION_PROBE_LABEL}>
+      {`${String(selection === undefined)}:${String(eventId)}`}
+    </output>
+  );
+}
+
+describe('PanelHost shared selection', () => {
+  it('provides nothing as selected before any selection is reported', async () => {
+    await renderPanel(makeSpec());
+
+    expect(latestSeenSelection()).toBeUndefined();
+  });
+
+  it("records an evidence chip's selection, with its coordinates, for every view", async () => {
+    const { actions } = await renderPanel(makeSpec());
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+
+    // The surface is still told, exactly as before the selection was shared.
+    expect(actions.selectEvent).toHaveBeenCalledWith(FIRST_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+
+    // And every view beneath the host now reads the same selection, holding
+    // exactly the coordinates the citation recorded and nothing else.
+    const seen = latestSeenSelection();
+    expect(seen).toEqual({
+      eventId: FIRST_EVENT_ID,
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+    expect(Object.keys(seen ?? {}).sort()).toEqual(['eventId', 'spanId', 'traceId']);
+  });
+
+  it('moves the selection when another citation is selected, inventing no coordinate', async () => {
+    await renderPanel(makeSpec());
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    await clickByName(SECOND_CITATION_LABEL, observedRegion());
+
+    const seen = latestSeenSelection();
+    expect(seen).toEqual({ eventId: SECOND_EVENT_ID });
+    expect(Object.keys(seen ?? {})).toEqual(['eventId']);
+  });
+
+  it('re-renders no view when the selected event is selected again', async () => {
+    const { actions } = await renderPanel(makeSpec());
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    const before = vi.mocked(SourceLink).mock.calls.length;
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+
+    // The surface hears both activations; the views re-render for neither the
+    // second nor its unchanged selection value.
+    expect(actions.selectEvent).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(SourceLink).mock.calls.length - before).toBe(0);
+  });
+
+  it('records a selection reported through view-form actions as well', async () => {
+    const onSelectEvent = vi.fn<(ref: PanelEventRef) => void>();
+    const onOpenSource = vi.fn<(location: SourceLocation) => void>();
+    const { rerender } = await renderPanel(makeSpec());
+
+    rerender(makeSpec(), { onSelectEvent, onOpenSource });
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+
+    // One report, one call: the recording wrapper never calls the surface twice.
+    expect(onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(latestSeenSelection()).toEqual({
+      eventId: FIRST_EVENT_ID,
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+  });
+
+  it('drops the selection when another panel is swapped in', async () => {
+    const spec = makeSpec();
+    const { rerender } = await renderPanel(spec);
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    expect(latestSeenSelection()?.eventId).toBe(FIRST_EVENT_ID);
+
+    rerender({ ...spec, id: OTHER_PANEL_ID });
+    await screen.findAllByRole('list', { name: METRIC_VIEW_NAME });
+
+    expect(latestSeenSelection()).toBeUndefined();
+  });
+
+  it('keeps the selection when the same panel is re-delivered', async () => {
+    const spec = makeSpec();
+    const { rerender } = await renderPanel(spec);
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    rerender(makeSpec({ title: 'A retitled panel under test', layout: spec.layout }));
+
+    expect(latestSeenSelection()?.eventId).toBe(FIRST_EVENT_ID);
+  });
+
+  it('follows a selection the surface drives, and a cleared one', async () => {
+    const actions = makeActions();
+    const provider = makeDataProvider();
+    const spec = makeSpec();
+    const draw = (selectedEventId: string | null | undefined): ReactElement => (
+      <PanelHost
+        spec={spec}
+        dataProvider={provider.provider}
+        actions={actions.actions}
+        selectedEventId={selectedEventId}
+      />
+    );
+
+    const view = render(draw(CAUSE_EVENT_ID));
+    await screen.findAllByRole('list', { name: METRIC_VIEW_NAME });
+
+    // A driven id stands alone: no coordinate is invented for it.
+    expect(latestSeenSelection()).toEqual({ eventId: CAUSE_EVENT_ID });
+
+    // A report reaches the surface, and the driven selection holds until the
+    // surface changes the prop.
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    expect(actions.selectEvent).toHaveBeenCalledWith(FIRST_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+    expect(latestSeenSelection()).toEqual({ eventId: CAUSE_EVENT_ID });
+
+    // Driving the id that was just reported keeps the reporter's coordinates.
+    view.rerender(draw(FIRST_EVENT_ID));
+    expect(latestSeenSelection()).toEqual({
+      eventId: FIRST_EVENT_ID,
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+
+    // `null` and a blank id both clear it.
+    view.rerender(draw(null));
+    expect(latestSeenSelection()).toBeUndefined();
+    view.rerender(draw(CAUSE_EVENT_ID));
+    view.rerender(draw('   '));
+    expect(latestSeenSelection()).toBeUndefined();
+
+    // Omitted again, the host shows what the views last reported.
+    view.rerender(draw(undefined));
+    expect(latestSeenSelection()?.eventId).toBe(FIRST_EVENT_ID);
+  });
+
+  it('reads as nothing selected outside a host, and never throws', () => {
+    render(<SelectionProbe />);
+
+    expect(screen.getByRole('status', { name: SELECTION_PROBE_LABEL }).textContent).toBe(
+      'true:undefined',
+    );
+  });
+});
+
+/** The accessible name of {@link ViewSelectionProbe}'s output. */
+const VIEW_SELECTION_LABEL = 'view selection';
+
+/** The accessible name of {@link ViewSelectionProbe}'s selecting control. */
+const VIEW_SELECT_LABEL = 'select the second event';
+
+/**
+ * The smallest event-bearing view: it marks what {@link useViewSelection}
+ * reports and records a selection of its own when its control is pressed.
+ *
+ * @returns The printed selection and a selecting control.
+ */
+function ViewSelectionProbe(): ReactElement {
+  const { selection, shared, markSelected } = useViewSelection();
+
+  return (
+    <>
+      <output aria-label={VIEW_SELECTION_LABEL}>
+        {`${String(shared)}:${selection?.eventId ?? 'none'}`}
+      </output>
+      <button
+        type="button"
+        onClick={() => {
+          markSelected({ eventId: SECOND_EVENT_ID });
+        }}
+      >
+        {VIEW_SELECT_LABEL}
+      </button>
+    </>
+  );
+}
+
+describe('useViewSelection', () => {
+  it('keeps a selection of its own outside a host, so a standalone view still marks', async () => {
+    const user = userEvent.setup();
+
+    render(<ViewSelectionProbe />);
+    const output = screen.getByRole('status', { name: VIEW_SELECTION_LABEL });
+    expect(output.textContent).toBe('false:none');
+
+    await user.click(screen.getByRole('button', { name: VIEW_SELECT_LABEL }));
+    expect(output.textContent).toBe('false:' + SECOND_EVENT_ID);
+  });
+
+  it("marks the host's shared selection, and never keeps one of its own, inside a host", async () => {
+    const user = userEvent.setup();
+
+    render(
+      <PanelSelectionContext.Provider value={{ selection: { eventId: FIRST_EVENT_ID } }}>
+        <ViewSelectionProbe />
+      </PanelSelectionContext.Provider>,
+    );
+    const output = screen.getByRole('status', { name: VIEW_SELECTION_LABEL });
+    expect(output.textContent).toBe('true:' + FIRST_EVENT_ID);
+
+    // The host records every report itself; the view's own write is a no-op.
+    await user.click(screen.getByRole('button', { name: VIEW_SELECT_LABEL }));
+    expect(output.textContent).toBe('true:' + FIRST_EVENT_ID);
+  });
+
+  it('reads a host with nothing selected as shared and unselected', () => {
+    render(
+      <PanelSelectionContext.Provider value={{ selection: undefined }}>
+        <ViewSelectionProbe />
+      </PanelSelectionContext.Provider>,
+    );
+
+    expect(screen.getByRole('status', { name: VIEW_SELECTION_LABEL }).textContent).toBe(
+      'true:none',
+    );
+  });
+});
+
+describe('matchesPanelSelection', () => {
+  const selection: PanelSelection = {
+    eventId: FIRST_EVENT_ID,
+    traceId: CITATION_TRACE_ID,
+    spanId: CITATION_SPAN_ID,
+  };
+
+  it('matches the selected event id', () => {
+    expect(matchesPanelSelection(selection, { eventId: FIRST_EVENT_ID })).toBe(true);
+    expect(matchesPanelSelection({ eventId: FIRST_EVENT_ID }, { eventId: FIRST_EVENT_ID })).toBe(
+      true,
+    );
+  });
+
+  it('matches the same span of the same trace under another record id', () => {
+    expect(
+      matchesPanelSelection(selection, {
+        eventId: SECOND_EVENT_ID,
+        traceId: CITATION_TRACE_ID,
+        spanId: CITATION_SPAN_ID,
+      }),
+    ).toBe(true);
+  });
+
+  it('never matches on one shared coordinate, an absent coordinate or nothing', () => {
+    expect(
+      matchesPanelSelection(selection, { eventId: SECOND_EVENT_ID, spanId: CITATION_SPAN_ID }),
+    ).toBe(false);
+    expect(
+      matchesPanelSelection(selection, { eventId: SECOND_EVENT_ID, traceId: CITATION_TRACE_ID }),
+    ).toBe(false);
+    expect(matchesPanelSelection({ eventId: FIRST_EVENT_ID }, { eventId: SECOND_EVENT_ID })).toBe(
+      false,
+    );
+    expect(matchesPanelSelection(undefined, { eventId: FIRST_EVENT_ID })).toBe(false);
+    expect(matchesPanelSelection(selection, undefined)).toBe(false);
+  });
+});
+
 describe('PanelHost fallback notice', () => {
   it('announces a fallback panel in words, above the panel it announces', async () => {
     await renderPanel(makeSpec({ meta: { fallback: true } }));
@@ -1907,7 +2271,7 @@ describe('PanelHost query lifecycle', () => {
 
     // The answer replaces the loading state with the view it describes.
     await within(stack).findByRole('list', { name: METRIC_VIEW_NAME });
-    expect(within(stack).queryByRole('status')).toBeNull();
+    expect(within(stack).queryByRole('status', { busy: true })).toBeNull();
     expect(within(stack).queryByRole('alert')).toBeNull();
     expect(provider.resolve).toHaveBeenCalledTimes(1);
   });
@@ -1934,7 +2298,7 @@ describe('PanelHost query lifecycle', () => {
     const alert = await within(stack).findByRole('alert');
     expect(alert.textContent).toContain(PROVIDER_FAILURE_CODE);
     expect(within(stack).queryByRole('list', { name: METRIC_VIEW_NAME })).toBeNull();
-    expect(within(stack).queryByRole('status')).toBeNull();
+    expect(within(stack).queryByRole('status', { busy: true })).toBeNull();
 
     const user = userEvent.setup();
     await user.click(within(alert).getByRole('button', { name: RETRY_PATTERN }));
@@ -2308,11 +2672,17 @@ describe('the host data contract: wire-to-view mapping and the response check', 
    * mapping is exercised. The array-valued payloads are the paged sources.
    */
   const WIRE_PAYLOADS = {
-    trace: { traceId: CITATION_TRACE_ID, roots: [] },
+    trace: { traceId: CITATION_TRACE_ID, roots: [], nodeCount: 0 },
     spans: [WIRE_EVENT],
     events: [WIRE_EVENT],
     renders: [WIRE_RENDER_STAT],
-    componentTree: { capturedAt: 0, roots: [] },
+    componentTree: {
+      capturedAt: 0,
+      origin: 'commit-snapshot',
+      degraded: false,
+      nodeCount: 0,
+      roots: [],
+    },
     requests: [WIRE_REQUEST_GROUP],
     queries: [{ id: 'query-group-example', normalizedStatement: 'SELECT $1', executionCount: 2 }],
     stateTransitions: [{ id: 'evt-state-example', eventId: 'evt-state-example' }],
@@ -2507,14 +2877,31 @@ describe('the host data contract: wire-to-view mapping and the response check', 
     {
       name: 'a trace without its roots',
       query: { source: 'trace' },
-      body: wireBody('trace', { traceId: CITATION_TRACE_ID }),
+      body: wireBody('trace', { traceId: CITATION_TRACE_ID, nodeCount: 0 }),
       field: 'trace.roots',
+    },
+    {
+      name: 'a trace without the node count its view reads',
+      query: { source: 'trace' },
+      body: wireBody('trace', { traceId: CITATION_TRACE_ID, roots: [] }),
+      field: 'trace.nodeCount',
     },
     {
       name: 'a component tree without its capture time',
       query: { source: 'componentTree' },
-      body: wireBody('componentTree', { roots: [] }),
+      body: wireBody('componentTree', {
+        origin: 'commit-snapshot',
+        degraded: false,
+        nodeCount: 0,
+        roots: [],
+      }),
       field: 'componentTree.capturedAt',
+    },
+    {
+      name: 'a component tree without the origin its view reads',
+      query: { source: 'componentTree' },
+      body: wireBody('componentTree', { capturedAt: 0, degraded: false, nodeCount: 0, roots: [] }),
+      field: 'componentTree.origin',
     },
     {
       name: 'a graph of null, which a graph never is',
@@ -2557,7 +2944,12 @@ describe('the host data contract: wire-to-view mapping and the response check', 
     expect(mapped.error).toBeInstanceOf(DebuggenError);
     expect(mapped.error.code).toBe(MALFORMED_RESPONSE_CODE);
     expect(mapped.error.details).toMatchObject({ source: query.source, form: 'wire', field });
-    expect(mapped.error.message).toContain(field);
+    // The field at fault is developer detail: it is named in the details, which
+    // the error state keeps behind its closed disclosure, while the message is
+    // the one reader sentence every unreadable answer shares.
+    expect(mapped.error.message).toBe(
+      `The "${query.source}" data for this view arrived in a form it cannot read.`,
+    );
     expect(mapped.error.hint ?? '').not.toBe('');
   });
 
@@ -2571,11 +2963,16 @@ describe('the host data contract: wire-to-view mapping and the response check', 
     }
 
     expect(mapped.error.code).toBe(MALFORMED_RESPONSE_CODE);
-    expect(mapped.error.details).toEqual({
+
+    // Both sources and the form, machine-readably, beside the integration
+    // remedy that belongs to the developer rather than on the hint line.
+    const { remedy, ...identity } = mapped.error.details ?? {};
+    expect(identity).toEqual({
       requested: 'renders',
       received: 'requests',
       form: 'wire',
     });
+    expect(remedy).toMatch(/\S/u);
   });
 
   it('never quotes a refused value in the message, the hint or the details', () => {
@@ -3245,5 +3642,1473 @@ describe('PanelHost treatment of the specification', () => {
     expect(container.querySelectorAll('[role="alert"]')).toHaveLength(0);
     expect(container.querySelectorAll('.dg-panel__node-error')).toHaveLength(0);
     expect(container.querySelectorAll('.dg-panel__node')).toHaveLength(countNodes(spec));
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Cross-view selection through the real host (B2-F21)
+ *
+ * The panel has one selected event, and every view that draws it marks it
+ * (AAP 0.7.3: evidence chips "select the underlying events"). These cases draw
+ * the two event-bearing tables a panel most often pairs — a `table` node (the
+ * span table) and an `eventLog` node — over the same three records, through
+ * the real host and the real views, and select from each of the three places a
+ * reader can: an evidence chip, a log line and a table row.
+ *
+ * The suite's shared stub answers the metric view only, so these cases build
+ * their own resolver for the two sources the tables read. The records are the
+ * ones the summary's citations name, with the first citation's trace and span.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The span table's title, which is also its grid's accessible name. */
+const CROSS_VIEW_TABLE_TITLE = 'Spans under test';
+
+/** The event log's title, which is also its grid's accessible name. */
+const CROSS_VIEW_LOG_TITLE = 'Records under test';
+
+/** A second span of the citations' trace: 16 lower-case hex digits. */
+const SECOND_SPAN_ID = '00f067aa0ba902b8';
+
+/** A third span of that trace. */
+const CAUSE_SPAN_ID = '00f067aa0ba902b9';
+
+/**
+ * One captured record, as the service returns it for `spans` and `events`.
+ *
+ * @param overrides The identity, name, start and duration of the record.
+ * @returns A fresh record.
+ */
+function makeCrossViewEvent(overrides: {
+  readonly id: string;
+  readonly spanId: string;
+  readonly name: string;
+  readonly startOffset: number;
+  readonly duration: number;
+  readonly seq: number;
+}): TelemetryEvent {
+  return {
+    id: overrides.id,
+    traceId: CITATION_TRACE_ID,
+    spanId: overrides.spanId,
+    kind: 'function',
+    name: overrides.name,
+    startTime: 1_767_225_600_000 + overrides.startOffset,
+    duration: overrides.duration,
+    tier: 'server',
+    attributes: {},
+    status: 'ok',
+    producerId: 'producer-under-test',
+    seq: overrides.seq,
+    sessionId: SESSION_ID,
+    captureId: 'capture-under-test',
+    ingestSeq: overrides.seq + 1,
+  };
+}
+
+/** The records both tables draw: the three the summary's citations name. */
+const CROSS_VIEW_EVENTS: readonly TelemetryEvent[] = [
+  makeCrossViewEvent({
+    id: FIRST_EVENT_ID,
+    spanId: CITATION_SPAN_ID,
+    name: 'example.alpha',
+    startOffset: 0,
+    duration: 120,
+    seq: 0,
+  }),
+  makeCrossViewEvent({
+    id: SECOND_EVENT_ID,
+    spanId: SECOND_SPAN_ID,
+    name: 'example.beta',
+    startOffset: 8,
+    duration: 60,
+    seq: 1,
+  }),
+  makeCrossViewEvent({
+    id: CAUSE_EVENT_ID,
+    spanId: CAUSE_SPAN_ID,
+    name: 'example.gamma',
+    startOffset: 16,
+    duration: 30,
+    seq: 2,
+  }),
+];
+
+/** The record names, as the row queries below match them. */
+const ALPHA_ROW = /example\.alpha/;
+const BETA_ROW = /example\.beta/;
+const GAMMA_ROW = /example\.gamma/;
+
+/**
+ * A provider answering the two record sources the tables read, with the same
+ * records, and rejecting any other source as the shared stub does.
+ *
+ * @returns The provider and its recorded resolver.
+ */
+function makeCrossViewProvider(): StubProvider {
+  const resolve = vi.fn<DataQueryResolver>((query) => {
+    if (query.source === 'spans') {
+      return Promise.resolve<DataQueryResponse>({
+        source: 'spans',
+        data: CROSS_VIEW_EVENTS,
+        total: CROSS_VIEW_EVENTS.length,
+      });
+    }
+
+    if (query.source === 'events') {
+      return Promise.resolve<DataQueryResponse>({
+        source: 'events',
+        data: CROSS_VIEW_EVENTS,
+        total: CROSS_VIEW_EVENTS.length,
+      });
+    }
+
+    return Promise.reject(
+      new DebuggenError(
+        'NOT_IMPLEMENTED',
+        `This case's stub provider answers no "${query.source}" query.`,
+      ),
+    );
+  });
+
+  return { provider: createDataProvider(resolve), resolve };
+}
+
+/**
+ * A panel of the span table and the event log, over the default summary.
+ *
+ * @returns The specification.
+ */
+function makeCrossViewSpec(): PanelSpec {
+  return makeSpec({
+    layout: [
+      {
+        type: 'table',
+        id: 'layout.0',
+        title: CROSS_VIEW_TABLE_TITLE,
+        query: { source: 'spans', sort: 'duration_desc', limit: DATA_QUERY_DEFAULT_LIMIT },
+      },
+      {
+        type: 'eventLog',
+        id: 'layout.1',
+        title: CROSS_VIEW_LOG_TITLE,
+        query: { source: 'events', sort: 'start_asc', limit: DATA_QUERY_DEFAULT_LIMIT },
+      },
+    ],
+  });
+}
+
+/** The two grids, once both have drawn their rows. */
+interface CrossViewGrids {
+  /** The span table's grid. */
+  readonly table: HTMLElement;
+
+  /** The event log's grid. */
+  readonly log: HTMLElement;
+}
+
+/**
+ * Mounts {@link makeCrossViewSpec} in the real host and waits for both grids.
+ *
+ * @returns The two grids and the host-form spies.
+ */
+async function renderCrossViewPanel(): Promise<CrossViewGrids & { readonly actions: ActionSpies }> {
+  const actions = makeActions();
+
+  render(
+    <PanelHost
+      spec={makeCrossViewSpec()}
+      dataProvider={makeCrossViewProvider().provider}
+      actions={actions.actions}
+    />,
+  );
+
+  const table = await screen.findByRole('grid', { name: CROSS_VIEW_TABLE_TITLE });
+  const log = await screen.findByRole('grid', { name: CROSS_VIEW_LOG_TITLE });
+  await within(table).findByRole('row', { name: ALPHA_ROW });
+  await within(log).findByRole('row', { name: ALPHA_ROW });
+
+  return { table, log, actions };
+}
+
+/**
+ * Which record rows of a grid report themselves selected.
+ *
+ * @param grid The grid.
+ * @returns For each record name, the row's `aria-selected`.
+ */
+function selectedStates(grid: HTMLElement): readonly (string | null)[] {
+  return [ALPHA_ROW, BETA_ROW, GAMMA_ROW].map((name) =>
+    within(grid).getByRole('row', { name }).getAttribute('aria-selected'),
+  );
+}
+
+describe('PanelHost cross-view selection', () => {
+  it("selects the cited event's rows in every table when its evidence chip is clicked", async () => {
+    const { table, log, actions } = await renderCrossViewPanel();
+
+    // Nothing is selected yet, and both tables say so rather than saying nothing.
+    expect(selectedStates(table)).toEqual(['false', 'false', 'false']);
+    expect(selectedStates(log)).toEqual(['false', 'false', 'false']);
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+
+    // The surface hears the chip exactly as before...
+    expect(actions.selectEvent).toHaveBeenCalledWith(FIRST_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: CITATION_SPAN_ID,
+    });
+
+    // ...and the event it cites is selected in both tables, marked by attribute
+    // and by the grid's own selected state.
+    await waitFor(() => {
+      expect(selectedStates(table)).toEqual(['true', 'false', 'false']);
+    });
+    expect(selectedStates(log)).toEqual(['true', 'false', 'false']);
+    expect(
+      within(table).getByRole('row', { name: ALPHA_ROW }).classList.contains('dg-is-selected'),
+    ).toBe(true);
+    expect(
+      within(log).getByRole('row', { name: ALPHA_ROW }).classList.contains('dg-is-selected'),
+    ).toBe(true);
+  });
+
+  it('marks the span-table row for a record selected in the event log', async () => {
+    const { table, log, actions } = await renderCrossViewPanel();
+    const user = userEvent.setup();
+
+    await user.click(within(log).getByRole('row', { name: BETA_ROW }));
+
+    expect(actions.selectEvent).toHaveBeenCalledWith(SECOND_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: SECOND_SPAN_ID,
+    });
+    await waitFor(() => {
+      expect(selectedStates(table)).toEqual(['false', 'true', 'false']);
+    });
+    expect(selectedStates(log)).toEqual(['false', 'true', 'false']);
+  });
+
+  it('marks the event-log line for a row selected in the span table, and moves every mark', async () => {
+    const { table, log } = await renderCrossViewPanel();
+    const user = userEvent.setup();
+
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+    await waitFor(() => {
+      expect(selectedStates(log)).toEqual(['true', 'false', 'false']);
+    });
+
+    await user.click(within(table).getByRole('row', { name: GAMMA_ROW }));
+
+    // One selection for the panel: the chip's is replaced in both tables.
+    await waitFor(() => {
+      expect(selectedStates(log)).toEqual(['false', 'false', 'true']);
+    });
+    expect(selectedStates(table)).toEqual(['false', 'false', 'true']);
+  });
+
+  it('marks the rows of an event the surface drives', async () => {
+    const actions = makeActions();
+    const provider = makeCrossViewProvider();
+    const spec = makeCrossViewSpec();
+    const draw = (selectedEventId: string | null): ReactElement => (
+      <PanelHost
+        spec={spec}
+        dataProvider={provider.provider}
+        actions={actions.actions}
+        selectedEventId={selectedEventId}
+      />
+    );
+
+    const view = render(draw(CAUSE_EVENT_ID));
+    const table = await screen.findByRole('grid', { name: CROSS_VIEW_TABLE_TITLE });
+    const log = await screen.findByRole('grid', { name: CROSS_VIEW_LOG_TITLE });
+    await within(log).findByRole('row', { name: GAMMA_ROW });
+
+    expect(selectedStates(table)).toEqual(['false', 'false', 'true']);
+    expect(selectedStates(log)).toEqual(['false', 'false', 'true']);
+
+    // A cleared drawer clears every mark.
+    view.rerender(draw(null));
+    expect(selectedStates(table)).toEqual(['false', 'false', 'false']);
+    expect(selectedStates(log)).toEqual(['false', 'false', 'false']);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Cross-view selection between the charts and the tables (B1-F24, B2-F21)
+ *
+ * The same one-selection rule, drawn through the real host across views of
+ * different shapes: the timeline's canvas and grid, the waterfall's tree and
+ * the span table's grid, over the same three calls of one interaction. A
+ * selection made in any of them is the panel's, so every other one marks the
+ * same call and none keeps a contradicting mark of its own.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The span table's title in the chart panel. */
+const CHART_PANEL_TABLE_TITLE = 'Calls under test';
+
+/** The three calls: a browser request, the server request and its statement. */
+const CHART_PANEL_EVENTS: readonly TelemetryEvent[] = [
+  {
+    ...makeCrossViewEvent({
+      id: FIRST_EVENT_ID,
+      spanId: CITATION_SPAN_ID,
+      name: 'example.alpha',
+      startOffset: 0,
+      duration: 120,
+      seq: 0,
+    }),
+    kind: 'fetch',
+    tier: 'browser',
+  },
+  {
+    ...makeCrossViewEvent({
+      id: SECOND_EVENT_ID,
+      spanId: SECOND_SPAN_ID,
+      name: 'example.beta',
+      startOffset: 8,
+      duration: 60,
+      seq: 1,
+    }),
+    kind: 'http.server',
+    tier: 'server',
+  },
+  {
+    ...makeCrossViewEvent({
+      id: CAUSE_EVENT_ID,
+      spanId: CAUSE_SPAN_ID,
+      name: 'example.gamma',
+      startOffset: 16,
+      duration: 30,
+      seq: 2,
+    }),
+    kind: 'db.query',
+    tier: 'db',
+  },
+];
+
+/** The three call names, in the order the cases read their marks. */
+const CHART_PANEL_NAMES = ['example.alpha', 'example.beta', 'example.gamma'] as const;
+
+/**
+ * A provider answering `spans` with the three calls, and rejecting any other
+ * source as the shared stub does.
+ *
+ * @returns The provider.
+ */
+function makeChartPanelProvider(): DataProvider {
+  return createDataProvider((query) =>
+    query.source === 'spans'
+      ? Promise.resolve<DataQueryResponse>({
+          source: 'spans',
+          data: CHART_PANEL_EVENTS,
+          total: CHART_PANEL_EVENTS.length,
+        })
+      : Promise.reject(
+          new DebuggenError(
+            'NOT_IMPLEMENTED',
+            `This case's stub provider answers no "${query.source}" query.`,
+          ),
+        ),
+  );
+}
+
+/**
+ * The block a view renders into, by its documented class.
+ *
+ * @param className The view's block class.
+ * @returns That block.
+ */
+function viewBlock(className: string): HTMLElement {
+  const block = document.querySelector<HTMLElement>(`.${className}`);
+  if (block === null) {
+    throw new Error(`no .${className} block is rendered`);
+  }
+  return block;
+}
+
+/**
+ * For each call, whether the timeline's bar, the waterfall's row and the span
+ * table's row mark it selected — each read from that view's own element, and
+ * each failing when the attribute and the class disagree where a view writes
+ * both.
+ *
+ * @returns One `[timeline, waterfall, table]` triple per call.
+ */
+function chartPanelMarks(): readonly (readonly [boolean, boolean, boolean])[] {
+  const bars = Array.from(
+    viewBlock('dg-timeline').querySelectorAll<SVGElement>('rect.dg-timeline__bar'),
+  );
+  const table = screen.getByRole('grid', { name: CHART_PANEL_TABLE_TITLE });
+
+  return CHART_PANEL_NAMES.map((name) => {
+    const bar = bars.find((candidate) =>
+      (candidate.querySelector('title')?.textContent ?? '').startsWith(`${name} `),
+    );
+    const treeitem = within(viewBlock('dg-waterfall'))
+      .getByText(name)
+      .closest<HTMLElement>('[role="treeitem"]');
+    const row = within(table).getByRole('row', { name: new RegExp(name.replace('.', '\\.')) });
+
+    if (bar === undefined || treeitem === null) {
+      throw new Error(`the charts do not both draw "${name}"`);
+    }
+
+    const waterfallMarked = treeitem.getAttribute('aria-selected') === 'true';
+    expect(treeitem.classList.contains('dg-is-selected')).toBe(waterfallMarked);
+    const tableMarked = row.getAttribute('aria-selected') === 'true';
+    expect(row.classList.contains('dg-is-selected')).toBe(tableMarked);
+
+    return [bar.classList.contains('dg-is-selected'), waterfallMarked, tableMarked] as const;
+  });
+}
+
+describe('PanelHost cross-view selection between charts and tables', () => {
+  it('marks one call in the timeline, the waterfall and the span table, wherever it was selected', async () => {
+    const actions = makeActions();
+    const user = userEvent.setup();
+
+    render(
+      <PanelHost
+        spec={makeSpec({
+          layout: [
+            { type: 'timeline', id: 'layout.0', query: { source: 'spans' } },
+            { type: 'waterfall', id: 'layout.1', query: { source: 'spans' } },
+            {
+              type: 'table',
+              id: 'layout.2',
+              title: CHART_PANEL_TABLE_TITLE,
+              query: { source: 'spans', sort: 'start_asc', limit: DATA_QUERY_DEFAULT_LIMIT },
+            },
+          ],
+        })}
+        dataProvider={makeChartPanelProvider()}
+        actions={actions.actions}
+      />,
+    );
+
+    const table = await screen.findByRole('grid', { name: CHART_PANEL_TABLE_TITLE });
+    await within(table).findByRole('row', { name: /example\.gamma/ });
+    await within(viewBlock('dg-waterfall')).findByText('example.gamma');
+    await waitFor(() => {
+      expect(viewBlock('dg-timeline').querySelectorAll('rect.dg-timeline__bar')).toHaveLength(3);
+    });
+
+    const none = [false, false, false] as const;
+    const all = [true, true, true] as const;
+    expect(chartPanelMarks()).toEqual([none, none, none]);
+
+    // A waterfall row: the timeline's bar and the table's row follow it.
+    const statementRow = within(viewBlock('dg-waterfall'))
+      .getByText('example.gamma')
+      .closest<HTMLElement>('[role="treeitem"]');
+    if (statementRow === null) {
+      throw new Error('the waterfall draws no row for the statement');
+    }
+    await user.click(statementRow);
+
+    expect(actions.selectEvent).toHaveBeenCalledTimes(1);
+    expect(actions.selectEvent).toHaveBeenLastCalledWith(CAUSE_EVENT_ID, {
+      traceId: CITATION_TRACE_ID,
+      spanId: CAUSE_SPAN_ID,
+    });
+    await waitFor(() => {
+      expect(chartPanelMarks()).toEqual([none, none, all]);
+    });
+
+    // A table row: the mark moves in every view at once, and no view keeps the
+    // previous one.
+    await user.click(within(table).getByRole('row', { name: /example\.beta/ }));
+
+    expect(actions.selectEvent).toHaveBeenCalledTimes(2);
+    await waitFor(() => {
+      expect(chartPanelMarks()).toEqual([none, all, none]);
+    });
+
+    // An evidence chip citing the first call moves it again.
+    await clickByName(FIRST_CITATION_LABEL, observedRegion());
+
+    await waitFor(() => {
+      expect(chartPanelMarks()).toEqual([all, none, none]);
+    });
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The failure contract: one error state, one wording, one alert per burst
+ * (B1-F14, B1-F16, B2-F12, B2-F14)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('the failure contract every query-backed node renders', () => {
+  /** The accessible name of the query block when its caller names it nothing else. */
+  const FAILING_QUERY_NAME = 'Failing query';
+
+  /** The summary of the technical-details disclosure, and the name of its block. */
+  const DETAILS_NAME = 'Technical details';
+
+  /** The generic lead every failed view's message opens with. */
+  const VIEW_LEAD = 'The data for this view could not be loaded.';
+
+  /** The generic lead every failed next page's message opens with. */
+  const PAGE_LEAD =
+    'The next page of this view could not be loaded. The rows already shown are unaffected.';
+
+  /**
+   * Words that belong to whoever integrated a host, never to the reader of a
+   * panel: a factory, a context, an argument name, the provider abstraction.
+   */
+  const INTEGRATION_VOCABULARY =
+    /createPanelDataProvider|createDataProvider|DataProviderContext|PanelSessionContext|sessionId|data provider/iu;
+
+  /** What {@link FailureProbe} resolves, and the name of the region it draws into. */
+  interface FailureProbeProps {
+    /** The accessible name of the probe's region. */
+    readonly label: string;
+    /** The query the probe hands the hook, unmodified. */
+    readonly query: DataQuery;
+  }
+
+  /**
+   * The smallest query-backed node: it resolves its query and, on failure,
+   * spreads the composed failure props onto the error state — exactly the
+   * call a catalogued view makes in its error branch. A probe rather than a
+   * catalogued view, because these cases pin the contract itself — hook,
+   * helpers and primitive — independent of any one component's call site.
+   *
+   * Anything but a failure is printed as a paragraph, which has no live-region
+   * role, so every `alert` and `status` on screen is an error state.
+   *
+   * @param props See {@link FailureProbeProps}.
+   * @returns The probe's labelled region.
+   */
+  function FailureProbe(props: FailureProbeProps): ReactElement {
+    const { label, query } = props;
+    const result = useQuery(query);
+
+    return (
+      <section aria-label={label}>
+        {result.status === 'error' ? (
+          <ErrorState {...queryFailureProps(result, query)} />
+        ) : (
+          <p>{result.status}</p>
+        )}
+      </section>
+    );
+  }
+
+  /** What {@link FailureProbes} mounts. */
+  interface FailureProbesProps {
+    /** The provider in context, or `undefined` for a host that provides none. */
+    readonly provider: DataProvider | undefined;
+    /** The session in context. */
+    readonly sessionId: string;
+    /** The probes to mount, keyed by label. */
+    readonly probes: readonly FailureProbeProps[];
+  }
+
+  /**
+   * Several probes under one provider and one session, as a panel's nodes are.
+   *
+   * @param props See {@link FailureProbesProps}.
+   * @returns The probes inside both contexts.
+   */
+  function FailureProbes(props: FailureProbesProps): ReactElement {
+    return (
+      <DataProviderContext.Provider value={props.provider}>
+        <PanelSessionContext.Provider value={props.sessionId}>
+          {props.probes.map((probe) => (
+            <FailureProbe key={probe.label} label={probe.label} query={probe.query} />
+          ))}
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+  }
+
+  /**
+   * A provider whose every call is rejected with a fresh cause.
+   *
+   * @param makeCause Builds the rejection reason for one call.
+   * @returns The provider and its recorded resolver.
+   */
+  function makeRejectingProvider(makeCause: () => Error): StubProvider {
+    const resolve = vi.fn<DataQueryResolver>(() => Promise.reject(makeCause()));
+
+    return { provider: createDataProvider(resolve), resolve };
+  }
+
+  /**
+   * The error state inside one probe's region, once it has settled.
+   *
+   * @param label The probe's region name.
+   * @returns The error state's container, whichever live-region role it took.
+   */
+  async function settledFailure(label: string): Promise<HTMLElement> {
+    const region = screen.getByRole('region', { name: label });
+    const retryControl = await within(region).findByRole('button', { name: RETRY_PATTERN });
+    const failure = retryControl.closest<HTMLElement>('[role="alert"], [role="status"]');
+    if (failure === null) {
+      throw new Error(`the "${label}" probe drew a retry outside any live region`);
+    }
+
+    return failure;
+  }
+
+  it('serialises a query in one canonical, pretty-printed form', () => {
+    const query: DataQuery = {
+      offset: 20,
+      limit: 10,
+      sort: 'duration_desc',
+      filter: {
+        tier: 'server',
+        minDuration: 5,
+        kinds: ['fetch', 'db.query'],
+        component: undefined,
+      },
+      source: 'spans',
+    };
+
+    // Member order source, filter, sort, limit, offset; filter keys sorted;
+    // the undefined member gone; array order kept; two-space indent.
+    expect(formatDataQuery(query)).toBe(
+      [
+        '{',
+        '  "source": "spans",',
+        '  "filter": {',
+        '    "kinds": [',
+        '      "fetch",',
+        '      "db.query"',
+        '    ],',
+        '    "minDuration": 5,',
+        '    "tier": "server"',
+        '  },',
+        '  "sort": "duration_desc",',
+        '  "limit": 10,',
+        '  "offset": 20',
+        '}',
+      ].join('\n'),
+    );
+
+    // The same request assembled in another order prints the same text, and
+    // the text is still the query a reader can parse back.
+    expect(
+      formatDataQuery({
+        source: 'spans',
+        filter: { kinds: ['fetch', 'db.query'], minDuration: 5, tier: 'server' },
+        sort: 'duration_desc',
+        limit: 10,
+        offset: 20,
+      }),
+    ).toBe(formatDataQuery(query));
+    expect(JSON.parse(formatDataQuery(query))).toEqual({
+      source: 'spans',
+      filter: { kinds: ['fetch', 'db.query'], minDuration: 5, tier: 'server' },
+      sort: 'duration_desc',
+      limit: 10,
+      offset: 20,
+    });
+    expect(formatDataQuery({ source: 'metrics' })).toBe('{\n  "source": "metrics"\n}');
+  });
+
+  it('composes a failed view as the generic lead, the cause, the hint and the details', () => {
+    const retry = vi.fn<() => void>();
+    const error = new DebuggenError(
+      PROVIDER_FAILURE_CODE,
+      '  The transport closed before the page arrived  ',
+      { hint: 'Reconnect, then retry.', details: { attempt: 2 } },
+    );
+
+    expect(
+      queryFailureProps({ error, announcement: 'polite', retry }, { source: 'metrics' }),
+    ).toEqual({
+      title: QUERY_FAILURE_TITLE,
+      message: `${VIEW_LEAD} The transport closed before the page arrived.`,
+      hint: 'Reconnect, then retry.',
+      code: PROVIDER_FAILURE_CODE,
+      query: formatDataQuery({ source: 'metrics' }),
+      details: JSON.stringify({ attempt: 2 }, null, 2),
+      announce: 'polite',
+      onRetry: retry,
+    });
+  });
+
+  it('titles a failed next page as a page, and keeps a cause that is already a sentence', () => {
+    const retry = vi.fn<() => void>();
+    const error = new DebuggenError(PROVIDER_FAILURE_CODE, 'Nothing arrived in time!');
+
+    const props = queryFailureProps(
+      { error, announcement: undefined, retry },
+      { source: 'renders', offset: 50 },
+      { scope: 'page' },
+    );
+
+    expect(props.title).toBe(PAGE_FAILURE_TITLE);
+    expect(props.message).toBe(`${PAGE_LEAD} Nothing arrived in time!`);
+    expect(props.hint).toBeUndefined();
+    expect(props.details).toBeUndefined();
+    expect(props.announce).toBe('assertive');
+  });
+
+  it('composes the lead alone, with the INTERNAL code, when no cause is known', () => {
+    const props = queryFailureProps(
+      { error: undefined, announcement: undefined, retry: vi.fn<() => void>() },
+      { source: 'events' },
+    );
+
+    expect(props.message).toBe(VIEW_LEAD);
+    expect(props.code).toBe('INTERNAL');
+    expect(props.hint).toBeUndefined();
+    expect(props.details).toBeUndefined();
+  });
+
+  it("words an unsupported query from the node catalog's label and sources", () => {
+    const renders = unsupportedQueryProps('renderTable', { source: 'spans' });
+    expect(renders).toEqual({
+      title: UNSUPPORTED_QUERY_TITLE,
+      message: `The ${catalogEntryFor('renderTable').label} view reads "renders" data, but this panel asks it for "spans".`,
+      code: 'PANEL_INVALID',
+      query: formatDataQuery({ source: 'spans' }),
+    });
+
+    // Two sources read as alternatives, in the catalog's own order.
+    expect(unsupportedQueryProps('timeline', { source: 'events' }).message).toBe(
+      `The ${catalogEntryFor('timeline').label} view reads "trace" or "spans" data, but this panel asks it for "events".`,
+    );
+  });
+
+  it('draws the whole contract, in order, with the details closed', () => {
+    const onRetry = vi.fn<() => void>();
+    const details = JSON.stringify({ attempt: 2, remedy: 'An integration step.' }, null, 2);
+
+    render(
+      <ErrorState
+        title="A failure title"
+        message="A failure message."
+        hint="A failure hint."
+        code={PROVIDER_FAILURE_CODE}
+        query={formatDataQuery({ source: 'metrics' })}
+        details={details}
+        onRetry={onRetry}
+      />,
+    );
+
+    const alert = screen.getByRole('alert');
+
+    // The default glyph, decorative and out of the accessibility tree.
+    const glyphBox = alert.querySelector('.dg-error-state__icon');
+    expect(glyphBox?.getAttribute('aria-hidden')).toBe('true');
+    expect(glyphBox?.querySelector('svg')).not.toBeNull();
+
+    // The hint is its own line, in the message's register.
+    expect(within(alert).getByText('A failure hint.').tagName).toBe('P');
+    expect(alert.querySelectorAll('.dg-error-state__message')).toHaveLength(2);
+
+    // The query block keeps its default name; the details sit in a closed
+    // native disclosure, behind a summary a keyboard can toggle.
+    within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    const summary = within(alert).getByText(DETAILS_NAME).closest('summary');
+    const disclosure = summary?.closest('details');
+    expect(disclosure?.open).toBe(false);
+    const detailsBlock = within(alert).getByRole('group', { name: DETAILS_NAME, hidden: true });
+    expect(detailsBlock.closest('details')).toBe(disclosure);
+    expect(detailsBlock.textContent).toBe(details);
+
+    // Glyph, title, message, hint, code, query, details, action.
+    const text = alert.textContent ?? '';
+    const positions = [
+      'A failure title',
+      'A failure message.',
+      'A failure hint.',
+      PROVIDER_FAILURE_CODE,
+      '"source": "metrics"',
+      DETAILS_NAME,
+      'Retry',
+    ].map((part) => text.indexOf(part));
+    expect(positions.every((position) => position >= 0)).toBe(true);
+    expect([...positions].sort((left, right) => left - right)).toEqual(positions);
+
+    // The retry control carries the focus key a remounting frame recognises.
+    const retryControl = within(alert).getByRole('button', { name: RETRY_PATTERN });
+    expect(FOCUS_KEY_ATTRIBUTE).toBe('data-dg-focus-key');
+    expect(ERROR_STATE_RETRY_FOCUS_KEY).toBe('error-state-retry');
+    expect(retryControl.getAttribute(FOCUS_KEY_ATTRIBUTE)).toBe(ERROR_STATE_RETRY_FOCUS_KEY);
+  });
+
+  it('names the query block as asked, announces politely on request, and drops the glyph on null', () => {
+    render(
+      <ErrorState
+        message="A failure message."
+        query='{ "type": "unknownNode" }'
+        queryLabel="Node definition"
+        announce="polite"
+        icon={null}
+        hint="   "
+      />,
+    );
+
+    const status = screen.getByRole('status');
+    expect(screen.queryByRole('alert')).toBeNull();
+    within(status).getByRole('group', { name: 'Node definition' });
+    expect(within(status).queryByRole('group', { name: FAILING_QUERY_NAME })).toBeNull();
+    expect(status.querySelector('.dg-error-state__icon')).toBeNull();
+
+    // A blank hint draws no line, and no retry is offered without a callback.
+    expect(status.querySelectorAll('.dg-error-state__message')).toHaveLength(1);
+    expect(within(status).queryByRole('button')).toBeNull();
+  });
+
+  it('falls back to the default query name for a blank label', () => {
+    render(<ErrorState message="A failure message." query="{}" queryLabel="  " />);
+
+    within(screen.getByRole('alert')).getByRole('group', { name: FAILING_QUERY_NAME });
+  });
+
+  it.each([
+    { label: 'Loading captured calls', announced: 'Loading captured calls…' },
+    { label: 'Loading captured calls...', announced: 'Loading captured calls…' },
+    { label: 'Loading captured calls.', announced: 'Loading captured calls…' },
+    { label: 'Loading captured calls…', announced: 'Loading captured calls…' },
+    { label: '  Loading requests  ', announced: 'Loading requests…' },
+    { label: '', announced: 'Loading…' },
+    { label: '   ', announced: 'Loading…' },
+    { label: '...', announced: 'Loading…' },
+    { label: '…', announced: 'Loading…' },
+    { label: undefined, announced: 'Loading…' },
+  ])('announces the loading label $label as $announced', ({ label, announced }) => {
+    render(<LoadingState label={label} />);
+
+    expect(screen.getByRole('status').textContent).toBe(announced);
+  });
+
+  /** One rejection a provider may raise, and the code a node must report it with. */
+  interface RejectionCase {
+    /** What the rejection is, for the case title. */
+    readonly name: string;
+    /** Builds the rejection. */
+    readonly cause: () => Error;
+    /** The code the error state shows. */
+    readonly code: string;
+  }
+
+  const REJECTIONS: readonly RejectionCase[] = [
+    {
+      name: 'an HTTP 503',
+      cause: () => Object.assign(new Error('Service Unavailable'), { status: 503 }),
+      code: 'TRANSPORT_DISCONNECTED',
+    },
+    {
+      name: 'an HTTP 404 on statusCode',
+      cause: () => Object.assign(new Error('Not Found'), { statusCode: 404 }),
+      code: 'SESSION_NOT_FOUND',
+    },
+    {
+      name: 'an HTTP 401 on the attached response',
+      cause: () => Object.assign(new Error(''), { response: { status: 401 } }),
+      code: 'UNAUTHORIZED',
+    },
+    {
+      name: 'an HTTP 500',
+      cause: () => Object.assign(new Error('Server Error'), { status: 500 }),
+      code: 'INTERNAL',
+    },
+    {
+      name: 'an HTTP 400',
+      cause: () => Object.assign(new Error('Bad Request'), { status: 400 }),
+      code: 'PROTOCOL_INVALID_MESSAGE',
+    },
+    {
+      name: 'a timeout',
+      cause: () => Object.assign(new Error('The operation timed out.'), { name: 'TimeoutError' }),
+      code: 'TRANSPORT_DISCONNECTED',
+    },
+    {
+      name: 'a plain error',
+      cause: () => new Error('Something unexplained happened.'),
+      code: 'INTERNAL',
+    },
+    {
+      name: 'a typed error that also carries a status',
+      cause: () =>
+        Object.assign(new DebuggenError('RATE_LIMITED', 'Too many requests.'), { status: 503 }),
+      code: 'RATE_LIMITED',
+    },
+  ];
+
+  it.each(REJECTIONS)('reports $name with the code $code', async ({ cause, code }) => {
+    const { provider } = makeRejectingProvider(cause);
+
+    render(
+      <FailureProbes
+        provider={provider}
+        sessionId={SESSION_ID}
+        probes={[{ label: 'rejected view', query: { source: 'metrics' } }]}
+      />,
+    );
+
+    const failure = await settledFailure('rejected view');
+    within(failure).getByText(code);
+  });
+
+  it('shows an HTTP status in the technical details, and no INTERNAL code, through a real view', async () => {
+    const { provider } = makeRejectingProvider(() =>
+      Object.assign(new Error('Service Unavailable'), { status: 503 }),
+    );
+
+    render(<PanelHost spec={makeSpec()} dataProvider={provider} actions={makeActions().actions} />);
+
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const alert = await within(stack).findByRole('alert');
+    expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
+    expect(alert.textContent).not.toContain('INTERNAL');
+
+    cleanup();
+
+    render(
+      <FailureProbes
+        provider={provider}
+        sessionId={SESSION_ID}
+        probes={[{ label: 'unavailable view', query: { source: 'metrics' } }]}
+      />,
+    );
+
+    const failure = await settledFailure('unavailable view');
+    expect(within(failure).getByText(`${VIEW_LEAD} Service Unavailable.`).tagName).toBe('P');
+    const detailsBlock = within(failure).getByRole('group', { name: DETAILS_NAME, hidden: true });
+    expect(JSON.parse(detailsBlock.textContent ?? '')).toEqual({ status: 503 });
+  });
+
+  it('keeps integration instructions off the hint line and in the details', async () => {
+    const refusals = [
+      mapPanelDataResult({ source: 'renders' }, null),
+      mapPanelDataResult({ source: 'renders' }, { source: 'requests', requests: [] }),
+    ].map((mapped) => (mapped.ok ? undefined : mapped.error));
+    const viewRefusals = [
+      checkDataQueryResponse({ source: 'spans' }, { source: 'spans', spans: [] }),
+      checkDataQueryResponse({ source: 'renders' }, { source: 'requests', data: [] }),
+      checkDataQueryResponse({ source: 'renders' }, { source: 42, data: [] }),
+    ];
+    const unaddressed = await createDataProvider(vi.fn<DataQueryResolver>())
+      .query('', { source: 'metrics' })
+      .then(
+        () => undefined,
+        (reason: unknown) => (DebuggenError.is(reason) ? reason : undefined),
+      );
+
+    const errors = [...refusals, ...viewRefusals, unaddressed];
+    expect(errors).toHaveLength(6);
+
+    for (const error of errors) {
+      if (error === undefined) {
+        throw new Error('a refusal under test was not refused');
+      }
+
+      // What the reader sees first names nothing from the integration…
+      expect(error.message).not.toMatch(INTEGRATION_VOCABULARY);
+      expect(error.hint ?? '').toMatch(/\S/u);
+      expect(error.hint ?? '').not.toMatch(INTEGRATION_VOCABULARY);
+
+      // …while the developer's instruction travels in the details.
+      expect(error.details?.['remedy']).toMatch(/\S/u);
+    }
+  });
+
+  it('puts the missing-session remedy behind the details, with no hint line', async () => {
+    const { provider, resolve } = makeRejectingProvider(() => new Error('never asked'));
+
+    render(
+      <FailureProbes
+        provider={provider}
+        sessionId={BLANK_SESSION_ID}
+        probes={[{ label: 'unaddressed view', query: { source: 'metrics' } }]}
+      />,
+    );
+
+    const failure = await settledFailure('unaddressed view');
+    within(failure).getByText(MISSING_SESSION_CODE);
+    expect(resolve).not.toHaveBeenCalled();
+
+    // One message line and no hint line; the remedy is inside the closed
+    // technical details, never in the text a reader meets first.
+    expect(failure.querySelectorAll('.dg-error-state__message')).toHaveLength(1);
+    const detailsBlock = within(failure).getByRole('group', { name: DETAILS_NAME, hidden: true });
+    expect(detailsBlock.closest('details')?.open).toBe(false);
+    expect(detailsBlock.textContent).toMatch(/PanelSessionContext/u);
+  });
+
+  it('announces a burst of failures with exactly one alert and statuses for the rest', async () => {
+    const { provider } = makeRejectingProvider(
+      () => new DebuggenError(PROVIDER_FAILURE_CODE, 'The service is unreachable.'),
+    );
+
+    render(
+      <FailureProbes
+        provider={provider}
+        sessionId={SESSION_ID}
+        probes={[
+          { label: 'first failing view', query: { source: 'metrics' } },
+          { label: 'second failing view', query: { source: 'renders' } },
+        ]}
+      />,
+    );
+
+    const first = await settledFailure('first failing view');
+    const second = await settledFailure('second failing view');
+
+    // Both failures are announced — neither is silent — but only one of them
+    // interrupts: the rest wait their turn.
+    expect(screen.getAllByRole('alert')).toHaveLength(1);
+    expect(screen.getAllByRole('status')).toHaveLength(1);
+    expect([first.getAttribute('role'), second.getAttribute('role')].sort()).toEqual([
+      'alert',
+      'status',
+    ]);
+  });
+
+  it('draws one failure contract across every query-backed catalogued view failing together', async () => {
+    // Every query-backed view the catalogue names, titled with its own label and
+    // reading its first source, each failing with the same transport fault.
+    // Where the probe cases above pin the hook, helpers and primitive, this case
+    // pins the call sites: every view's error branch, through the host, at once
+    // (B1-F16, B2-F14).
+    const layout = Object.values(PANEL_NODE_CATALOG)
+      .filter((entry) => entry.requiresQuery)
+      .map((entry) => {
+        const source = entry.defaultSource ?? entry.sources[0];
+
+        if (source === undefined) {
+          throw new Error(`the catalogue entry for "${entry.type}" names no data source`);
+        }
+
+        return {
+          type: entry.type,
+          id: `node:${entry.type}`,
+          title: entry.label,
+          query: { source },
+          ...(entry.type === 'metricCards' ? { metrics: [NODE_METRIC_ID] } : {}),
+        } as PanelNode;
+      });
+    // Thirteen visualization components, of which only the source-link leaf
+    // reads no captured data (AAP 0.6.2).
+    expect(layout).toHaveLength(12);
+
+    const { provider, resolve } = makeRejectingProvider(() =>
+      Object.assign(new Error('Service Unavailable'), { status: 503 }),
+    );
+
+    const { container } = render(
+      <PanelHost
+        spec={makeSpec({ layout })}
+        dataProvider={provider}
+        actions={makeActions().actions}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelectorAll('.dg-error-state')).toHaveLength(layout.length);
+    });
+    expect(resolve).toHaveBeenCalledTimes(layout.length);
+
+    const failures = Array.from(container.querySelectorAll<HTMLElement>('.dg-error-state'));
+
+    for (const failure of failures) {
+      // One title, one lead followed by the provider's own cause, one code.
+      expect(within(failure).getByText(QUERY_FAILURE_TITLE)).toBeTruthy();
+      const messages = Array.from(failure.querySelectorAll('.dg-error-state__message'));
+      expect(messages.map((line) => line.textContent)).toEqual([
+        `${VIEW_LEAD} Service Unavailable.`,
+      ]);
+      within(failure).getByText(PROVIDER_FAILURE_CODE);
+      expect(failure.textContent).not.toMatch(INTEGRATION_VOCABULARY);
+
+      // One glyph, and one query format: the canonical pretty-printed form of
+      // the query the view actually asked, whatever defaults it applied.
+      expect(failure.querySelectorAll('.dg-error-state__icon')).toHaveLength(1);
+      const queryBlock = within(failure).getByRole('group', { name: FAILING_QUERY_NAME });
+      const printed = queryBlock.textContent ?? '';
+      const asked = JSON.parse(printed) as DataQuery;
+      expect(printed).toBe(formatDataQuery(asked));
+
+      // The same retry control, keyed so the node frame can restore focus to it.
+      const retry = within(failure).getByRole('button', { name: RETRY_PATTERN });
+      expect(retry.getAttribute(FOCUS_KEY_ATTRIBUTE)).toBe(ERROR_STATE_RETRY_FOCUS_KEY);
+    }
+
+    // The failures of one burst interrupt once; the rest are polite.
+    expect(failures.filter((failure) => failure.getAttribute('role') === 'alert')).toHaveLength(1);
+    expect(failures.filter((failure) => failure.getAttribute('role') === 'status')).toHaveLength(
+      layout.length - 1,
+    );
+  });
+
+  it('alerts again for a failure that follows a released one', async () => {
+    const { provider, resolve } = makeRejectingProvider(
+      () => new DebuggenError(PROVIDER_FAILURE_CODE, 'The service is unreachable.'),
+    );
+    const firstProbe: FailureProbeProps = {
+      label: 'first failing view',
+      query: { source: 'metrics' },
+    };
+    const laterProbe: FailureProbeProps = {
+      label: 'later failing view',
+      query: { source: 'events' },
+    };
+
+    const view = render(
+      <FailureProbes provider={provider} sessionId={SESSION_ID} probes={[firstProbe]} />,
+    );
+    expect((await settledFailure(firstProbe.label)).getAttribute('role')).toBe('alert');
+
+    // A retry releases the failure it replaces, so the failure that follows it
+    // is not demoted by its own predecessor.
+    const user = userEvent.setup();
+    await user.click(screen.getByRole('button', { name: RETRY_PATTERN }));
+    await waitFor(() => {
+      expect(resolve).toHaveBeenCalledTimes(2);
+    });
+    expect((await settledFailure(firstProbe.label)).getAttribute('role')).toBe('alert');
+
+    // Unmounting releases it too: a failure somewhere else afterwards alerts.
+    view.rerender(
+      <FailureProbes provider={provider} sessionId={SESSION_ID} probes={[laterProbe]} />,
+    );
+    expect(screen.queryByRole('region', { name: firstProbe.label })).toBeNull();
+    expect((await settledFailure(laterProbe.label)).getAttribute('role')).toBe('alert');
+    expect(screen.queryByRole('status')).toBeNull();
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Focus after a retry: the node frame keeps keyboard focus inside the node
+ * (B1-F14, B2-F12)
+ * ---------------------------------------------------------------------------
+ */
+
+describe('PanelHost focus after a retry', () => {
+  /** The title of the query-backed leaf these cases retry, and its region's name. */
+  const RETRIED_VIEW_TITLE = 'Retried view';
+
+  /**
+   * The document path — and so the `data-node-path` — of the untitled metric
+   * leaf of {@link makeNestedLayout}.
+   */
+  const UNTITLED_LEAF_PATH = 'layout.0.children.0.children.0.children.0';
+
+  /**
+   * A titled query-backed leaf followed by a standalone source chip.
+   *
+   * The leaf is titled so the node frame has a heading of its own to park focus
+   * on; the chip is a control in *another* node, which is where a reader who
+   * moves on while a retry is in flight goes.
+   *
+   * @returns The two nodes, as fresh objects.
+   */
+  function makeRetryLayout(): readonly PanelNode[] {
+    return [
+      {
+        type: 'metricCards',
+        id: 'layout.0',
+        title: RETRIED_VIEW_TITLE,
+        query: { source: 'metrics' },
+        metrics: [NODE_METRIC_ID],
+      },
+      {
+        type: 'sourceLink',
+        id: 'layout.1',
+        location: { ...NODE_LOCATION },
+      },
+    ];
+  }
+
+  /**
+   * Mounts a panel over a controllable provider, so every attempt of the
+   * retried query is settled by the case itself.
+   *
+   * @param layout The panel's layout.
+   * @returns The provider, and the container the panel was drawn into.
+   */
+  function renderControlled(layout: readonly PanelNode[]): {
+    readonly provider: ControllableProvider;
+    readonly container: HTMLElement;
+  } {
+    const provider = makeControllableProvider();
+    const { container } = render(
+      <PanelHost
+        spec={makeSpec({ layout })}
+        dataProvider={provider.provider}
+        actions={makeActions().actions}
+      />,
+    );
+
+    return { provider, container };
+  }
+
+  /** A fresh transport rejection, for an attempt the case fails. */
+  function transportFailure(): DebuggenError {
+    return new DebuggenError(
+      PROVIDER_FAILURE_CODE,
+      'The transport closed before the page arrived.',
+    );
+  }
+
+  /**
+   * Fails the oldest pending attempt and waits for the error state's retry.
+   *
+   * @param provider The panel's provider.
+   * @param scope The node's region, which the retry must render inside.
+   * @returns The retry control of the error state that attempt produced.
+   */
+  async function failNext(
+    provider: ControllableProvider,
+    scope: HTMLElement,
+  ): Promise<HTMLElement> {
+    provider.takeNext().fail(transportFailure());
+
+    return within(scope).findByRole('button', { name: RETRY_PATTERN });
+  }
+
+  /**
+   * The node frame drawn at a document path.
+   *
+   * @param container The render's container.
+   * @param path The node's document path, as `data-node-path` spells it.
+   * @returns The frame.
+   */
+  function frameAt(container: HTMLElement, path: string): HTMLElement {
+    const frame = container.querySelector<HTMLElement>(`.dg-panel__node[data-node-path="${path}"]`);
+    if (frame === null) {
+      throw new Error(`no node frame is drawn at "${path}"`);
+    }
+
+    return frame;
+  }
+
+  it('puts focus on the new Retry when a keyboard retry fails again', async () => {
+    const { provider } = renderControlled(makeRetryLayout());
+    const region = screen.getByRole('region', { name: RETRIED_VIEW_TITLE });
+    const user = userEvent.setup();
+
+    const firstRetry = await failNext(provider, region);
+    firstRetry.focus();
+    expect(document.activeElement).toBe(firstRetry);
+
+    await user.keyboard('{Enter}');
+
+    // The keyboard press retried: the old control left the document with the
+    // error state it belonged to.
+    expect(provider.resolve).toHaveBeenCalledTimes(2);
+    expect(firstRetry.isConnected).toBe(false);
+
+    const secondRetry = await failNext(provider, region);
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(secondRetry);
+    });
+    expect(secondRetry).not.toBe(firstRetry);
+    expect(secondRetry.isConnected).toBe(true);
+    expect(secondRetry.getAttribute(FOCUS_KEY_ATTRIBUTE)).toBe(ERROR_STATE_RETRY_FOCUS_KEY);
+
+    // The heading focus waited on while the retry was in flight gave back the
+    // tab stop it borrowed when focus moved on.
+    const heading = within(region).getByRole('heading', { name: RETRIED_VIEW_TITLE });
+    expect(heading.hasAttribute('tabindex')).toBe(false);
+  });
+
+  it("keeps focus on the node's heading, not the body, while a retry is in flight", async () => {
+    const { provider } = renderControlled(makeRetryLayout());
+    const region = screen.getByRole('region', { name: RETRIED_VIEW_TITLE });
+    const user = userEvent.setup();
+
+    const retry = await failNext(provider, region);
+    retry.focus();
+    await user.keyboard('{Enter}');
+
+    // Loading, with the pressed control gone — and focus inside the node.
+    expect(within(region).getByRole('status').getAttribute('aria-busy')).toBe('true');
+    expect(retry.isConnected).toBe(false);
+
+    const heading = within(region).getByRole('heading', { name: RETRIED_VIEW_TITLE });
+    expect(document.activeElement).not.toBe(document.body);
+    expect(document.activeElement).toBe(heading);
+    expect(heading.getAttribute('tabindex')).toBe('-1');
+
+    provider.takeNext().answer(metricsResponse());
+    await within(region).findByRole('list', { name: METRIC_VIEW_NAME });
+  });
+
+  it('leaves focus on the node heading when a clicked retry succeeds, borrowing tabindex only while focused', async () => {
+    const { provider } = renderControlled(makeRetryLayout());
+    const region = screen.getByRole('region', { name: RETRIED_VIEW_TITLE });
+    const user = userEvent.setup();
+
+    const retry = await failNext(provider, region);
+    await user.click(retry);
+    expect(provider.resolve).toHaveBeenCalledTimes(2);
+
+    provider.takeNext().answer(metricsResponse());
+    await within(region).findByRole('list', { name: METRIC_VIEW_NAME });
+
+    // The recovered view has no control equivalent to Retry, so focus stays on
+    // the node's own region: its heading, focusable only while it holds focus.
+    const heading = within(region).getByRole('heading', { name: RETRIED_VIEW_TITLE });
+    await waitFor(() => {
+      expect(document.activeElement).toBe(heading);
+    });
+    expect(heading.getAttribute('tabindex')).toBe('-1');
+
+    await user.tab();
+
+    expect(document.activeElement).not.toBe(heading);
+    expect(document.activeElement).not.toBe(document.body);
+    expect(heading.hasAttribute('tabindex')).toBe(false);
+  });
+
+  /** How one in-flight retry settles, and what the node draws once it has. */
+  interface RetryOutcome {
+    /** The outcome, for the case title. */
+    readonly outcome: string;
+    /** Settles the pending attempt. */
+    readonly settle: (pending: PendingQuery) => void;
+    /** The role of what the settled node draws. */
+    readonly settledRole: 'button' | 'list';
+    /** The accessible name of what the settled node draws. */
+    readonly settledName: string | RegExp;
+  }
+
+  const RETRY_OUTCOMES: readonly RetryOutcome[] = [
+    {
+      outcome: 'fails again',
+      settle: (pending) => {
+        pending.fail(transportFailure());
+      },
+      settledRole: 'button',
+      settledName: RETRY_PATTERN,
+    },
+    {
+      outcome: 'succeeds',
+      settle: (pending) => {
+        pending.answer(metricsResponse());
+      },
+      settledRole: 'list',
+      settledName: METRIC_VIEW_NAME,
+    },
+  ];
+
+  it.each(RETRY_OUTCOMES)(
+    'leaves focus where the reader moved it while the retry was in flight, when the retry $outcome',
+    async ({ settle, settledRole, settledName }) => {
+      const { provider } = renderControlled(makeRetryLayout());
+      const region = screen.getByRole('region', { name: RETRIED_VIEW_TITLE });
+      const user = userEvent.setup();
+
+      const retry = await failNext(provider, region);
+      retry.focus();
+      await user.keyboard('{Enter}');
+
+      const heading = within(region).getByRole('heading', { name: RETRIED_VIEW_TITLE });
+      expect(document.activeElement).toBe(heading);
+
+      // The reader moves on, to the next control on the panel: a chip in
+      // another node.
+      await user.tab();
+      const chip = screen.getByRole('button', { name: chipName(NODE_LOCATION) });
+      expect(document.activeElement).toBe(chip);
+      expect(heading.hasAttribute('tabindex')).toBe(false);
+
+      settle(provider.takeNext());
+
+      // Whatever the retry settles on — a fresh Retry or the recovered view —
+      // nothing pulls focus back into the node.
+      await within(region).findByRole(settledRole, { name: settledName });
+      expect(document.activeElement).toBe(chip);
+      expect(heading.hasAttribute('tabindex')).toBe(false);
+    },
+  );
+
+  it('parks focus on the frame of a node without a heading, never on its container', async () => {
+    const { provider, container } = renderControlled(makeNestedLayout());
+    const stack = screen.getByRole('region', { name: STACK_TITLE });
+    const frame = frameAt(container, UNTITLED_LEAF_PATH);
+    const user = userEvent.setup();
+
+    const retry = await failNext(provider, stack);
+    expect(frame.contains(retry)).toBe(true);
+    retry.focus();
+    await user.keyboard('{Enter}');
+
+    // The leaf draws no heading; the stack's heading belongs to the stack's own
+    // frame, so focus waits on the leaf's frame instead.
+    expect(document.activeElement).toBe(frame);
+    expect(frame.getAttribute('tabindex')).toBe('-1');
+
+    provider.takeNext().answer(metricsResponse());
+    await within(frame).findByRole('list', { name: METRIC_VIEW_NAME });
+
+    await waitFor(() => {
+      expect(document.activeElement).toBe(frame);
+    });
+
+    await user.tab();
+
+    expect(document.activeElement).not.toBe(frame);
+    expect(frame.hasAttribute('tabindex')).toBe(false);
+  });
+
+  it('moves no focus for a node the reader was not in', async () => {
+    const { provider } = renderControlled(makeRetryLayout());
+    const region = screen.getByRole('region', { name: RETRIED_VIEW_TITLE });
+    const chip = screen.getByRole('button', { name: chipName(NODE_LOCATION) });
+
+    // Focus rests elsewhere while the node fails, and on nothing at all when
+    // its retry is pressed from the pointer without taking focus. The chip's
+    // tooltip follows its focus in React state, hence `act`.
+    act(() => {
+      chip.focus();
+    });
+    const retry = await failNext(provider, region);
+    expect(document.activeElement).toBe(chip);
+
+    act(() => {
+      chip.blur();
+    });
+    expect(document.activeElement).toBe(document.body);
+    fireEvent.click(retry);
+    expect(provider.resolve).toHaveBeenCalledTimes(2);
+
+    provider.takeNext().fail(transportFailure());
+    await within(region).findByRole('button', { name: RETRY_PATTERN });
+
+    expect(document.activeElement).toBe(document.body);
+    expect(region.querySelector('[tabindex="-1"]')).toBeNull();
+  });
+
+  it("names an unrenderable node's block for what it holds: the node definition, not a query", () => {
+    // A type outside the vocabulary, cast because the closed union cannot
+    // express it — the shape a stored panel from a newer vocabulary arrives in.
+    const unrenderable = {
+      type: 'unrecordedVisualization',
+      id: 'layout.0',
+    } as unknown as PanelNode;
+    const provider = makeDataProvider();
+
+    render(
+      <PanelHost
+        spec={makeSpec({ layout: [unrenderable] })}
+        dataProvider={provider.provider}
+        actions={makeActions().actions}
+      />,
+    );
+
+    const failure = screen.getByRole('alert');
+    const block = within(failure).getByRole('group', { name: 'Node definition' });
+
+    expect(JSON.parse(block.textContent ?? '')).toEqual(unrenderable);
+    expect(within(failure).queryByRole('group', { name: 'Failing query' })).toBeNull();
+    expect(provider.resolve).not.toHaveBeenCalled();
   });
 });

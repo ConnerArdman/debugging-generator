@@ -22,8 +22,10 @@
  *     the two apart.
  *   - **The picture is never the only representation** (AAP 0.6.4). The `<svg>`
  *     is `role="img"` with a text alternative, and beneath it every frame the
- *     chart draws is a row of a keyboard-reachable list. A frame neither shows
- *     is named in a note, so a reduction is always stated and never silent.
+ *     chart draws is a row of a keyboard-reachable tree. A frame neither shows
+ *     is named in a note or in the partial-result notice, so a reduction is
+ *     always stated and never silent — and where more of the trace is in
+ *     memory, the notice offers it.
  *   - **Nothing here presents itself as a profiler** (AAP 0.6.6). The product
  *     samples no stacks and measures no CPU time; this component renders the
  *     recorded nesting of measured spans, and says so on screen. One assertion
@@ -60,20 +62,28 @@
  *     `unionDurationMs` and the rest — takes part in either building or
  *     verifying a fixture. A test that reused the implementation's own
  *     arithmetic would agree with it whatever it computed.
- *   - **Nothing is measured from the DOM, and nothing is stubbed for it.** The
- *     component's geometry is arithmetic over a fixed `viewBox`, so there is no
- *     `getBoundingClientRect`, `ResizeObserver` or `offsetWidth` to fake.
+ *   - **Layout is absent, and stubbed only where a case is about it.**
+ *     happy-dom reports a zero-width viewport, so most cases draw in the
+ *     component's unmeasured mode — a fixed 1 000-unit coordinate space
+ *     stretched to the container, with labels fitted by the deterministic
+ *     estimate, and a bounded window of tree rows — and its geometry is
+ *     arithmetic a case can assert exactly. The measured-canvas cases give the
+ *     chart's viewport, and nothing else, a `clientWidth`; the scrolling cases
+ *     give the tree's viewport and rows, and nothing else, their block sizes.
+ *     Every such spy is restored by `afterEach`; no global layout is faked.
  *   - **Generic fixture vocabulary only** (AAP 0.5.2, 0.5.4): operation names, a
  *     file path and a symbol that belong to no application, demonstration or
  *     otherwise. `scripts/check-no-hardcoding.mjs` scans this text with the rest
  *     of `packages/**`.
- *   - **Queries by role and accessible name.** The canvas, the list, its rows
+ *   - **Queries by role and accessible name.** The canvas, the tree, its rows
  *     and their controls are all reached that way; a class is read only off an
  *     element already obtained semantically, since no `jest-dom` matcher is
  *     available in this repository.
  *   - **No timers, no fake clocks, no arbitrary waits.** Post-resolution
- *     assertions go through `await screen.findBy…`, and interactions through
- *     `userEvent`.
+ *     assertions go through `await screen.findBy…`, interactions through
+ *     `userEvent`, and the one asynchronous hand-over that is not a query —
+ *     the virtualizer taking the render over once it has measured — through
+ *     `waitFor` on the state it produces.
  *
  * @see ./FlameChart for the component, its states, its notes and its classes.
  * @see ../host/DataProvider for the seam the stubs below implement.
@@ -83,25 +93,30 @@
  */
 
 import type { DataQuery, FlameNode } from '@debuggen/panel-schema';
+import { catalogEntryFor } from '@debuggen/panel-schema';
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type {
+  OrphanReason,
   TelemetryEvent,
   TelemetryKind,
   TelemetryTier,
   TraceNode,
   TraceTree,
 } from '@debuggen/telemetry';
-import { cleanup, render, screen, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
-import { formatDuration } from '../utils/format';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelectionState } from '../host/PanelActions';
+import { formatDuration, formatCount } from '../utils/format';
+import { estimateTextWidth } from '../utils/measure';
+import { kindColorVar, kindInkColorVar } from '../utils/color';
 import { FlameChart } from './FlameChart';
 
 /*
@@ -119,6 +134,9 @@ import { FlameChart } from './FlameChart';
 
 /** The fixture trace every frame below belongs to: 32 lower-case hex digits. */
 const TRACE_ID = 'b7c8d9e0f1a2b3c4d5e6f70819202122';
+
+/** A second trace id, for the case that re-points a node at another query. */
+const OTHER_TRACE_ID = 'c8d9e0f1a2b3c4d5e6f7081920212223';
 
 /** The fixture session and capture the persisted events are attributed to. */
 const SESSION_ID = 'session-example-0001';
@@ -167,6 +185,46 @@ const RETRY_NAME = 'Retry';
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
 
+/*
+ * The shared error-state contract, spelled out rather than read back from
+ * `../host/useQuery`, so this suite pins the words a reader sees on this node
+ * instead of restating whatever the contract currently holds (B1-F16, B2-F14).
+ */
+
+/** The first line of a node whose own data could not be loaded. */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+
+/** The generic lead every failed view's message opens with. */
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+
+/** The first line of a node whose query names a source it cannot draw. */
+const UNSUPPORTED_TITLE = 'This view cannot draw the requested data';
+
+/** The attribute and value the retry control carries so focus can follow it. */
+const RETRY_FOCUS_ATTRIBUTE = 'data-dg-focus-key';
+const RETRY_FOCUS_KEY = 'error-state-retry';
+
+/**
+ * The parts of a rendered error state, read through the class contract
+ * `primitives/ErrorState` declares.
+ *
+ * @param alert The error state's live-region container.
+ * @returns Its title, its message paragraphs (message, then hint) and its code chip.
+ */
+function errorStateParts(alert: HTMLElement): {
+  readonly title: string | undefined;
+  readonly paragraphs: readonly string[];
+  readonly code: string | undefined;
+} {
+  return {
+    title: alert.querySelector('.dg-error-state__title')?.textContent ?? undefined,
+    paragraphs: Array.from(alert.querySelectorAll('.dg-error-state__message')).map(
+      (paragraph) => paragraph.textContent ?? '',
+    ),
+    code: alert.querySelector(':scope > .dg-badge')?.textContent ?? undefined,
+  };
+}
+
 /**
  * The prefix every fixture operation name shares.
  *
@@ -186,6 +244,16 @@ const FRAME_NAME_PATTERN = /^example\./;
  * spans into a sampled call stack.
  */
 const PROFILER_WORDING = /cpu|sampl|profil/i;
+
+/**
+ * How far two bars on one row may share an edge before they count as
+ * overlapping, in user units: a millionth of one, far below any rendered
+ * pixel, which only absorbs the rounding of two edges computed separately.
+ */
+const TOUCH_SLACK = 1e-6;
+
+/** Why the correlator re-attached a record: its parent never arrived. */
+const MISSING_PARENT: OrphanReason = 'missing-parent';
 
 /**
  * The tiers, in the order a correlated tree lists them.
@@ -526,19 +594,27 @@ function resolvingProvider(tree: TraceTree): StubProvider {
  *
  * The response is well formed at the transport's level — it echoes the source
  * it was asked about, so the factory's own check passes — and it carries the
- * envelope of a trace: an own `traceId` and an array `roots`, which is all a
- * host-side response check can confirm of a tree without walking it. What it
- * lacks is `nodeCount`, a field this view dereferences before drawing, so only
- * the component's own shape guard can catch it — and that guard is what keeps
- * it from throwing inside a render.
+ * envelope of a trace: an own `traceId` and an array `roots`. Its `nodeCount`,
+ * a field this view dereferences before drawing, is broken in one of two ways:
  *
+ * - `"missing"`: absent. The host's response check requires the member, so it
+ *   refuses the answer before the view sees it, and the view renders an
+ *   ordinary failed query.
+ * - `"mistyped"`: present but not a number. That passes the host's presence
+ *   check, so only the component's own shape guard catches it — the guard that
+ *   keeps it from throwing inside a render — and it words the refusal exactly
+ *   as the host does.
+ *
+ * @param variant - How the payload's `nodeCount` is broken.
  * @returns The stub provider.
  */
-function wrongShapeProvider(): StubProvider {
+function wrongShapeProvider(variant: 'missing' | 'mistyped'): StubProvider {
   // Asserted through `unknown` because the case under test is precisely a
   // payload that breaks the `TraceTree` type: the compiler refuses it here, but
   // nothing refuses it in a provider that decoded it from a transport.
-  const partialTree = { traceId: TRACE_ID, roots: [] } as unknown as TraceTree;
+  const partialTree = (variant === 'missing'
+    ? { traceId: TRACE_ID, roots: [] }
+    : { traceId: TRACE_ID, roots: [], nodeCount: 'many' }) as unknown as TraceTree;
 
   return recordingProvider(() =>
     Promise.resolve<DataQueryResponse>({ source: 'trace', data: partialTree }),
@@ -636,25 +712,89 @@ function renderComponent(
   node: FlameNode,
   context: { readonly provider: DataProvider; readonly actions: PanelActions },
 ): HTMLElement {
-  return render(
+  return render(hostedChart(node, context)).container;
+}
+
+/**
+ * The component inside both host contexts, as an element — for the cases that
+ * re-render the same mounted chart with a changed node.
+ *
+ * @param node The node to draw.
+ * @param context The provider to resolve its query and the actions to report to.
+ * @returns The element tree {@link renderComponent} mounts.
+ */
+function hostedChart(
+  node: FlameNode,
+  context: { readonly provider: DataProvider; readonly actions: PanelActions },
+): ReactElement {
+  return (
     <DataProviderContext.Provider value={context.provider}>
       <PanelSessionContext.Provider value={SESSION_ID}>
         <PanelActionsContext.Provider value={context.actions}>
           <FlameChart node={node} />
         </PanelActionsContext.Provider>
       </PanelSessionContext.Provider>
-    </DataProviderContext.Provider>,
-  ).container;
+    </DataProviderContext.Provider>
+  );
 }
 
-/** The text equivalent: the list that carries one row per drawn frame. */
+/** The text equivalent: the tree that carries one row per drawn frame. */
 function frameList(): HTMLElement {
-  return screen.getByRole('list');
+  return screen.getByRole('tree');
 }
 
-/** Its rows, in document order. */
+/**
+ * Its RENDERED rows, in document order.
+ *
+ * The tree is virtualized, so this is every row only while the list is short
+ * enough to render whole — every fixture below except the one built to prove
+ * the window is bounded.
+ */
 function frameRows(): HTMLElement[] {
-  return within(frameList()).getAllByRole('listitem');
+  return within(frameList()).getAllByRole('treeitem');
+}
+
+/** The rows of the tree that are in the Tab order: exactly one, when any row renders. */
+function tabStops(): HTMLElement[] {
+  return frameRows().filter((row) => row.getAttribute('tabindex') === '0');
+}
+
+/**
+ * Every element inside the tree that the Tab key could land on.
+ *
+ * A composite widget is one stop, so this must be its single active row and
+ * nothing else: no nested button, chip or name may carry a non-negative tab
+ * index of its own.
+ */
+function tabbableInTree(): Element[] {
+  return Array.from(
+    frameList().querySelectorAll('button, a[href], input, select, textarea, [tabindex]'),
+  ).filter((element) => element.getAttribute('tabindex') !== '-1');
+}
+
+/**
+ * The row that holds focus, failing when focus is anywhere else.
+ *
+ * @returns The focused treeitem.
+ */
+function focusedRow(): HTMLElement {
+  const active = document.activeElement;
+
+  if (!(active instanceof HTMLElement) || active.getAttribute('role') !== 'treeitem') {
+    throw new Error('focus is not on a row of the frame tree');
+  }
+
+  return active;
+}
+
+/**
+ * The frame name a row shows, read off its name control.
+ *
+ * @param row A row of the text equivalent.
+ * @returns The row's frame name.
+ */
+function nameOfRow(row: HTMLElement): string {
+  return nameControlOf(row).textContent ?? '';
 }
 
 /**
@@ -728,19 +868,22 @@ function canvas(): HTMLElement {
   return screen.getByRole('img');
 }
 
-/** The icicle's depth rows, in document order — one group per shown depth. */
+/**
+ * The icicle's drawn rows, in document order — one group per row: a depth, or
+ * one sub-row of a depth whose siblings overlap.
+ */
 function icicleRows(): SVGGElement[] {
   return Array.from(canvas().querySelectorAll<SVGGElement>('g.dg-flame__row'));
 }
 
 /**
- * The `y` coordinate of the first bar of each depth row, in document order.
+ * The `y` coordinate of the first bar of each drawn row, in document order.
  *
  * The vertical rhythm itself is not asserted anywhere in this suite — it
  * belongs to `../utils/scale` — so these are read as opaque numbers and only
  * their order and distinctness are checked.
  *
- * @returns One coordinate per shown depth.
+ * @returns One coordinate per drawn row.
  */
 function depthOffsets(): number[] {
   return icicleRows().map((group) => {
@@ -757,6 +900,157 @@ function depthOffsets(): number[] {
 /** Every `<title>` the canvas carries, in document order: one per bar. */
 function barTitles(): string[] {
   return Array.from(canvas().querySelectorAll('title')).map((title) => title.textContent ?? '');
+}
+
+/** One drawn frame's name and its geometry, read off its `<rect>`. */
+interface DrawnFrame {
+  readonly name: string;
+  readonly x: number;
+  readonly width: number;
+  readonly y: number;
+}
+
+/**
+ * Every frame the canvas draws, with the geometry its `<rect>` carries.
+ *
+ * The name is the first line of the bar's `<title>`, which is the frame's own
+ * name; the numbers are read as opaque user units, as {@link depthOffsets}
+ * reads them.
+ *
+ * @returns One entry per `rect.dg-flame__frame`, in document order.
+ */
+function drawnFrames(): DrawnFrame[] {
+  return Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).map((rect) => ({
+    name: (rect.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '',
+    x: Number.parseFloat(rect.getAttribute('x') ?? ''),
+    width: Number.parseFloat(rect.getAttribute('width') ?? ''),
+    y: Number.parseFloat(rect.getAttribute('y') ?? ''),
+  }));
+}
+
+/**
+ * The drawn frame named `name`.
+ *
+ * @param name The frame name to find.
+ * @returns Its drawn geometry.
+ */
+function drawnFrameNamed(name: string): DrawnFrame {
+  const frame = drawnFrames().find((candidate) => candidate.name === name);
+
+  if (frame === undefined) {
+    throw new Error(`the canvas draws no frame named "${name}"`);
+  }
+
+  return frame;
+}
+
+/**
+ * Every pair of frames drawn on one row whose bars intersect horizontally.
+ *
+ * Bars that merely touch — one ending exactly where the next begins — do not
+ * count; the slack is far below a rendered pixel and only absorbs the rounding
+ * of two edges computed through the scale separately.
+ *
+ * @returns The overlapping pairs, by name; empty when no row paints over itself.
+ */
+function sameRowOverlaps(): string[] {
+  const frames = drawnFrames();
+  const overlaps: string[] = [];
+
+  for (const [index, first] of frames.entries()) {
+    for (const second of frames.slice(index + 1)) {
+      if (first.y !== second.y) {
+        continue;
+      }
+      const disjoint =
+        first.x + first.width <= second.x + TOUCH_SLACK ||
+        second.x + second.width <= first.x + TOUCH_SLACK;
+      if (!disjoint) {
+        overlaps.push(`${first.name} × ${second.name}`);
+      }
+    }
+  }
+
+  return overlaps;
+}
+
+/** One drawn frame's bar geometry and label, as the canvas carries them. */
+interface LabelledFrame {
+  /** The bar's `x`, in user units. */
+  readonly x: number;
+  /** The bar's `width`, in user units. */
+  readonly width: number;
+  /** The label's `x`, in user units, when a label is drawn. */
+  readonly labelX: number | undefined;
+  /** The label's text, when a label is drawn. */
+  readonly label: string | undefined;
+}
+
+/**
+ * The bar drawn for the frame named `name`, and the label drawn inside it.
+ *
+ * Found through the bar's `<title>`, whose first line is the frame's full name,
+ * so a truncated label cannot hide which frame it belongs to. Unlike
+ * {@link drawnFrameNamed}, it also reads the label the frame carries.
+ *
+ * @param name The frame's recorded name.
+ * @returns Its bar's geometry and its label, read as numbers and text.
+ */
+function drawnFrame(name: string): LabelledFrame {
+  const bar = Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).find(
+    (rect) => rect.querySelector('title')?.textContent?.split('\n')[0] === name,
+  );
+
+  if (bar === undefined) {
+    throw new Error(`the canvas drew no frame named "${name}"`);
+  }
+
+  // A bar and its label are siblings — the chart wraps no group around a
+  // frame — so the label, when one is drawn, is the element right after it.
+  const next = bar.nextElementSibling;
+  const text = next?.matches('text.dg-flame__frame-label') === true ? next : null;
+
+  return {
+    x: Number.parseFloat(bar.getAttribute('x') ?? ''),
+    width: Number.parseFloat(bar.getAttribute('width') ?? ''),
+    labelX: text === null ? undefined : Number.parseFloat(text.getAttribute('x') ?? ''),
+    label: text === null ? undefined : (text.textContent ?? ''),
+  };
+}
+
+/**
+ * The canvas's `viewBox`, parsed.
+ *
+ * @returns Its four numbers: min-x, min-y, width and height.
+ */
+function viewBoxOf(): readonly number[] {
+  return (canvas().getAttribute('viewBox') ?? '').split(' ').map(Number);
+}
+
+/**
+ * Gives the chart's scroll viewport — and no other element — a laid-out inner
+ * width, as a browser would report it.
+ *
+ * happy-dom performs no layout, so every element reports a `clientWidth` of
+ * `0` and the chart draws in its unmeasured mode. The spy answers `width` for
+ * `.dg-flame__viewport` alone and defers to happy-dom for everything else, and
+ * the suite's `afterEach` restores the prototype, so the stub cannot reach
+ * another case.
+ *
+ * @param width The inner width to report, in CSS pixels.
+ */
+function layOutFlameViewport(width: number): void {
+  const native = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientWidth');
+
+  vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function clientWidth(
+    this: HTMLElement,
+  ): number {
+    if (this.classList.contains('dg-flame__viewport')) {
+      return width;
+    }
+    const fallback: unknown = native?.get?.call(this);
+    return typeof fallback === 'number' ? fallback : 0;
+  });
 }
 
 /** The single query a stub provider received, failing on any other count. */
@@ -949,6 +1243,158 @@ const PARALLEL_TREE = makeTree([
 
 /*
  * ---------------------------------------------------------------------------
+ * Siblings that overlap on one depth
+ *
+ * An icicle draws each depth on its own row, which is only legible while the
+ * siblings on that row are disjoint. Two shapes break that, and both are
+ * ordinary: a record the correlator re-attached to the root while it ran
+ * inside another child's window, and a run of short siblings that only overlap
+ * once each has been widened to the minimum visible width.
+ *
+ *   root      [ 0 …………………………………………………………………………… 120 ]
+ *   request       [ 4 ……………………………………………………… 104 ]
+ *   orphan                                   [ 90 … 95 ]   ← depth 1 as well
+ * ---------------------------------------------------------------------------
+ */
+
+/** Depth 1, re-attached to the root: its parent never arrived, and it ran inside the request. */
+const ORPHAN_EVENT = makeEvent({
+  id: 'event-example-0021',
+  spanId: spanIdFor(21),
+  parentSpanId: spanIdFor(99),
+  name: 'example.orphan',
+  kind: 'db.query',
+  tier: 'db',
+  startTime: BASE_START_MS + 90,
+  duration: 5,
+  seq: 3,
+  ingestSeq: 4,
+});
+
+/** The root with its request and, beside it on the same depth, the orphan. */
+const ORPHAN_TREE = makeTree(
+  [
+    makeTraceNode(
+      INTERACTION_EVENT,
+      [
+        makeTraceNode(REQUEST_EVENT, [], 1),
+        { ...makeTraceNode(ORPHAN_EVENT, [], 1), orphaned: true, orphanReason: MISSING_PARENT },
+      ],
+      0,
+    ),
+  ],
+  { orphanCount: 1 },
+);
+
+/** The window of the short-siblings root, in milliseconds. */
+const SHORT_SIBLINGS_ROOT_MS = 1000;
+
+/** How many back-to-back 1 ms siblings it holds. */
+const SHORT_SIBLING_COUNT = 40;
+
+/**
+ * A root holding `count` consecutive 1 ms operations.
+ *
+ * Measured, the siblings are disjoint — each starts where the one before it
+ * ended. Drawn, each is a thousandth of the canvas and is widened to the
+ * scale's minimum visible width, so neighbours overlap: exactly the shape that
+ * painted frames over one another before rows were packed. At a few hundred
+ * siblings it is also the long list the virtualization case needs, and at a
+ * few thousand the trace the row bound stops short of.
+ *
+ * @param count How many siblings. The root's window is
+ * {@link SHORT_SIBLINGS_ROOT_MS}, widened to one millisecond per sibling when
+ * there are more, so every child lies inside it.
+ * @returns The correlated trace.
+ */
+function shortSiblingsTree(count: number = SHORT_SIBLING_COUNT): TraceTree {
+  const root = makeEvent({
+    id: 'event-example-0100',
+    spanId: spanIdFor(100),
+    name: 'example.batch',
+    kind: 'route.handler',
+    tier: 'server',
+    startTime: BASE_START_MS,
+    duration: Math.max(SHORT_SIBLINGS_ROOT_MS, count),
+    seq: 0,
+    ingestSeq: 1,
+  });
+  const children = Array.from({ length: count }, (_unused, index) =>
+    makeTraceNode(
+      makeEvent({
+        id: `event-example-short-${String(index).padStart(3, '0')}`,
+        spanId: spanIdFor(200 + index),
+        parentSpanId: spanIdFor(100),
+        name: `example.step.${String(index).padStart(3, '0')}`,
+        kind: 'function',
+        tier: 'server',
+        startTime: BASE_START_MS + index,
+        duration: 1,
+        seq: index + 1,
+        ingestSeq: index + 2,
+      }),
+      [],
+      1,
+    ),
+  );
+
+  return makeTree([makeTraceNode(root, children, 0)]);
+}
+
+/** A 100 ms root whose two children touch: the first ends as the second begins. */
+const TOUCHING_TREE = makeTree([
+  makeTraceNode(
+    makeEvent({
+      id: 'event-example-0031',
+      spanId: spanIdFor(31),
+      name: 'example.handler',
+      kind: 'route.handler',
+      tier: 'server',
+      startTime: BASE_START_MS,
+      duration: 100,
+      seq: 0,
+      ingestSeq: 1,
+    }),
+    [
+      makeTraceNode(
+        makeEvent({
+          id: 'event-example-0032',
+          spanId: spanIdFor(32),
+          parentSpanId: spanIdFor(31),
+          name: 'example.first',
+          kind: 'function',
+          tier: 'server',
+          startTime: BASE_START_MS,
+          duration: 50,
+          seq: 1,
+          ingestSeq: 2,
+        }),
+        [],
+        1,
+      ),
+      makeTraceNode(
+        makeEvent({
+          id: 'event-example-0033',
+          spanId: spanIdFor(33),
+          parentSpanId: spanIdFor(31),
+          name: 'example.second',
+          kind: 'function',
+          tier: 'server',
+          startTime: BASE_START_MS + 50,
+          duration: 50,
+          seq: 2,
+          ingestSeq: 3,
+        }),
+        [],
+        1,
+      ),
+    ],
+    0,
+  ),
+]);
+
+/*
+ * ---------------------------------------------------------------------------
  * Deep chains, for the bounds the component states rather than hides
  *
  * The three constants below are the component's own, restated here so a case
@@ -1021,6 +1467,112 @@ function deepChain(levels: number): TraceTree {
   return makeTree([nest(events)]);
 }
 
+/*
+ * ---------------------------------------------------------------------------
+ * Row-bounded traces, for the partial-result notice
+ *
+ * The step is the component's own default row bound, restated so the counts
+ * below are stated numbers rather than whatever the traversal currently does.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The traversal's default row bound, and the step "Show more" raises it by. */
+const ROW_BOUND_STEP = 2000;
+
+/**
+ * Siblings under one root for the row-bound case: with the root, one
+ * operation more than two steps, so the bound is raised twice — once by a
+ * whole step, then capped at the trace's own count.
+ */
+const ROW_BOUNDED_SIBLING_COUNT = 2 * ROW_BOUND_STEP;
+
+/** The label of the control that raises the row bound. */
+const SHOW_MORE_NAME = 'Show more operations';
+
+/** The badge every partial result carries. */
+const PARTIAL_RESULT_BADGE = 'Partial result';
+
+/** The chain's length in the depth-ended fixture: past the depth bound. */
+const DEPTH_ENDED_CHAIN_LEVELS = 40;
+
+/**
+ * A trace whose walk ends on exactly the row bound because the DEPTH bound cut
+ * the rest — the case a row-bound notice would misreport.
+ *
+ * One root holds a chain of {@link DEPTH_ENDED_CHAIN_LEVELS} levels and enough
+ * 1 ms leaves that the operations the depth bound lets through — the root,
+ * chain levels 1 … {@link ICICLE_DEPTH_BOUND}, and the leaves — number exactly
+ * {@link ROW_BOUND_STEP}, while the trace itself holds more than that: the
+ * chain levels below the bound.
+ *
+ * @returns The correlated trace.
+ */
+function depthEndedTree(): TraceTree {
+  const reachableChainLevels = ICICLE_DEPTH_BOUND;
+  const leafCount = ROW_BOUND_STEP - 1 - reachableChainLevels;
+  const windowMs = leafCount + DEEP_CHAIN_ROOT_DURATION_MS;
+  const rootSpanId = spanIdFor(3000);
+
+  // Built from the innermost level outward, each level at its own depth: the
+  // chain hangs one level below the root, so `nest`'s zero-based depths would
+  // not fit it.
+  let chain: TraceNode | undefined;
+  for (let level = DEPTH_ENDED_CHAIN_LEVELS - 1; level >= 1; level -= 1) {
+    chain = makeTraceNode(
+      makeEvent({
+        id: `event-example-ended-chain-${String(level).padStart(4, '0')}`,
+        spanId: spanIdFor(3000 + level),
+        parentSpanId: level === 1 ? rootSpanId : spanIdFor(3000 + level - 1),
+        name: `example.chain.${String(level).padStart(3, '0')}`,
+        kind: 'function',
+        tier: 'server',
+        startTime: BASE_START_MS + leafCount + level,
+        duration: DEEP_CHAIN_ROOT_DURATION_MS - 2 * level,
+        seq: level,
+        ingestSeq: level + 1,
+      }),
+      chain === undefined ? [] : [chain],
+      level,
+    );
+  }
+  if (chain === undefined) {
+    throw new Error('the depth-ended chain needs at least one level');
+  }
+
+  const leaves = Array.from({ length: leafCount }, (_unused, index) =>
+    makeTraceNode(
+      makeEvent({
+        id: `event-example-ended-leaf-${String(index).padStart(4, '0')}`,
+        spanId: spanIdFor(4000 + index),
+        parentSpanId: rootSpanId,
+        name: `example.leaf.${String(index).padStart(4, '0')}`,
+        kind: 'function',
+        tier: 'server',
+        startTime: BASE_START_MS + index,
+        duration: 1,
+        seq: DEPTH_ENDED_CHAIN_LEVELS + index,
+        ingestSeq: DEPTH_ENDED_CHAIN_LEVELS + index + 1,
+      }),
+      [],
+      1,
+    ),
+  );
+
+  const root = makeEvent({
+    id: 'event-example-ended-root',
+    spanId: rootSpanId,
+    name: 'example.batch',
+    kind: 'route.handler',
+    tier: 'server',
+    startTime: BASE_START_MS,
+    duration: windowMs,
+    seq: 0,
+    ingestSeq: 1,
+  });
+
+  return makeTree([makeTraceNode(root, [...leaves, chain], 0)]);
+}
+
 describe('FlameChart states', () => {
   it('announces a query in flight, draws nothing else, and asks for the node’s own query', () => {
     const stub = pendingProvider();
@@ -1038,7 +1590,7 @@ describe('FlameChart states', () => {
     // Nothing is drawn yet: no picture, no text equivalent, and above all no
     // empty state — an unsettled query is not an answer (AAP 0.5.5).
     expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
 
     // One query, issued as the node carried it: this view adds no paging,
@@ -1057,12 +1609,21 @@ describe('FlameChart states', () => {
     const message = await screen.findByText(/no trace was captured/i);
     expect(message.classList.contains('dg-empty-state__message')).toBe(true);
 
+    // Announced as the settled status, placed in the view's own empty box, and
+    // carrying a short title and a decorative glyph like every other view's
+    // empty capture.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.parentElement?.classList.contains('dg-flame__empty')).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe('No trace');
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty trace is a success, so it is drawn as an absence and not as a
     // failure — and there is no picture to imply frames behind it.
     expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
   });
 
   it('renders an alert carrying the failed query, and retries it on request', async () => {
@@ -1076,19 +1637,20 @@ describe('FlameChart states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.parentElement?.classList.contains('dg-flame__error')).toBe(true);
 
-    // What the reader is told: this view's own sentence about what could not be
-    // drawn, and the failure's CODE, which is the part of a rejection that
-    // identifies it. The provider's prose is deliberately not restated in the
-    // alert — an error state is not an analysis (AAP 0.5.5) — so the assertion
-    // is that the code arrives, not that the message is echoed.
-    expect(alert.textContent).toContain('nested timing');
-    expect(alert.textContent).toContain('could not be loaded');
+    // What the reader is told: the shared lead, the cause the provider stated
+    // and the failure's code — the same words any other node would use.
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
+    expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
 
-    // The query that failed is shown field by field, in this view's own
-    // vocabulary, so a reader can tell which interaction went unanswered.
+    // The query that failed is shown in full, and compared as a value rather
+    // than as a spelling, so a reader can tell which interaction went
+    // unanswered.
     const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
-    expect(shown.textContent).toBe(`source=trace traceId=${TRACE_ID}`);
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({
+      source: 'trace',
+      filter: { traceId: TRACE_ID },
+    });
 
     expect(stub.resolve).toHaveBeenCalledTimes(1);
 
@@ -1100,7 +1662,7 @@ describe('FlameChart states', () => {
 
     // No frames were invented behind the failure.
     expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
   });
 
   it('reports a node whose query names a source it cannot draw, and asks for nothing', async () => {
@@ -1113,30 +1675,130 @@ describe('FlameChart states', () => {
 
     const alert = await screen.findByRole('alert');
 
-    // The node's own query is what the reader is shown, and no retry is
-    // offered: re-issuing it cannot change the answer.
+    // The node's own query is what the reader is shown, as a value, and no
+    // retry is offered: re-issuing it cannot change the answer.
     const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
-    expect(shown.textContent).toBe('source=spans');
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({ source: 'spans' });
     expect(within(alert).queryByRole('button', { name: RETRY_NAME })).toBeNull();
-    expect(alert.textContent).toContain('needs regenerating');
+    expect(alert.textContent).toContain('"trace"');
+    expect(alert.textContent).toContain('"spans"');
 
     // Nothing was asked of the provider, and nothing was drawn as if it had been.
     expect(stub.resolve).not.toHaveBeenCalled();
     expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.queryByRole('list')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
   });
 
-  it('reports a payload that is not a correlated trace instead of crashing on it', async () => {
-    const stub = wrongShapeProvider();
+  it.each(['missing', 'mistyped'] as const)(
+    'reports a payload whose nodeCount is %s instead of crashing on it',
+    async (variant) => {
+      const stub = wrongShapeProvider(variant);
+      const user = userEvent.setup();
+
+      renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+      // The payload carries a trace's envelope but not the fields this view reads,
+      // so it would otherwise be read as a tree and throw inside a render. It is
+      // reported as the host's own response check reports a refused payload: the
+      // view-failure title, the shared lead and a cause of its own, the code that
+      // check uses, the query as a value, and a retry.
+      const alert = await screen.findByRole('alert');
+      expect(alert.parentElement?.classList.contains('dg-flame__error')).toBe(true);
+
+      const parts = errorStateParts(alert);
+      expect(parts.title).toBe(VIEW_FAILURE_TITLE);
+      expect(parts.paragraphs[0]?.startsWith(`${VIEW_FAILURE_LEAD} `)).toBe(true);
+      expect(parts.paragraphs[0]).toContain('"trace"');
+      expect(parts.paragraphs[0]).toContain('cannot read');
+      expect(parts.code).toBe('PROTOCOL_INVALID_MESSAGE');
+
+      const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+      expect(JSON.parse(shown.textContent ?? '')).toEqual({
+        source: 'trace',
+        filter: { traceId: TRACE_ID },
+      });
+
+      // The shape the guard required is developer detail, kept behind the closed
+      // disclosure rather than on the lines a reader meets first.
+      const disclosure = alert.querySelector('details');
+      expect(disclosure?.open).toBe(false);
+      expect(disclosure?.textContent).toContain('nodeCount');
+      expect(parts.paragraphs.join(' ')).not.toContain('nodeCount');
+
+      expect(screen.queryByRole('tree')).toBeNull();
+      expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+      // A provider that answered in the wrong form once may answer in the right
+      // form next time, so the retry really asks again.
+      await user.click(within(alert).getByRole('button', { name: RETRY_NAME }));
+      expect(stub.resolve).toHaveBeenCalledTimes(2);
+      expect(queryOfCall(stub, 2)).toEqual(queryOfCall(stub, 1));
+    },
+  );
+
+  it('draws a rejected query through the shared error-state contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.', {
+        hint: 'Reconnect the panel and ask again.',
+      }),
+    );
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    // The payload carries a trace's envelope but not the fields this view reads,
-    // so it would otherwise be read as a tree and throw inside a render.
+    // A lone failure alerts: nothing else on screen failed with it.
     const alert = await screen.findByRole('alert');
-    expect(alert.textContent).toContain('needs regenerating');
-    expect(screen.queryByRole('list')).toBeNull();
-    expect(stub.resolve).toHaveBeenCalledTimes(1);
+    expect(alert.classList.contains('dg-error-state')).toBe(true);
+
+    // Title, then the generic lead followed by the provider's own cause, then
+    // the provider's hint on a line of its own, then the code chip.
+    const parts = errorStateParts(alert);
+    expect(parts.title).toBe(VIEW_FAILURE_TITLE);
+    expect(parts.paragraphs).toEqual([
+      `${VIEW_FAILURE_LEAD} The channel to the service is closed.`,
+      'Reconnect the panel and ask again.',
+    ]);
+    expect(parts.code).toBe('TRANSPORT_DISCONNECTED');
+
+    // The query block, found by its name — the error state's `<details>` is an
+    // unnamed group too — parses back to exactly the query that was asked.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(soleQuery(stub));
+
+    // The retry carries the key the node frame restores focus by.
+    const retryControl = within(alert).getByRole('button', { name: RETRY_NAME });
+    expect(retryControl.getAttribute(RETRY_FOCUS_ATTRIBUTE)).toBe(RETRY_FOCUS_KEY);
+
+    // One glyph for every failure: the primitive's own, decorative.
+    expect(alert.querySelector('.dg-error-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+  });
+
+  it('draws a source it cannot read through the shared unsupported-query contract', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode({ query: { source: 'spans', limit: 20 } }), {
+      provider: stub.provider,
+      actions: makeActions().actions,
+    });
+
+    const alert = await screen.findByRole('alert');
+    expect(alert.parentElement?.classList.contains('dg-flame__error')).toBe(true);
+
+    // The contract's title and code, and a message worded from the node
+    // catalog: what this view reads next to what it was asked for.
+    const parts = errorStateParts(alert);
+    expect(parts.title).toBe(UNSUPPORTED_TITLE);
+    expect(parts.paragraphs).toEqual([
+      `The ${catalogEntryFor('flame').label} view reads "trace" data, but this panel asks it for "spans".`,
+    ]);
+    expect(parts.code).toBe('PANEL_INVALID');
+
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    expect(JSON.parse(shown.textContent ?? '')).toEqual({ source: 'spans', limit: 20 });
+
+    // A defect in the panel, not a failed request: nothing to retry.
+    expect(within(alert).queryByRole('button', { name: RETRY_NAME })).toBeNull();
+    expect(alert.querySelector(`[${RETRY_FOCUS_ATTRIBUTE}]`)).toBeNull();
+    expect(stub.resolve).not.toHaveBeenCalled();
   });
 
   it('renders its own empty message, not an error, when no trace matched the query', async () => {
@@ -1154,8 +1816,8 @@ describe('FlameChart states', () => {
     expect(screen.queryByRole('alert')).toBeNull();
     expect(screen.queryByRole('button', { name: RETRY_NAME })).toBeNull();
     expect(screen.queryByRole('img')).toBeNull();
-    expect(screen.queryByRole('list')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('tree')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
   });
 });
@@ -1166,7 +1828,7 @@ describe('FlameChart hierarchy', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     // Document order is outermost first in both representations — the icicle
     // orientation, not a bottom-up flame.
@@ -1191,13 +1853,112 @@ describe('FlameChart hierarchy', () => {
     expect(middleOffset).toBeLessThan(leafOffset);
   });
 
+  it('packs a re-attached frame that overlaps its sibling onto a row of its own', async () => {
+    const stub = resolvingProvider(ORPHAN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // No row paints one frame over another: the orphan ran inside the
+    // request's window, so the two cannot share a row.
+    expect(sameRowOverlaps()).toEqual([]);
+
+    // Depth 1 takes two rows — the request's and the orphan's, below it — and
+    // both sit beneath the root, so the icicle still reads downward.
+    const root = drawnFrameNamed(INTERACTION_EVENT.name);
+    const request = drawnFrameNamed(REQUEST_EVENT.name);
+    const orphan = drawnFrameNamed(ORPHAN_EVENT.name);
+    expect(icicleRows()).toHaveLength(3);
+    expect(root.y).toBeLessThan(request.y);
+    expect(request.y).toBeLessThan(orphan.y);
+
+    // The orphan is still marked as one on the canvas and in the list.
+    const orphanBars = canvas().querySelectorAll('rect.dg-flame__frame.dg-is-orphan');
+    expect(orphanBars).toHaveLength(1);
+    expect(rowNamed(ORPHAN_EVENT.name).classList.contains('dg-is-orphan')).toBe(true);
+    expect(rowNamed(ORPHAN_EVENT.name).getAttribute('aria-level')).toBe('2');
+  });
+
+  it('packs siblings widened to the minimum visible width instead of stacking them', async () => {
+    const tree = shortSiblingsTree();
+    const stub = resolvingProvider(tree);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // Every sibling is drawn, and none on top of another.
+    expect(drawnFrames()).toHaveLength(tree.nodeCount);
+    expect(sameRowOverlaps()).toEqual([]);
+
+    // Their depth needed more than one row, and every one of those rows lies
+    // below the root's.
+    const root = drawnFrameNamed('example.batch');
+    const siblingRows = new Set(
+      drawnFrames()
+        .filter((frame) => frame.name !== 'example.batch')
+        .map((frame) => frame.y),
+    );
+    expect(siblingRows.size).toBeGreaterThan(1);
+    for (const y of siblingRows) {
+      expect(y).toBeGreaterThan(root.y);
+    }
+    expect(icicleRows()).toHaveLength(1 + siblingRows.size);
+  });
+
+  it('keeps siblings that only touch on one row', async () => {
+    const stub = resolvingProvider(TOUCHING_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // One ends exactly as the other begins: they share an edge, not a span of
+    // time, so the depth keeps a single row.
+    expect(drawnFrameNamed('example.first').y).toBe(drawnFrameNamed('example.second').y);
+    expect(sameRowOverlaps()).toEqual([]);
+    expect(icicleRows()).toHaveLength(2);
+  });
+
+  it('aligns a leaf’s name with the foldable rows at its depth', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // A foldable row's disclosure control and a leaf's empty placeholder carry
+    // the same class, so both reserve the same box before the name.
+    for (const name of [INTERACTION_EVENT.name, REQUEST_EVENT.name]) {
+      const toggle = within(rowNamed(name)).getByRole('button', { name: /^Collapse the / });
+      expect(toggle.classList.contains('dg-flame__toggle')).toBe(true);
+    }
+
+    const leaf = rowNamed(HANDLER_EVENT.name);
+    expect(within(leaf).queryByRole('button', { name: /^(Expand|Collapse) the / })).toBeNull();
+
+    const placeholder = leaf.querySelector('.dg-flame__toggle');
+    if (!(placeholder instanceof HTMLElement)) {
+      throw new Error('a leaf row must hold the toggle placeholder');
+    }
+    expect(placeholder.tagName).toBe('SPAN');
+    expect(placeholder.childElementCount).toBe(0);
+    expect(placeholder.textContent).toBe('');
+    expect(placeholder.getAttribute('aria-hidden')).toBe('true');
+    expect(placeholder.getAttribute('tabindex')).toBeNull();
+
+    // It comes first in the row, where the control sits on a foldable row.
+    expect(leaf.firstElementChild).toBe(placeholder);
+  });
+
   it('carries every frame in a keyboard-reachable list beside the picture', async () => {
     const stub = resolvingProvider(CHAIN_TREE);
     const user = userEvent.setup();
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     // One entry per node in the trace — the text equivalent is complete, not a
     // sample of it (AAP 0.6.4).
@@ -1222,15 +1983,14 @@ describe('FlameChart hierarchy', () => {
       expect(row.getAttribute('style')).toContain(`--dgc-depth: ${String(index)}`);
     }
 
-    // The keyboard reaches the list without passing through the picture: the
-    // canvas exposes no focusable bar, so the first Tab lands inside the first
-    // row.
+    // The keyboard reaches the tree without passing through the picture: the
+    // canvas exposes no focusable bar, so the first Tab lands on the first row.
     await user.tab();
     const [firstRow] = frameRows();
     if (firstRow === undefined) {
       throw new Error('the text equivalent rendered no rows');
     }
-    expect(firstRow.contains(document.activeElement)).toBe(true);
+    expect(document.activeElement).toBe(firstRow);
 
     // The picture is an image with a text alternative, and the list is named
     // separately: neither representation stands alone.
@@ -1238,6 +1998,43 @@ describe('FlameChart hierarchy', () => {
     expect(picture.getAttribute('aria-label')).toContain('operations');
     expect(picture.getAttribute('aria-hidden')).toBeNull();
     expect(frameList().getAttribute('aria-label')).toContain('operations');
+  });
+
+  it('inks every frame label with the ink paired with that frame’s own fill', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // A label is text on its frame's fill, so its colour is the fill's paired
+    // ink (AAP 0.6.3's 4.5:1 text bar), not one colour for every frame: on the
+    // light scale no single ink clears it on every fill. The pairs themselves
+    // are measured by the token suite; this checks the view wires each label
+    // to its own frame's pair.
+    const kindByName = new Map(CHAIN_EVENTS.map((event) => [event.name, event.kind]));
+    const labels = Array.from(canvas().querySelectorAll('text.dg-flame__frame-label'));
+    expect(labels.length).toBeGreaterThan(0);
+
+    for (const label of labels) {
+      const frame = label.parentElement?.querySelector('rect.dg-flame__frame');
+      const name = frame?.querySelector('title')?.textContent?.split('\n')[0] ?? '';
+      const kind = kindByName.get(name);
+      if (frame === null || frame === undefined || kind === undefined) {
+        throw new Error(`the label "${label.textContent ?? ''}" sits beside no known frame`);
+      }
+
+      expect(frame.getAttribute('style')).toContain(kindColorVar(kind));
+      expect(label.getAttribute('style')).toContain(`--dgc-frame-ink: ${kindInkColorVar(kind)}`);
+    }
+
+    // The case the pairing exists for: the fetch fill takes its own ink token.
+    const fetchLabel = labels.find(
+      (label) =>
+        label.parentElement?.querySelector('title')?.textContent?.split('\n')[0] ===
+        REQUEST_EVENT.name,
+    );
+    expect(fetchLabel?.getAttribute('style')).toContain('var(--dg-kind-fetch-ink)');
   });
 
   it('never describes itself as a profile, a sample or CPU time', async () => {
@@ -1248,7 +2045,7 @@ describe('FlameChart hierarchy', () => {
       actions: makeActions().actions,
     });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     // The on-screen statement AAP 0.6.6 requires: what a bar actually is.
     expect(screen.getByText(/recorded operation/i)).toBeDefined();
@@ -1276,7 +2073,7 @@ describe('FlameChart hierarchy', () => {
     const first = resolvingProvider(CHAIN_TREE);
 
     renderComponent(makeNode(), { provider: first.provider, actions: makeActions().actions });
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     const firstNames = frameNames();
     const firstTitles = barTitles();
@@ -1286,7 +2083,7 @@ describe('FlameChart hierarchy', () => {
     const second = resolvingProvider(CHAIN_TREE);
 
     renderComponent(makeNode(), { provider: second.provider, actions: makeActions().actions });
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     // Same frames, same order, in both representations: the traversal preserves
     // the correlator's canonical ordering and nothing here re-sorts it.
@@ -1301,7 +2098,7 @@ describe('FlameChart own time', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     const parent = rowNamed(PARALLEL_PARENT_EVENT.name);
     const figures = figuresOf(parent);
@@ -1345,7 +2142,7 @@ describe('FlameChart interactions', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     const row = rowNamed(REQUEST_EVENT.name);
     expect(row.getAttribute('aria-current')).toBeNull();
@@ -1439,7 +2236,7 @@ describe('FlameChart interactions', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     const row = rowNamed(INTERACTION_EVENT.name);
 
@@ -1448,6 +2245,303 @@ describe('FlameChart interactions', () => {
 
     // Exactly one frame in this trace resolved, so exactly one chip exists.
     expect(screen.getAllByRole('button', { name: /^Open / })).toHaveLength(1);
+  });
+});
+
+/** How many 1 ms siblings the virtualization case lists under its root. */
+const LONG_SIBLING_COUNT = 499;
+
+/**
+ * The most rows the tree may put in the document while nothing is measured.
+ *
+ * Deliberately looser than the component's own window: the contract is that
+ * the list is BOUNDED, not what the bound is, and a case pinned to the exact
+ * window would fail on a tuning change that broke nothing.
+ */
+const RENDERED_ROW_CEILING = 100;
+
+describe('FlameChart keyboard', () => {
+  it('is one tab stop, however many rows and controls it holds', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // One row is in the Tab order — the first, since nothing is selected — and
+    // nothing else inside the tree is: the disclosure controls, the names and
+    // the source chip are all out of it.
+    const [firstRow] = frameRows();
+    if (firstRow === undefined) {
+      throw new Error('the text equivalent rendered no rows');
+    }
+    expect(tabStops()).toEqual([firstRow]);
+    expect(tabbableInTree()).toEqual([firstRow]);
+    for (const row of frameRows()) {
+      expect(nameControlOf(row).getAttribute('tabindex')).toBe('-1');
+    }
+    expect(screen.getByRole('button', { name: SOURCE_CHIP_NAME }).getAttribute('tabindex')).toBe(
+      '-1',
+    );
+
+    // Tab enters on that row, and the next Tab leaves the tree altogether.
+    await user.tab();
+    expect(document.activeElement).toBe(firstRow);
+    await user.tab();
+    expect(frameList().contains(document.activeElement)).toBe(false);
+
+    // Shift+Tab comes back to the row that was left.
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(firstRow);
+  });
+
+  it('starts the tab stop on the selected frame, and moves it with focus', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // Selecting a frame with the pointer makes its row the stop.
+    await user.click(nameControlOf(rowNamed(HANDLER_EVENT.name)));
+    expect(tabStops().map(nameOfRow)).toEqual([HANDLER_EVENT.name]);
+
+    // The arrow keys move it, and it is never on two rows at once.
+    await user.keyboard('{ArrowUp}');
+    expect(nameOfRow(focusedRow())).toBe(REQUEST_EVENT.name);
+    expect(tabStops()).toEqual([focusedRow()]);
+  });
+
+  it('moves between rows with the arrow keys, Home and End', async () => {
+    const stub = resolvingProvider(ORPHAN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+    await user.tab();
+
+    const visited = [nameOfRow(focusedRow())];
+    for (const key of [
+      '{ArrowDown}',
+      '{ArrowDown}',
+      '{ArrowDown}',
+      '{ArrowUp}',
+      '{Home}',
+      '{End}',
+    ]) {
+      await user.keyboard(key);
+      visited.push(nameOfRow(focusedRow()));
+      expect(tabStops()).toEqual([focusedRow()]);
+    }
+
+    // Down, down, down at the last row stays put, up, then the two ends.
+    expect(visited).toEqual([
+      INTERACTION_EVENT.name,
+      REQUEST_EVENT.name,
+      ORPHAN_EVENT.name,
+      ORPHAN_EVENT.name,
+      REQUEST_EVENT.name,
+      INTERACTION_EVENT.name,
+      ORPHAN_EVENT.name,
+    ]);
+  });
+
+  it('folds, opens and steps through the hierarchy with ArrowLeft and ArrowRight', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree');
+    await user.tab();
+
+    const root = focusedRow();
+    expect(root.getAttribute('aria-expanded')).toBe('true');
+
+    // ArrowLeft on an open row folds it, keeps focus on it, and reports the
+    // state after the gesture.
+    await user.keyboard('{ArrowLeft}');
+    expect(frameNames()).toEqual([INTERACTION_EVENT.name]);
+    expect(focusedRow().getAttribute('aria-expanded')).toBe('false');
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, INTERACTION_EVENT.spanId, false);
+
+    // ArrowRight on a folded row opens it, and on an open row steps inside.
+    await user.keyboard('{ArrowRight}');
+    expect(frameNames()).toEqual([...CHAIN_NAMES]);
+    expect(nameOfRow(focusedRow())).toBe(INTERACTION_EVENT.name);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, INTERACTION_EVENT.spanId, true);
+
+    await user.keyboard('{ArrowRight}');
+    expect(nameOfRow(focusedRow())).toBe(REQUEST_EVENT.name);
+    await user.keyboard('{ArrowRight}');
+    expect(nameOfRow(focusedRow())).toBe(HANDLER_EVENT.name);
+
+    // A leaf has nothing to open or step into; ArrowLeft steps out to its parent.
+    await user.keyboard('{ArrowRight}');
+    expect(nameOfRow(focusedRow())).toBe(HANDLER_EVENT.name);
+    expect(focusedRow().getAttribute('aria-expanded')).toBeNull();
+    await user.keyboard('{ArrowLeft}');
+    expect(nameOfRow(focusedRow())).toBe(REQUEST_EVENT.name);
+
+    // Fold the parent, then step out to the root.
+    await user.keyboard('{ArrowLeft}');
+    expect(frameNames()).toEqual([INTERACTION_EVENT.name, REQUEST_EVENT.name]);
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, REQUEST_EVENT.spanId, false);
+    await user.keyboard('{ArrowLeft}');
+    expect(nameOfRow(focusedRow())).toBe(INTERACTION_EVENT.name);
+
+    // Three disclosures, each reported once; moving between rows reports none.
+    expect(spies.onExpand).toHaveBeenCalledTimes(3);
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('selects with Enter and Space, and opens the source with Shift+Enter', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('tree');
+    await user.tab();
+
+    // Enter selects the focused frame, naming it as the event it stands for.
+    await user.keyboard('{Enter}');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: INTERACTION_EVENT.id,
+      spanId: INTERACTION_EVENT.spanId,
+      traceId: INTERACTION_EVENT.traceId,
+    });
+    expect(focusedRow().getAttribute('aria-selected')).toBe('true');
+
+    // Shift+Enter on a row with no resolved location does nothing at all.
+    expect(focusedRow().getAttribute('aria-keyshortcuts')).toBeNull();
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+
+    // Space selects too.
+    await user.keyboard('{End}');
+    await user.keyboard('[Space]');
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: HANDLER_EVENT.id,
+      spanId: HANDLER_EVENT.spanId,
+      traceId: HANDLER_EVENT.traceId,
+    });
+    expect(rowNamed(INTERACTION_EVENT.name).getAttribute('aria-selected')).toBe('false');
+    expect(focusedRow().getAttribute('aria-selected')).toBe('true');
+
+    // The row that resolved to a location advertises the chord, and the chord
+    // hands the host that very location — and selects nothing.
+    const expectedKeys = Object.keys({ ...BASE_SOURCE }).sort();
+    expect(focusedRow().getAttribute('aria-keyshortcuts')).toBe('Shift+Enter');
+    await user.keyboard('{Shift>}{Enter}{/Shift}');
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    const [call] = spies.onOpenSource.mock.calls;
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+    expect(call[0]).toEqual(BASE_SOURCE);
+    expect(Object.keys(call[0]).sort()).toEqual(expectedKeys);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(2);
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('names each row with its whole detail and reveals that detail on keyboard focus', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // The row's name carries what only its tooltip shows on screen: the
+    // measured duration, the ancestry and the nested-call count.
+    const request = rowNamed(REQUEST_EVENT.name);
+    const label = request.getAttribute('aria-label') ?? '';
+    expect(label).toContain(REQUEST_EVENT.name);
+    expect(label).toContain(`duration ${formatDuration(REQUEST_EVENT.duration)}`);
+    expect(label).toContain(`inside ${INTERACTION_EVENT.name}`);
+    expect(label).toContain('1 nested call');
+
+    // Nothing is revealed until a row takes keyboard focus…
+    expect(frameList().querySelector('.dg-tooltip__bubble.dg-is-open')).toBeNull();
+
+    await user.tab();
+    await user.keyboard('{ArrowDown}');
+
+    // …and then the focused row's detail is shown, hidden from assistive
+    // technology because the row's name already says it.
+    const revealed = within(focusedRow()).getByRole('tooltip', { hidden: true });
+    expect(revealed.classList.contains('dg-is-open')).toBe(true);
+    expect(revealed.getAttribute('aria-hidden')).toBe('true');
+    // Placed by the primitive's own measurement, as a hovered bubble is: an open
+    // bubble is fixed to the viewport, and one nothing placed paints at its corner.
+    expect(revealed.style.getPropertyValue('--dgc-tooltip-block')).not.toBe('');
+    expect(revealed.style.getPropertyValue('--dgc-tooltip-inline')).not.toBe('');
+    expect(revealed.textContent).toContain(`inside ${INTERACTION_EVENT.name}`);
+
+    // Escape dismisses it without moving focus.
+    await user.keyboard('{Escape}');
+    expect(frameList().querySelector('.dg-tooltip__bubble.dg-is-open')).toBeNull();
+    expect(nameOfRow(focusedRow())).toBe(REQUEST_EVENT.name);
+  });
+});
+
+describe('FlameChart virtualization', () => {
+  it('renders a bounded window of a long tree while every row states its place', async () => {
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
+    const stub = resolvingProvider(tree);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // Every frame is drawn on the canvas, but only a window of rows is in the
+    // document: this test DOM measures nothing, which is the bounded state a
+    // real browser starts in too.
+    expect(tree.nodeCount).toBe(LONG_SIBLING_COUNT + 1);
+    expect(drawnFrames()).toHaveLength(tree.nodeCount);
+    const rendered = frameRows();
+    expect(rendered.length).toBeGreaterThan(0);
+    expect(rendered.length).toBeLessThan(RENDERED_ROW_CEILING);
+
+    // Each rendered row still states its level and its position among ALL of
+    // its siblings, not among the rendered ones.
+    const [root, firstChild] = rendered;
+    if (root === undefined || firstChild === undefined) {
+      throw new Error('the window rendered fewer than two rows');
+    }
+    expect(root.getAttribute('aria-level')).toBe('1');
+    expect(root.getAttribute('aria-setsize')).toBe('1');
+    expect(root.getAttribute('aria-posinset')).toBe('1');
+    expect(firstChild.getAttribute('aria-level')).toBe('2');
+    expect(firstChild.getAttribute('aria-setsize')).toBe(String(LONG_SIBLING_COUNT));
+    expect(firstChild.getAttribute('aria-posinset')).toBe('1');
+
+    // End reaches the last row, which the window follows, and it is focused.
+    await user.tab();
+    await user.keyboard('{End}');
+    const last = focusedRow();
+    expect(nameOfRow(last)).toBe(`example.step.${String(LONG_SIBLING_COUNT - 1).padStart(3, '0')}`);
+    expect(last.getAttribute('aria-posinset')).toBe(String(LONG_SIBLING_COUNT));
+    expect(last.getAttribute('aria-setsize')).toBe(String(LONG_SIBLING_COUNT));
+    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(tabStops()).toEqual([last]);
+
+    // ArrowUp from there stays inside the window, and Home goes back to the top.
+    await user.keyboard('{ArrowUp}');
+    expect(focusedRow().getAttribute('aria-posinset')).toBe(String(LONG_SIBLING_COUNT - 1));
+    await user.keyboard('{Home}');
+    expect(nameOfRow(focusedRow())).toBe('example.batch');
+    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
   });
 });
 
@@ -1460,15 +2554,27 @@ describe('FlameChart honesty', () => {
       actions: makeActions().actions,
     });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
-    // The honesty note comes first because it frames everything under it; the
-    // reduction follows it rather than replacing it.
+    // The honesty note still comes first, because it frames everything under
+    // it; the truncation is a partial result rather than a note.
     const notes = Array.from(container.querySelectorAll('.dg-flame__note')).map(
       (note) => note.textContent ?? '',
     );
     expect(notes[0]).toMatch(/recorded operation/i);
-    expect(notes.some((note) => /arrived incomplete/i.test(note))).toBe(true);
+    expect(notes.some((note) => /arrived incomplete/i.test(note))).toBe(false);
+
+    // The notice carries the badge, says what happened and gives the refine
+    // route — and offers no control, because nothing more is in memory.
+    const badge = screen.getByText(PARTIAL_RESULT_BADGE);
+    const notice = screen.getByText(/arrived incomplete/i);
+    expect(notice.textContent).toMatch(/narrow the query or capture a shorter interaction/i);
+    expect(badge.parentElement).toBe(notice.parentElement);
+    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+
+    // The picture says so too, and the notice precedes it.
+    expect(canvas().getAttribute('aria-label')).toMatch(/arrived incomplete/i);
+    expect(notice.compareDocumentPosition(canvas()) & Node.DOCUMENT_POSITION_FOLLOWING).not.toBe(0);
 
     // The frames that did arrive are still drawn: a partial trace is evidence,
     // not an error.
@@ -1484,7 +2590,7 @@ describe('FlameChart honesty', () => {
       actions: makeActions().actions,
     });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     // Depths 0 … 12 are shown; the subtree at the fold depth arrives folded,
     // which is what keeps a deep trace readable.
@@ -1507,6 +2613,11 @@ describe('FlameChart honesty', () => {
     ).toBe(true);
     expect(notes.some((note) => /folded, hiding \d+ operations/i.test(note))).toBe(true);
 
+    // Neither reduction is a partial result: no larger bound would lift either,
+    // so there is no badge and no control to offer.
+    expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+
     // The picture and the list agree about what is on screen.
     expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(rows.length);
   });
@@ -1518,7 +2629,7 @@ describe('FlameChart honesty', () => {
 
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     const folded = rowNamed(FOLDED_FRAME_NAME);
     const disclosure = within(folded).getByRole('button', { name: /^Expand the / });
@@ -1549,7 +2660,7 @@ describe('FlameChart honesty', () => {
     // Reaching the list at all is the assertion: the traversal, the model and
     // both representations are iterative, so a pathological depth costs rows
     // and a note rather than a thrown `RangeError`.
-    await screen.findByRole('list');
+    await screen.findByRole('tree');
 
     expect(tree.nodeCount).toBe(DEEP_CHAIN_LEVELS);
     expect(frameRows()).toHaveLength(VISIBLE_DEPTH_COUNT);
@@ -1557,6 +2668,939 @@ describe('FlameChart honesty', () => {
     expect(
       Array.from(container.querySelectorAll('.dg-flame__note')).some((note) =>
         /deeper than/i.test(note.textContent ?? ''),
+      ),
+    ).toBe(true);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The shared selection
+ *
+ * Under a panel host the selected frame is the host's, not this chart's: the
+ * frame and its list row mark whatever the host's selection context carries,
+ * matched by event id or by the same trace and span, and an activation is
+ * reported for the host to record rather than kept here.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The component inside the host contexts, the selection context included:
+ * {@link hostedChart}'s tree for the chain's node, under the host's shared
+ * selection.
+ *
+ * @param selection The selection the host provides.
+ * @param context The provider to resolve the query and the actions to report to.
+ * @returns The element tree to render.
+ */
+function selectionHostedChart(
+  selection: PanelSelectionState,
+  context: { readonly provider: DataProvider; readonly actions: PanelActions },
+): ReactElement {
+  return (
+    <PanelSelectionContext.Provider value={selection}>
+      {hostedChart(makeNode(), context)}
+    </PanelSelectionContext.Provider>
+  );
+}
+
+/** The first line of the SVG title of every frame carrying the selected state. */
+function selectedFrameNames(): string[] {
+  return Array.from(canvas().querySelectorAll('rect.dg-flame__frame.dg-is-selected')).map(
+    (frame) => (frame.querySelector('title')?.textContent ?? '').split('\n')[0] ?? '',
+  );
+}
+
+/** The names of the list rows carrying the selected state and `aria-current`. */
+function currentRowNames(): string[] {
+  return frameRows()
+    .filter(
+      (row) =>
+        row.classList.contains('dg-is-selected') && row.getAttribute('aria-current') === 'true',
+    )
+    .map((row) => nameControlOf(row).textContent ?? '');
+}
+
+describe('FlameChart shared selection', () => {
+  it('marks the frame the panel selection names, by event id or by trace and span, and keeps none of its own', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const context = { provider: stub.provider, actions: spies.actions };
+
+    const { rerender } = render(
+      selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context),
+    );
+    await screen.findByRole('tree');
+
+    // The provided selection is what the frame and its row show, and only it.
+    expect(currentRowNames()).toEqual([HANDLER_EVENT.name]);
+    expect(selectedFrameNames()).toEqual([HANDLER_EVENT.name]);
+
+    // Another record's id naming this trace and this span still lands on it.
+    rerender(
+      selectionHostedChart(
+        {
+          selection: {
+            eventId: 'event-example-elsewhere',
+            traceId: TRACE_ID,
+            spanId: REQUEST_EVENT.spanId,
+          },
+        },
+        context,
+      ),
+    );
+
+    expect(currentRowNames()).toEqual([REQUEST_EVENT.name]);
+    expect(selectedFrameNames()).toEqual([REQUEST_EVENT.name]);
+
+    // Activating a frame reports it and leaves the marking to the host: a host
+    // that has not recorded the report still shows its own selection.
+    await user.click(nameControlOf(rowNamed(INTERACTION_EVENT.name)));
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: INTERACTION_EVENT.id,
+      spanId: INTERACTION_EVENT.spanId,
+      traceId: INTERACTION_EVENT.traceId,
+    });
+    expect(currentRowNames()).toEqual([REQUEST_EVENT.name]);
+
+    // A span of another trace is not this chart's to mark, and neither is an
+    // empty host selection.
+    rerender(
+      selectionHostedChart(
+        {
+          selection: {
+            eventId: 'event-example-elsewhere',
+            traceId: 'c8d2e3f405162738495a6b7c8d9e0f1a',
+            spanId: REQUEST_EVENT.spanId,
+          },
+        },
+        context,
+      ),
+    );
+    expect(currentRowNames()).toEqual([]);
+    expect(selectedFrameNames()).toEqual([]);
+
+    rerender(selectionHostedChart({ selection: undefined }, context));
+    expect(currentRowNames()).toEqual([]);
+    expect(selectedFrameNames()).toEqual([]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Hover detail and its dismissal (WCAG 1.4.13)
+ *
+ * A frame's SVG title is the user agent's tooltip, so the view draws its own
+ * hover detail — the frame's list row, marked while the frame is hovered — and
+ * Escape dismisses it without moving the pointer. The keyboard reaches the same
+ * facts through the row name's description, which opens on focus and closes on
+ * Escape.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The frame on the canvas whose SVG title names `name` on its first line.
+ *
+ * @param name The frame's name.
+ * @returns That frame.
+ */
+function frameNamed(name: string): Element {
+  const frame = Array.from(canvas().querySelectorAll('rect.dg-flame__frame')).find(
+    (candidate) => (candidate.querySelector('title')?.textContent ?? '').split('\n')[0] === name,
+  );
+
+  if (frame === undefined) {
+    throw new Error(`no frame on the canvas is named "${name}"`);
+  }
+
+  return frame;
+}
+
+/** The names of the list rows carrying the hover state, in document order. */
+function hoveredRowNames(): string[] {
+  return frameRows()
+    .filter((row) => row.classList.contains('dg-is-hovered'))
+    .map((row) => nameControlOf(row).textContent ?? '');
+}
+
+describe('FlameChart hover detail and dismissal', () => {
+  it('marks the list row of the frame under the pointer, and Escape dismisses it without moving the pointer', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    expect(hoveredRowNames()).toEqual([]);
+
+    await user.hover(frameNamed(REQUEST_EVENT.name));
+    expect(hoveredRowNames()).toEqual([REQUEST_EVENT.name]);
+
+    // The mark follows the pointer from frame to frame.
+    await user.hover(frameNamed(HANDLER_EVENT.name));
+    expect(hoveredRowNames()).toEqual([HANDLER_EVENT.name]);
+
+    // The pointer moves no focus, so the key arrives at the page body. It
+    // dismisses the mark there and is not consumed.
+    expect(document.activeElement).toBe(document.body);
+    expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
+    expect(hoveredRowNames()).toEqual([]);
+
+    // Nothing was selected by it, and the next frame entered is marked again.
+    expect(frameRows().filter((row) => row.classList.contains('dg-is-selected'))).toHaveLength(0);
+
+    await user.hover(frameNamed(INTERACTION_EVENT.name));
+    expect(hoveredRowNames()).toEqual([INTERACTION_EVENT.name]);
+
+    await user.unhover(frameNamed(INTERACTION_EVENT.name));
+    expect(hoveredRowNames()).toEqual([]);
+  });
+
+  it("opens a row's full description on keyboard focus, and Escape closes it without moving focus", async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+    await screen.findByRole('tree');
+
+    // The name is out of the Tab order — the row is the tree's one stop, and
+    // the keyboard suite covers what focusing the row reveals — so focus is
+    // moved onto it directly, as a pointer press would move it.
+    const row = rowNamed(INTERACTION_EVENT.name);
+    const name = nameControlOf(row);
+    act(() => {
+      name.focus();
+    });
+    expect(document.activeElement).toBe(name);
+
+    const bubble = row.querySelector<HTMLElement>('.dg-tooltip__bubble.dg-is-open');
+    if (bubble === null) {
+      throw new Error('the focused name did not open its description');
+    }
+    expect(bubble.textContent).toContain(INTERACTION_EVENT.name);
+    expect(bubble.textContent).toContain('own time');
+
+    await user.keyboard('{Escape}');
+    expect(row.querySelector('.dg-tooltip__bubble.dg-is-open')).toBeNull();
+    expect(document.activeElement).toBe(name);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Marks and reveals on the virtualized tree
+ *
+ * The tree renders only a window of its rows, so the selected or hovered
+ * frame's row may not be in the document. Both marks are keyed by frame id and
+ * land whenever that row renders; a selection made anywhere but the tree
+ * scrolls its row into the tree's own viewport once, and a hover never scrolls
+ * it. happy-dom lays nothing out, so the cases that exercise scrolling give
+ * the tree's viewport and rows — and no other element — a size through spies
+ * the suite's `afterEach` restores.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The block size the laid-out cases give the tree's viewport, in CSS pixels. */
+const TREE_VIEWPORT_HEIGHT = 40;
+
+/** The block size the laid-out cases give every tree row, in CSS pixels. */
+const TREE_ROW_HEIGHT = 32;
+
+/** The index, among the long tree's siblings, of the one a host selects. */
+const FAR_SIBLING_INDEX = 300;
+
+/** The long tree's sibling at `index`: its event id and its frame name. */
+function longSibling(index: number): { readonly eventId: string; readonly name: string } {
+  const suffix = String(index).padStart(3, '0');
+  return { eventId: `event-example-short-${suffix}`, name: `example.step.${suffix}` };
+}
+
+/** The tree's scroll container: the role-less viewport around the tree. */
+function treeViewport(): HTMLElement {
+  const viewport = frameList().closest('.dg-virtual-viewport');
+
+  if (!(viewport instanceof HTMLElement)) {
+    throw new Error('the frame tree is not inside its scroll viewport');
+  }
+
+  return viewport;
+}
+
+/**
+ * Lays out the tree's viewport and its rows in normal flow, as a browser
+ * would: the viewport is {@link TREE_VIEWPORT_HEIGHT} tall at the top of the
+ * page, and the row at index `n` spans `[n, n + 1)` row heights of its content,
+ * moved up by however far the viewport is scrolled.
+ */
+function layOutTreeInFlow(): void {
+  const nativeHeight = Object.getOwnPropertyDescriptor(HTMLElement.prototype, 'clientHeight');
+
+  vi.spyOn(HTMLElement.prototype, 'clientHeight', 'get').mockImplementation(function clientHeight(
+    this: HTMLElement,
+  ): number {
+    if (this.classList.contains('dg-virtual-viewport')) {
+      return TREE_VIEWPORT_HEIGHT;
+    }
+    const fallback: unknown = nativeHeight?.get?.call(this);
+    return typeof fallback === 'number' ? fallback : 0;
+  });
+
+  vi.spyOn(HTMLElement.prototype, 'getBoundingClientRect').mockImplementation(
+    function getBoundingClientRect(this: HTMLElement): DOMRect {
+      if (this.classList.contains('dg-virtual-viewport')) {
+        return new DOMRect(0, 0, 0, TREE_VIEWPORT_HEIGHT);
+      }
+      const index = this.getAttribute('data-frame-index');
+      const viewport = this.closest('.dg-virtual-viewport');
+      if (this.getAttribute('role') === 'treeitem' && index !== null && viewport !== null) {
+        const top = Number(index) * TREE_ROW_HEIGHT - viewport.scrollTop;
+        return new DOMRect(0, top, 0, TREE_ROW_HEIGHT);
+      }
+      // happy-dom's own answer for every other element: no layout, no box.
+      return new DOMRect();
+    },
+  );
+}
+
+/** The block size the virtualized case gives the tree's viewport: eight bands. */
+const VIRTUAL_VIEWPORT_HEIGHT = TREE_VIEWPORT_HEIGHT * 8;
+
+/**
+ * Gives the tree's viewport and its positioned rows the sizes the virtualizer
+ * reads — the viewport's `offsetHeight`, `clientHeight` and `scrollHeight`,
+ * and each row wrapper's `offsetHeight` — so it measures a viewport, takes
+ * over the render from the unmeasured window, and may scroll the viewport as
+ * far as `rowCount` rows reach.
+ *
+ * @param rowCount How many rows the tree lists, which sets its scroll range.
+ */
+function layOutTreeForVirtualizer(rowCount: number): void {
+  const sized = (
+    property: 'offsetHeight' | 'clientHeight' | 'scrollHeight',
+    size: (element: HTMLElement) => number | undefined,
+  ): void => {
+    const native =
+      Object.getOwnPropertyDescriptor(Element.prototype, property) ??
+      Object.getOwnPropertyDescriptor(HTMLElement.prototype, property);
+
+    vi.spyOn(HTMLElement.prototype, property, 'get').mockImplementation(function measured(
+      this: HTMLElement,
+    ): number {
+      const stated = size(this);
+      if (stated !== undefined) {
+        return stated;
+      }
+      const fallback: unknown = native?.get?.call(this);
+      return typeof fallback === 'number' ? fallback : 0;
+    });
+  };
+
+  const isViewport = (element: HTMLElement): boolean =>
+    element.classList.contains('dg-virtual-viewport');
+
+  sized('offsetHeight', (element) => {
+    if (isViewport(element)) {
+      return VIRTUAL_VIEWPORT_HEIGHT;
+    }
+    return element.classList.contains('dg-virtual-row') ? TREE_ROW_HEIGHT : undefined;
+  });
+  sized('clientHeight', (element) => (isViewport(element) ? VIRTUAL_VIEWPORT_HEIGHT : undefined));
+  sized('scrollHeight', (element) =>
+    isViewport(element) ? rowCount * TREE_ROW_HEIGHT : undefined,
+  );
+}
+
+describe('FlameChart marks and reveals on the virtualized tree', () => {
+  it('marks a host selection far down a long tree, and keys the hover mark by frame', async () => {
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
+    const far = longSibling(FAR_SIBLING_INDEX);
+    const near = longSibling(10);
+    const user = userEvent.setup();
+
+    render(
+      selectionHostedChart(
+        { selection: { eventId: far.eventId } },
+        { provider: resolvingProvider(tree).provider, actions: makeActions().actions },
+      ),
+    );
+    await screen.findByRole('tree');
+
+    // Unmeasured, the tree renders a bounded window anchored on its tab stop,
+    // which starts on the selected frame: so the selected row is rendered,
+    // marked in every way a row states selection, and is the one stop.
+    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    const selectedRow = rowNamed(far.name);
+    expect(currentRowNames()).toEqual([far.name]);
+    expect(selectedRow.getAttribute('aria-selected')).toBe('true');
+    expect(tabStops()).toEqual([selectedRow]);
+    expect(selectedFrameNames()).toEqual([far.name]);
+
+    // The hover mark lands on the rendered row of the frame under the pointer.
+    await user.hover(frameNamed(far.name));
+    expect(hoveredRowNames()).toEqual([far.name]);
+
+    // A frame whose row is outside the window is marked by id: no rendered
+    // row carries the mark, and the window does not move to it.
+    await user.hover(frameNamed(near.name));
+    expect(hoveredRowNames()).toEqual([]);
+    expect(frameNames()).not.toContain(near.name);
+    expect(frameNames()).toContain(far.name);
+
+    // Back on a rendered row's frame, the mark follows; Escape dismisses it.
+    await user.hover(frameNamed(far.name));
+    expect(hoveredRowNames()).toEqual([far.name]);
+    expect(fireEvent.keyDown(document.body, { key: 'Escape' })).toBe(true);
+    expect(hoveredRowNames()).toEqual([]);
+  });
+
+  it('scrolls a selection made elsewhere into the tree’s viewport, never one made in the tree', async () => {
+    layOutTreeInFlow();
+    const spies = makeActions();
+    const context = { provider: resolvingProvider(CHAIN_TREE).provider, actions: spies.actions };
+    const user = userEvent.setup();
+
+    const { rerender } = render(selectionHostedChart({ selection: undefined }, context));
+    await screen.findByRole('tree');
+
+    const viewport = treeViewport();
+    expect(viewport.scrollTop).toBe(0);
+
+    // Another view selects the handler, the third row: [64, 96) below a 40 px
+    // band. The viewport moves the least that shows it whole — its bottom edge
+    // to the band's — and neither focus nor the page moves.
+    rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
+    expect(currentRowNames()).toEqual([HANDLER_EVENT.name]);
+    expect(viewport.scrollTop).toBe(3 * TREE_ROW_HEIGHT - TREE_VIEWPORT_HEIGHT);
+    expect(document.activeElement).toBe(document.body);
+    expect(document.documentElement.scrollTop).toBe(0);
+
+    // A row activated in the tree is one the reader is looking at: when the
+    // host records that selection, the tree stays where the reader left it.
+    viewport.scrollTop = 0;
+    await user.click(nameControlOf(rowNamed(REQUEST_EVENT.name)));
+    expect(spies.onSelectEvent).toHaveBeenLastCalledWith({
+      eventId: REQUEST_EVENT.id,
+      spanId: REQUEST_EVENT.spanId,
+      traceId: REQUEST_EVENT.traceId,
+    });
+    rerender(selectionHostedChart({ selection: { eventId: REQUEST_EVENT.id } }, context));
+    expect(currentRowNames()).toEqual([REQUEST_EVENT.name]);
+    expect(viewport.scrollTop).toBe(0);
+
+    // Each new selection from elsewhere is revealed once, and a re-render for
+    // any other reason scrolls nothing.
+    rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
+    expect(viewport.scrollTop).toBe(3 * TREE_ROW_HEIGHT - TREE_VIEWPORT_HEIGHT);
+    viewport.scrollTop = 0;
+    rerender(selectionHostedChart({ selection: { eventId: HANDLER_EVENT.id } }, context));
+    expect(viewport.scrollTop).toBe(0);
+  });
+
+  it('asks the virtualizer to reveal a selection whose row is outside its window', async () => {
+    const tree = shortSiblingsTree(LONG_SIBLING_COUNT);
+    layOutTreeForVirtualizer(tree.nodeCount);
+    const far = longSibling(FAR_SIBLING_INDEX);
+    const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
+
+    const { rerender } = render(selectionHostedChart({ selection: undefined }, context));
+    await screen.findByRole('tree');
+
+    // Measured, the virtualizer drives the render: its rows are positioned,
+    // the window is bounded, and the far sibling is not in it.
+    await waitFor(() => {
+      expect(frameList().querySelector('.dg-virtual-row')).not.toBeNull();
+    });
+    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(frameNames()).not.toContain(far.name);
+    const viewport = treeViewport();
+    expect(viewport.scrollTop).toBe(0);
+
+    // A host selection of it scrolls the tree's own viewport until its row —
+    // the root, then the siblings, so at index FAR_SIBLING_INDEX + 1 — lies
+    // whole inside the viewport, and the window follows.
+    rerender(selectionHostedChart({ selection: { eventId: far.eventId } }, context));
+
+    const rowStart = (FAR_SIBLING_INDEX + 1) * TREE_ROW_HEIGHT;
+    await waitFor(() => {
+      expect(viewport.scrollTop).toBeGreaterThanOrEqual(
+        rowStart + TREE_ROW_HEIGHT - VIRTUAL_VIEWPORT_HEIGHT,
+      );
+    });
+    expect(viewport.scrollTop).toBeLessThanOrEqual(rowStart);
+    await waitFor(() => {
+      expect(currentRowNames()).toEqual([far.name]);
+    });
+    expect(frameRows().length).toBeLessThan(RENDERED_ROW_CEILING);
+    expect(document.activeElement).toBe(document.body);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The canvas's coordinate system
+ *
+ * The chain above spans 120 ms: the interaction [0, 120], the request [4, 104]
+ * and the handler [10, 90]. A 600 px canvas therefore draws 5 px per
+ * millisecond and every edge lands on a whole pixel; the 1 000-unit fallback
+ * draws 25/3 units per millisecond. The two widths below are the component's
+ * own bounds, restated so a case asserts a stated number.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The coordinate width the chart lays out at when nothing is measured. */
+const FALLBACK_CANVAS_WIDTH = 1000;
+
+/** The narrowest canvas a measured chart draws; a narrower viewport scrolls. */
+const MIN_MEASURED_CANVAS_WIDTH = 320;
+
+/** The inner width the measured case gives the viewport, in CSS pixels. */
+const MEASURED_VIEWPORT_WIDTH = 600;
+
+/** A viewport narrower than {@link MIN_MEASURED_CANVAS_WIDTH}. */
+const NARROW_VIEWPORT_WIDTH = 200;
+
+/** The gap between a frame's left edge and its label, in user units. */
+const LABEL_INSET = 4;
+
+/**
+ * The narrowest bar the scale draws, in user units: `../utils/scale`'s minimum
+ * visible width, restated so the packing case below asserts a stated number.
+ */
+const MIN_VISIBLE_BAR_WIDTH = 2;
+
+describe('FlameChart canvas', () => {
+  it('draws a measured canvas in the viewport’s own pixels, unscaled', async () => {
+    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // As wide as the viewport, with a viewBox of the same size: one user unit
+    // is one CSS pixel, so neither the frames nor the text are scaled — and no
+    // `preserveAspectRatio="none"` is left to stretch glyphs.
+    const picture = canvas();
+    const [minX, minY, boxWidth, boxHeight] = viewBoxOf();
+    expect(picture.getAttribute('width')).toBe(String(MEASURED_VIEWPORT_WIDTH));
+    expect([minX, minY, boxWidth]).toEqual([0, 0, MEASURED_VIEWPORT_WIDTH]);
+    expect(String(boxHeight)).toBe(picture.getAttribute('height'));
+    expect(picture.hasAttribute('preserveAspectRatio')).toBe(false);
+
+    // Every frame is its share of the trace's window in pixels: 5 px per ms.
+    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({ x: 0, width: 600 });
+    expect(drawnFrame(REQUEST_EVENT.name)).toMatchObject({ x: 20, width: 500 });
+    expect(drawnFrame(HANDLER_EVENT.name)).toMatchObject({ x: 50, width: 400 });
+
+    // Labels sit inside their frames at the inset, and fit whole at this size.
+    for (const event of CHAIN_EVENTS) {
+      const frame = drawnFrame(event.name);
+      expect(frame.label).toBe(event.name);
+      expect(frame.labelX).toBe(frame.x + LABEL_INSET);
+    }
+  });
+
+  it('scrolls a canvas it will not squeeze below its minimum width', async () => {
+    layOutFlameViewport(NARROW_VIEWPORT_WIDTH);
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // Wider than its viewport, so the viewport scrolls: the frames keep a
+    // legible width and the text keeps its size.
+    expect(canvas().getAttribute('width')).toBe(String(MIN_MEASURED_CANVAS_WIDTH));
+    expect(viewBoxOf()[2]).toBe(MIN_MEASURED_CANVAS_WIDTH);
+    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({
+      x: 0,
+      width: MIN_MEASURED_CANVAS_WIDTH,
+    });
+  });
+
+  it('stretches a fixed 1 000-unit space across its container where nothing is measured', async () => {
+    const stub = resolvingProvider(CHAIN_TREE);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // The layout-free mode: relational width, the fallback coordinate space,
+    // and a horizontal-only stretch so the frames still span the container.
+    const picture = canvas();
+    expect(picture.getAttribute('width')).toBe('100%');
+    expect(viewBoxOf().slice(0, 3)).toEqual([0, 0, FALLBACK_CANVAS_WIDTH]);
+    expect(picture.getAttribute('preserveAspectRatio')).toBe('none');
+
+    // Exact per-mille placements of the 120 ms window.
+    expect(drawnFrame(INTERACTION_EVENT.name)).toMatchObject({ x: 0, width: 1000 });
+    const request = drawnFrame(REQUEST_EVENT.name);
+    expect(request.x).toBeCloseTo((4 / 120) * FALLBACK_CANVAS_WIDTH, 6);
+    expect(request.width).toBeCloseTo((100 / 120) * FALLBACK_CANVAS_WIDTH, 6);
+    const handler = drawnFrame(HANDLER_EVENT.name);
+    expect(handler.x).toBeCloseTo((10 / 120) * FALLBACK_CANVAS_WIDTH, 6);
+    expect(handler.width).toBeCloseTo((80 / 120) * FALLBACK_CANVAS_WIDTH, 6);
+  });
+
+  it('packs overlapping siblings at the width the canvas is drawn at', async () => {
+    // Forty back-to-back 1 ms siblings under a 1 000 ms root. At 600 px a
+    // sibling measures 0.6 px and is widened to the scale's 2 px minimum, so
+    // four of them stack over one point — 2.4 px of starts is the first gap
+    // wide enough — and the depth needs four rows. The unmeasured 1 000-unit
+    // space draws each at 1 unit widened to 2, so only two stack.
+    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
+    const stub = resolvingProvider(shortSiblingsTree());
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // Drawn in the viewport's pixels, and still never one bar over another.
+    expect(canvas().getAttribute('width')).toBe(String(MEASURED_VIEWPORT_WIDTH));
+    expect(drawnFrameNamed('example.batch')).toMatchObject({ x: 0, width: 600 });
+    expect(drawnFrameNamed('example.step.001').x).toBeCloseTo(0.6, 6);
+    expect(drawnFrameNamed('example.step.001').width).toBe(MIN_VISIBLE_BAR_WIDTH);
+    expect(sameRowOverlaps()).toEqual([]);
+
+    // The root's row and the siblings' four, each below the root; the canvas
+    // is as tall as the rows it draws.
+    const root = drawnFrameNamed('example.batch');
+    const siblingRows = new Set(
+      drawnFrames()
+        .filter((frame) => frame.name !== 'example.batch')
+        .map((frame) => frame.y),
+    );
+    expect(siblingRows.size).toBe(4);
+    for (const y of siblingRows) {
+      expect(y).toBeGreaterThan(root.y);
+    }
+    expect(icicleRows()).toHaveLength(5);
+    expect(viewBoxOf()[3]).toBeGreaterThan(Math.max(...siblingRows));
+
+    // The same trace without layout packs into the two rows its own widths need.
+    cleanup();
+    vi.restoreAllMocks();
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(shortSiblingsTree()).provider,
+      actions: makeActions().actions,
+    });
+    await screen.findByRole('tree');
+    expect(canvas().getAttribute('width')).toBe('100%');
+    expect(sameRowOverlaps()).toEqual([]);
+    expect(icicleRows()).toHaveLength(3);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Frame labels, fitted by measured width
+ *
+ * Every trace below spans 1 000 ms, so the 1 000-unit fallback draws exactly
+ * one unit per millisecond. In that mode labels are fitted with the measure's
+ * estimate at the 11 px label size: 0.6 em = 6.6 units per narrow grapheme
+ * (the ellipsis included) and 1.25 em = 13.75 units per wide one. The long
+ * name is 243 UTF-16 units: a 133-grapheme head, one emoji — a single code
+ * point outside the BMP, so a surrogate pair — and a 108-grapheme tail, with
+ * no whitespace anywhere near a cut, so each expected label below is a hand
+ * calculation rather than a re-run of the fitting search.
+ * ---------------------------------------------------------------------------
+ */
+
+/** The label font size the estimate assumes, in CSS pixels. */
+const LABEL_FONT_SIZE = 11;
+
+/** The truncation mark a fitted label ends with: U+2026. */
+const ELLIPSIS_MARK = '\u2026';
+
+/** A wide grapheme, stored as a surrogate pair. */
+const WIDE_NAME_GRAPHEME = '\u{1F680}';
+
+/** The long name's head: 133 narrow graphemes. */
+const LONG_NAME_HEAD = `example.${'aggregate-'.repeat(12)}final`;
+
+/** A 243-unit operation name with a wide grapheme after its head. */
+const LONG_FRAME_NAME = `${LONG_NAME_HEAD}${WIDE_NAME_GRAPHEME}${'-overflow'.repeat(12)}`;
+
+/**
+ * An unpaired surrogate. Under the `u` flag a well-formed pair is one code
+ * point, so this class matches only half of a split pair.
+ */
+const LONE_SURROGATE = /[\uD800-\uDFFF]/u;
+
+/** One child of a label fixture's root: a name and its window, in ms from the root's start. */
+interface LabelFixtureChild {
+  readonly name: string;
+  readonly offsetMs: number;
+  readonly durationMs: number;
+}
+
+/**
+ * A 1 000 ms root named `example.root` with the given children one level down.
+ *
+ * @param children The children, in canonical order.
+ * @returns The correlated trace they form.
+ */
+function labelTree(children: readonly LabelFixtureChild[]): TraceTree {
+  const rootSpanId = spanIdFor(2000);
+  const root = makeEvent({
+    id: 'event-example-label-0000',
+    spanId: rootSpanId,
+    name: 'example.root',
+    startTime: BASE_START_MS,
+    duration: 1000,
+    seq: 0,
+    ingestSeq: 1,
+  });
+
+  return makeTree([
+    makeTraceNode(
+      root,
+      children.map((child, index) =>
+        makeTraceNode(
+          makeEvent({
+            id: `event-example-label-${String(index + 1).padStart(4, '0')}`,
+            spanId: spanIdFor(2001 + index),
+            parentSpanId: rootSpanId,
+            name: child.name,
+            startTime: BASE_START_MS + child.offsetMs,
+            duration: child.durationMs,
+            seq: index + 1,
+            ingestSeq: index + 2,
+          }),
+          [],
+          1,
+        ),
+      ),
+      0,
+    ),
+  ]);
+}
+
+/**
+ * Asserts the properties every drawn label owes its frame: it is the name or a
+ * prefix of it ending in the ellipsis, it keeps every surrogate pair whole, and
+ * it fits between the insets — measured with the same estimate the layout-free
+ * mode fits with.
+ *
+ * @param frame The frame as the canvas drew it.
+ * @param name The frame's recorded name.
+ * @returns The label, known to be drawn.
+ */
+function expectLabelInsideFrame(frame: LabelledFrame, name: string): string {
+  const { label, labelX } = frame;
+
+  if (label === undefined || labelX === undefined) {
+    throw new Error(`the frame named "${name}" carries no label`);
+  }
+
+  const kept = label.endsWith(ELLIPSIS_MARK) ? label.slice(0, -ELLIPSIS_MARK.length) : label;
+  expect(name.startsWith(kept)).toBe(true);
+  expect(LONE_SURROGATE.test(label)).toBe(false);
+  expect(estimateTextWidth(label, LABEL_FONT_SIZE)).toBeLessThanOrEqual(
+    frame.width - 2 * LABEL_INSET,
+  );
+  expect(labelX + estimateTextWidth(label, LABEL_FONT_SIZE)).toBeLessThanOrEqual(
+    frame.x + frame.width - LABEL_INSET,
+  );
+
+  return label;
+}
+
+/** The text of every label the canvas draws, in document order. */
+function frameLabels(): string[] {
+  return Array.from(canvas().querySelectorAll('text.dg-flame__frame-label')).map(
+    (text) => text.textContent ?? '',
+  );
+}
+
+describe('FlameChart frame labels', () => {
+  it('cuts a long name to its frame by measured width, with the ellipsis inside the frame', async () => {
+    const stub = resolvingProvider(
+      labelTree([{ name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 900 }]),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    expect(LONG_FRAME_NAME).toHaveLength(243);
+
+    // A 900-unit frame leaves 892 between the insets. The head and the ellipsis
+    // are 134 narrow graphemes, 884.4 units; the emoji would add 13.75, making
+    // 898.15, which does not fit. So the cut lands before the emoji, whole.
+    const frame = drawnFrame(LONG_FRAME_NAME);
+    expect(frame.width).toBeCloseTo(900, 6);
+    const label = expectLabelInsideFrame(frame, LONG_FRAME_NAME);
+    expect(label).toBe(`${LONG_NAME_HEAD}${ELLIPSIS_MARK}`);
+    expect(label.includes(WIDE_NAME_GRAPHEME)).toBe(false);
+
+    // The root's short name fits whole and is not marked as cut.
+    expect(expectLabelInsideFrame(drawnFrame('example.root'), 'example.root')).toBe('example.root');
+  });
+
+  it('keeps a wide grapheme whole when the cut falls after it', async () => {
+    const stub = resolvingProvider(
+      labelTree([{ name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 950 }]),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // 942 units between the insets: the head (877.8) and the emoji (13.75)
+    // take 891.55, six tail graphemes and the ellipsis 46.2 more — 937.75 —
+    // and a seventh tail grapheme would reach 944.35.
+    const label = expectLabelInsideFrame(drawnFrame(LONG_FRAME_NAME), LONG_FRAME_NAME);
+    expect(label).toBe(`${LONG_NAME_HEAD}${WIDE_NAME_GRAPHEME}-overf${ELLIPSIS_MARK}`);
+  });
+
+  it('draws no label in a frame too narrow for a legible fragment', async () => {
+    const stub = resolvingProvider(
+      labelTree([
+        // 33 units: wide enough to be considered, but the 25 between the insets
+        // cannot hold three graphemes and the ellipsis (26.4).
+        { name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 33 },
+        // 31 units: below the 32-unit floor, although "run" (19.8) would fit.
+        { name: 'run', offsetMs: 200, durationMs: 31 },
+        // 40 units: above the floor, and "set" fits whole.
+        { name: 'set', offsetMs: 300, durationMs: 40 },
+      ]),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    expect(drawnFrame(LONG_FRAME_NAME).label).toBeUndefined();
+    expect(drawnFrame('run').label).toBeUndefined();
+    expect(expectLabelInsideFrame(drawnFrame('set'), 'set')).toBe('set');
+
+    // No fragment of the long name is painted anywhere on the canvas.
+    const labels = frameLabels();
+    expect(labels).toEqual(['example.root', 'set']);
+    expect(labels.some((text) => text.includes('aggregate'))).toBe(false);
+  });
+
+  it('re-fits every label to the frame widths of a measured canvas', async () => {
+    layOutFlameViewport(MEASURED_VIEWPORT_WIDTH);
+    const stub = resolvingProvider(
+      labelTree([{ name: LONG_FRAME_NAME, offsetMs: 0, durationMs: 900 }]),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('tree');
+
+    // 900 ms of a 1 000 ms window on a 600 px canvas is 540 px, leaving 532:
+    // 79 graphemes and the ellipsis are 528, an 80th would reach 534.6.
+    const frame = drawnFrame(LONG_FRAME_NAME);
+    expect(frame.width).toBeCloseTo(540, 6);
+    const label = expectLabelInsideFrame(frame, LONG_FRAME_NAME);
+    expect(label).toBe(`example.${'aggregate-'.repeat(7)}a${ELLIPSIS_MARK}`);
+  });
+});
+
+describe('FlameChart partial results', () => {
+  it('states the row bound as N of M and shows more on request, one step at a time', async () => {
+    const tree = shortSiblingsTree(ROW_BOUNDED_SIBLING_COUNT);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: spies.actions,
+    });
+
+    await screen.findByRole('tree');
+
+    // The first step: the walk stopped at the default bound, and the notice,
+    // the canvas and the tree all state the same subset of the same total.
+    const total = formatCount(tree.nodeCount);
+    const firstSentence = `Showing ${formatCount(ROW_BOUND_STEP)} of ${total} operations.`;
+    expect(screen.getByText(PARTIAL_RESULT_BADGE)).toBeDefined();
+    const notice = screen.getByText(firstSentence);
+    expect(notice.getAttribute('aria-live')).toBe('polite');
+    expect(canvas().getAttribute('aria-label')).toContain(firstSentence);
+    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(ROW_BOUND_STEP);
+    expect(frameRows()[1]?.getAttribute('aria-setsize')).toBe(String(ROW_BOUND_STEP - 1));
+
+    // A whole step more.
+    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
+    const secondSentence = `Showing ${formatCount(2 * ROW_BOUND_STEP)} of ${total} operations.`;
+    expect(screen.getByText(secondSentence)).toBeDefined();
+    expect(canvas().getAttribute('aria-label')).toContain(secondSentence);
+    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(2 * ROW_BOUND_STEP);
+
+    // Then capped at the trace's own count: everything is drawn, the notice —
+    // the same live element, so the change is announced — now says so, and
+    // focus, whose control is gone, lands on the tree's tab stop rather than on
+    // the document.
+    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
+    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(tree.nodeCount);
+    expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
+    expect(notice.isConnected).toBe(true);
+    expect(notice.getAttribute('aria-live')).toBe('polite');
+    expect(notice.textContent).toBe(`Showing all ${total} operations.`);
+    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+    expect(canvas().getAttribute('aria-label')).not.toMatch(/showing/i);
+    expect(tabStops()).toHaveLength(1);
+    expect(document.activeElement).toBe(tabStops()[0]);
+
+    // Showing more is neither a selection nor a disclosure.
+    expect(spies.onSelectEvent).not.toHaveBeenCalled();
+    expect(spies.onExpand).not.toHaveBeenCalled();
+  });
+
+  it('starts from the default bound again when the node’s query changes', async () => {
+    const tree = shortSiblingsTree(ROW_BOUNDED_SIBLING_COUNT);
+    const context = { provider: resolvingProvider(tree).provider, actions: makeActions().actions };
+    const user = userEvent.setup();
+
+    const { rerender } = render(hostedChart(makeNode(), context));
+    await screen.findByRole('tree');
+    await user.click(screen.getByRole('button', { name: SHOW_MORE_NAME }));
+    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(2 * ROW_BOUND_STEP);
+
+    rerender(
+      hostedChart(
+        makeNode({ query: { source: 'trace', filter: { traceId: OTHER_TRACE_ID } } }),
+        context,
+      ),
+    );
+
+    const sentence = `Showing ${formatCount(ROW_BOUND_STEP)} of ${formatCount(
+      tree.nodeCount,
+    )} operations.`;
+    expect(await screen.findByText(sentence)).toBeDefined();
+    expect(canvas().querySelectorAll('rect.dg-flame__frame')).toHaveLength(ROW_BOUND_STEP);
+  });
+
+  it('offers no more rows when the depth bound, not the row bound, ended the walk', async () => {
+    const tree = depthEndedTree();
+
+    const container = renderComponent(makeNode(), {
+      provider: resolvingProvider(tree).provider,
+      actions: makeActions().actions,
+    });
+
+    await screen.findByRole('tree');
+
+    // The trace holds more than the bound, and the walk produced exactly the
+    // bound — yet every operation a larger bound could reach is already here.
+    expect(tree.nodeCount).toBeGreaterThan(ROW_BOUND_STEP);
+    expect(screen.queryByText(PARTIAL_RESULT_BADGE)).toBeNull();
+    expect(screen.queryByRole('button', { name: SHOW_MORE_NAME })).toBeNull();
+    expect(canvas().getAttribute('aria-label')).not.toMatch(/showing/i);
+
+    // What is left out is the depth bound's, and its note says so.
+    expect(
+      Array.from(container.querySelectorAll('.dg-flame__note')).some((note) =>
+        new RegExp(`deeper than ${String(ICICLE_DEPTH_BOUND)} levels`, 'i').test(
+          note.textContent ?? '',
+        ),
       ),
     ).toBe(true);
   });

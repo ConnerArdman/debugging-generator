@@ -509,6 +509,27 @@ export interface ComponentTreeNode {
   totalDurationMs: number;
   /** Trigger of the component's most recent observed render. */
   lastTrigger?: RenderTrigger;
+  /**
+   * Event id of the render that supplied {@link lastTrigger} — the node's
+   * representative event, what a view selects when the node is activated.
+   *
+   * That render is the latest one of this component in canonical order (start
+   * time, then event id), so the reference does not depend on the order the
+   * events were handed over in. A real, captured event: present only when the
+   * component rendered at least once during the capture, and absent — never an
+   * invented id — for a node that is structure alone.
+   */
+  lastRenderEventId?: EventId;
+  /**
+   * Span id of that same render, so a view can select it on a timeline. Present
+   * exactly when {@link lastRenderEventId} is.
+   */
+  lastRenderSpanId?: SpanId;
+  /**
+   * Trace that same render belongs to. Present exactly when
+   * {@link lastRenderEventId} is.
+   */
+  lastRenderTraceId?: TraceId;
   /** Where the component is declared, when a resolver supplied it. */
   source?: SourceLocation;
   /** Child nodes, in the order the structure presented them. */
@@ -744,7 +765,21 @@ interface ComponentAccumulator {
   lastTrigger: RenderTrigger | undefined;
   lastOrderStartTime: number;
   lastOrderEventId: string;
+  /**
+   * Coordinates of the render that owns {@link lastTrigger}: the latest one in
+   * canonical order. `undefined` only between creation and the first fold,
+   * which `accumulate` performs together; kept explicit so the tree builder
+   * handles "no captured render" rather than assuming a reference exists.
+   */
+  lastRender: RenderCoordinates | undefined;
   readonly occurrences: RenderRecord[];
+}
+
+/** The three ids that address one captured render. */
+interface RenderCoordinates {
+  readonly eventId: EventId;
+  readonly spanId: SpanId;
+  readonly traceId: TraceId;
 }
 
 /**
@@ -1274,6 +1309,7 @@ function createAccumulator(component: string, id: string, startTime: number): Co
     lastTrigger: undefined,
     lastOrderStartTime: Number.NEGATIVE_INFINITY,
     lastOrderEventId: '',
+    lastRender: undefined,
     occurrences: [],
   };
 }
@@ -1308,11 +1344,19 @@ function accumulate(components: Map<string, ComponentAccumulator>, record: Rende
   }
 
   // The latest render in canonical order owns `lastTrigger`, so the value does
-  // not depend on the order the caller handed the events over in.
+  // not depend on the order the caller handed the events over in. The same
+  // render's coordinates are kept with it: they are the tree node's
+  // representative event, and taking them from any other render would let a
+  // view select an event whose trigger is not the one the node shows.
   if (isLaterInCanonicalOrder(record, accumulator)) {
     accumulator.lastTrigger = record.trigger;
     accumulator.lastOrderStartTime = record.startTime;
     accumulator.lastOrderEventId = record.eventId;
+    accumulator.lastRender = {
+      eventId: record.eventId,
+      spanId: record.spanId,
+      traceId: record.traceId,
+    };
   }
 
   accumulator.source = preferSource(accumulator.source, record.source);
@@ -2044,6 +2088,7 @@ function buildNode(
 ): ComponentTreeNode {
   const accumulator = index.components.get(renderStatId(draft.component));
   const lastTrigger = accumulator?.lastTrigger;
+  const lastRender = accumulator?.lastRender;
   const source = accumulator?.source;
 
   return {
@@ -2054,6 +2099,15 @@ function buildNode(
     renderCount: accumulator?.renderCount ?? 0,
     totalDurationMs: accumulator === undefined ? 0 : roundMs(accumulator.totalDuration),
     ...(lastTrigger === undefined ? {} : { lastTrigger }),
+    // All three or none: a node that never rendered has no representative
+    // event, and a partial reference would address nothing.
+    ...(lastRender === undefined
+      ? {}
+      : {
+          lastRenderEventId: lastRender.eventId,
+          lastRenderSpanId: lastRender.spanId,
+          lastRenderTraceId: lastRender.traceId,
+        }),
     ...(source === undefined ? {} : { source }),
     children,
   };

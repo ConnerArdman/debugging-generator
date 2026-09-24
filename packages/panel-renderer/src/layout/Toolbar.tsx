@@ -116,8 +116,19 @@
  * | `dg-toolbar--compact`  | variant: tighter gap and padding                    |
  * | `dg-toolbar--wrap`     | variant: the sections may break internally too      |
  *
- * Three facts about those rules matter to anyone reading the markup below:
+ * Four facts about those rules matter to anyone reading the markup below:
  *
+ *   - Every control box sits on one line. A field whose label is shown renders
+ *     as a column (label above, box below) beside controls that are the box
+ *     alone, so the bar and its sections align their items to the END of the
+ *     line rather than centring them, and the dense field box and the dense
+ *     button are one height (the 24 px target floor both primitives carry).
+ *     A visible label therefore sits above its own control without dropping
+ *     that control below its neighbours; the badge and shortcut sections are
+ *     given a control's height with their content centred, so they read level
+ *     with the controls too. This is why no section here is wrapped in extra
+ *     markup to line things up, and why `labelHidden` is a choice about space,
+ *     never about alignment.
  *   - The bar WRAPS at narrow widths rather than scrolling horizontally. A
  *     DevTools panel is routinely around four hundred pixels wide, and the
  *     panel shell's viewport is the only `overflow: auto` container in a

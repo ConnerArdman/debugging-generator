@@ -33,6 +33,14 @@
  * reveal, and an affordance implying otherwise would promise what the product
  * deliberately never captured.
  *
+ * A cell still clips what its track cannot hold, so the clipped-cell cases pin
+ * where the rest of the *displayed* text is readable: a whole summary's and a
+ * name's own `title`, and the expanded detail, which repeats the component, the
+ * hook and both displayed summaries unclipped — byte-identical to the row, and
+ * for a shortened summary the shortened preview only. The stylesheet rules that
+ * bound a cell to its track are pinned by reading the sheet itself, because the
+ * happy-dom environment computes no layout.
+ *
  * ## Two places this suite pins the component's contract precisely
  *
  * Both are deliberate decisions of the code under test, documented in its own
@@ -105,6 +113,10 @@
  * opaque text, never parsed content.
  */
 
+import { readFileSync } from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+
 import {
   DATA_QUERY_DEFAULT_LIMIT,
   DATA_QUERY_DEFAULT_OFFSET,
@@ -114,15 +126,17 @@ import type { DataQuery, DataQuerySort, StateTransitionsNode } from '@debuggen/p
 import { DebuggenError } from '@debuggen/shared';
 import type { SourceLocation } from '@debuggen/shared';
 import type { StateTransition } from '@debuggen/telemetry';
-import { act, cleanup, render, screen, waitFor, within } from '@testing-library/react';
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import type { ReactElement } from 'react';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
 import {
   ELLIPSIS,
   MAX_PREVIEW_LENGTH,
@@ -132,6 +146,7 @@ import {
   humanizeLabel,
   oneLinePreview,
 } from '../utils/format';
+import { sourceLinkAccessibleName } from './SourceLink';
 import { StateTransitionViewer } from './StateTransitionViewer';
 
 /*
@@ -236,7 +251,9 @@ const FAILING_QUERY_NAME = 'Failing query';
 
 /** The toolbar's accessible name and the names of its four controls. */
 const TOOLBAR_NAME = 'State transition filters';
-const ORDER_CONTROL_NAME = 'Order';
+// Names what it orders: a panel sets several tables' order controls side by
+// side, and a bare "Order" would be one name shared by all of them.
+const ORDER_CONTROL_NAME = 'Order state transitions';
 const COMPONENT_CONTROL_NAME = 'Component';
 const CHANGED_ONLY_NAME = 'Changed only';
 const GROUPING_NAME = 'Group by component';
@@ -251,11 +268,27 @@ const LOAD_MORE_NAME = 'Load more';
 /** The same control while that page is in flight. */
 const LOADING_MORE_NAME = 'Loading more…';
 
-/** What the footer's alert says when a next page failed. */
-const PAGE_ERROR_TEXT = 'The next page of state transitions could not be loaded.';
+/**
+ * The package's one failure contract, as a reader meets it: the title and the
+ * generic lead of a view that failed, and of a next page that failed behind
+ * rows already on screen (see `queryFailureProps` in `../host/useQuery`).
+ * Spelled out rather than imported, so these cases pin the words a reader
+ * hears rather than whatever the module currently holds.
+ */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+const PAGE_FAILURE_TITLE = 'Could not load the next page';
+const PAGE_ERROR_TEXT =
+  'The next page of this view could not be loaded. The rows already shown are unaffected.';
+
+/** The focus key every error state's retry carries, for the host's node frame. */
+const RETRY_FOCUS_KEY = 'error-state-retry';
 
 /** The node's own empty-capture sentence, shown only when nothing was captured. */
 const EMPTY_CAPTURE_MESSAGE = 'No state transitions were captured for this interaction.';
+
+/** The short title above that sentence, which only the empty capture carries. */
+const EMPTY_CAPTURE_TITLE = 'No transitions';
 
 /** The empty state's title for a count-only request. */
 const COUNT_ONLY_TITLE = 'Count only';
@@ -266,9 +299,35 @@ const EMPTY_PAGE_TITLE = 'Nothing on this page';
 /** Either of those titles, for asserting that neither is shown. */
 const ANY_EMPTY_PAGE_TITLE = /^(Count only|Nothing on this page)$/u;
 
-/** The row-level disclosure control, in both of its states. */
-const SHOW_DETAILS_NAME = 'Show details';
-const HIDE_DETAILS_NAME = 'Hide details';
+/**
+ * The row-level disclosure control's name, in both of its states: the action,
+ * then the row it acts on — its component, then its hook when the producer
+ * identified one, exactly as the row header and the hook cell show them.
+ *
+ * @param identity The row's identity, as {@link WIDGET_VALUE_IDENTITY} spells one.
+ * @returns The toggle's accessible name.
+ */
+function showDetailsName(identity: string): string {
+  return `Show details of ${identity}`;
+}
+
+/** The same control's name while the row's detail is open; see {@link showDetailsName}. */
+function hideDetailsName(identity: string): string {
+  return `Hide details of ${identity}`;
+}
+
+/** The identity of a row of {@link COMPONENT_WIDGET} whose hook was labelled {@link HOOK_VALUE_LABEL}. */
+const WIDGET_VALUE_IDENTITY = `${COMPONENT_WIDGET} ${HOOK_VALUE_LABEL}`;
+
+/** The identity of a row of {@link COMPONENT_WIDGET} whose hook was labelled {@link HOOK_FLAG_LABEL}. */
+const WIDGET_FLAG_LABEL_IDENTITY = `${COMPONENT_WIDGET} ${HOOK_FLAG_LABEL}`;
+
+/**
+ * The identity of a row of {@link COMPONENT_WIDGET} whose hook the producer
+ * could place at index 2 but not name: the index is printed, never a guessed
+ * name.
+ */
+const WIDGET_SECOND_HOOK_IDENTITY = `${COMPONENT_WIDGET} Hook #2`;
 
 /** The trigger cell's two non-interactive labels. */
 const UNDETERMINED_LABEL = 'Undetermined';
@@ -739,6 +798,64 @@ function elementWithClass(scope: HTMLElement, className: string): HTMLElement {
 }
 
 /**
+ * The element a disclosure control's `aria-controls` names, failing when the
+ * attribute is missing, names more than one id, or names nothing in the
+ * document.
+ *
+ * Resolved through the attribute rather than by position, because this is the
+ * very link assistive technology follows from the toggle to what it reveals.
+ *
+ * @param control The disclosure control.
+ * @returns The element it controls.
+ */
+function controlledElementOf(control: HTMLElement): HTMLElement {
+  const id = control.getAttribute('aria-controls') ?? '';
+
+  if (id.length === 0 || /\s/u.test(id)) {
+    throw new Error(`the control names no single element in aria-controls ("${id}")`);
+  }
+
+  const element = document.getElementById(id);
+
+  if (element === null) {
+    throw new Error(`aria-controls names "${id}", which is not in the document`);
+  }
+
+  return element;
+}
+
+/**
+ * The one explanation bubble a cell carries, opened the way a reader opens it.
+ *
+ * The tooltip primitive keeps every bubble mounted — its trigger's
+ * `aria-describedby` always names it — but a closed bubble carries the `hidden`
+ * attribute, so it is out of the accessibility tree and no role query finds
+ * it. The cell's triggers are therefore focused in document order — focus
+ * opens a bubble at once — until a role query finds one bubble shown, and that
+ * bubble is returned, still open, for the case to read. A trigger that showed
+ * nothing is blurred again before the next one is tried.
+ *
+ * @param scope The cell whose explanation is wanted.
+ * @returns The open bubble.
+ */
+function openedTooltipIn(scope: HTMLElement): HTMLElement {
+  const triggers = [...scope.querySelectorAll<HTMLElement>('.dg-tooltip__trigger > *')];
+
+  for (const trigger of triggers) {
+    fireEvent.focus(trigger);
+
+    const [bubble] = within(scope).queryAllByRole('tooltip');
+    if (bubble !== undefined) {
+      return bubble;
+    }
+
+    fireEvent.blur(trigger);
+  }
+
+  throw new Error('no trigger in the given scope opens an explanation');
+}
+
+/**
  * The empty state a rendered sentence belongs to, found from the sentence.
  *
  * The sentence is obtained by its text first, so the class checks below read
@@ -836,6 +953,57 @@ function queryOfCall(stub: StubProvider, call: number): DataQuery {
   }
 
   return query;
+}
+
+/**
+ * The detail block of the one disclosed row.
+ *
+ * Found by role first: the detail beneath a data row is a `role="row"` of its
+ * own that carries no `data-row-index`, and the header row is the other row
+ * without one, told apart by holding the column headers. The block this
+ * component renders inside it is then read by its class, off that row.
+ *
+ * @returns The expanded row's detail block.
+ */
+function disclosedDetail(): HTMLElement {
+  const detailRows = screen
+    .getAllByRole('row')
+    .filter(
+      (row) =>
+        row.getAttribute('data-row-index') === null &&
+        within(row).queryAllByRole('columnheader').length === 0,
+    );
+
+  expect(detailRows).toHaveLength(1);
+
+  const [detailRow] = detailRows;
+
+  if (detailRow === undefined) {
+    throw new Error('no row detail is disclosed');
+  }
+
+  return elementWithClass(detailRow, 'dg-state-transitions__detail');
+}
+
+/**
+ * The value element of one captioned field of a disclosed detail.
+ *
+ * The caption is found by its exact text; the value is the element rendered
+ * right after it, which is how the detail's fields pair a caption with what it
+ * captions.
+ *
+ * @param detail A detail block from {@link disclosedDetail}.
+ * @param caption The field's caption.
+ * @returns The field's value element.
+ */
+function detailFieldValue(detail: HTMLElement, caption: string): HTMLElement {
+  const value = within(detail).getByText(caption).nextElementSibling;
+
+  if (!(value instanceof HTMLElement)) {
+    throw new Error(`the detail field "${caption}" renders no value after its caption`);
+  }
+
+  return value;
 }
 
 // Explicit, per the harness note above: automatic cleanup belongs to the
@@ -1084,9 +1252,13 @@ describe('StateTransitionViewer states', () => {
     expect(message.textContent).toBe(EMPTY_CAPTURE_MESSAGE);
 
     // The first page with no total and no page after it is the one empty page
-    // that is an empty capture, so it carries neither empty-page title.
+    // that is an empty capture, so it carries neither empty-page title — it
+    // carries its own, with a decorative glyph, as the settled status.
     const block = emptyStateOf(message);
     expect(within(block).queryByText(ANY_EMPTY_PAGE_TITLE)).toBeNull();
+    expect(block.querySelector('.dg-empty-state__title')?.textContent).toBe(EMPTY_CAPTURE_TITLE);
+    expect(block.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+    expect(screen.getByRole('status')).toBe(block);
 
     for (const value of PROVIDER_ORDER_VALUES) {
       expect(message.textContent).not.toContain(value);
@@ -1096,12 +1268,14 @@ describe('StateTransitionViewer states', () => {
     // An empty page is a success, so it is drawn as an absence and not as a
     // failure, and there is no grid to hold rows.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
 
-    // The footer states what it knows and claims no total, because the provider
-    // reported none.
-    expect(screen.getByText(countsText(0, 0))).toBeDefined();
+    // A settled empty capture, reached with no narrowing of the reader's, has
+    // nothing for a control to act on and no count beyond its own sentence: no
+    // toolbar, no footer, and no page to load.
+    expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+    expect(screen.queryByText(countsText(0, 0))).toBeNull();
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
   });
 
@@ -1116,14 +1290,14 @@ describe('StateTransitionViewer states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.classList.contains('dg-state-transitions__error')).toBe(true);
 
-    // What failed, in the view's own words, plus the provider's CODE so a
-    // developer has something to search for. The provider's prose is
-    // deliberately not painted onto the panel: a transport sentence rendered
-    // where an analysis goes would read as a finding about the capture, and
-    // AAP 0.5.5 keeps a failure from being presented as one.
-    expect(alert.textContent).toContain('The captured state transitions could not be loaded.');
+    // What failed, in the package's one failure contract: the generic lead,
+    // then the provider's own cause as a sentence of its own, plus its CODE so
+    // a developer has something to search for (B2-F14). The cause is stated
+    // inside the error box, never where an analysis goes, so it cannot read as
+    // a finding about the capture (AAP 0.5.5).
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
+    expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
-    expect(alert.textContent).not.toContain('The channel to the service is closed.');
 
     // The query that failed is shown in full, including the window and offset
     // the view applied on top of what the node authored. Compared as a value
@@ -1148,6 +1322,54 @@ describe('StateTransitionViewer states', () => {
     expect(screen.queryAllByRole('row')).toHaveLength(0);
   });
 
+  it('renders a provider rejection through the shared error contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.', {
+        hint: 'Start the local service and reconnect.',
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // One design for every failed node (B2-F14, B1-F16), in its fixed order:
+    // the default glyph, the view-scope title, the generic lead followed by the
+    // provider's own cause, the provider's hint on a line of its own, the code
+    // as a chip, the query, and a retry.
+    const alert = await screen.findByRole('alert');
+    expect(alert.querySelector('.dg-error-state__icon svg')).not.toBeNull();
+    expect(
+      within(alert).getByText(VIEW_FAILURE_TITLE).classList.contains('dg-error-state__title'),
+    ).toBe(true);
+
+    const [message, hint] = Array.from(
+      alert.querySelectorAll('.dg-error-state__message'),
+      (line) => line.textContent ?? '',
+    );
+    expect(message?.startsWith(VIEW_FAILURE_LEAD)).toBe(true);
+    expect(message).toContain('The channel to the service is closed.');
+    expect(hint).toBe('Start the local service and reconnect.');
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
+      true,
+    );
+
+    // The query asked, printed by the package's one formatter: pretty JSON with
+    // its members in the canonical order, so every node prints it alike.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    const asked = {
+      source: 'stateTransitions',
+      sort: CHRONOLOGICAL,
+      limit: DATA_QUERY_DEFAULT_LIMIT,
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    };
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(asked);
+    expect(shown.textContent).toBe(JSON.stringify(asked, null, 2));
+
+    // The retry carries the key the host's node frame returns focus by.
+    expect(
+      within(alert).getByRole('button', { name: RETRY_NAME }).getAttribute(FOCUS_KEY_ATTRIBUTE),
+    ).toBe(RETRY_FOCUS_KEY);
+  });
+
   it('reports a node whose query names a source it cannot draw, and asks for nothing', async () => {
     const stub = resolvingProvider(PROVIDER_ORDER);
 
@@ -1159,9 +1381,12 @@ describe('StateTransitionViewer states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.classList.contains('dg-state-transitions__error')).toBe(true);
 
-    // A defect in the panel rather than in the capture, said with a code a
-    // developer can search for.
-    expect(alert.textContent).toContain('PANEL_NODE_SOURCE_UNSUPPORTED');
+    // A defect in the panel rather than in the capture, said by the package's
+    // one contract for it — worded from the node catalog, naming the source it
+    // was asked for — with a code a developer can search for.
+    expect(alert.textContent).toContain('This view cannot draw the requested data');
+    expect(alert.textContent).toContain('but this panel asks it for "renders".');
+    expect(alert.textContent).toContain('PANEL_INVALID');
 
     // The node's own query is what the reader is shown, and no retry is
     // offered: re-issuing it cannot change the answer.
@@ -1482,21 +1707,331 @@ describe('StateTransitionViewer value summaries', () => {
 
     // The cell says that it shortened something, and explains the bound rather
     // than offering the rest.
-    const hint = within(cells.previous).getByRole('tooltip');
+    const hint = openedTooltipIn(cells.previous);
     expect(hint.textContent).toContain('bounded summary');
     expect(within(cells.previous).queryAllByRole('button')).toHaveLength(0);
 
     // The part past the bound reached no part of the document — not the cell,
-    // not a title attribute, not a tooltip.
+    // not a title attribute, not a tooltip. The shortened summary carries no
+    // title at all: its hover belongs to the tooltip explaining the bound.
     expect(document.body.textContent).not.toContain(OVER_BOUND_TAIL);
+    expect(value.getAttribute('title')).toBeNull();
+    const titles = [...document.querySelectorAll('[title]')].map(
+      (element) => element.getAttribute('title') ?? '',
+    );
+    expect(titles.some((title) => title.includes(OVER_BOUND_TAIL))).toBe(false);
 
-    // And disclosing the row's detail does not produce it: the detail adds
-    // identifiers and categories, never a fuller value.
-    await user.click(within(cells.component).getByRole('button', { name: SHOW_DETAILS_NAME }));
-    await screen.findByRole('button', { name: HIDE_DETAILS_NAME });
+    // And disclosing the row's detail does not produce it: the detail repeats
+    // the row's displayed summary — the shortened preview, whole — and never a
+    // fuller value.
+    await user.click(
+      within(cells.component).getByRole('button', { name: showDetailsName(WIDGET_VALUE_IDENTITY) }),
+    );
+    await screen.findByRole('button', { name: hideDetailsName(WIDGET_VALUE_IDENTITY) });
 
+    expect(detailFieldValue(disclosedDetail(), 'Value before').textContent).toBe(expected);
     expect(document.body.textContent).not.toContain(OVER_BOUND_TAIL);
     expect(document.body.textContent).not.toContain(OVER_BOUND_SUMMARY);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Clipped cells
+ *
+ * Every cell is bounded to its grid track, so a summary, a name or a trigger
+ * label wider than the track ellipsizes inside it rather than painting across
+ * the next column. These cases pin where the clipped part of the DISPLAYED
+ * text stays readable, and the stylesheet rules that do the bounding.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The component stylesheet, read from disk with the `import.meta.url`
+ * convention `../tokens/tokens.test.ts` documents, so the working directory is
+ * irrelevant. The path is joined with `node:path` rather than resolved with
+ * `new URL(…)`: under happy-dom the global `URL` is the DOM's, which Node's
+ * `fileURLToPath` rejects.
+ */
+const COMPONENT_STYLESHEET = readFileSync(
+  path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'styles', 'components.css'),
+  'utf8',
+);
+
+/** One declaration of a stylesheet rule, as written. */
+interface Declaration {
+  /** The property name. */
+  readonly property: string;
+  /** The value, trimmed, without the terminating semicolon. */
+  readonly value: string;
+}
+
+/**
+ * Every declaration of every rule in {@link COMPONENT_STYLESHEET} whose
+ * selector list names `selector` exactly, in source order, failing when no rule
+ * names it.
+ *
+ * Comments are removed first, so prose that quotes a declaration cannot satisfy
+ * or fail an assertion. A rule nested in an at-rule is read like a top-level
+ * one: the pattern only ever matches an innermost brace pair. An exact entry of
+ * a comma-separated list is required, so `.a.b` or `.a:hover` never stands in
+ * for `.a`.
+ *
+ * @param selector One selector, exactly as it is written in its list.
+ * @returns The declarations of every rule naming it.
+ */
+function declarationsFor(selector: string): Declaration[] {
+  const sheet = COMPONENT_STYLESHEET.replace(/\/\*[\s\S]*?\*\//gu, '');
+  const declarations: Declaration[] = [];
+  let rules = 0;
+
+  for (const match of sheet.matchAll(/([^{}]+)\{([^{}]*)\}/gu)) {
+    const [, selectorList = '', body = ''] = match;
+    const selectors = selectorList.split(',').map((entry) => entry.trim());
+
+    if (!selectors.includes(selector)) {
+      continue;
+    }
+
+    rules += 1;
+
+    for (const declaration of body.split(';')) {
+      const colon = declaration.indexOf(':');
+
+      if (colon > 0) {
+        declarations.push({
+          property: declaration.slice(0, colon).trim(),
+          value: declaration.slice(colon + 1).trim(),
+        });
+      }
+    }
+  }
+
+  expect(rules).toBeGreaterThan(0);
+
+  return declarations;
+}
+
+describe('StateTransitionViewer clipped cells', () => {
+  it("carries a whole summary's displayed text as its title, and gives a shortened one none", async () => {
+    const shortened = oneLinePreview(OVER_BOUND_SUMMARY);
+    const stub = resolvingProvider([
+      makeTransition({
+        id: 'evt_example_0044',
+        spanId: spanIdFor(44),
+        component: COMPONENT_WIDGET,
+        hookLabel: HOOK_VALUE_LABEL,
+        previousValue: AT_BOUND_SUMMARY,
+        nextValue: OVER_BOUND_SUMMARY,
+        transitionSource: 'state',
+        triggerEventId: TRIGGER_EVENT_ID,
+        triggerName: TRIGGER_NAME,
+        triggerKind: 'interaction',
+      }),
+    ]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const cells = cellsOf(rowWithValueBefore(AT_BOUND_SUMMARY));
+
+    // Shown whole, so its title is its displayed text byte for byte: a cell
+    // that clips it still lets the reader hover the rest into view.
+    const whole = elementWithClass(cells.previous, 'dg-state-transitions__value');
+    expect(whole.classList.contains('dg-is-truncated')).toBe(false);
+    expect(whole.getAttribute('title')).toBe(AT_BOUND_SUMMARY);
+    expect(whole.getAttribute('title')).toBe(whole.textContent);
+
+    // Shortened by the display bound, so no title: its hover belongs to the
+    // tooltip explaining the bound, and there is no fuller string to put there.
+    const cut = elementWithClass(cells.next, 'dg-state-transitions__value');
+    expect(cut.classList.contains('dg-is-truncated')).toBe(true);
+    expect(cut.textContent).toBe(shortened);
+    expect(cut.getAttribute('title')).toBeNull();
+    expect(document.body.innerHTML).not.toContain(OVER_BOUND_TAIL);
+  });
+
+  it('names every clipped component, hook, trigger and chip in full as its own title', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    for (const transition of PROVIDER_ORDER) {
+      const cells = cellsOf(rowWithValueBefore(transition.previousValue ?? ''));
+      const component = transition.component ?? '';
+      const hook = transition.hookLabel ?? `Hook #${String(transition.hookIndex ?? Number.NaN)}`;
+      const dimension = humanizeLabel(transition.transitionSource ?? '');
+      const trigger = transition.triggerName ?? '';
+      const kind = formatKindLabel(transition.triggerKind ?? 'interaction');
+
+      expect(within(cells.component).getByText(component).getAttribute('title')).toBe(component);
+      expect(within(cells.hook).getByText(hook).getAttribute('title')).toBe(hook);
+
+      // The title repeats the label; the control's accessible name is still
+      // its label, which is how it was found.
+      expect(
+        within(cells.trigger).getByRole('button', { name: trigger }).getAttribute('title'),
+      ).toBe(trigger);
+
+      // A chip clips at its own border in a track narrower than its word, so
+      // each plain chip carries its word whole as its title too.
+      for (const [cell, word] of [
+        [cells.hook, dimension],
+        [cells.trigger, kind],
+        [cells.changed, CHANGED_LABEL],
+      ] as const) {
+        const chip = within(cell).getByText(word).closest<HTMLElement>('.dg-badge');
+
+        expect(chip?.getAttribute('title')).toBe(word);
+      }
+    }
+  });
+
+  it('lets the chips of the trigger and hook cells wrap onto a line of their own', async () => {
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const cells = cellsOf(rowWithValueBefore(NUMBER_BEFORE));
+
+    // The trigger control and its kind chip share one Stack, found from the
+    // control, which is the cell's semantic anchor.
+    const control = within(cells.trigger).getByRole('button', { name: TRIGGER_NAME });
+    const triggerStack = control.closest<HTMLElement>('.dg-stack');
+
+    if (triggerStack === null) {
+      throw new Error('the trigger control was rendered outside any Stack');
+    }
+
+    expect(triggerStack.classList.contains('dg-stack--wrap')).toBe(true);
+    expect(within(triggerStack).getByText(formatKindLabel('interaction'))).toBeDefined();
+
+    // The hook label and its changed-dimension chip, likewise.
+    const hookStack = elementWithClass(cells.hook, 'dg-state-transitions__hook');
+    expect(hookStack.classList.contains('dg-stack')).toBe(true);
+    expect(hookStack.classList.contains('dg-stack--wrap')).toBe(true);
+    expect(within(hookStack).getByText(humanizeLabel('state'))).toBeDefined();
+  });
+
+  it("repeats the row's identity and both displayed summaries, unclipped, in its detail", async () => {
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const cells = cellsOf(rowWithValueBefore(NUMBER_BEFORE));
+    const rowBefore = valueTextOf(cells.previous);
+    const rowAfter = valueTextOf(cells.next);
+
+    // The row's one disclosure toggle, named by the row's identity (see
+    // {@link showDetailsName}); the cell holds no other "Show details" control.
+    await user.click(within(cells.component).getByRole('button', { name: /^Show details of / }));
+
+    const detail = disclosedDetail();
+
+    expect(detailFieldValue(detail, 'Component').textContent).toBe(COMPONENT_WIDGET);
+    expect(detailFieldValue(detail, 'Hook').textContent).toBe(HOOK_VALUE_LABEL);
+
+    // Byte-identical to what the row displays, so the detail shows the part a
+    // cell clips and nothing the row was not given.
+    const before = detailFieldValue(detail, 'Value before');
+    const after = detailFieldValue(detail, 'Value after');
+    expect(before.textContent).toBe(rowBefore);
+    expect(before.textContent).toBe(NUMBER_BEFORE);
+    expect(after.textContent).toBe(rowAfter);
+    expect(after.textContent).toBe(NUMBER_AFTER);
+
+    // Opaque code that wraps instead of clipping, and not a second row summary:
+    // the row-summary class is the one the stylesheet clips to a single line.
+    for (const value of [before, after]) {
+      expect(value.classList.contains('dg-code')).toBe(true);
+      expect(value.classList.contains('dg-code--wrap')).toBe(true);
+      expect(value.classList.contains('dg-state-transitions__value')).toBe(false);
+    }
+
+    // The row's own summaries are still the only ones the row helpers read.
+    expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE]);
+  });
+
+  it('says in its detail what the producer could not name or describe', async () => {
+    const bare = makeTransition({
+      id: 'evt_example_0045',
+      spanId: spanIdFor(45),
+      previousValue: NUMBER_BEFORE,
+      triggerEventId: TRIGGER_EVENT_ID,
+      triggerName: TRIGGER_NAME,
+      triggerKind: 'interaction',
+    });
+    const stub = resolvingProvider([bare]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const cells = cellsOf(rowWithValueBefore(NUMBER_BEFORE));
+
+    // The row's one disclosure toggle, named by the row's identity (see
+    // {@link showDetailsName}); the cell holds no other "Show details" control.
+    await user.click(within(cells.component).getByRole('button', { name: /^Show details of / }));
+
+    const detail = disclosedDetail();
+
+    // The same words the row uses for each absence, never a guess.
+    expect(detailFieldValue(detail, 'Component').textContent).toBe(UNNAMED_COMPONENT_LABEL);
+    expect(detailFieldValue(detail, 'Hook').textContent).toBe(NOT_AVAILABLE_LABEL);
+    expect(detailFieldValue(detail, 'Value before').textContent).toBe(NUMBER_BEFORE);
+
+    const after = detailFieldValue(detail, 'Value after');
+    expect(after.textContent).toBe(NOT_AVAILABLE_LABEL);
+    expect(after.classList.contains('dg-code')).toBe(false);
+  });
+
+  it('bounds each value, trigger and chip to its own cell in the stylesheet', () => {
+    // The value cells: bounded to the track, and no display or cross-axis
+    // alignment of their own — an inline-flex, baseline-aligned cell once let
+    // the summary's row size itself from its content, so the ellipsis never
+    // triggered and a long summary painted across the next column.
+    for (const selector of [
+      '.dg-state-transitions__from',
+      '.dg-state-transitions__to',
+      '.dg-state-transitions__previous',
+      '.dg-state-transitions__next',
+    ]) {
+      const declarations = declarationsFor(selector);
+      const properties = declarations.map((declaration) => declaration.property);
+
+      expect(declarations).toContainEqual({ property: 'min-inline-size', value: '0' });
+      expect(declarations).toContainEqual({ property: 'max-inline-size', value: '100%' });
+      expect(properties).not.toContain('display');
+      expect(properties).not.toContain('align-items');
+    }
+
+    // The summary itself ellipsizes on one line inside that bound.
+    const summary = declarationsFor('.dg-state-transitions__value');
+    expect(summary).toContainEqual({ property: 'min-inline-size', value: '0' });
+    expect(summary).toContainEqual({ property: 'max-inline-size', value: '100%' });
+    expect(summary).toContainEqual({ property: 'overflow', value: 'hidden' });
+    expect(summary).toContainEqual({ property: 'text-overflow', value: 'ellipsis' });
+    expect(summary).toContainEqual({ property: 'white-space', value: 'nowrap' });
+
+    // The trigger control may shrink below its label inside its track.
+    const trigger = declarationsFor('.dg-state-transitions__trigger');
+    expect(trigger).toContainEqual({ property: 'min-inline-size', value: '0' });
+    expect(trigger).toContainEqual({ property: 'max-inline-size', value: '100%' });
+
+    // And every chip in a row's cells shrinks with its cell and clips at its
+    // own border instead of overflowing into the next column.
+    const chip = declarationsFor('.dg-state-transitions .dg-data-table__cell .dg-badge');
+    expect(chip).toContainEqual({ property: 'min-inline-size', value: '0' });
+    expect(chip).toContainEqual({ property: 'overflow', value: 'hidden' });
   });
 });
 
@@ -1572,7 +2107,7 @@ describe('StateTransitionViewer trigger', () => {
     expect(within(cells.trigger).queryByRole('button', { name: GENERIC_TRIGGER_LABEL })).toBeNull();
 
     // Why it reads that way, and what is explicitly NOT being claimed.
-    const hint = within(cells.trigger).getByRole('tooltip');
+    const hint = openedTooltipIn(cells.trigger);
     expect(hint.textContent).toContain('Nothing is claimed about what caused it');
 
     // "No trigger could be determined" and "the value did not change" are
@@ -1619,7 +2154,7 @@ describe('StateTransitionViewer trigger', () => {
     expect(within(cells.trigger).queryByText(UNDETERMINED_LABEL)).toBeNull();
     expect(within(cells.trigger).queryAllByRole('button')).toHaveLength(0);
 
-    const hint = within(cells.trigger).getByRole('tooltip');
+    const hint = openedTooltipIn(cells.trigger);
     expect(hint.textContent).toContain('outside the page loaded here');
     expect(cells.trigger.textContent).not.toMatch(/unchanged/iu);
   });
@@ -1649,7 +2184,7 @@ describe('StateTransitionViewer reported state', () => {
     expect(state.classList.contains('dg-is-changed')).toBe(false);
 
     // And the sentence that keeps the two findings apart, in full.
-    const hint = within(cells.changed).getByRole('tooltip');
+    const hint = openedTooltipIn(cells.changed);
     expect(hint.textContent).toContain('not a statement that the value stayed the same');
 
     // Neither side is shown, because neither was described — said as "not
@@ -1680,6 +2215,7 @@ describe('StateTransitionViewer reported state', () => {
     expect(within(cells.changed).queryByText(UNREPORTED_LABEL)).toBeNull();
     expect(within(cells.changed).queryByText(TRUNCATED_LABEL)).toBeNull();
     expect(within(cells.changed).queryAllByRole('tooltip')).toHaveLength(0);
+    expect(cells.changed.querySelectorAll('.dg-tooltip')).toHaveLength(0);
   });
 
   it('draws the capture truncation disclosure as a disclosure, not as a transition', async () => {
@@ -1708,7 +2244,7 @@ describe('StateTransitionViewer reported state', () => {
     // says it is a floor rather than a total.
     expect(within(cells.changed).getByText(`${TRUNCATED_LABEL}: ${formatCount(12)}`)).toBeDefined();
 
-    const hint = within(cells.changed).getByRole('tooltip');
+    const hint = openedTooltipIn(cells.changed);
     expect(hint.textContent).toContain('not a total');
 
     // It describes a list and no value, so it claims neither state of the
@@ -1834,27 +2370,114 @@ describe('StateTransitionViewer interactions', () => {
 
     const cells = cellsOf(rowWithValueBefore(NUMBER_BEFORE));
 
-    await user.click(within(cells.component).getByRole('button', { name: SHOW_DETAILS_NAME }));
+    await user.click(
+      within(cells.component).getByRole('button', { name: showDetailsName(WIDGET_VALUE_IDENTITY) }),
+    );
 
     expect(spies.onExpand).toHaveBeenCalledTimes(1);
     expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, WIDGET_VALUE_TRANSITION.id, true);
 
-    // Identifiers and categories, which the columns have no room for — and
-    // nothing more of the two summaries, because this panel holds nothing more
-    // of them.
+    // Identifiers and categories, which the columns have no room for. The two
+    // summaries the detail repeats are the row's own displayed strings — the
+    // clipped-cell cases pin that — because this panel holds nothing more of
+    // them.
     expect(screen.getByText(WIDGET_VALUE_TRANSITION.eventId)).toBeDefined();
     expect(screen.getByText(WIDGET_VALUE_TRANSITION.traceId)).toBeDefined();
 
     // The same control now offers the opposite action, and the second
     // activation is reported as a collapse rather than as another disclosure —
     // a host told "expanded" twice would keep a row open that is closed.
-    await user.click(screen.getByRole('button', { name: HIDE_DETAILS_NAME }));
+    await user.click(screen.getByRole('button', { name: hideDetailsName(WIDGET_VALUE_IDENTITY) }));
 
     expect(spies.onExpand).toHaveBeenCalledTimes(2);
     expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, WIDGET_VALUE_TRANSITION.id, false);
 
     // Disclosing a row is not selecting its record.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
+  });
+
+  it('names each disclosure toggle by the row it opens, and reports its state on the toggle', async () => {
+    // A row neither component nor hook of which the producer could name: its
+    // toggle says the component is not named and adds no hook at all, rather
+    // than a guessed name or a not-available token.
+    const bare = makeTransition({
+      id: 'evt_example_0032',
+      spanId: spanIdFor(32),
+      startTime: BASE_START_MS + 50,
+      previousValue: OBJECT_AFTER,
+      triggerEventId: TRIGGER_EVENT_ID,
+      triggerName: TRIGGER_NAME,
+      triggerKind: 'interaction',
+    });
+    const stub = resolvingProvider([...PROVIDER_ORDER, bare]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // One toggle per row, named by that row's component and — when the
+    // producer identified one — its hook label or index, in the row's order.
+    const expected: readonly { readonly component: string; readonly identity: string }[] = [
+      { component: COMPONENT_WIDGET, identity: WIDGET_VALUE_IDENTITY },
+      { component: COMPONENT_WIDGET, identity: WIDGET_SECOND_HOOK_IDENTITY },
+      { component: COMPONENT_PANEL, identity: `${COMPONENT_PANEL} ${HOOK_FLAG_LABEL}` },
+      { component: UNNAMED_COMPONENT_LABEL, identity: UNNAMED_COMPONENT_LABEL },
+    ];
+    const rows = dataRows();
+    expect(rows).toHaveLength(expected.length);
+
+    rows.forEach((row, index) => {
+      const entry = expected[index];
+      if (entry === undefined) {
+        throw new Error(`no expected identity for row ${String(index)}`);
+      }
+
+      const cells = cellsOf(row);
+      const toggle = within(cells.component).getByRole('button', {
+        name: showDetailsName(entry.identity),
+      });
+
+      // The name contains the component the row header shows beside it, and
+      // never the not-available token a missing hook would otherwise leave.
+      expect(within(cells.component).getByText(entry.component)).toBeDefined();
+      expect(toggle.getAttribute('aria-label')).toContain(entry.component);
+      expect(toggle.getAttribute('aria-label')).not.toContain(NOT_AVAILABLE_LABEL);
+
+      // Closed: the toggle says so and names no element, since the detail row
+      // it would control is not in the document.
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      expect(toggle.hasAttribute('aria-controls')).toBe(false);
+      expect(row.hasAttribute('aria-expanded')).toBe(false);
+    });
+
+    // No two rows of this page share a toggle name.
+    const names = screen
+      .getAllByRole('button', { name: /^Show details of / })
+      .map((toggle) => toggle.getAttribute('aria-label'));
+    expect(new Set(names).size).toBe(names.length);
+
+    // Opened: the same control takes the opposite action for the same row,
+    // reports the open state, and names the detail row it revealed.
+    const [firstRow] = rows;
+    if (firstRow === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await user.click(
+      within(cellsOf(firstRow).component).getByRole('button', {
+        name: showDetailsName(WIDGET_VALUE_IDENTITY),
+      }),
+    );
+
+    const opened = within(cellsOf(firstRow).component).getByRole('button', {
+      name: hideDetailsName(WIDGET_VALUE_IDENTITY),
+    });
+    expect(opened.getAttribute('aria-expanded')).toBe('true');
+    expect(
+      within(controlledElementOf(opened)).getByText(WIDGET_VALUE_TRANSITION.eventId),
+    ).toBeDefined();
+    expect(firstRow.hasAttribute('aria-expanded')).toBe(false);
   });
 });
 
@@ -1893,9 +2516,16 @@ describe('StateTransitionViewer narrowing', () => {
       expect(renderedValuesBefore()).toEqual([OBJECT_BEFORE]);
     });
 
-    // The host is told, so it can remember the reader's choice.
+    // The host is told, so it can remember the reader's choice — as the whole
+    // toolbar state, the same snapshot every other control reports, so the
+    // latest report alone restores the view.
     expect(spies.onFilterChange).toHaveBeenCalledTimes(1);
-    expect(spies.onFilterChange).toHaveBeenCalledWith(NODE_ID, { component: COMPONENT_PANEL });
+    expect(spies.onFilterChange).toHaveBeenCalledWith(NODE_ID, {
+      sort: CHRONOLOGICAL,
+      component: COMPONENT_PANEL,
+      changedOnly: 'false',
+      grouped: 'true',
+    });
 
     // Widening again clears the narrowing on the query rather than keeping it
     // and filtering locally.
@@ -1907,7 +2537,13 @@ describe('StateTransitionViewer narrowing', () => {
 
     expect(stub.resolve).toHaveBeenCalledTimes(3);
     expect(queryOfCall(stub, 3).filter).toBeUndefined();
-    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {});
+    // "Every component" is spelled by the narrowing's absence, never by a
+    // sentinel value a host would have to know.
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: CHRONOLOGICAL,
+      changedOnly: 'false',
+      grouped: 'true',
+    });
   });
 
   it('merges a reader narrowing into the filter the node authored', async () => {
@@ -1961,6 +2597,15 @@ describe('StateTransitionViewer narrowing', () => {
 
     const order = screen.getByRole('combobox', { name: ORDER_CONTROL_NAME });
     expect(within(order).getByRole('option', { name: LONGEST_FIRST_LABEL })).toBeDefined();
+
+    // The name is the visible label, whole: a label bound to the control and
+    // shown on screen, so what a sighted reader sees is what speech input can
+    // say (WCAG 2.5.3) — and it names what it orders, unlike a bare "Order"
+    // another table's control would share.
+    const orderLabel = screen.getByText(ORDER_CONTROL_NAME);
+    expect(orderLabel.tagName).toBe('LABEL');
+    expect(orderLabel.getAttribute('for')).toBe(order.id);
+    expect(orderLabel.classList.contains('dg-visually-hidden')).toBe(false);
 
     await user.selectOptions(order, LONGEST_FIRST);
 
@@ -2025,6 +2670,53 @@ describe('StateTransitionViewer narrowing', () => {
     expect(await screen.findByText(/no transitions in this page match/i)).toBeDefined();
     expect(screen.queryByText(/were captured for this interaction/i)).toBeNull();
     expect(stub.resolve).toHaveBeenCalledTimes(1);
+
+    // The narrowing that emptied the view stays where it was made, pressed, so
+    // it can be undone, and the footer keeps stating what was loaded.
+    const toolbar = screen.getByRole('group', { name: TOOLBAR_NAME });
+    expect(
+      within(toolbar).getByRole('button', { name: CHANGED_ONLY_NAME }).getAttribute('aria-pressed'),
+    ).toBe('true');
+    expect(screen.getByText(countsText(0, 1))).toBeDefined();
+  });
+
+  it('keeps its toolbar and footer when a component narrowing empties the result', async () => {
+    const stub = pagingProvider([
+      { data: PROVIDER_ORDER },
+      { data: [], total: 0 },
+      { data: PROVIDER_ORDER },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME }),
+      COMPONENT_PANEL,
+    );
+
+    // The narrowed query matched nothing. That is the reader's narrowing
+    // speaking, not an empty capture: the narrowing copy, no capture title or
+    // glyph, and the toolbar and footer both kept.
+    const block = emptyStateOf(await screen.findByText(/no transitions in this page match/i));
+    expect(within(block).queryByText(EMPTY_CAPTURE_TITLE)).toBeNull();
+    expect(block.querySelector('.dg-empty-state__icon')).toBeNull();
+    expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+    expect(screen.getByRole('group', { name: TOOLBAR_NAME })).toBeDefined();
+    expect(screen.getByText(countsText(0, 0, 0))).toBeDefined();
+
+    // And the kept control undoes it: widening again re-queries and the rows
+    // of the whole capture return.
+    const picker = screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME });
+    await user.selectOptions(
+      picker,
+      within(picker).getByRole('option', { name: ALL_COMPONENTS_LABEL }),
+    );
+
+    await screen.findByRole('grid');
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3).filter).toBeUndefined();
   });
 });
 
@@ -2138,6 +2830,38 @@ describe('StateTransitionViewer paging', () => {
     expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE, FLAG_BEFORE]);
   });
 
+  it('announces the counts through a polite live region that stays mounted as they change', async () => {
+    // The second page holds a row whose values were not reported, so the local
+    // "changed only" narrowing below has one row to hide.
+    const stub = pagingProvider([
+      { data: [WIDGET_VALUE_TRANSITION], total: 14, nextOffset: 1 },
+      { data: [UNREPORTED_TRANSITION], total: 14, nextOffset: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(pagedNode(1), { provider: stub.provider, actions: makeActions().actions });
+
+    // Polite, so the announcement waits for the reader; atomic, so the whole
+    // sentence is read rather than one changed figure out of context.
+    const counts = await screen.findByText(countsText(1, 1, 14));
+    expect(counts.getAttribute('aria-live')).toBe('polite');
+    expect(counts.getAttribute('aria-atomic')).toBe('true');
+
+    // A live region is only heard when it CHANGES while mounted, so the same
+    // element must carry the next sentence rather than being replaced by one.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await screen.findByText(countsText(2, 2, 14));
+    expect(counts.textContent).toBe(countsText(2, 2, 14));
+    expect(counts.getAttribute('aria-live')).toBe('polite');
+
+    // The local narrowing changes the counts too, through the same region.
+    await user.click(screen.getByRole('button', { name: CHANGED_ONLY_NAME }));
+    await screen.findByText(countsText(1, 2, 14));
+    expect(counts.isConnected).toBe(true);
+    expect(counts.textContent).toBe(countsText(1, 2, 14));
+    expect(counts.getAttribute('aria-live')).toBe('polite');
+  });
+
   it('appends the next page in provider order, keeping the first copy of a repeated row', async () => {
     // The second page repeats the flag transition the first page already
     // delivered, as a result that shifted between two requests would.
@@ -2195,7 +2919,7 @@ describe('StateTransitionViewer paging', () => {
     // replaces the grid, and the counts keep the total the provider reported.
     expect(screen.getByRole('grid')).toBeDefined();
     expect(renderedValuesBefore()).toEqual([NUMBER_BEFORE]);
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.getByText(countsText(1, 1, 2))).toBeDefined();
 
     // The footer reports the load, and the control cannot request it twice.
@@ -2237,12 +2961,15 @@ describe('StateTransitionViewer paging', () => {
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
 
     // Reported in the footer, beside the counts of the rows it left untouched —
-    // never by replacing those rows with an error state.
+    // never by replacing those rows with an error state — in the contract's
+    // page scope: the next-page title, a lead that says the rows above are
+    // unaffected, then the provider's own cause and its code.
     const alert = await screen.findByRole('alert');
     expect(alert.closest('.dg-state-transitions__footer')).not.toBeNull();
+    expect(alert.textContent).toContain(PAGE_FAILURE_TITLE);
     expect(alert.textContent).toContain(PAGE_ERROR_TEXT);
+    expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(alert.textContent).toContain('TRANSPORT_DISCONNECTED');
-    expect(alert.textContent).not.toContain('The channel to the service is closed.');
 
     // The request that failed is the next page's, offset included.
     const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
@@ -2513,7 +3240,7 @@ describe('StateTransitionViewer paging', () => {
       reading: 'a later page of a total of zero',
       offset: 400,
       total: 0,
-      title: undefined,
+      title: EMPTY_CAPTURE_TITLE,
       message: EMPTY_CAPTURE_MESSAGE,
     },
   ])('says what $reading holds, and nothing more', async ({ offset, total, title, message }) => {
@@ -2526,20 +3253,28 @@ describe('StateTransitionViewer paging', () => {
 
     const block = emptyStateOf(await screen.findByText(message));
 
-    if (title === undefined) {
-      // A reported total of zero is an empty capture wherever the page starts.
+    if (title === EMPTY_CAPTURE_TITLE) {
+      // A reported total of zero is an empty capture wherever the page starts:
+      // its own title rather than an empty-page one, and neither the toolbar
+      // nor the footer, since no control could reach anything and the sentence
+      // already says what the footer's zeros would.
       expect(within(block).queryByText(ANY_EMPTY_PAGE_TITLE)).toBeNull();
+      expect(within(block).getByText(EMPTY_CAPTURE_TITLE)).toBeDefined();
+      expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+      expect(screen.queryByText(countsText(0, 0, total))).toBeNull();
     } else {
       // Anything else with a positive or unknown total is an empty page, and
-      // the empty-capture copy would contradict the provider's own count.
+      // the empty-capture copy would contradict the provider's own count. The
+      // footer states the same counts, under the toolbar.
       expect(within(block).getByText(title)).toBeDefined();
       expect(screen.queryByText(EMPTY_CAPTURE_MESSAGE)).toBeNull();
+      expect(screen.getByText(countsText(0, 0, total))).toBeDefined();
+      expect(screen.getByRole('group', { name: TOOLBAR_NAME })).toBeDefined();
     }
 
-    // The authored offset was requested as authored, the footer states the
-    // same counts, and no page past the provider's last one is offered.
+    // The authored offset was requested as authored, and no page past the
+    // provider's last one is offered.
     expect(soleQuery(stub).offset).toBe(offset);
-    expect(screen.getByText(countsText(0, 0, total))).toBeDefined();
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
   });
@@ -2660,18 +3395,40 @@ describe('StateTransitionViewer paging', () => {
 
     await user.click(row);
     await user.click(
-      within(cellsOf(row).component).getByRole('button', { name: SHOW_DETAILS_NAME }),
+      within(cellsOf(row).component).getByRole('button', {
+        name: showDetailsName(WIDGET_VALUE_IDENTITY),
+      }),
     );
 
     await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
     await screen.findByText(countsText(2, 2));
 
-    // Appending a page is neither a new selection nor a collapse.
+    // Appending a page is neither a new selection nor a collapse. The open
+    // state is reported by the toggle, never by the row: `aria-expanded` is not
+    // a state a `grid` row supports.
     const selected = rowWithValueBefore(NUMBER_BEFORE);
     expect(selected.getAttribute('aria-selected')).toBe('true');
-    expect(selected.getAttribute('aria-expanded')).toBe('true');
+    expect(selected.hasAttribute('aria-expanded')).toBe(false);
     expect(rowWithValueBefore(FLAG_BEFORE).getAttribute('aria-selected')).toBe('false');
-    expect(screen.getByText(WIDGET_VALUE_TRANSITION.traceId)).toBeDefined();
+
+    const toggle = within(cellsOf(selected).component).getByRole('button', {
+      name: hideDetailsName(WIDGET_VALUE_IDENTITY),
+    });
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+
+    // And the toggle names the detail row it opened, which holds the row's
+    // identifiers: an `aria-controls` that resolves, to that transition.
+    const detail = controlledElementOf(toggle);
+    expect(detail.getAttribute('role')).toBe('row');
+    expect(within(detail).getByText(WIDGET_VALUE_TRANSITION.traceId)).toBeDefined();
+
+    // The collapsed row next to it reports its state and names nothing.
+    const collapsed = within(cellsOf(rowWithValueBefore(FLAG_BEFORE)).component).getByRole(
+      'button',
+      { name: showDetailsName(WIDGET_SECOND_HOOK_IDENTITY) },
+    );
+    expect(collapsed.getAttribute('aria-expanded')).toBe('false');
+    expect(collapsed.hasAttribute('aria-controls')).toBe(false);
   });
 
   it('claims no total when the provider reported none, and offers no next page', async () => {
@@ -2774,15 +3531,26 @@ describe('StateTransitionViewer paging', () => {
   });
 });
 
-describe('StateTransitionViewer keyboard access to explanations', () => {
+describe('StateTransitionViewer keyboard model', () => {
   /*
-   * Every tooltip a row can carry is opened by keyboard focus here, through a
-   * trigger that is a tab stop only while its row holds focus: the grid keeps
-   * one roving row stop, and the explanations of the row being read follow it.
+   * The APG grid pattern, as `../primitives/DataTable` implements it and this
+   * view adopts it: the grid is ONE Tab stop — its active row — and every
+   * control and explanation inside a row is `tabIndex={-1}`, reached by the
+   * grid's arrow keys rather than by Tab. A tooltip opens on any focus, so an
+   * arrow key landing on its trigger shows the explanation, and the first
+   * Escape closes it before the second returns to the row.
    */
 
-  /** Enough presses to cross the toolbar and one row of controls, and no more. */
-  const MAX_TAB_PRESSES = 12;
+  /**
+   * An upper bound on the Tab presses one pass through the rendered document
+   * can take: the toolbar's controls, the grid's single stop and the footer,
+   * with room to spare. Reaching it means focus never left the sequence, which
+   * fails the case rather than looping.
+   */
+  const MAX_TAB_PRESSES = 24;
+
+  /** Every element the grid could make focusable: `DataTable`'s own reach. */
+  const FOCUSABLE_SELECTOR = 'a[href], button, input, select, textarea, [tabindex]';
 
   /** A shortened value before, and a trigger the capture knows of but cannot open. */
   const SHORTENED_ROW = makeTransition({
@@ -2835,6 +3603,32 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
   }
 
   /**
+   * The elements inside the grid that are in the page's Tab order: those with
+   * a `tabindex` of `0`. `DataTable` writes one explicitly on its active row,
+   * and no control inside the grid may carry one.
+   *
+   * @param grid The grid.
+   * @returns Its Tab stops, in document order.
+   */
+  function tabStopsIn(grid: HTMLElement): HTMLElement[] {
+    return [...grid.querySelectorAll<HTMLElement>('[tabindex="0"]')];
+  }
+
+  /**
+   * Every focusable element inside the grid that is not a data row: the
+   * disclosure toggles, the trigger controls and labels, the source chips and
+   * the explained chips — everything the arrow keys, and never Tab, reach.
+   *
+   * @param grid The grid.
+   * @returns Those elements, in document order.
+   */
+  function inRowControlsOf(grid: HTMLElement): HTMLElement[] {
+    return [...grid.querySelectorAll<HTMLElement>(FOCUSABLE_SELECTOR)].filter(
+      (element) => element.getAttribute('data-row-index') === null,
+    );
+  }
+
+  /**
    * Press Tab until `target` holds focus, failing if it never does.
    *
    * @param user The session pressing the keys.
@@ -2851,25 +3645,54 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
     expect(document.activeElement).toBe(target);
   }
 
+  /**
+   * Walk the whole Tab sequence once, from the document's start until focus
+   * falls back to the body, and record every element Tab stopped on.
+   *
+   * @param user The session pressing the keys.
+   * @returns The Tab stops, in the order Tab reached them.
+   */
+  async function tabSequence(user: ReturnType<typeof userEvent.setup>): Promise<HTMLElement[]> {
+    const stops: HTMLElement[] = [];
+
+    for (let press = 0; press < MAX_TAB_PRESSES; press += 1) {
+      await user.tab();
+
+      const focused = document.activeElement;
+
+      if (!(focused instanceof HTMLElement) || focused === document.body) {
+        return stops;
+      }
+
+      stops.push(focused);
+    }
+
+    throw new Error('Tab never left the rendered document within the press bound');
+  }
+
   /** The two rows, and the tooltip triggers each of them carries. */
   interface ExplainedRows {
+    readonly grid: HTMLElement;
     readonly first: HTMLElement;
     readonly second: HTMLElement;
+    readonly firstToggle: HTMLElement;
+    readonly secondToggle: HTMLElement;
     readonly firstTriggers: readonly HTMLElement[];
     readonly secondTriggers: readonly HTMLElement[];
   }
 
   /**
-   * Render both rows and find their triggers semantically.
+   * Render both rows and find their controls semantically.
    *
-   * @returns The rows and their triggers, in document order.
+   * @returns The grid, its rows, their toggles and their tooltip triggers, in
+   * document order.
    */
   async function renderExplainedRows(): Promise<ExplainedRows> {
     const stub = resolvingProvider([SHORTENED_ROW, UNDESCRIBED_ROW]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
 
-    await screen.findByRole('grid');
+    const grid = await screen.findByRole('grid');
 
     const [first, second] = dataRows();
     if (first === undefined || second === undefined) {
@@ -2880,8 +3703,15 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
     const secondCells = cellsOf(second);
 
     return {
+      grid,
       first,
       second,
+      firstToggle: within(firstCells.component).getByRole('button', {
+        name: showDetailsName(WIDGET_VALUE_IDENTITY),
+      }),
+      secondToggle: within(secondCells.component).getByRole('button', {
+        name: showDetailsName(WIDGET_FLAG_LABEL_IDENTITY),
+      }),
       firstTriggers: [
         elementWithClass(firstCells.previous, 'dg-state-transitions__value'),
         within(firstCells.trigger).getByText(GENERIC_TRIGGER_LABEL),
@@ -2894,9 +3724,53 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
     };
   }
 
-  it('opens every explanation from the keyboard, through tab stops of the focused row only', async () => {
+  it('keeps the grid one Tab stop: Tab enters on the row and the next Tab leaves', async () => {
     const user = userEvent.setup();
-    const { first, firstTriggers, secondTriggers } = await renderExplainedRows();
+    const { grid, first, second, firstTriggers, secondTriggers } = await renderExplainedRows();
+
+    // Before focus enters, the grid holds exactly one stop, its first row, and
+    // every control and explanation inside it is focusable yet out of the Tab
+    // order.
+    expect(tabStopsIn(grid)).toEqual([first]);
+    expect(second.getAttribute('tabindex')).toBe('-1');
+
+    const controls = inRowControlsOf(grid);
+    expect(controls.length).toBeGreaterThanOrEqual(firstTriggers.length + secondTriggers.length);
+    for (const control of controls) {
+      expect(control.getAttribute('tabindex')).toBe('-1');
+    }
+    for (const trigger of [...firstTriggers, ...secondTriggers]) {
+      expect(controls).toContain(trigger);
+    }
+
+    // One pass of Tab through the whole document stops inside the grid once,
+    // on the row, and then leaves it: nothing in a row adds a stop.
+    const stops = await tabSequence(user);
+    expect(stops.filter((stop) => grid.contains(stop))).toEqual([first]);
+
+    const rowPosition = stops.indexOf(first);
+    const afterRow = stops[rowPosition + 1];
+    if (afterRow !== undefined) {
+      expect(grid.contains(afterRow)).toBe(false);
+    }
+
+    // Tab back in lands on the row again, and focus there leaves the grid
+    // still holding exactly one stop.
+    await tabUntil(user, first);
+    expect(tabStopsIn(grid)).toEqual([first]);
+
+    await user.tab();
+    expect(grid.contains(document.activeElement)).toBe(false);
+
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(first);
+    expect(tabStopsIn(grid)).toEqual([first]);
+  });
+
+  it('reaches every explanation of a row with the arrow keys, and opens each on focus', async () => {
+    const user = userEvent.setup();
+    const { grid, first, second, firstToggle, secondToggle, firstTriggers, secondTriggers } =
+      await renderExplainedRows();
     const [shortenedValue, outOfPageTrigger] = firstTriggers;
     const [undeterminedTrigger, unreportedChip, truncatedChip] = secondTriggers;
 
@@ -2910,101 +3784,175 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
       throw new Error('a tooltip trigger of this case was not rendered');
     }
 
-    // Before focus enters the grid, not one trigger adds a tab stop: the grid's
-    // single roving row stop is the way in.
-    for (const trigger of [...firstTriggers, ...secondTriggers]) {
-      expect(trigger.getAttribute('tabindex')).toBeNull();
-    }
-    expect(first.getAttribute('tabindex')).toBe('0');
-
     // No explanation sits in a column header, where it would be nested inside
-    // a sort control.
+    // a sort control. Closed bubbles are hidden, so the query counts hidden
+    // ones too: a mounted-but-closed bubble in a header would still be one.
     for (const header of screen.getAllByRole('columnheader')) {
-      expect(within(header).queryAllByRole('tooltip')).toHaveLength(0);
+      expect(within(header).queryAllByRole('tooltip', { hidden: true })).toHaveLength(0);
     }
 
-    // Tab reaches the row, and the row's own triggers join the tab order.
     await tabUntil(user, first);
 
-    for (const trigger of firstTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBe('0');
-    }
-    for (const trigger of secondTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBeNull();
-    }
+    // ArrowRight on a collapsed row opens its detail and keeps focus on the
+    // row; the next one enters the row on its first control, the toggle, which
+    // now reports the open state.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(first);
+    expect(firstToggle.getAttribute('aria-expanded')).toBe('true');
 
-    // Tab walks from the row into its explanations, and focus opens each one.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(firstToggle);
+
+    // ArrowRight walks the row's explanations in reading order, and focus by
+    // arrow key opens each exactly as Tab would. Before its turn a bubble is
+    // mounted and named by its trigger's `aria-describedby`, but none is shown:
+    // it is `hidden`, out of the accessibility tree. The text of each is read
+    // while it is open.
+    const explanations = new Map<HTMLElement, string>();
+
     for (const trigger of firstTriggers) {
       const bubble = describedBubble(trigger);
+      expect(bubble.hidden).toBe(true);
       expect(bubble.classList.contains('dg-is-open')).toBe(false);
 
-      await tabUntil(user, trigger);
+      await user.keyboard('{ArrowRight}');
 
+      expect(document.activeElement).toBe(trigger);
+      expect(bubble.hidden).toBe(false);
       expect(bubble.classList.contains('dg-is-open')).toBe(true);
+      explanations.set(trigger, bubble.textContent);
     }
 
-    // Tab onward crosses into the next row, whose triggers take over the stops
-    // while the row left behind drops out of the tab order.
+    // The last control keeps focus on a further ArrowRight, and ArrowLeft walks
+    // back to the toggle and then out to the row.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(outOfPageTrigger);
+    await user.keyboard('{ArrowLeft}{ArrowLeft}');
+    expect(document.activeElement).toBe(firstToggle);
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(first);
+
+    // ArrowDown moves the roving stop to the next row, and F2 enters it
+    // without opening its detail.
+    await user.keyboard('{ArrowDown}');
+    expect(document.activeElement).toBe(second);
+    expect(tabStopsIn(grid)).toEqual([second]);
+
+    await user.keyboard('{F2}');
+    expect(document.activeElement).toBe(secondToggle);
+    expect(secondToggle.getAttribute('aria-expanded')).toBe('false');
+
     for (const trigger of secondTriggers) {
+      await user.keyboard('{ArrowRight}');
+
       const bubble = describedBubble(trigger);
-
-      await tabUntil(user, trigger);
-
-      expect(trigger.getAttribute('tabindex')).toBe('0');
+      expect(document.activeElement).toBe(trigger);
       expect(bubble.classList.contains('dg-is-open')).toBe(true);
-    }
-    for (const trigger of firstTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBeNull();
+      explanations.set(trigger, bubble.textContent);
     }
 
-    // Each bubble says what its trigger needs explained, and Escape dismisses
-    // the one the keyboard opened.
-    expect(describedBubble(shortenedValue).textContent).toContain('bounded summary');
-    expect(describedBubble(outOfPageTrigger).textContent).toContain('outside the page loaded here');
-    expect(describedBubble(undeterminedTrigger).textContent).toContain(
+    // Each bubble said what its trigger needs explained.
+    expect(explanations.get(shortenedValue)).toContain('bounded summary');
+    expect(explanations.get(outOfPageTrigger)).toContain('outside the page loaded here');
+    expect(explanations.get(undeterminedTrigger)).toContain(
       'Nothing is claimed about what caused it',
     );
-    expect(describedBubble(unreportedChip).textContent).toContain(
+    expect(explanations.get(unreportedChip)).toContain(
       'not a statement that the value stayed the same',
     );
-    expect(describedBubble(truncatedChip).textContent).toContain('not a total');
+    expect(explanations.get(truncatedChip)).toContain('not a total');
 
+    // Home and End jump across the row's controls.
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(secondToggle);
+    await user.keyboard('{End}');
+    expect(document.activeElement).toBe(truncatedChip);
+
+    // The first Escape dismisses the bubble the keyboard opened and keeps
+    // focus on its trigger, leaving no explanation shown anywhere while the
+    // trigger's description still resolves; the second returns to the row.
+    expect(describedBubble(truncatedChip).classList.contains('dg-is-open')).toBe(true);
     await user.keyboard('{Escape}');
-
     expect(document.activeElement).toBe(truncatedChip);
     expect(describedBubble(truncatedChip).classList.contains('dg-is-open')).toBe(false);
-  });
+    expect(describedBubble(truncatedChip).hidden).toBe(true);
+    expect(document.querySelector('.dg-tooltip__bubble.dg-is-open')).toBeNull();
+    expect(screen.queryAllByRole('tooltip')).toHaveLength(0);
 
-  it('moves the in-row tab stops with the row the arrow keys move to', async () => {
-    const user = userEvent.setup();
-    const { first, second, firstTriggers, secondTriggers } = await renderExplainedRows();
-
-    await tabUntil(user, first);
-
-    await user.keyboard('{ArrowDown}');
-
+    await user.keyboard('{Escape}');
     expect(document.activeElement).toBe(second);
-    for (const trigger of secondTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBe('0');
-    }
-    for (const trigger of firstTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBeNull();
-    }
-
-    await user.keyboard('{ArrowUp}');
-
-    expect(document.activeElement).toBe(first);
-    for (const trigger of firstTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBe('0');
-    }
-    for (const trigger of secondTriggers) {
-      expect(trigger.getAttribute('tabindex')).toBeNull();
-    }
+    expect(tabStopsIn(grid)).toEqual([second]);
   });
 
-  it('keeps row navigation after a pointer click on a trigger outside the focused row', async () => {
+  it('reaches the trigger control and both source chips by arrow key, and each keeps its own action', async () => {
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION]);
+    const spies = makeActions();
     const user = userEvent.setup();
-    const { first, second, secondTriggers } = await renderExplainedRows();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    const grid = await screen.findByRole('grid');
+    const [row] = dataRows();
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    await tabUntil(user, row);
+
+    // Open the detail, then enter the row: the toggle, the compact chip, the
+    // trigger control and — in the open detail — the full chip, in document
+    // order, every one of them out of the Tab order.
+    await user.keyboard('{ArrowRight}{ArrowRight}');
+
+    const cells = cellsOf(row);
+    const toggle = within(cells.component).getByRole('button', {
+      name: hideDetailsName(WIDGET_VALUE_IDENTITY),
+    });
+    const compactChip = within(cells.component).getByRole('button', { name: SOURCE_CHIP_NAME });
+    const trigger = within(cells.trigger).getByRole('button', { name: TRIGGER_NAME });
+    const detailChip = within(controlledElementOf(toggle)).getByRole('button', {
+      name: sourceLinkAccessibleName({ location: BASE_SOURCE }),
+    });
+
+    expect(document.activeElement).toBe(toggle);
+
+    for (const control of [compactChip, trigger, detailChip]) {
+      expect(control.getAttribute('tabindex')).toBe('-1');
+
+      await user.keyboard('{ArrowRight}');
+
+      expect(document.activeElement).toBe(control);
+    }
+
+    expect(tabStopsIn(grid)).toEqual([row]);
+
+    // Enter on the trigger control opens the attributed record — its id alone,
+    // once — and activates neither the row nor anything else.
+    await user.keyboard('{Home}{ArrowRight}{ArrowRight}');
+    expect(document.activeElement).toBe(trigger);
+
+    await user.keyboard('{Enter}');
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({ eventId: TRIGGER_EVENT_ID });
+    expect(row.getAttribute('aria-selected')).toBe('false');
+    expect(spies.onOpenSource).not.toHaveBeenCalled();
+
+    // Enter on the compact chip hands the host the very location the row
+    // resolved to.
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(compactChip);
+
+    await user.keyboard('{Enter}');
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource.mock.calls[0]?.[0]).toBe(BASE_SOURCE);
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it('moves the roving stop to the row of a control a pointer focuses, and keeps row navigation', async () => {
+    const user = userEvent.setup();
+    const { grid, first, second, secondTriggers } = await renderExplainedRows();
     const [undeterminedTrigger] = secondTriggers;
 
     if (undeterminedTrigger === undefined) {
@@ -3013,15 +3961,273 @@ describe('StateTransitionViewer keyboard access to explanations', () => {
 
     await tabUntil(user, first);
 
-    // The trigger carries no tab index outside the focused row, so a click on
-    // it focuses its row — where the grid answers the arrow keys — rather than
-    // the trigger itself.
+    // A click focuses the explanation itself — it is focusable, only out of
+    // the Tab order — and its row becomes the grid's one stop.
     await user.click(undeterminedTrigger);
 
-    expect(document.activeElement).toBe(second);
+    expect(document.activeElement).toBe(undeterminedTrigger);
+    expect(describedBubble(undeterminedTrigger).classList.contains('dg-is-open')).toBe(true);
+    expect(tabStopsIn(grid)).toEqual([second]);
+    expect(first.getAttribute('tabindex')).toBe('-1');
 
+    // The arrow keys still move between rows from there.
     await user.keyboard('{ArrowUp}');
 
     expect(document.activeElement).toBe(first);
+    expect(tabStopsIn(grid)).toEqual([first]);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * The panel's shared selection, and the toolbar's filter reports (B2-F21)
+ *
+ * Under the panel host the selected row is the panel's one selection — the
+ * record any view or evidence chip last selected — rather than a state of this
+ * view (AAP 0.7.3: evidence chips "select the underlying events"). These cases
+ * provide that selection directly through `PanelSelectionContext`, which is
+ * exactly what the host mounts, and re-render with another value to move it.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * The component inside every host context, the panel's selection included.
+ *
+ * @param node The node to draw.
+ * @param context The provider, the actions and the selection the host provides.
+ * @returns The element tree.
+ */
+function selectionTree(
+  node: StateTransitionsNode,
+  context: {
+    readonly provider: DataProvider;
+    readonly actions: PanelActions;
+    readonly selection: PanelSelection | undefined;
+  },
+): ReactElement {
+  return (
+    <DataProviderContext.Provider value={context.provider}>
+      <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+        <PanelActionsContext.Provider value={context.actions}>
+          <PanelSelectionContext.Provider value={{ selection: context.selection }}>
+            <StateTransitionViewer node={node} />
+          </PanelSelectionContext.Provider>
+        </PanelActionsContext.Provider>
+      </PanelSessionContext.Provider>
+    </DataProviderContext.Provider>
+  );
+}
+
+describe('StateTransitionViewer shared selection', () => {
+  it('marks the transition whose record the panel selection names, and no other', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    render(
+      selectionTree(makeNode(), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+        selection: { eventId: WIDGET_FLAG_TRANSITION.eventId },
+      }),
+    );
+
+    await screen.findByRole('grid');
+
+    const selected = rowWithValueBefore(FLAG_BEFORE);
+    expect(selected.getAttribute('aria-selected')).toBe('true');
+    expect(selected.classList.contains('dg-is-selected')).toBe(true);
+    expect(rowWithValueBefore(NUMBER_BEFORE).getAttribute('aria-selected')).toBe('false');
+    expect(rowWithValueBefore(OBJECT_BEFORE).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('marks a transition a selection names by its trace and span alone', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    render(
+      selectionTree(makeNode(), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+        // Another record's id, but this transition's own span in its own trace:
+        // the pair is the span's identity across tiers, so it names this row.
+        selection: {
+          eventId: 'evt_example_elsewhere',
+          traceId: PANEL_CONTEXT_TRANSITION.traceId,
+          spanId: PANEL_CONTEXT_TRANSITION.spanId,
+        },
+      }),
+    );
+
+    await screen.findByRole('grid');
+
+    expect(rowWithValueBefore(OBJECT_BEFORE).getAttribute('aria-selected')).toBe('true');
+    expect(rowWithValueBefore(NUMBER_BEFORE).getAttribute('aria-selected')).toBe('false');
+  });
+
+  it('follows the panel selection instead of keeping one of its own', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+    const context = { provider: stub.provider, actions: spies.actions };
+
+    const view = render(selectionTree(makeNode(), { ...context, selection: undefined }));
+
+    await screen.findByRole('grid');
+    await user.click(rowWithValueBefore(NUMBER_BEFORE));
+
+    // The activation is reported with the transition's own record, exactly as
+    // outside a host...
+    expect(spies.onSelectEvent).toHaveBeenCalledWith({
+      eventId: WIDGET_VALUE_TRANSITION.eventId,
+      spanId: WIDGET_VALUE_TRANSITION.spanId,
+      traceId: WIDGET_VALUE_TRANSITION.traceId,
+    });
+
+    // ...but the mark is the host's to move: until the panel's selection names
+    // the record, no row claims to be selected.
+    expect(rowWithValueBefore(NUMBER_BEFORE).getAttribute('aria-selected')).toBe('false');
+
+    view.rerender(
+      selectionTree(makeNode(), {
+        ...context,
+        selection: { eventId: WIDGET_VALUE_TRANSITION.eventId },
+      }),
+    );
+    expect(rowWithValueBefore(NUMBER_BEFORE).getAttribute('aria-selected')).toBe('true');
+
+    // A selection made in another view moves the mark here as well.
+    view.rerender(
+      selectionTree(makeNode(), {
+        ...context,
+        selection: { eventId: PANEL_CONTEXT_TRANSITION.eventId },
+      }),
+    );
+    expect(rowWithValueBefore(NUMBER_BEFORE).getAttribute('aria-selected')).toBe('false');
+    expect(rowWithValueBefore(OBJECT_BEFORE).getAttribute('aria-selected')).toBe('true');
+  });
+
+  it('marks nothing for a selected record the reader narrowed away', async () => {
+    const stub = resolvingProvider([WIDGET_VALUE_TRANSITION, UNREPORTED_TRANSITION]);
+    const user = userEvent.setup();
+
+    render(
+      selectionTree(makeNode(), {
+        provider: stub.provider,
+        actions: makeActions().actions,
+        selection: { eventId: UNREPORTED_TRANSITION.eventId },
+      }),
+    );
+
+    await screen.findByRole('grid');
+    expect(dataRows().filter((row) => row.getAttribute('aria-selected') === 'true')).toHaveLength(
+      1,
+    );
+
+    await user.click(screen.getByRole('button', { name: CHANGED_ONLY_NAME }));
+
+    // The narrowed-away record leaves no neighbour marked in its place.
+    expect(dataRows()).toHaveLength(1);
+    expect(dataRows()[0]?.getAttribute('aria-selected')).toBe('false');
+  });
+});
+
+describe('StateTransitionViewer toolbar filter reports', () => {
+  it('reports each toggle as the toolbar state it leaves, in plain strings', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    await user.click(screen.getByRole('button', { name: CHANGED_ONLY_NAME }));
+
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(1);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: CHRONOLOGICAL,
+      changedOnly: 'true',
+      grouped: 'true',
+    });
+
+    await user.click(screen.getByRole('button', { name: GROUPING_NAME }));
+
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: CHRONOLOGICAL,
+      changedOnly: 'true',
+      grouped: 'false',
+    });
+
+    // Both reports agree with what the toolbar now shows.
+    expect(
+      screen.getByRole('button', { name: CHANGED_ONLY_NAME }).getAttribute('aria-pressed'),
+    ).toBe('true');
+    expect(screen.getByRole('button', { name: GROUPING_NAME }).getAttribute('aria-pressed')).toBe(
+      'false',
+    );
+
+    // Every value is a string: the report carries what the toolbar holds and
+    // no query shape.
+    for (const [, filter] of spies.onFilterChange.mock.calls) {
+      expect(Object.values(filter).every((value) => typeof value === 'string')).toBe(true);
+    }
+
+    // A local narrowing requests no page.
+    expect(stub.resolve).toHaveBeenCalledTimes(1);
+  });
+
+  it('reports a new order as the toolbar state it leaves, keeping the toggles', async () => {
+    const stub = pagingProvider([{ data: PROVIDER_ORDER }, { data: PROVIDER_ORDER }]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    // A toggle first, so the order's report is seen to carry it.
+    await user.click(screen.getByRole('button', { name: CHANGED_ONLY_NAME }));
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: ORDER_CONTROL_NAME }),
+      LONGEST_FIRST,
+    );
+
+    expect(spies.onFilterChange).toHaveBeenCalledTimes(2);
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: LONGEST_FIRST,
+      changedOnly: 'true',
+      grouped: 'true',
+    });
+
+    // The report names the order the next request carries.
+    expect(queryOfCall(stub, 2).sort).toBe(LONGEST_FIRST);
+  });
+
+  it('includes the component narrowing and the chosen order in a toggle report', async () => {
+    const stub = pagingProvider([{ data: PROVIDER_ORDER }, { data: [PANEL_CONTEXT_TRANSITION] }]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode({ query: { source: 'stateTransitions', sort: LONGEST_FIRST } }), {
+      provider: stub.provider,
+      actions: spies.actions,
+    });
+
+    await screen.findByRole('grid');
+    await user.selectOptions(
+      screen.getByRole('combobox', { name: COMPONENT_CONTROL_NAME }),
+      COMPONENT_PANEL,
+    );
+    await waitFor(() => {
+      expect(renderedValuesBefore()).toEqual([OBJECT_BEFORE]);
+    });
+
+    await user.click(screen.getByRole('button', { name: GROUPING_NAME }));
+
+    expect(spies.onFilterChange).toHaveBeenLastCalledWith(NODE_ID, {
+      sort: LONGEST_FIRST,
+      component: COMPONENT_PANEL,
+      changedOnly: 'false',
+      grouped: 'false',
+    });
   });
 });

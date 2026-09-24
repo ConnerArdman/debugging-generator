@@ -55,10 +55,12 @@
  *   implicit metrics source and the discarding of an authored summary's
  *   purported facts are all normalisation behaviours, asserted in
  *   `./normalize.test.ts`.
- * - **Well-formed, not true.** Whether a node type may read the source it names
- *   is the node catalog's statement, applied by `./validate.ts`; whether the
- *   evidence a panel points at exists in the capture is `./semantic.ts`'s. Both
- *   are deliberately absent here.
+ * - **Well-formed, not true.** Which sources a node type may read, and whether
+ *   it must name one, is the node catalog's statement; the authoring schema
+ *   derives both rules from it and this file asserts them at step 1, iterating
+ *   the catalog rather than restating it. Whether the evidence a panel points
+ *   at exists in the capture is `./semantic.ts`'s question, and deliberately
+ *   absent here.
  * - **No fixture file.** AAP §0.2.5 grants fixture directories to the
  *   telemetry, instrumentation and code-analysis packages only, so every input
  *   below is an in-file literal or is built by one of the small helpers. The
@@ -88,6 +90,7 @@ import {
 } from '@debuggen/shared';
 import { METRIC_IDS, TELEMETRY_KINDS, TELEMETRY_TIERS } from '@debuggen/telemetry';
 
+import { PANEL_NODE_CATALOG, isKnownPanelNodeType } from './catalog.js';
 import { PANEL_INPUT_MAX_NODE_COUNT as ENTRY_MAX_NODE_COUNT } from './index.js';
 import {
   PANEL_INPUT_MAX_NODE_COUNT,
@@ -111,9 +114,10 @@ import {
   DATA_QUERY_MAX_LIMIT,
   DATA_QUERY_SORTS,
   DATA_QUERY_SOURCES,
+  type DataQuerySource,
 } from './nodes/query.js';
 import { VISUALIZATION_NODE_TYPES } from './nodes/viz.js';
-import { PANEL_LAYOUT_MAX_NODES, PANEL_NODE_TYPES } from './spec.js';
+import { PANEL_LAYOUT_MAX_NODES, PANEL_NODE_TYPES, type PanelNodeType } from './spec.js';
 import { PANEL_MAX_NODE_DEPTH, isPanelValidationIssueCode } from './validate.js';
 
 /*
@@ -242,6 +246,35 @@ function rejectionLocations(value: unknown): readonly string[] {
   return issueLocations(parsed.error.issues);
 }
 
+/**
+ * The messages of the issues a rejected document reported, as `path: message`
+ * — the lines the model provider's repair loop shows the author — failing the
+ * test if the document was accepted instead.
+ *
+ * @param value The document expected to be rejected.
+ * @returns One `path: message` string per issue, in report order.
+ */
+function schemaMessages(value: unknown): readonly string[] {
+  const parsed = panelSpecInputSchema.safeParse(value);
+
+  if (parsed.success) {
+    throw new Error('the authoring schema accepted a document this test expects it to reject.');
+  }
+
+  return parsed.error.issues.map(
+    (issue) => `${issue.path.map((segment) => String(segment)).join('.')}: ${issue.message}`,
+  );
+}
+
+/**
+ * The longest `path: message` line the model provider's repair loop passes on
+ * uncut — `MAX_ISSUE_LINE_LENGTH` in `packages/model-provider/src/structured.ts`.
+ * Restated rather than imported because this package sits below the model
+ * provider in the package graph; the messages that list a vocabulary are
+ * measured against it.
+ */
+const REPAIR_LINE_BUDGET = 200;
+
 /** Whether a document is accepted, for the membership loops over a vocabulary. */
 function accepts(value: unknown): boolean {
   return panelSpecInputSchema.safeParse(value).success;
@@ -308,13 +341,62 @@ const LAYOUT_TYPE_NAMES: readonly string[] = LAYOUT_NODE_TYPES;
 const METRIC_ID_NAMES: readonly string[] = METRIC_IDS;
 
 /**
+ * The sources the node catalog lets a node type read, in catalog order, or
+ * none for a string that is not a catalogued type.
+ *
+ * Every source-bearing fixture below takes its source from here rather than
+ * naming one, so a catalog entry that gains or loses a source moves the
+ * fixtures with it.
+ *
+ * @param type Any node type string.
+ * @returns The catalogued sources of that type.
+ */
+function catalogSourcesOf(type: string): readonly DataQuerySource[] {
+  return isKnownPanelNodeType(type) ? PANEL_NODE_CATALOG[type].sources : [];
+}
+
+/**
+ * The first source the catalog lists for a query-backed node type — the one the
+ * type was designed around — failing the test for a type that reads none.
+ *
+ * @param type A query-backed node type.
+ * @returns Its first catalogued source.
+ */
+function firstSourceOf(type: string): DataQuerySource {
+  const [first] = catalogSourcesOf(type);
+
+  if (first === undefined) {
+    throw new Error(`the node catalog lists no source for ${type}.`);
+  }
+
+  return first;
+}
+
+/**
+ * The query-backed node types: every type whose catalog entry requires a query,
+ * in vocabulary order.
+ */
+const QUERY_BACKED_TYPES: readonly PanelNodeType[] = PANEL_NODE_TYPES.filter(
+  (type) => PANEL_NODE_CATALOG[type].requiresQuery,
+);
+
+/**
+ * The query-backed node types that must name a source: those whose catalog
+ * entry implies none.
+ */
+const SOURCE_REQUIRED_TYPES: readonly PanelNodeType[] = QUERY_BACKED_TYPES.filter(
+  (type) => PANEL_NODE_CATALOG[type].defaultSource === undefined,
+);
+
+/**
  * The smallest authored node of a given type that the schema accepts.
  *
  * One builder rather than sixteen literals, driven by the vocabulary itself, so
  * the completeness loop below covers a node type added to `./nodes/layout.ts` or
  * `./nodes/viz.ts` without an edit here. Two children are given to every
  * container, which satisfies the section and stack minimum of one and the split
- * minimum of two at once.
+ * minimum of two at once, and every query-backed leaf names the first source
+ * its catalog entry lists.
  *
  * @param type One member of the panel node vocabulary.
  * @returns A minimal node of that type.
@@ -338,7 +420,7 @@ function minimalNode(type: string): Record<string, unknown> {
     return sourceLinkNode();
   }
 
-  return { type, source: 'spans' };
+  return { type, source: firstSourceOf(type) };
 }
 
 /*
@@ -462,18 +544,61 @@ describe('the authored panel example of AAP §0.1.2', () => {
  */
 
 describe('the closed authoring vocabularies', () => {
-  it('accepts every data source the query module declares', () => {
-    const rejected = DATA_QUERY_SOURCES.filter(
-      (source) => !accepts(panelOf([{ type: 'table', source }])),
-    );
+  it('accepts on each query-backed node type exactly the sources its catalog entry lists', () => {
+    // Every type crossed with every declared source, so a source the catalog
+    // withholds from a type is proven refused, not merely a listed one accepted.
+    const mismatches: string[] = [];
 
-    expect(rejected).toEqual([]);
+    for (const type of QUERY_BACKED_TYPES) {
+      for (const source of DATA_QUERY_SOURCES) {
+        const node = { ...minimalNode(type), source };
+
+        if (accepts(panelOf([node])) !== catalogSourcesOf(type).includes(source)) {
+          mismatches.push(`${type} + ${source}`);
+        }
+      }
+    }
+
+    expect(mismatches).toEqual([]);
   });
 
-  it('rejects a source outside that vocabulary', () => {
-    expect(rejectionLocations(panelOf([{ type: 'table', source: 'somewhereElse' }]))).toEqual([
-      'layout.0.source: invalid_value',
+  it('lets some node type read every data source the query module declares', () => {
+    const unreadable = DATA_QUERY_SOURCES.filter(
+      (source) => !QUERY_BACKED_TYPES.some((type) => catalogSourcesOf(type).includes(source)),
+    );
+
+    expect(unreadable).toEqual([]);
+  });
+
+  it('rejects a source the node type cannot read, naming the sources it can', () => {
+    const document = panelOf([{ type: 'table', source: 'metrics' }]);
+
+    expect(rejectionLocations(document)).toEqual(['layout.0.source: invalid_union']);
+    expect(schemaMessages(document)).toEqual([
+      `layout.0.source: Not a source a table node can read; use one of: ${catalogSourcesOf('table').join(', ')}.`,
     ]);
+    expect(reportedIssues(document)).toEqual([
+      {
+        path: 'layout.0.source',
+        code: 'panel_node_query_source_not_allowed',
+        expected: catalogSourcesOf('table').join(' | '),
+      },
+    ]);
+  });
+
+  it('rejects a source outside that vocabulary, without repeating it', () => {
+    const document = panelOf([{ type: 'table', source: 'somewhereElse' }]);
+
+    expect(rejectionLocations(document)).toEqual(['layout.0.source: invalid_union']);
+    expect(reportedIssues(document)).toEqual([
+      {
+        path: 'layout.0.source',
+        code: 'panel_node_query_source_unknown',
+        expected: catalogSourcesOf('table').join(' | '),
+      },
+    ]);
+    expect(schemaMessages(document).join('\n')).not.toContain('somewhereElse');
+    expect(rejectionSurfaces(document)).not.toContain('somewhereElse');
   });
 
   it('accepts every sort the query module declares', () => {
@@ -583,9 +708,62 @@ describe('the closed authoring vocabularies', () => {
     ]);
   });
 
-  it('rejects a node with no type at all, at the same path', () => {
+  it.each(['gauge', 'scatterPlot'])(
+    'tells the author the node types for the unknown type %s, and reports the catalog code',
+    (type) => {
+      // The QA reproduction: the repair loop quotes the schema's message, so
+      // it must say the type is unknown and list the types there are; the
+      // parser reports the validator's code, with the vocabulary as `expected`.
+      const document = panelOf([{ type, source: 'spans' }]);
+
+      expect(schemaMessages(document)).toEqual([
+        `layout.0.type: Unknown node type: ${PANEL_NODE_TYPES.join('|')}`,
+      ]);
+      // The repair loop cuts a `path: message` line past its budget, so the
+      // whole vocabulary must fit at a top-level node, where the type is
+      // usually written (see `MAX_ISSUE_LINE_LENGTH` in
+      // packages/model-provider/src/structured.ts).
+      for (const line of schemaMessages(panelOf([...tableLeaves(63), { type }]))) {
+        expect(line.length).toBeLessThanOrEqual(REPAIR_LINE_BUDGET);
+      }
+      expect(reportedIssues(document)).toEqual([
+        {
+          path: 'layout.0.type',
+          code: 'panel_node_type_unknown',
+          expected: PANEL_NODE_TYPES.join(' | '),
+        },
+      ]);
+      expect(isPanelValidationIssueCode('panel_node_type_unknown')).toBe(true);
+      expect(rejectionSurfaces(document)).not.toContain(type);
+      expect(schemaMessages(document).join('\n')).not.toContain(type);
+    },
+  );
+
+  it('rejects a node with no type at all, at the same path and with the same vocabulary', () => {
     expect(rejectionLocations(panelOf([{ source: 'spans' }]))).toEqual([
       'layout.0.type: invalid_union',
+    ]);
+    expect(reportedIssues(panelOf([{ source: 'spans' }]))).toEqual([
+      {
+        path: 'layout.0.type',
+        code: 'panel_node_type_unknown',
+        expected: PANEL_NODE_TYPES.join(' | '),
+      },
+    ]);
+  });
+
+  it('reports an unknown type inside a container at the nested node’s own path', () => {
+    const document = panelOf([{ type: 'stack', children: [{ type: 'gauge' }] }]);
+
+    expect(schemaMessages(document)).toEqual([
+      `layout.0.children.0.type: Unknown node type: ${PANEL_NODE_TYPES.join('|')}`,
+    ]);
+    expect(reportedIssues(document)).toEqual([
+      {
+        path: 'layout.0.children.0.type',
+        code: 'panel_node_type_unknown',
+        expected: PANEL_NODE_TYPES.join(' | '),
+      },
     ]);
   });
 });
@@ -891,17 +1069,28 @@ describe('input that is not an object', () => {
 describe('the dual query form', () => {
   it('accepts every flat query field, one field at a time', () => {
     // Driven by the authoritative flat-field tuple, which is the same list the
-    // normaliser lifts by, so a field added there is covered here.
+    // normaliser lifts by, so a field added there is covered here. The source
+    // an event log must name is written flat when it is the field under test,
+    // and nested otherwise, so each other field is the only one written flat.
     const values: Readonly<Record<string, unknown>> = {
-      source: 'spans',
+      source: firstSourceOf('eventLog'),
       filter: { minDuration: 1 },
       sort: 'duration_desc',
       limit: 10,
       offset: 2,
     };
-    const rejected = DATA_QUERY_FLAT_FIELD_KEYS.filter(
-      (field) => !accepts(panelOf([{ type: 'eventLog', [field]: values[field] }])),
-    );
+    const rejected = DATA_QUERY_FLAT_FIELD_KEYS.filter((field) => {
+      const node =
+        field === 'source'
+          ? { type: 'eventLog', source: values[field] }
+          : {
+              type: 'eventLog',
+              query: { source: firstSourceOf('eventLog') },
+              [field]: values[field],
+            };
+
+      return !accepts(panelOf([node]));
+    });
 
     expect(rejected).toEqual([]);
   });
@@ -952,27 +1141,152 @@ describe('the dual query form', () => {
     expect(parseNodeOrFail(node)).toEqual(node);
   });
 
-  it('accepts a node with no query information at all', () => {
-    // A node whose source is implied, or whose query the normaliser completes
-    // from the catalog: whether a source was ultimately supplied is
-    // `./validate.ts`'s question, asked after normalisation.
-    expect(parseNodeOrFail({ type: 'timeline' })).toEqual({ type: 'timeline' });
+  it('accepts the source written only inside the nested query', () => {
+    expect(parseNodeOrFail({ type: 'timeline', query: { source: 'trace' } })).toEqual({
+      type: 'timeline',
+      query: { source: 'trace' },
+    });
+    // `null` is the nested spelling's explicit "not on the node", and means
+    // what leaving the key out means.
+    expect(parseNodeOrFail({ type: 'timeline', source: null, query: { source: 'trace' } })).toEqual(
+      { type: 'timeline', source: null, query: { source: 'trace' } },
+    );
   });
 
-  it('accepts an empty filter and an empty query object', () => {
+  it.each(SOURCE_REQUIRED_TYPES)(
+    'refuses a %s node that names no source, at step 1, with its sources and both spellings',
+    (type) => {
+      // The QA reproduction: a repairable omission must fail the authoring
+      // schema — the step the repair loop re-prompts on — rather than pass it
+      // and fail the internal schema as a product bug (AAP 0.5.3).
+      const document = panelOf([{ type }]);
+      const listed = catalogSourcesOf(type);
+
+      expect(rejectionLocations(document)).toEqual(['layout.0.query: invalid_type']);
+      expect(schemaMessages(document)).toEqual([
+        `layout.0.query: A ${type} node needs a source (one of: ${listed.join(', ')}), written as "source" on the node or inside its "query" object.`,
+      ]);
+      for (const line of schemaMessages(document)) {
+        expect(line.length).toBeLessThanOrEqual(REPAIR_LINE_BUDGET);
+      }
+      expect(reportedIssues(document)).toEqual([
+        {
+          path: 'layout.0.source',
+          code: 'panel_node_query_source_missing',
+          expected: listed.join(' | '),
+        },
+      ]);
+    },
+  );
+
+  it('covers every query-backed type but the one whose catalog entry implies a source', () => {
+    expect(SOURCE_REQUIRED_TYPES).toHaveLength(QUERY_BACKED_TYPES.length - 1);
+    expect(QUERY_BACKED_TYPES.filter((type) => !SOURCE_REQUIRED_TYPES.includes(type))).toEqual([
+      'metricCards',
+    ]);
+  });
+
+  it('refuses the source missing from a nested query, a null flat source and a query that is no object', () => {
+    const missing = {
+      path: 'layout.0.source',
+      code: 'panel_node_query_source_missing',
+      expected: catalogSourcesOf('table').join(' | '),
+    };
+
+    expect(rejectionLocations(panelOf([{ type: 'table', query: {} }]))).toEqual([
+      'layout.0.query.source: invalid_value',
+    ]);
+    expect(reportedIssues(panelOf([{ type: 'table', query: {} }]))).toEqual([missing]);
+    expect(reportedIssues(panelOf([{ type: 'table', source: null }]))).toEqual([missing]);
+    expect(reportedIssues(panelOf([{ type: 'table', filter: { minDuration: 1 } }]))).toEqual([
+      missing,
+    ]);
+
+    // A query that is present but not an object is a shape fault, not a missing
+    // source: the schema's own code, with a message that says so.
+    expect(rejectionLocations(panelOf([{ type: 'table', query: 'spans' }]))).toEqual([
+      'layout.0.query: invalid_type',
+    ]);
+    expect(schemaMessages(panelOf([{ type: 'table', query: 'spans' }]))).toEqual([
+      `layout.0.query: The "query" of a table node must be an object of query fields, and its source one of: ${catalogSourcesOf('table').join(', ')}.`,
+    ]);
+  });
+
+  it('refuses a nested source the node type cannot read, at the path it was written', () => {
+    // The QA reproduction for the nested spelling.
+    const document = panelOf([{ type: 'requestTable', query: { source: 'spans' } }]);
+
+    expect(rejectionLocations(document)).toEqual(['layout.0.query.source: invalid_value']);
+    expect(schemaMessages(document)).toEqual([
+      `layout.0.query.source: Not a source a requestTable node can read; use one of: ${catalogSourcesOf('requestTable').join(', ')}.`,
+    ]);
+    expect(reportedIssues(document)).toEqual([
+      {
+        path: 'layout.0.query.source',
+        code: 'panel_node_query_source_not_allowed',
+        expected: catalogSourcesOf('requestTable').join(' | '),
+      },
+    ]);
+  });
+
+  it('refuses the QA reproductions of a flat source the node type cannot read', () => {
+    const cases: readonly { readonly node: Record<string, unknown>; readonly type: string }[] = [
+      { node: { type: 'timeline', source: 'metrics' }, type: 'timeline' },
+      { node: { type: 'requestTable', source: 'spans' }, type: 'requestTable' },
+      {
+        node: { type: 'metricCards', source: 'spans', metrics: [METRIC_IDS[0]] },
+        type: 'metricCards',
+      },
+    ];
+
+    for (const { node, type } of cases) {
+      expect(reportedIssues(panelOf([node]))).toEqual([
+        {
+          path: 'layout.0.source',
+          code: 'panel_node_query_source_not_allowed',
+          expected: catalogSourcesOf(type).join(' | '),
+        },
+      ]);
+    }
+  });
+
+  it('accepts a metric-tile row with no source, and with the source its catalog implies', () => {
+    const tiles = { type: 'metricCards', metrics: [METRIC_IDS[0]] };
+    const implied = PANEL_NODE_CATALOG.metricCards.defaultSource;
+
+    expect(parseNodeOrFail(tiles)).toEqual(tiles);
+    expect(parseNodeOrFail({ ...tiles, source: implied })).toEqual({ ...tiles, source: implied });
+    expect(parseNodeOrFail({ ...tiles, query: { source: implied } })).toEqual({
+      ...tiles,
+      query: { source: implied },
+    });
+  });
+
+  it('accepts an empty filter and an empty query object beside a named source', () => {
     // Every filter field narrows, so an empty filter means "the whole source"
     // rather than "nothing", and an empty query object is the same statement one
     // level up.
-    expect(parseNodeOrFail({ type: 'table', filter: {} })).toEqual({ type: 'table', filter: {} });
-    expect(parseNodeOrFail({ type: 'table', query: {} })).toEqual({ type: 'table', query: {} });
+    expect(parseNodeOrFail({ type: 'table', source: 'spans', filter: {} })).toEqual({
+      type: 'table',
+      source: 'spans',
+      filter: {},
+    });
+    expect(parseNodeOrFail({ type: 'table', source: 'spans', query: {} })).toEqual({
+      type: 'table',
+      source: 'spans',
+      query: {},
+    });
   });
 
   it('accepts the two node labels and rejects a blank one', () => {
-    expect(parseNodeOrFail({ type: 'table', title: 'Slowest operations' })).toEqual({
+    expect(
+      parseNodeOrFail({ type: 'table', source: 'spans', title: 'Slowest operations' }),
+    ).toEqual({
       type: 'table',
+      source: 'spans',
       title: 'Slowest operations',
     });
-    expect(rejectionLocations(panelOf([{ type: 'table', title: '' }]))).toEqual([
+    expect(rejectionLocations(panelOf([{ type: 'table', source: 'spans', title: '' }]))).toEqual([
       'layout.0.title: too_small',
     ]);
   });
@@ -1132,35 +1446,23 @@ describe('recursion and layout bounds', () => {
 
     // A division with one pane is just that pane, so the split's minimum is two
     // while the other two containers are content with one.
-    expect(accepts(panelOf([{ type: 'stack', children: [{ type: 'table' }] }]))).toBe(true);
-    expect(accepts(panelOf([{ type: 'section', children: [{ type: 'table' }] }]))).toBe(true);
-    expect(rejectionLocations(panelOf([{ type: 'split', children: [{ type: 'table' }] }]))).toEqual(
-      ['layout.0.children: too_small'],
-    );
+    const table = minimalNode('table');
+
+    expect(accepts(panelOf([{ type: 'stack', children: [table] }]))).toBe(true);
+    expect(accepts(panelOf([{ type: 'section', children: [table] }]))).toBe(true);
+    expect(rejectionLocations(panelOf([{ type: 'split', children: [table] }]))).toEqual([
+      'layout.0.children: too_small',
+    ]);
   });
 
   it('accepts a split direction from the declared axes and rejects another', () => {
+    const panes = [minimalNode('table'), minimalNode('flame')];
+
+    expect(accepts(panelOf([{ type: 'split', direction: 'horizontal', children: panes }]))).toBe(
+      true,
+    );
     expect(
-      accepts(
-        panelOf([
-          {
-            type: 'split',
-            direction: 'horizontal',
-            children: [{ type: 'table' }, { type: 'flame' }],
-          },
-        ]),
-      ),
-    ).toBe(true);
-    expect(
-      rejectionLocations(
-        panelOf([
-          {
-            type: 'split',
-            direction: 'diagonal',
-            children: [{ type: 'table' }, { type: 'flame' }],
-          },
-        ]),
-      ),
+      rejectionLocations(panelOf([{ type: 'split', direction: 'diagonal', children: panes }])),
     ).toEqual(['layout.0.direction: invalid_value']);
   });
 });
@@ -1365,6 +1667,25 @@ describe('the nesting-depth bound', () => {
         DEPTH_SENTINEL,
       );
     }
+  });
+
+  it('lists the visualization node types for an unknown type at the deepest level', () => {
+    // Not a container placed too deep, so not the depth message: the position
+    // accepts leaves only, and those are what the author is told about.
+    const document = nestedPanel(PANEL_MAX_NODE_DEPTH, { type: 'gauge', title: DEPTH_SENTINEL });
+    const typePath = `${chainPathAt(PANEL_MAX_NODE_DEPTH)}.type`;
+
+    expect(schemaMessages(document)).toEqual([
+      `${typePath}: Unknown node type; at the deepest nesting level (${String(PANEL_MAX_NODE_DEPTH)}) use a visualization node: ${VISUALIZATION_NODE_TYPES.join('|')}`,
+    ]);
+    expect(reportedIssues(document)).toEqual([
+      {
+        path: typePath,
+        code: 'panel_node_type_unknown',
+        expected: VISUALIZATION_NODE_TYPES.join(' | '),
+      },
+    ]);
+    expect(rejectionSurfaces(document)).not.toContain(DEPTH_SENTINEL);
   });
 
   it('keeps the ordinary message for a malformed leaf at the deepest level', () => {
@@ -2357,46 +2678,97 @@ function keywordStrings(value: unknown, keyword: string, found: string[] = []): 
 }
 
 /**
+ * The node type one rendered spelling pins, failing the test if it pins none.
+ *
+ * @param document The emitted document.
+ * @param spelling One object option, dereferenced.
+ * @param what How to name the union in a failure.
+ * @returns The `type` constant.
+ */
+function pinnedTypeOf(document: JsonRecord, spelling: JsonRecord, what: string): string {
+  const properties = asRecord(spelling['properties'], `properties of a branch of ${what}`);
+  const constant = deref(document, properties['type'], `type of a branch of ${what}`)['const'];
+
+  if (typeof constant !== 'string') {
+    throw new Error(`a branch of the emitted schema's ${what} pins no node type.`);
+  }
+
+  return constant;
+}
+
+/**
  * The options of one rendered node union, keyed by the node type each option
- * pins, every option dereferenced.
+ * pins: for every node type, its **spellings**, each dereferenced.
  *
  * Each branch is followed through its references, because a leaf is one shared
  * schema at every nesting level and therefore renders as a definition each
- * level's union refers to. A branch that does not resolve to an object with a
- * `type` constant fails the test: that is the assertion that the union survived
- * rendering as a discriminated set of branches rather than collapsing into a
- * permissive object.
+ * level's union refers to. A branch is either one object — a node type with a
+ * single spelling — or a union of objects that all pin the same node type: a
+ * node type that must name its source renders as its two spellings, source on
+ * the node or inside `query`. A branch that resolves to neither fails the
+ * test: that is the assertion that the union survived rendering as a
+ * discriminated set of branches rather than collapsing into a permissive
+ * object.
  *
  * @param document The emitted document.
  * @param union The rendered union, already dereferenced.
  * @param what How to name the union in a failure.
- * @returns The union's options by node type, in branch order.
+ * @returns The union's spellings by node type, in branch order.
  */
 function unionOptionsOf(
   document: JsonRecord,
   union: JsonRecord,
   what: string,
-): Map<string, JsonRecord> {
+): Map<string, readonly JsonRecord[]> {
   const branches = union['oneOf'] ?? union['anyOf'];
 
   if (!Array.isArray(branches)) {
     throw new Error(`the emitted schema's ${what} is not a union.`);
   }
 
-  const optionsByType = new Map<string, JsonRecord>();
+  const optionsByType = new Map<string, readonly JsonRecord[]>();
 
   for (const branch of branches) {
     const option = deref(document, branch, `branch of ${what}`);
-    const properties = asRecord(option['properties'], `properties of a branch of ${what}`);
-    const constant = deref(document, properties['type'], `type of a branch of ${what}`)['const'];
+    const nested = option['oneOf'] ?? option['anyOf'];
+    const spellings =
+      option['properties'] === undefined && Array.isArray(nested)
+        ? nested.map((spelling) => deref(document, spelling, `spelling of a branch of ${what}`))
+        : [option];
+    const types = new Set(spellings.map((spelling) => pinnedTypeOf(document, spelling, what)));
+    const [constant] = types;
 
-    if (typeof constant !== 'string') {
-      throw new Error(`a branch of the emitted schema's ${what} pins no node type.`);
+    if (types.size !== 1 || constant === undefined) {
+      throw new Error(`a branch of the emitted schema's ${what} pins more than one node type.`);
     }
-    optionsByType.set(constant, option);
+    optionsByType.set(constant, spellings);
   }
 
   return optionsByType;
+}
+
+/**
+ * The one spelling a node type renders as, failing the test for a type that
+ * renders several.
+ *
+ * @param optionsByType A union's spellings by node type.
+ * @param type The node type.
+ * @param what How to name the option in a failure.
+ * @returns Its only spelling.
+ */
+function onlySpellingOf(
+  optionsByType: ReadonlyMap<string, readonly JsonRecord[]>,
+  type: string,
+  what: string,
+): JsonRecord {
+  const spellings = optionsByType.get(type) ?? [];
+  const [only] = spellings;
+
+  if (spellings.length !== 1 || only === undefined) {
+    throw new Error(`the emitted ${what} renders ${String(spellings.length)} spellings, not one.`);
+  }
+
+  return only;
 }
 
 /**
@@ -2412,7 +2784,7 @@ function unionOptionsOf(
  */
 function nodeUnionOf(document: JsonRecord): {
   union: JsonRecord;
-  optionsByType: Map<string, JsonRecord>;
+  optionsByType: Map<string, readonly JsonRecord[]>;
 } {
   const properties = asRecord(document['properties'], 'properties');
   const layout = deref(document, properties['layout'], 'layout');
@@ -2617,8 +2989,8 @@ describe('the authoring schema rendered as JSON Schema', () => {
     // ids exist at all.
     const document = panelSpecInputJsonSchema();
     const { optionsByType } = nodeUnionOf(document);
-    const option = optionsByType.get('metricCards');
-    const properties = asRecord(asRecord(option, 'metricCards option')['properties'], 'properties');
+    const option = onlySpellingOf(optionsByType, 'metricCards', 'metricCards option');
+    const properties = asRecord(option['properties'], 'properties');
     const metrics = deref(document, properties['metrics'], 'metrics');
     const items = deref(document, metrics['items'], 'metrics items');
 
@@ -2629,25 +3001,59 @@ describe('the authoring schema rendered as JSON Schema', () => {
   });
 
   it('renders both spellings of a node’s query, and the closed source and sort enumerations', () => {
+    // Per query-backed type, from the catalog: every spelling carries the five
+    // flat fields and a nested query object holding the same five, and each
+    // `source` — flat and nested — is exactly the type's catalog sources.
     const document = panelSpecInputJsonSchema();
     const { optionsByType } = nodeUnionOf(document);
-    const option = asRecord(optionsByType.get('table'), 'table option');
-    const properties = asRecord(option['properties'], 'properties');
 
-    // Both spellings: the five flat fields, and the nested query object holding
-    // the same five.
-    const missingFlat = DATA_QUERY_FLAT_FIELD_KEYS.filter((field) => !(field in properties));
-    expect(missingFlat).toEqual([]);
+    for (const type of QUERY_BACKED_TYPES) {
+      const spellings = optionsByType.get(type) ?? [];
+      const sources = [...catalogSourcesOf(type)];
 
-    const query = deref(document, properties['query'], 'query');
-    const queryProperties = asRecord(query['properties'], 'query properties');
-    const missingNested = DATA_QUERY_FLAT_FIELD_KEYS.filter((field) => !(field in queryProperties));
-    expect(missingNested).toEqual([]);
+      expect(spellings.length, type).toBe(SOURCE_REQUIRED_TYPES.includes(type) ? 2 : 1);
 
-    expect(deref(document, properties['source'], 'source')['enum']).toEqual([
-      ...DATA_QUERY_SOURCES,
-    ]);
-    expect(deref(document, properties['sort'], 'sort')['enum']).toEqual([...DATA_QUERY_SORTS]);
+      for (const [index, spelling] of spellings.entries()) {
+        const what = `${type} spelling ${String(index)}`;
+        const properties = asRecord(spelling['properties'], `properties of ${what}`);
+        const query = deref(document, properties['query'], `query of ${what}`);
+        const queryProperties = asRecord(query['properties'], `query properties of ${what}`);
+
+        expect(
+          DATA_QUERY_FLAT_FIELD_KEYS.filter((field) => !(field in properties)),
+          what,
+        ).toEqual([]);
+        expect(
+          DATA_QUERY_FLAT_FIELD_KEYS.filter((field) => !(field in queryProperties)),
+          what,
+        ).toEqual([]);
+        expect(deref(document, queryProperties['source'], what)['enum'], what).toEqual(sources);
+        expect(deref(document, properties['sort'], what)['enum'], what).toEqual([
+          ...DATA_QUERY_SORTS,
+        ]);
+      }
+
+      // The first spelling names the source on the node: an enumeration of the
+      // catalog's sources, required unless the catalog implies one.
+      const [flat, nested] = spellings;
+      const flatProperties = asRecord(flat?.['properties'], `flat ${type} properties`);
+
+      expect(deref(document, flatProperties['source'], type)['enum'], type).toEqual(sources);
+      expect(flat?.['required'], type).toEqual(
+        SOURCE_REQUIRED_TYPES.includes(type) ? ['type', 'source'] : ['type', 'metrics'],
+      );
+
+      // The second names it inside `query`, which that spelling requires, and
+      // leaves the flat source out (or null).
+      if (nested !== undefined) {
+        const nestedProperties = asRecord(nested['properties'], `nested ${type} properties`);
+        const query = deref(document, nestedProperties['query'], `nested ${type} query`);
+
+        expect(nested['required'], type).toEqual(['type', 'query']);
+        expect(query['required'], type).toEqual(['source']);
+        expect(deref(document, nestedProperties['source'], type)['type'], type).toBe('null');
+      }
+    }
   });
 
   it('renders the summary as a union of both authored branches', () => {
@@ -2708,7 +3114,7 @@ describe('the authoring schema rendered as JSON Schema', () => {
           containers.map((type) =>
             childUnionPointerOf(
               document,
-              asRecord(optionsByType.get(type), `${type} at level ${String(level)}`),
+              onlySpellingOf(optionsByType, type, `${type} at level ${String(level)}`),
               `${type} at level ${String(level)} (${target})`,
             ),
           ),

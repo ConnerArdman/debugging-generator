@@ -2762,6 +2762,30 @@ function failedActionHeadline(adapter: string, failure: ReportedFailure | undefi
 }
 
 /**
+ * The headline for an install whose adapter rejected instead of returning a
+ * result.
+ *
+ * Names the adapter, and — when the rejection is a `DebuggenError`, whose
+ * message was written for the developer — quotes that message, so a condition
+ * such as a backup store built for another session reaches the developer as
+ * itself rather than as "the adapter failed". Any other thrown value keeps the
+ * generic sentence: its message is an arbitrary exception's, and it stays on
+ * the error's `cause` for the log rather than in the text a user interface
+ * shows.
+ *
+ * @param adapter The failing adapter's id.
+ * @param rejection The coded error it rejected with, when it was one.
+ * @returns One or two sentences for the error message.
+ */
+function rejectedInstallHeadline(adapter: string, rejection: DebuggenError | undefined): string {
+  const opening = `The adapter "${adapter}" failed while installing its share of the plan`;
+
+  return rejection === undefined || !isNonEmptyString(rejection.message)
+    ? `${opening}.`
+    : `${opening}: ${asSentence(rejection.message)}`;
+}
+
+/**
  * The identifying facts of a reported failure, as they go into the returned
  * error's details and its log line.
  *
@@ -2836,6 +2860,10 @@ async function unwind(
  * and quotes the failure's own message, and the hint is the failure's own hint
  * whenever the rollback left the project intact — it names the recovery for
  * the cause — falling back to the generic re-ask otherwise. An
+ * `'adapter-failed'` stop does the same with a rejection that is a
+ * `DebuggenError` — its message is quoted after the adapter's name and its hint
+ * is used while the project is intact — and keeps the generic wording for any
+ * other thrown value. An
  * `'unreported-modification'` stop names the adapter whose result left records
  * out, or says that none reported them, and its hint names the defect. A
  * rollback that left conflicts always points at them instead, and one whose
@@ -2856,6 +2884,12 @@ async function unwindCollected(
   const settled = report.conflicts.length === 0 && report.failures.length === 0;
   const intact = settled && set.reread !== 'failed';
   const adapter = input.adapterId ?? 'unknown';
+  // A coded rejection was written for the developer and names its own cause —
+  // a backup store scoped to another session, a refused path — so it is quoted
+  // like a reported failure. Anything else an adapter threw is an arbitrary
+  // exception whose message is not ours to repeat, and stays out of the text.
+  const rejection =
+    input.reason === 'adapter-failed' && DebuggenError.is(input.cause) ? input.cause : undefined;
   const headline =
     input.reason === 'aborted'
       ? 'Installing instrumentation was cancelled before it finished.'
@@ -2865,12 +2899,14 @@ async function unwindCollected(
           ? failedActionHeadline(adapter, input.failure)
           : input.reason === 'unreported-modification'
             ? unreportedHeadline(input.adapterId, input.unreported ?? set.discovered.length)
-            : `The adapter "${adapter}" failed while installing its share of the plan.`;
-  const failureHint = input.failure?.error.hint;
+            : rejectedInstallHeadline(adapter, rejection);
+  const failureHint =
+    input.reason === 'action-failed' ? input.failure?.error.hint : rejection?.hint;
   const hint = intact
     ? input.reason === 'aborted'
       ? "Start the session's instrumentation again when you are ready to capture."
-      : input.reason === 'action-failed' && isNonEmptyString(failureHint)
+      : (input.reason === 'action-failed' || input.reason === 'adapter-failed') &&
+          isNonEmptyString(failureHint)
         ? failureHint
         : input.reason === 'unreported-modification'
           ? 'Nothing from this attempt remains in the project. An adapter must report every file modification it journals, so this is a defect in the adapter: report it with the service log.'

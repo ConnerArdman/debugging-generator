@@ -314,16 +314,17 @@ export interface AdapterRegistry extends PlanAdapterResolver {
    * lookup {@link resolveActionType} answers from.
    *
    * Refused — with an `Err`, never an exception — when the adapter does not
-   * satisfy the contract at runtime (a non-string or blank `id`, an `id`
-   * carrying a control character, or a missing contract method) or when its id
-   * is already taken. Both are expected failures at a boundary where the
-   * adapter may have been written in JavaScript, and both carry
-   * `'INSTRUMENTATION_UNAVAILABLE'`: the consequence is that the signals that
-   * adapter would have provided cannot be enabled here. A duplicate id is
-   * refused rather than resolved in favour of either candidate, because the id
-   * is what a stored plan, a modification record and a readiness report all
-   * address an adapter by — two adapters under one id would make every one of
-   * those ambiguous.
+   * satisfy the contract at runtime (a value that is not an object, a
+   * non-string or blank `id`, an `id` carrying a control character or longer
+   * than the 64 characters a stored plan and a readiness report accept, or a
+   * missing contract method) or when its id is already taken. Both are
+   * expected failures at a boundary where the adapter may have been written in
+   * JavaScript, and both carry `'INSTRUMENTATION_UNAVAILABLE'`: the consequence
+   * is that the signals that adapter would have provided cannot be enabled
+   * here. A duplicate id is refused rather than resolved in favour of either
+   * candidate, because the id is what a stored plan, a modification record and
+   * a readiness report all address an adapter by — two adapters under one id
+   * would make every one of those ambiguous.
    *
    * @param adapter The adapter to register.
    * @returns `ok(undefined)` when it was added; otherwise `err` explaining
@@ -486,6 +487,19 @@ const C1_CONTROL_MIN = 0x7f;
 
 /** Highest code point of the C1 control block. */
 const C1_CONTROL_MAX = 0x9f;
+
+/**
+ * Longest adapter id a registered adapter may carry, in UTF-16 code units.
+ *
+ * Mirrors the `adapter` bound of `./schema/plan.ts` and
+ * `./schema/readiness.ts`, which keep theirs module-private. It has to be
+ * enforced here as well: an id longer than those schemas store would register,
+ * resolve action types and then fail every plan routed to it as `PLAN_INVALID`
+ * — the unretryable product-defect path of AAP §0.5.3 — and every readiness
+ * report naming it, rather than being refused once, where the adapter's author
+ * can act on it.
+ */
+const MAX_ADAPTER_ID_LENGTH = 64;
 
 /** How much of a rejected string value a diagnostic repeats. */
 const MAX_DESCRIBED_LENGTH = 64;
@@ -669,10 +683,15 @@ function resolveClaims(adapter: InstrumentationAdapter, logger: Logger): Adapter
  * Checks that a value can be registered and addressed as an adapter.
  *
  * Two rules, both from the contract in `./adapter.ts`: the id is a non-blank,
- * single-line string — it is a map key, a field on every stored plan and
- * modification record, and a value named in two user interfaces — and the five
- * contract methods are callable, because the installer, cleanup and the
- * readiness gate will call them without asking again.
+ * single-line string no longer than {@link MAX_ADAPTER_ID_LENGTH} — it is a map
+ * key, a field on every stored plan and modification record, and a value named
+ * in two user interfaces — and the five contract methods are callable, because
+ * the installer, cleanup and the readiness gate will call them without asking
+ * again.
+ *
+ * A candidate that is not an object at all — `null`, `undefined`, a string —
+ * carries no id, so it is refused under the first rule rather than allowed to
+ * throw a `TypeError` out of a function whose contract is to return a refusal.
  *
  * Each method is read through the typed member rather than by name, so renaming
  * one in the contract fails this function at compile time instead of turning
@@ -682,12 +701,21 @@ function resolveClaims(adapter: InstrumentationAdapter, logger: Logger): Adapter
  * @returns The refusal, or `undefined` when the candidate is registrable.
  */
 function validateAdapter(adapter: InstrumentationAdapter): DebuggenError | undefined {
-  const id: unknown = adapter.id;
+  const candidate: unknown = adapter;
+  const id: unknown =
+    (typeof candidate === 'object' && candidate !== null) || typeof candidate === 'function'
+      ? propertyOf(candidate, 'id')
+      : undefined;
 
-  if (typeof id !== 'string' || id.trim().length === 0 || hasControlCharacter(id)) {
+  if (
+    typeof id !== 'string' ||
+    id.trim().length === 0 ||
+    id.length > MAX_ADAPTER_ID_LENGTH ||
+    hasControlCharacter(id)
+  ) {
     return new DebuggenError(
       'INSTRUMENTATION_UNAVAILABLE',
-      'An instrumentation adapter must carry a non-blank, single-line string id.',
+      `An instrumentation adapter must carry a non-blank, single-line string id of at most ${String(MAX_ADAPTER_ID_LENGTH)} characters.`,
       {
         hint: 'Give the adapter a stable, kebab-case id: it is the value stored plans and modification records address it by.',
         details: { reason: 'invalid-id', id: describeUnreadable(id) },

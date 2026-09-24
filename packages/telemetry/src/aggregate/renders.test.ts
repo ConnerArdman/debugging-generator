@@ -2399,6 +2399,86 @@ describe('buildComponentTreeSnapshot', () => {
       expect(parent.depth).toBe(0);
     });
 
+    it('names the render that owns the trigger as the node’s representative event', () => {
+      const { events } = twoCommitCapture();
+
+      const listRow = nodeFor(requireSnapshot(buildComponentTreeSnapshot(events)), 'ListRow');
+
+      // ListRow rendered at ordinals 2 and 5; the later one supplied the
+      // context trigger, and it is the one a view selects for the node.
+      expect(listRow.lastTrigger).toBe(CONTEXT_TRIGGER);
+      expect(listRow.lastRenderEventId).toBe(eventIdFor(5));
+      expect(listRow.lastRenderSpanId).toBe(spanIdFor(5));
+      expect(listRow.lastRenderTraceId).toBe(traceIdFor(DEFAULT_TRACE_SEED));
+    });
+
+    it('chooses the representative event in canonical order, whatever the input order', () => {
+      const commit = makeCommitEvent({
+        at: 1,
+        serializedTree: [{ component: 'ListRow', children: [] }],
+      });
+      const laterTrace = traceIdFor(DEFAULT_TRACE_SEED + 1);
+      const renders = [
+        makeRenderEvent({
+          at: 2,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({ component: 'ListRow', trigger: PROPS_TRIGGER }),
+        }),
+        // Two renders at one start time: the event id breaks the tie, and the
+        // later one sits in a trace of its own, so the trace is proven to come
+        // from the render rather than from the commit.
+        makeRenderEvent({
+          at: 3,
+          startTime: EPOCH_BASE + 9,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({ component: 'ListRow', trigger: STATE_TRIGGER }),
+        }),
+        makeRenderEvent({
+          at: 4,
+          startTime: EPOCH_BASE + 9,
+          traceId: laterTrace,
+          parentSpanId: commit.spanId,
+          attributes: renderAttributes({ component: 'ListRow', trigger: CONTEXT_TRIGGER }),
+        }),
+      ];
+
+      const forward = nodeFor(
+        requireSnapshot(buildComponentTreeSnapshot([commit, ...renders])),
+        'ListRow',
+      );
+      const reversed = nodeFor(
+        requireSnapshot(buildComponentTreeSnapshot([...renders].reverse().concat(commit))),
+        'ListRow',
+      );
+
+      for (const node of [forward, reversed]) {
+        expect(node.lastTrigger).toBe(CONTEXT_TRIGGER);
+        expect(node.lastRenderEventId).toBe(eventIdFor(4));
+        expect(node.lastRenderSpanId).toBe(spanIdFor(4));
+        expect(node.lastRenderTraceId).toBe(laterTrace);
+      }
+    });
+
+    it('omits the representative event for a node that never rendered', () => {
+      const fromCommit = nodeFor(
+        requireSnapshot(buildComponentTreeSnapshot(twoCommitCapture().events)),
+        'ParentView',
+      );
+      const fromSnapshotEvent = nodeFor(
+        requireSnapshot(buildComponentTreeSnapshot(agentSnapshotCapture().events)),
+        'Sleeper',
+      );
+
+      // Absent keys rather than `undefined` values: a serialized node carries
+      // no reference it could not address, and invents none.
+      for (const node of [fromCommit, fromSnapshotEvent]) {
+        expect(node.renderCount).toBe(0);
+        expect(Object.hasOwn(node, 'lastRenderEventId')).toBe(false);
+        expect(Object.hasOwn(node, 'lastRenderSpanId')).toBe(false);
+        expect(Object.hasOwn(node, 'lastRenderTraceId')).toBe(false);
+      }
+    });
+
     it('carries the component location a resolver supplied', () => {
       const commit = makeCommitEvent({
         at: 1,
@@ -2875,6 +2955,9 @@ const TREE_NODE_FIELDS: readonly (keyof ComponentTreeNode)[] = [
   'renderCount',
   'totalDurationMs',
   'lastTrigger',
+  'lastRenderEventId',
+  'lastRenderSpanId',
+  'lastRenderTraceId',
   'source',
   'children',
 ];

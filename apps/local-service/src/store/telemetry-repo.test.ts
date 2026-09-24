@@ -44,6 +44,7 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath } from 'node:url';
 
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -67,7 +68,7 @@ import {
   newTraceId,
   unwrap,
 } from '@debuggen/shared';
-import type { LogRecord } from '@debuggen/shared';
+import type { DebuggenError, LogRecord, Result } from '@debuggen/shared';
 import { TELEMETRY_KINDS, TELEMETRY_TIERS, allowedTiersFor } from '@debuggen/telemetry';
 import { compareEventsCanonical } from '@debuggen/telemetry';
 import type {
@@ -79,6 +80,7 @@ import type {
 
 import { openStore } from './db.js';
 import type { Store } from './db.js';
+import { STORE_SCHEMA_VERSION } from './migrations.js';
 import {
   CANONICAL_ORDER_BY,
   DEFAULT_PURGE_BATCH_SIZE,
@@ -2892,37 +2894,6 @@ describe('bulk insertion and index use', () => {
     expect(elapsed).toBeLessThan(15_000);
   }, 60_000);
 
-  it('answers the default page and a trace read from an index, never a table scan', () => {
-    insertOk([buildEvent(), buildEvent({ traceId: TRACE_B })]);
-
-    // The statement texts mirror what the read path assembles, including the
-    // exported ordering constants, so a change to either shape fails here: the
-    // default page is `query`'s, in the panel-data order, and the trace read is
-    // `listByTrace`'s, in the canonical order the correlator pages through.
-    const defaultPage = queryPlan(
-      `SELECT ingest_seq, event FROM telemetry_events
-       WHERE session_id = ? AND capture_id = ?
-       ORDER BY ${PANEL_START_ASC_ORDER_BY} LIMIT ? OFFSET ?`,
-    );
-    const byTrace = queryPlan(
-      `SELECT ingest_seq, event FROM telemetry_events
-       WHERE session_id = ? AND trace_id = ?
-       ORDER BY ${CANONICAL_ORDER_BY} LIMIT ? OFFSET ?`,
-    );
-    const count = queryPlan(
-      'SELECT COUNT(*) AS total FROM telemetry_events WHERE session_id = ? AND capture_id = ?',
-    );
-
-    expect(defaultPage[0]).toContain('idx_telemetry_events_session_id_capture_id_start_time');
-    expect(byTrace[0]).toContain('idx_telemetry_events_trace_id_start_time');
-    expect(count[0]).toContain('idx_telemetry_events_session_id_capture_id_start_time');
-
-    for (const plan of [defaultPage, byTrace, count]) {
-      expect(plan[0]).toContain('SEARCH');
-      expect(plan.join(' ')).not.toContain('SCAN telemetry_events');
-    }
-  });
-
   it('takes every purge batch from a covering purge index, with no sort and no table scan', () => {
     insertOk([
       buildEvent(),
@@ -2951,5 +2922,648 @@ describe('bulk insertion and index use', () => {
       expect(plan).not.toContain('TEMP B-TREE');
       expect(plan).not.toContain('SCAN telemetry_events');
     }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The index each reader is answered from
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The single-column index on `span_id`, declared by the version-1 schema. */
+const SPAN_INDEX = 'idx_telemetry_events_span_id';
+
+/** The single-column index on `parent_span_id`, declared by the version-1 schema. */
+const PARENT_SPAN_INDEX = 'idx_telemetry_events_parent_span_id';
+
+/** The `(trace_id, start_time)` index, declared by the version-1 schema. */
+const TRACE_INDEX = 'idx_telemetry_events_trace_id_start_time';
+
+/** The index SQLite builds for the `UNIQUE` constraint on `telemetry_events.id`. */
+const EVENT_ID_INDEX = 'sqlite_autoindex_telemetry_events_1';
+
+/** The `(session_id, capture_id, start_time)` index behind the default page of a capture. */
+const CAPTURE_INDEX = 'idx_telemetry_events_session_id_capture_id_start_time';
+
+/** The `(session_id, kind)` index, declared by the version-1 schema. */
+const KIND_INDEX = 'idx_telemetry_events_session_id_kind';
+
+/** The `(session_id, kind, start_time, id)` index, added by schema version 3. */
+const KIND_ORDER_INDEX = 'idx_telemetry_events_session_id_kind_start_time_id';
+
+/** The `(session_id, request_key)` index, declared by the version-1 schema. */
+const REQUEST_KEY_INDEX = 'idx_telemetry_events_session_id_request_key';
+
+/** The `(session_id, request_key, start_time, producer_id, seq)` index, added by schema version 3. */
+const REQUEST_KEY_ORDER_INDEX =
+  'idx_telemetry_events_session_id_request_key_start_time_producer_id_seq';
+
+/**
+ * The version-2 purge index. It leads with `session_id` and satisfies the
+ * leading `start_time` term of every read ordering, which is why the planner
+ * chose it — and walked a whole session — for span, parent-span, trace,
+ * event-id, request-group and single-kind lookups before schema version 3. No
+ * reader below may be planned on it.
+ */
+const SESSION_PURGE_INDEX = 'idx_telemetry_events_session_id_start_time_ingest_seq';
+
+/**
+ * How many events {@link seedPlanFixture} stores, across both sessions.
+ *
+ * The store never runs `ANALYZE`, so the planner reads no statistics and its
+ * choice does not depend on this number. It is sized so that a plan walking a
+ * whole session instead of one key would be a real cost, while seeding stays
+ * cheap enough to repeat per test.
+ */
+const PLAN_FIXTURE_EVENTS = 2_000;
+
+/**
+ * The kinds of one family of consecutive events, in order: an `interaction`
+ * root, then its children — one `fetch` carrying a request key and three
+ * render-tier events.
+ */
+const FAMILY_KINDS: readonly TelemetryKind[] = [
+  'interaction',
+  'fetch',
+  'render',
+  'commit',
+  'render',
+];
+
+/** Consecutive events sharing one root span: the root, then its children. */
+const FAMILY_SIZE = FAMILY_KINDS.length;
+
+/** How many distinct trace ids {@link seedPlanFixture} spreads its families over. */
+const FIXTURE_TRACES = 40;
+
+/** How many distinct request keys {@link seedPlanFixture} spreads its requests over. */
+const FIXTURE_REQUEST_KEYS = 8;
+
+/** The keys of {@link SESSION_A}'s data that the plan cases look up. */
+interface PlanFixture {
+  /** A child span of {@link SESSION_A}. */
+  readonly spanId: string;
+
+  /** A root span of {@link SESSION_A}, parent of `FAMILY_SIZE - 1` children. */
+  readonly parentSpanId: string;
+
+  /** A trace of {@link SESSION_A}, recorded under {@link CAPTURE_A1}. */
+  readonly traceId: string;
+
+  /** A request key {@link SESSION_A} holds many occurrences of. */
+  readonly requestKey: string;
+
+  /** Three event ids of {@link SESSION_A}: an `IN` list of several values. */
+  readonly eventIds: readonly string[];
+
+  /** Two trace ids of {@link SESSION_A} and one no session holds. */
+  readonly traceIds: readonly string[];
+}
+
+/**
+ * The element of a fixture list at `index`, wrapping around its end.
+ *
+ * @param items A non-empty list.
+ * @param index Any non-negative integer.
+ * @returns The element.
+ * @throws When the list is empty, which is a defect in the fixture itself.
+ */
+function cycle<T>(items: readonly T[], index: number): T {
+  const item = items[index % items.length];
+
+  if (item === undefined) {
+    throw new Error('A plan fixture list must not be empty.');
+  }
+
+  return item;
+}
+
+/**
+ * Stores {@link PLAN_FIXTURE_EVENTS} events in families of {@link FAMILY_SIZE}.
+ *
+ * Every fourth family belongs to {@link SESSION_B}; the rest alternate between
+ * the two captures of {@link SESSION_A}. A family shares one trace and has the
+ * kinds {@link FAMILY_KINDS} lists. Because {@link FIXTURE_TRACES} and
+ * {@link FIXTURE_REQUEST_KEYS} are multiples of four, every trace and every
+ * request key belongs to exactly one session and one capture, and the keys
+ * the cases look up all come from family 0: {@link SESSION_A},
+ * {@link CAPTURE_A1}.
+ *
+ * @returns The keys the plan cases look up.
+ */
+function seedPlanFixture(): PlanFixture {
+  const traces = Array.from({ length: FIXTURE_TRACES }, () => newTraceId());
+  const requestKeys = Array.from({ length: FIXTURE_REQUEST_KEYS }, (_unused, index) =>
+    index.toString(16).padStart(2, '0').repeat(32),
+  );
+  const events: PersistableTelemetryEvent[] = [];
+  let rootSpanId = '';
+
+  for (let index = 0; index < PLAN_FIXTURE_EVENTS; index += 1) {
+    const family = Math.floor(index / FAMILY_SIZE);
+    const isRoot = index % FAMILY_SIZE === 0;
+    const inSessionB = family % 4 === 3;
+    const kind = cycle(FAMILY_KINDS, index);
+    const spanId = newSpanId();
+
+    if (isRoot) {
+      rootSpanId = spanId;
+    }
+
+    events.push(
+      buildEvent({
+        sessionId: inSessionB ? SESSION_B : SESSION_A,
+        captureId: inSessionB ? CAPTURE_B1 : family % 2 === 0 ? CAPTURE_A1 : CAPTURE_A2,
+        traceId: cycle(traces, family),
+        spanId,
+        ...(isRoot ? {} : { parentSpanId: rootSpanId }),
+        kind,
+        startTime: BASE_TIME + index,
+        duration: 1 + (index % 7),
+        attributes: kind === 'fetch' ? { request_key: cycle(requestKeys, family) } : {},
+      }),
+    );
+  }
+
+  insertOk(events);
+
+  // Family 0: session A, capture A1, the first trace and the first request key.
+  const root = cycle(events, 0);
+  const request = cycle(events, 1);
+  const child = cycle(events, 2);
+
+  return {
+    spanId: child.spanId,
+    parentSpanId: root.spanId,
+    traceId: cycle(traces, 0),
+    requestKey: cycle(requestKeys, 0),
+    eventIds: [root.id, request.id, child.id],
+    traceIds: [cycle(traces, 0), cycle(traces, 1), newTraceId()],
+  };
+}
+
+/**
+ * A store handle that records the text of every statement prepared through it
+ * and is otherwise the real store.
+ *
+ * A `Proxy` rather than a hand-written wrapper, so every other member — the
+ * transaction helper and the `db`, `schemaVersion` and `isClosed` getters
+ * among them — is the real one without being restated. Reads and calls use the
+ * real store as the receiver: its state lives in private class fields, which a
+ * getter or method invoked on the proxy itself could not reach.
+ *
+ * @param real The suite's store.
+ * @param texts Receives each statement text, in the order it was prepared.
+ * @returns The recording handle.
+ */
+function recordingStore(real: Store, texts: string[]): Store {
+  const statement: Store['statement'] = (sql) => {
+    texts.push(sql);
+
+    return real.statement(sql);
+  };
+
+  return new Proxy(real, {
+    get(target, property): unknown {
+      if (property === 'statement') {
+        return statement;
+      }
+
+      const value: unknown = Reflect.get(target, property, target);
+
+      return typeof value === 'function' ? value.bind(target) : value;
+    },
+  });
+}
+
+/** Whether a recorded statement text is a read of the telemetry table. */
+function isTelemetrySelect(sql: string): boolean {
+  return /^\s*SELECT\b/u.test(sql) && sql.includes('FROM telemetry_events');
+}
+
+/**
+ * Runs one read through a repository over a {@link recordingStore} and returns
+ * every telemetry read it prepared, in order.
+ *
+ * @param read The reader call.
+ * @returns The statement texts the repository actually ran.
+ */
+function statementsRunBy(
+  read: (reader: TelemetryRepo) => Result<unknown, DebuggenError>,
+): string[] {
+  const texts: string[] = [];
+  const result = read(createTelemetryRepo({ store: recordingStore(store, texts) }));
+
+  if (isErr(result)) {
+    throw new Error(`A plan case expected its read to succeed: ${result.error.code}`);
+  }
+
+  return texts.filter(isTelemetrySelect);
+}
+
+describe('the index each reader is answered from', () => {
+  /** What the plan of one statement a reader runs must show. */
+  interface StatementExpectation {
+    /** The indexes the statement may be read from; its plan must name one. */
+    readonly from: readonly string[];
+
+    /** Whether the plan must also need no temporary B-tree: the index yields the order. */
+    readonly sortFree?: boolean;
+  }
+
+  /** One reader call and the plan of each statement it runs, in order. */
+  interface ReaderCase {
+    readonly reader: string;
+    readonly read: (reader: TelemetryRepo, fixture: PlanFixture) => Result<unknown, DebuggenError>;
+    readonly statements: readonly StatementExpectation[];
+  }
+
+  /**
+   * Every reader whose plan the residual session term or a schema-version-3
+   * index decides, plus the default capture page, which must keep its own
+   * index.
+   *
+   * A `kinds` filter naming several kinds is absent on purpose: no index yields
+   * the start order across several kind ranges, so it keeps the planner's
+   * ordered session read (see `./migrations.ts`, schema version 3).
+   */
+  const READER_CASES: readonly ReaderCase[] = [
+    {
+      reader: 'getBySpanId',
+      read: (reader, fixture) => reader.getBySpanId(SESSION_A, fixture.spanId),
+      statements: [{ from: [SPAN_INDEX] }, { from: [SPAN_INDEX] }],
+    },
+    {
+      reader: 'listChildren',
+      read: (reader, fixture) => reader.listChildren(SESSION_A, fixture.parentSpanId),
+      statements: [{ from: [PARENT_SPAN_INDEX] }, { from: [PARENT_SPAN_INDEX] }],
+    },
+    {
+      reader: 'listByTrace',
+      read: (reader, fixture) => reader.listByTrace(SESSION_A, fixture.traceId),
+      statements: [{ from: [TRACE_INDEX] }, { from: [TRACE_INDEX] }],
+    },
+    {
+      reader: 'listByTrace narrowed to one capture',
+      read: (reader, fixture) =>
+        reader.listByTrace(SESSION_A, fixture.traceId, { captureId: CAPTURE_A1 }),
+      statements: [{ from: [TRACE_INDEX] }, { from: [TRACE_INDEX] }],
+    },
+    {
+      reader: 'queryGroups narrowed to one trace',
+      read: (reader, fixture) =>
+        reader.queryGroups({ sessionId: SESSION_A, traceId: fixture.traceId, groupBy: 'name' }),
+      statements: [{ from: [TRACE_INDEX] }],
+    },
+    {
+      reader: 'listByRequestKey',
+      read: (reader, fixture) => reader.listByRequestKey(SESSION_A, fixture.requestKey),
+      statements: [
+        { from: [REQUEST_KEY_INDEX, REQUEST_KEY_ORDER_INDEX] },
+        { from: [REQUEST_KEY_ORDER_INDEX], sortFree: true },
+      ],
+    },
+    {
+      // The panel-data order ends in `id`, which the request-group composite
+      // does not carry, so its last term is sorted — over one group's rows,
+      // never over the whole capture the capture index would walk.
+      reader: 'query narrowed to one request group of one capture',
+      read: (reader, fixture) =>
+        reader.query({
+          sessionId: SESSION_A,
+          captureId: CAPTURE_A1,
+          requestKey: fixture.requestKey,
+        }),
+      statements: [
+        { from: [REQUEST_KEY_INDEX, REQUEST_KEY_ORDER_INDEX] },
+        { from: [REQUEST_KEY_ORDER_INDEX] },
+      ],
+    },
+    {
+      reader: 'query narrowed to one kind',
+      read: (reader) => reader.query({ sessionId: SESSION_A, kinds: ['fetch'] }),
+      statements: [
+        { from: [KIND_INDEX, KIND_ORDER_INDEX] },
+        { from: [KIND_ORDER_INDEX], sortFree: true },
+      ],
+    },
+    {
+      reader: 'query narrowed to one kind of one capture',
+      read: (reader) =>
+        reader.query({ sessionId: SESSION_A, captureId: CAPTURE_A1, kinds: ['fetch'] }),
+      statements: [
+        { from: [KIND_INDEX, KIND_ORDER_INDEX] },
+        { from: [KIND_ORDER_INDEX], sortFree: true },
+      ],
+    },
+    {
+      reader: 'query for the default page of one capture',
+      read: (reader) => reader.query({ sessionId: SESSION_A, captureId: CAPTURE_A1 }),
+      statements: [{ from: [CAPTURE_INDEX] }, { from: [CAPTURE_INDEX] }],
+    },
+    {
+      reader: 'existingEventIds',
+      read: (reader, fixture) => reader.existingEventIds(SESSION_A, fixture.eventIds),
+      statements: [{ from: [EVENT_ID_INDEX] }],
+    },
+    {
+      reader: 'existingEventIds narrowed to one capture',
+      read: (reader, fixture) => reader.existingEventIds(SESSION_A, fixture.eventIds, CAPTURE_A1),
+      statements: [{ from: [EVENT_ID_INDEX] }],
+    },
+    {
+      reader: 'existingTraceIds',
+      read: (reader, fixture) => reader.existingTraceIds(SESSION_A, fixture.traceIds),
+      statements: [{ from: [TRACE_INDEX] }],
+    },
+    {
+      reader: 'existingTraceIds narrowed to one capture',
+      read: (reader, fixture) => reader.existingTraceIds(SESSION_A, fixture.traceIds, CAPTURE_A1),
+      statements: [{ from: [TRACE_INDEX] }],
+    },
+  ];
+
+  it.each(READER_CASES)(
+    'plans every statement $reader runs on its own index, never on a walk of the session',
+    ({ read, statements }) => {
+      const fixture = seedPlanFixture();
+      const selects = statementsRunBy((reader) => read(reader, fixture));
+
+      expect(selects).toHaveLength(statements.length);
+
+      for (const [position, expected] of statements.entries()) {
+        const sql = selects[position];
+
+        if (sql === undefined) {
+          throw new Error(`The reader ran no statement at position ${String(position)}.`);
+        }
+
+        // The plan of the exact text the repository prepared, not of a copy.
+        const plan = queryPlan(sql).join(' | ');
+
+        expect(plan).toMatch(
+          new RegExp(
+            `SEARCH telemetry_events USING (?:COVERING )?INDEX (?:${expected.from.join('|')}) \\(`,
+            'u',
+          ),
+        );
+        expect(plan).not.toContain(SESSION_PURGE_INDEX);
+        expect(plan).not.toContain('SCAN telemetry_events');
+
+        if (expected.sortFree === true) {
+          expect(plan).not.toContain('TEMP B-TREE');
+        }
+      }
+    },
+  );
+
+  it('keeps a lookup answered from a global index inside its own session', () => {
+    const traceId = newTraceId();
+    const rootSpanId = newSpanId();
+    const childSpanId = newSpanId();
+
+    /** One root and one child, under ids the other session holds too. */
+    function family(
+      sessionId: string,
+      captureId: string,
+      startTime: number,
+    ): readonly [PersistableTelemetryEvent, PersistableTelemetryEvent] {
+      return [
+        buildEvent({
+          sessionId,
+          captureId,
+          traceId,
+          spanId: rootSpanId,
+          kind: 'interaction',
+          startTime,
+        }),
+        buildEvent({
+          sessionId,
+          captureId,
+          traceId,
+          spanId: childSpanId,
+          parentSpanId: rootSpanId,
+          startTime: startTime + 1,
+        }),
+      ];
+    }
+
+    // Session B's copies start first, so a read that lost its session scope
+    // would return them ahead of session A's.
+    const inB = family(SESSION_B, CAPTURE_B1, BASE_TIME);
+    const inA = family(SESSION_A, CAPTURE_A1, BASE_TIME + 10);
+    const everyId = [...inA, ...inB].map((event) => event.id);
+
+    insertOk([...inB, ...inA]);
+
+    for (const [sessionId, captureId, [root, child]] of [
+      [SESSION_A, CAPTURE_A1, inA],
+      [SESSION_B, CAPTURE_B1, inB],
+    ] as const) {
+      expect(unwrap(repo.getBySpanId(sessionId, rootSpanId))?.id).toBe(root.id);
+      expect(unwrap(repo.getBySpanId(sessionId, childSpanId))?.id).toBe(child.id);
+      expect(
+        unwrap(repo.listChildren(sessionId, rootSpanId)).rows.map((event) => event.id),
+      ).toEqual([child.id]);
+
+      const trace = unwrap(repo.listByTrace(sessionId, traceId));
+
+      expect(trace.rows.map((event) => event.id)).toEqual([root.id, child.id]);
+      expect(trace.total).toBe(2);
+      expect(unwrap(repo.listByTrace(sessionId, traceId, { captureId })).total).toBe(2);
+      expect([...unwrap(repo.existingTraceIds(sessionId, [traceId]))]).toEqual([traceId]);
+      expect([...unwrap(repo.existingTraceIds(sessionId, [traceId], captureId))]).toEqual([
+        traceId,
+      ]);
+      expect([...unwrap(repo.existingEventIds(sessionId, everyId))].sort()).toEqual(
+        [root.id, child.id].sort(),
+      );
+    }
+
+    // Another session's capture narrows a shared trace to nothing.
+    expect(unwrap(repo.listByTrace(SESSION_A, traceId, { captureId: CAPTURE_B1 })).total).toBe(0);
+    expect(unwrap(repo.existingTraceIds(SESSION_A, [traceId], CAPTURE_B1)).size).toBe(0);
+  });
+
+  it('keeps a request-group read inside its capture when the capture is a residual filter', () => {
+    const requestKey = 'c4'.repeat(32);
+    const occurrence = (captureId: string, startTime: number): PersistableTelemetryEvent =>
+      buildEvent({ captureId, startTime, attributes: { request_key: requestKey } });
+
+    // The same request in both captures of one session, the second capture's
+    // occurrence first, so a read that dropped the capture narrowing would
+    // return it ahead of the first capture's.
+    const inA2 = occurrence(CAPTURE_A2, BASE_TIME);
+    const inA1 = [occurrence(CAPTURE_A1, BASE_TIME + 5), occurrence(CAPTURE_A1, BASE_TIME + 6)];
+
+    insertOk([inA2, ...inA1]);
+
+    const narrowed = unwrap(
+      repo.query({ sessionId: SESSION_A, captureId: CAPTURE_A1, requestKey }),
+    );
+
+    expect(narrowed.rows.map((event) => event.id)).toEqual(inA1.map((event) => event.id));
+    expect(narrowed.total).toBe(2);
+    expect(
+      unwrap(repo.listByRequestKey(SESSION_A, requestKey, { captureId: CAPTURE_A2 })).rows.map(
+        (event) => event.id,
+      ),
+    ).toEqual([inA2.id]);
+    expect(
+      unwrap(repo.query({ sessionId: SESSION_A, captureId: CAPTURE_B1, requestKey })).total,
+    ).toBe(0);
+    expect(unwrap(repo.listByRequestKey(SESSION_A, requestKey)).total).toBe(3);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Schema version 3
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('schema version 3', () => {
+  /** The two indexes version 3 adds, each with its key columns in order. */
+  const VERSION_3_INDEXES = [
+    [KIND_ORDER_INDEX, ['session_id', 'kind', 'start_time', 'id']],
+    [REQUEST_KEY_ORDER_INDEX, ['session_id', 'request_key', 'start_time', 'producer_id', 'seq']],
+  ] as const;
+
+  /** A logger whose records land in the suite's `logs`. */
+  function collectingLogger(): ReturnType<typeof createConsoleLogger> {
+    return createConsoleLogger({
+      level: 'trace',
+      sink: (record) => {
+        logs.push(record);
+      },
+    });
+  }
+
+  /** The key columns of one index, in order, or `[]` when it does not exist. */
+  function indexColumns(db: DatabaseSync, index: string): string[] {
+    return db
+      .prepare('SELECT name FROM pragma_index_info(?) ORDER BY seqno')
+      .all(index)
+      .map((row) => String(row['name']));
+  }
+
+  /** Every telemetry row, in arrival order, as stored. */
+  function telemetryRows(db: DatabaseSync): Record<string, unknown>[] {
+    return db.prepare('SELECT * FROM telemetry_events ORDER BY ingest_seq').all();
+  }
+
+  /**
+   * Everything a reopen could change: the header version, every schema object,
+   * every bookkeeping row (`updated_at` among them) and every telemetry row.
+   */
+  function storeSnapshot(db: DatabaseSync): unknown {
+    return {
+      userVersion: db.prepare('PRAGMA user_version').get()?.['user_version'],
+      objects: db
+        .prepare('SELECT type, name, tbl_name, sql FROM sqlite_master ORDER BY type, name')
+        .all(),
+      meta: db.prepare('SELECT key, value FROM meta ORDER BY key').all(),
+      telemetry: telemetryRows(db),
+    };
+  }
+
+  it('stamps a new store at the current version, with both lookup indexes', () => {
+    expect(STORE_SCHEMA_VERSION).toBeGreaterThanOrEqual(3);
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+
+    for (const [index, columns] of VERSION_3_INDEXES) {
+      expect(indexColumns(store.db, index)).toEqual(columns);
+    }
+  });
+
+  it('migrates a version-2 store forward, adding both indexes and keeping every row', () => {
+    const fixture = seedPlanFixture();
+    const databasePath = store.path;
+    const rowsBefore = telemetryRows(store.db);
+
+    store.close();
+
+    // Turn the file back into what a version-2 build left behind: stamped 2,
+    // with neither version-3 index.
+    const legacy = new DatabaseSync(databasePath);
+
+    try {
+      for (const [index] of VERSION_3_INDEXES) {
+        legacy.exec(`DROP INDEX ${index}`);
+      }
+
+      legacy.exec('PRAGMA user_version = 2');
+
+      for (const [index] of VERSION_3_INDEXES) {
+        expect(indexColumns(legacy, index)).toEqual([]);
+      }
+    } finally {
+      legacy.close();
+    }
+
+    // Only the reopen's records from here on: creating the store in
+    // `beforeEach` already logged every rung once.
+    logs.length = 0;
+
+    const logger = collectingLogger();
+
+    store = unwrap(openStore({ databasePath, logger }));
+    repo = createTelemetryRepo({ store, logger });
+
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+    expect(store.db.prepare('PRAGMA user_version').get()?.['user_version']).toBe(
+      STORE_SCHEMA_VERSION,
+    );
+    expect(
+      store.db.prepare(`SELECT value FROM meta WHERE key = 'schema_version'`).get()?.['value'],
+    ).toBe(String(STORE_SCHEMA_VERSION));
+
+    for (const [index, columns] of VERSION_3_INDEXES) {
+      expect(
+        store.db
+          .prepare(`SELECT tbl_name FROM sqlite_master WHERE type = 'index' AND name = ?`)
+          .get(index)?.['tbl_name'],
+      ).toBe('telemetry_events');
+      expect(indexColumns(store.db, index)).toEqual(columns);
+    }
+
+    expect(telemetryRows(store.db)).toEqual(rowsBefore);
+
+    // Every rung above version 2 ran once, lowest first: version 3 leads.
+    const applied = logs.filter((record) => record.message.startsWith('applied store migration'));
+
+    expect(applied).toHaveLength(STORE_SCHEMA_VERSION - 2);
+    expect(applied[0]?.message).toMatch(/^applied store migration 3 \(/u);
+
+    // The migrated store answers from what the step added.
+    const statements = statementsRunBy((reader) =>
+      reader.listByRequestKey(SESSION_A, fixture.requestKey),
+    );
+    const rows = statements.at(-1);
+
+    expect(statements).toHaveLength(2);
+
+    if (rows === undefined) {
+      throw new Error('listByRequestKey ran no row statement.');
+    }
+
+    expect(queryPlan(rows).join(' | ')).toContain(`USING INDEX ${REQUEST_KEY_ORDER_INDEX} (`);
+    expect(unwrap(repo.listByRequestKey(SESSION_A, fixture.requestKey)).total).toBeGreaterThan(0);
+  });
+
+  it('reopens a store already at the current version without changing anything', () => {
+    seedPlanFixture();
+
+    const databasePath = store.path;
+    const before = storeSnapshot(store.db);
+
+    store.close();
+    logs.length = 0;
+
+    const logger = collectingLogger();
+
+    store = unwrap(openStore({ databasePath, logger }));
+    repo = createTelemetryRepo({ store, logger });
+
+    expect(store.schemaVersion).toBe(STORE_SCHEMA_VERSION);
+    expect(storeSnapshot(store.db)).toEqual(before);
+    expect(logs.some((record) => record.message.startsWith('applied store migration'))).toBe(false);
   });
 });

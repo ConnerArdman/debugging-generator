@@ -18,12 +18,31 @@
  *    expressed one, and has its page size clamped to the bounds the schema
  *    publishes ({@link DATA_QUERY_DEFAULT_LIMIT}, {@link DATA_QUERY_MAX_LIMIT},
  *    {@link DATA_QUERY_DEFAULT_OFFSET}). Nothing else constructs a query.
- * 2. **Sorting is a re-query, never an array operation.** The service applied
- *    `filter`, `sort`, `limit` and `offset` before these rows existed
- *    (AAP 0.4.2), so re-ordering them here would show an order the panel
- *    specification never asked for and quietly break the ranking this node
- *    exists to present. A header click changes the query and the data comes
- *    back ordered.
+ * 2. **An order the service can apply is a re-query, never an array
+ *    operation.** The service applied `filter`, `sort`, `limit` and `offset`
+ *    before these rows existed (AAP 0.4.2), so re-ordering them here would show
+ *    an order the panel specification never asked for and quietly break the
+ *    ranking this node exists to present. A header click that names one of the
+ *    data layer's orderings changes the query and the data comes back ordered.
+ *
+ *    This table goes one step further, and says so. The data layer can order a
+ *    span list in exactly two ways — longest duration first (`duration_desc`)
+ *    and earliest start first (`start_asc`) — and AAP 0.2.3 freezes that
+ *    vocabulary. Every other column and direction a reader asks for (Operation,
+ *    Kind and Tier either way, Start latest first, Duration shortest first) is
+ *    a **view order**: the rows already loaded are re-arranged here, stably,
+ *    with the service's own position as the tie-break, and nothing is
+ *    re-queried. The rows are never re-arranged inside `primitives/DataTable`,
+ *    which stays controlled; this component hands it the arranged rows and the
+ *    view order as its `sort`, so the header's indicator and `aria-sort` show
+ *    the order on screen. A view order changes only the arrangement, never
+ *    which rows are loaded, so "Load more" still requests the next page in the
+ *    service's order and the view order is re-applied to every accumulated
+ *    row. While the loaded rows are not the whole result, the footer says that
+ *    the order covers only those rows — the one thing a local re-arrangement
+ *    could otherwise misrepresent. Re-activating a service ordering that is
+ *    already applied clears the view order without a re-query, because the
+ *    accumulated rows are already in that order.
  * 3. **A page is a page, and the footer says so.** A response carries `total`
  *    and `nextOffset`; this component renders the loaded count against the
  *    total and offers "Load more" only while the service reports a next offset
@@ -33,16 +52,32 @@
  *    counts rows the service offered no page for, the footer says so instead of
  *    inventing one. It never truncates in silence, and when the service reported
  *    no total it says the total is unknown instead of implying the table is
- *    complete.
+ *    complete. The footer's sentence is a polite live region, so the new count
+ *    is announced when a page arrives.
+ *
+ *    The footer is drawn whenever rows are on screen, including when every row
+ *    is loaded ("Showing 115 of 115 spans."): a count is how a reader knows the
+ *    table is complete, and a footer that appeared only for partial results
+ *    would make its absence the signal. The node's `limit` is the **page
+ *    size**, not a cap on the table (AAP 0.4.2 pages with `limit`/`offset`;
+ *    `RenderTable` and `QueryTable` read it the same way), so "Load more"
+ *    continues past it for as long as the service reports a next page, and
+ *    while a further page is offered or loading the footer states that size so
+ *    the reader can tell a page of the result from the whole of it.
  * 4. **Three states, one precedence.** A query in flight with nothing to show
  *    renders `LoadingState`; a failure with nothing to show renders
- *    `ErrorState` with the serialised query and a retry; a successful result
+ *    `ErrorState` with the serialised query and a retry, worded by the host's
+ *    one error-state contract (`queryFailureProps` in `host/useQuery`) so it
+ *    reads like every other failed node in the panel; a successful result
  *    with no rows renders `EmptyState`, whose copy tells an empty capture
  *    (nothing matched) apart from a count-only query (`limit: 0`) and from a
  *    page that holds none of the rows the reported total counts, and names that
  *    total instead of claiming nothing was captured. Once rows are on screen
  *    they stay on screen: a page that fails or is still loading is reported in
  *    the footer rather than by replacing rows the reader is already reading.
+ *    Once the reader has asked for an order, the grid's header stays on screen
+ *    too: the state that follows a re-query is drawn in the grid's empty slot,
+ *    so the sort control they activated keeps its place and their focus.
  *
  * ## What this component is not allowed to do, and therefore does not
  *
@@ -85,9 +120,16 @@
  * - **No grid of its own.** `primitives/DataTable` owns the ARIA grid roles,
  *   the header, the roving tab stop, the keyboard model and the virtual
  *   viewport; this module contributes rows, columns and callbacks. It adds no
- *   `role`, no second scroll container and no measurement of its own — the
- *   primitive's measurement fallback is what makes these rows render in a
- *   test environment that measures nothing.
+ *   `role`, no key handler, no second scroll container and no measurement of
+ *   its own — the primitive's measurement fallback is what makes these rows
+ *   render in a test environment that measures nothing.
+ * - **No Tab stop inside a row.** The grid is one Tab stop, its active row;
+ *   ArrowRight (or F2) moves into that row's controls and ArrowLeft or Escape
+ *   returns, while ArrowUp/Down, Home/End and PageUp/PageDown move between
+ *   rows and Enter or Space selects one. The one obligation that model places
+ *   on a caller is met here: the only focusable control a cell renders — the
+ *   source chip — carries `tabIndex={-1}`, so it is reached by those keys and
+ *   by the pointer, never by Tab.
  *
  * ## Which fields it may read
  *
@@ -113,17 +155,23 @@ import type { DataQuery, DataQuerySort, TableNode } from '@debuggen/panel-schema
 import type { SourceLocation } from '@debuggen/shared';
 import type { TelemetryEvent } from '@debuggen/telemetry';
 import clsx from 'clsx';
+import { Timer } from 'lucide-react';
 import { useCallback, useMemo, useState } from 'react';
 import type { MouseEvent as ReactMouseEvent, ReactElement } from 'react';
 
 import { usePanelSessionId } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import { Stack } from '../layout/Stack';
 import { Badge } from '../primitives/Badge';
 import { Button } from '../primitives/Button';
 import { DataTable } from '../primitives/DataTable';
-import type { DataTableColumn, DataTableSort } from '../primitives/DataTable';
+import type {
+  DataTableColumn,
+  DataTableSort,
+  DataTableSortDirection,
+} from '../primitives/DataTable';
 import { DurationCell } from '../primitives/DurationCell';
 import { EmptyState } from '../primitives/EmptyState';
 import { ErrorState } from '../primitives/ErrorState';
@@ -259,7 +307,7 @@ function clampOffset(offset: number | undefined): number {
 
 /*
  * ---------------------------------------------------------------------------
- * Serialisation: one stable string, used for identity and for display
+ * Serialisation: one stable string, used for identity
  * ---------------------------------------------------------------------------
  */
 
@@ -267,12 +315,13 @@ function clampOffset(offset: number | undefined): number {
  * A data query as a compact, stable string: keys sorted, absent members
  * dropped, so the same query always serialises identically.
  *
- * Used for two things and nothing else — the identity of a page sequence (see
- * {@link PageAccumulator}) and the text `ErrorState` shows for a failed query,
- * which `primitives/ErrorState` takes as a plain string because the primitives
- * layer does not depend on the panel schema. A data query holds a source, a
- * narrowing filter, an ordering and two whole numbers; there is nothing
- * sensitive in it to withhold (AAP 0.5.2).
+ * Used for one thing and nothing else — the identity of a page sequence (see
+ * {@link PageAccumulator}). It is never shown to a reader: the text an
+ * `ErrorState` shows for a failed query is the host's one formatter's
+ * (`formatDataQuery`, reached through `queryFailureProps` and
+ * `unsupportedQueryProps`), so every node prints a query the same way. A data
+ * query holds a source, a narrowing filter, an ordering and two whole numbers;
+ * there is nothing sensitive in it to withhold (AAP 0.5.2).
  *
  * Deliberately mirrors the serialiser inside `host/useQuery`: this component
  * must be able to tell "the same query, one page further" from "a different
@@ -318,8 +367,8 @@ function stableJson(value: unknown): string {
 
 /*
  * A column's key is the name of the event field it orders by, so the key the
- * table reports upward through `onSortChange` translates into the data layer's
- * ordering vocabulary without a second lookup table. `satisfies` is what keeps
+ * table reports upward through `onSortChange` names the field a view order
+ * compares and the field a service ordering ranks by. `satisfies` is what keeps
  * that true: renaming a field in the event schema fails this file rather than
  * silently producing a column that sorts nothing.
  */
@@ -329,13 +378,118 @@ const TIER_COLUMN_KEY = 'tier' satisfies keyof TelemetryEvent;
 const START_COLUMN_KEY = 'startTime' satisfies keyof TelemetryEvent;
 const DURATION_COLUMN_KEY = 'duration' satisfies keyof TelemetryEvent;
 
-/**
- * The identity column's grid track: four times the share of each other column,
- * because an operation name is the one value here that is long and variable.
- * A ratio rather than an intrinsic track, so the column lands at the same
- * offset in every row (the header and each row are separate grid containers).
+/*
+ * The column tracks. Each is `minmax(<floor>, <share>)`:
+ *
+ * - The SHARE is a ratio, so a column lands at the same offset in every row
+ *   (the header and each row are separate grid containers) and spare width goes
+ *   to the operation name, the one long and variable value here, four parts to
+ *   every other column's one.
+ * - The FLOOR is what the column never shrinks below. `primitives/DataTable`
+ *   sums the floors into the grid's own minimum width, so a surface narrower
+ *   than their sum scrolls the table horizontally with every column still
+ *   readable, instead of squeezing each column to its padding and letting one
+ *   cell's content paint over the next. Each floor is measured in `ch` of the
+ *   table's type and covers the column's header - with the sort arrow where the
+ *   column is sortable - its widest bounded value and the cell's own inline
+ *   padding. `ch` rather than any literal length (AAP 0.6.4).
  */
-const NAME_COLUMN_TRACK = 'minmax(0, 4fr)';
+
+/**
+ * The operation name, its failure chip and its source chip. The value is free
+ * text, so the floor keeps a readable excerpt of the name beside a compact
+ * source chip whose file label ellipsizes; the full name wins spare width.
+ */
+const NAME_COLUMN_TRACK = 'minmax(28ch, 4fr)';
+
+/** The kind chip: fits the longest kind label, "Performance entry", whole. */
+const KIND_COLUMN_TRACK = 'minmax(18ch, 1fr)';
+
+/** The tier chip: fits the longest tier label, "Database", whole. */
+const TIER_COLUMN_TRACK = 'minmax(11ch, 1fr)';
+
+/**
+ * The relative start: fits an offset up to five integer digits in seconds
+ * ("12,345.678 s") and the sortable header with its arrow.
+ */
+const START_COLUMN_TRACK = 'minmax(12ch, 1fr)';
+
+/**
+ * The duration, in the duration cell's wider figures: fits every millisecond
+ * value ("999.99 ms") and seconds up to four integer digits ("1,234.567 s"),
+ * and the sortable header with its arrow.
+ */
+const DURATION_COLUMN_TRACK = 'minmax(13ch, 1fr)';
+
+/** The key of one of this table's columns. */
+type SpanColumnKey =
+  | typeof NAME_COLUMN_KEY
+  | typeof KIND_COLUMN_KEY
+  | typeof TIER_COLUMN_KEY
+  | typeof START_COLUMN_KEY
+  | typeof DURATION_COLUMN_KEY;
+
+/** Every column key, for narrowing the plain string the primitive reports. */
+const SPAN_COLUMN_KEYS: readonly SpanColumnKey[] = Object.freeze([
+  NAME_COLUMN_KEY,
+  KIND_COLUMN_KEY,
+  TIER_COLUMN_KEY,
+  START_COLUMN_KEY,
+  DURATION_COLUMN_KEY,
+]);
+
+/**
+ * Narrow a key `primitives/DataTable` reported to one of this table's columns.
+ *
+ * @param key The {@link DataTableSort.key} the primitive proposed.
+ * @returns The column key, or `undefined` for a key this table never rendered.
+ */
+function spanColumnKeyOf(key: string): SpanColumnKey | undefined {
+  return SPAN_COLUMN_KEYS.find((candidate) => candidate === key);
+}
+
+/**
+ * One column and one direction of this table: what the reader asked for by
+ * activating a header, and — when the service cannot apply it — the view order
+ * the loaded rows are arranged in. Assignable to {@link DataTableSort}, which
+ * is how the arranged order reaches the header's indicator and `aria-sort`.
+ */
+interface SpanOrder {
+  /** The column the rows are ordered by. */
+  readonly key: SpanColumnKey;
+
+  /** The direction that ordering runs in. */
+  readonly direction: DataTableSortDirection;
+}
+
+/**
+ * The name each column's ordering is reported under, as the first half of
+ * `<column>_<direction>` — see {@link sortReportFor}.
+ */
+const SORT_REPORT_COLUMN_NAMES: Readonly<Record<SpanColumnKey, string>> = Object.freeze({
+  [NAME_COLUMN_KEY]: 'name',
+  [KIND_COLUMN_KEY]: 'kind',
+  [TIER_COLUMN_KEY]: 'tier',
+  [START_COLUMN_KEY]: 'start',
+  [DURATION_COLUMN_KEY]: 'duration',
+});
+
+/**
+ * What an order change is reported to the host as, through
+ * `PanelActions.onFilterChange(nodeId, { sort })`.
+ *
+ * `<column>_<direction>` for every column (`name_asc`, `tier_desc`, …). The two
+ * orderings the service applies are spelled exactly as the data layer spells
+ * them — `duration_desc` and `start_asc` — so a host that remembers the
+ * reader's choice sees the {@link DataQuerySort} names for those two, and a
+ * name outside that vocabulary is, by construction, a view order.
+ *
+ * @param order The column and direction now in force.
+ * @returns The report's `sort` value.
+ */
+function sortReportFor(order: SpanOrder): string {
+  return `${SORT_REPORT_COLUMN_NAMES[order.key]}_${order.direction}`;
+}
 
 /**
  * The ordering a data query can actually be given, rendered as the table's own
@@ -349,7 +503,7 @@ const NAME_COLUMN_TRACK = 'minmax(0, 4fr)';
  * @param sort The ordering the effective query carries, if any.
  * @returns The column and direction to show as sorted, or `null` for none.
  */
-function displaySortFor(sort: DataQuerySort | undefined): DataTableSort | null {
+function displaySortFor(sort: DataQuerySort | undefined): SpanOrder | null {
   if (sort === 'duration_desc') {
     return { key: DURATION_COLUMN_KEY, direction: 'desc' };
   }
@@ -362,29 +516,148 @@ function displaySortFor(sort: DataQuerySort | undefined): DataTableSort | null {
 }
 
 /**
- * The data-query ordering nearest to a sort the table proposed.
+ * The data-query ordering that applies a requested order, when the service can
+ * apply it.
  *
- * The direction is deliberately ignored. The data layer offers one direction per
- * key — longest first, or earliest first — so a second click on a sorted column,
- * which the primitive proposes as a flip, has no equivalent to re-query with.
- * Returning the same ordering leaves the applied order and the header's
- * `aria-sort` in agreement instead of showing an ascending arrow over rows the
- * service ordered descending (AAP 0.4.2). A column outside that vocabulary
- * yields `undefined` and the caller declines the change.
+ * The data layer orders a span list in two ways only (AAP 0.2.3 freezes the
+ * vocabulary): longest duration first and earliest start first. Exactly those
+ * two column-and-direction pairs are service orders, and re-query; every other
+ * pair — including the reverse of either — yields `undefined` and becomes a
+ * view order over the rows already loaded (module decision 2). The direction is
+ * therefore part of the mapping: re-activating the sorted Duration header, which
+ * the primitive proposes as a flip to ascending, is a view order rather than a
+ * silent no-op or a re-query that would come back in the same order.
  *
- * @param sort The sort the primitive proposed.
- * @returns The ordering to request, or `undefined` when there is none.
+ * @param order The column and direction the reader asked for.
+ * @returns The ordering to request, or `undefined` when the service has none.
  */
-function querySortFor(sort: DataTableSort): DataQuerySort | undefined {
-  if (sort.key === DURATION_COLUMN_KEY) {
+function serviceSortFor(order: SpanOrder): DataQuerySort | undefined {
+  if (order.key === DURATION_COLUMN_KEY && order.direction === 'desc') {
     return 'duration_desc';
   }
 
-  if (sort.key === START_COLUMN_KEY) {
+  if (order.key === START_COLUMN_KEY && order.direction === 'asc') {
     return 'start_asc';
   }
 
   return undefined;
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * View orders: arranging the rows already loaded
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Compares operation names and kind labels as a reader reads them: by the
+ * runtime's locale, with digit runs compared as numbers so `step 2` precedes
+ * `step 10`. Built once, because a collator is costly to construct and cheap to
+ * call.
+ */
+const DISPLAY_TEXT_COLLATOR = new Intl.Collator(undefined, { numeric: true });
+
+/**
+ * The tiers in the order a request travels through them: the page, then the
+ * server, then the datastore. Ascending Tier follows this pipeline order,
+ * descending reverses it. Keyed by the closed tier vocabulary, so a tier added
+ * to the event schema fails this file until it is placed.
+ */
+const TIER_PIPELINE_RANK: Readonly<Record<TelemetryEvent['tier'], number>> = Object.freeze({
+  browser: 0,
+  server: 1,
+  db: 2,
+});
+
+/** `1` for ascending, `-1` for descending: the factor a comparison is scaled by. */
+type OrderSign = 1 | -1;
+
+/**
+ * Compares two figures in the requested direction, with any value that is not
+ * a finite number placed after every finite one in either direction: such a
+ * value renders as "n/a", and a reversal should not bring the unmeasured rows
+ * to the top of a ranking.
+ *
+ * @param left The first figure.
+ * @param right The second figure.
+ * @param sign The direction factor.
+ * @returns A negative number, zero or a positive number, as `Array#sort` expects.
+ */
+function compareFigures(left: number, right: number, sign: OrderSign): number {
+  const leftFinite = Number.isFinite(left);
+  const rightFinite = Number.isFinite(right);
+
+  if (!leftFinite || !rightFinite) {
+    if (leftFinite === rightFinite) {
+      return 0;
+    }
+
+    return leftFinite ? -1 : 1;
+  }
+
+  return sign * (left - right);
+}
+
+/**
+ * The pipeline position of a tier, or `NaN` — which {@link compareFigures}
+ * places last — for a tier this build does not know. The annotation widens the
+ * lookup so that runtime case is handled rather than assumed away.
+ *
+ * @param tier The event's tier.
+ * @returns Its rank in {@link TIER_PIPELINE_RANK}.
+ */
+function tierRankOf(tier: TelemetryEvent['tier']): number {
+  const rank: number | undefined = TIER_PIPELINE_RANK[tier];
+
+  return rank ?? Number.NaN;
+}
+
+/** Compares two rows by one column, in the direction the sign names. */
+type RowComparator = (left: TelemetryEvent, right: TelemetryEvent, sign: OrderSign) => number;
+
+/**
+ * How each column compares two rows: text columns by the text the cell
+ * displays, through {@link DISPLAY_TEXT_COLLATOR}; Tier by pipeline position;
+ * Start and Duration numerically. Keyed by every column, so a column added to
+ * {@link SpanColumnKey} fails this file until it can be ordered.
+ */
+const ROW_COMPARATORS: Readonly<Record<SpanColumnKey, RowComparator>> = Object.freeze({
+  [NAME_COLUMN_KEY]: (left, right, sign) =>
+    sign * DISPLAY_TEXT_COLLATOR.compare(left.name, right.name),
+  [KIND_COLUMN_KEY]: (left, right, sign) =>
+    sign * DISPLAY_TEXT_COLLATOR.compare(formatKindLabel(left.kind), formatKindLabel(right.kind)),
+  [TIER_COLUMN_KEY]: (left, right, sign) =>
+    compareFigures(tierRankOf(left.tier), tierRankOf(right.tier), sign),
+  [START_COLUMN_KEY]: (left, right, sign) => compareFigures(left.startTime, right.startTime, sign),
+  [DURATION_COLUMN_KEY]: (left, right, sign) => compareFigures(left.duration, right.duration, sign),
+});
+
+/**
+ * The loaded rows arranged in a view order, as a new array.
+ *
+ * Stable by construction rather than by trusting the engine: rows that compare
+ * equal keep the position the service gave them, in both directions, so a
+ * reversal re-ranks only what differs and the service's own tie-break (its
+ * stable secondary key, AAP 0.4.2) still decides among equals. The input is
+ * never mutated: it is the accumulated service-ordered sequence that "Load
+ * more" appends to.
+ *
+ * @param rows The accumulated rows, in the service's order.
+ * @param order The view order to arrange them in.
+ * @returns The same rows, re-arranged.
+ */
+function arrangeRows(rows: readonly TelemetryEvent[], order: SpanOrder): readonly TelemetryEvent[] {
+  const compare = ROW_COMPARATORS[order.key];
+  const sign: OrderSign = order.direction === 'asc' ? 1 : -1;
+  const positioned = rows.map((event, position) => ({ event, position }));
+
+  positioned.sort((left, right) => {
+    const primary = compare(left.event, right.event, sign);
+
+    return primary === 0 ? left.position - right.position : primary;
+  });
+
+  return positioned.map((entry) => entry.event);
 }
 
 /*
@@ -400,21 +673,27 @@ const TIER_HEADER = 'Tier';
 const START_HEADER = 'Start';
 const DURATION_HEADER = 'Duration';
 
+/*
+ * Every header's accessible name is its column's name and nothing about a
+ * direction: each column sorts both ways, and the direction in force is
+ * reported by the header cell's `aria-sort`, never by a label that would go
+ * stale the moment the reader reversed it.
+ */
+
 /** Names the sort control of a column whose values are relative, not absolute. */
 const START_HEADER_LABEL = 'Start, relative to the earliest listed operation';
 
-/** Names the duration sort control, which orders longest-first in one direction only. */
-const DURATION_HEADER_LABEL = 'Duration, longest first';
-
 const EMPTY_MESSAGE = 'No spans matched this query.';
+const EMPTY_TITLE = 'No spans';
 const COUNT_ONLY_TITLE = 'Count only';
 const COUNT_ONLY_UNKNOWN_TOTAL_MESSAGE =
   'This view requests a count without rows, and no total was reported for its query.';
 const EMPTY_PAGE_TITLE = 'Nothing on this page';
-const ERROR_MESSAGE = 'The spans for this view could not be loaded.';
-const UNSUPPORTED_SOURCE_MESSAGE =
-  'This view reads span records, and its query names a source that does not provide them.';
-const PAGE_ERROR_MESSAGE = 'The next page of spans could not be loaded.';
+/**
+ * What the first page's loading state announces, ending in the single `…` every
+ * busy region in a panel announces itself with.
+ */
+const LOADING_LABEL = `Loading captured spans${ELLIPSIS}`;
 const LOAD_MORE_LABEL = 'Load more';
 const LOADING_MORE_LABEL = `Loading${ELLIPSIS}`;
 
@@ -467,6 +746,47 @@ function rowKeyOf(event: TelemetryEvent): string {
 }
 
 /**
+ * The pointer a row stands for: what it reports when activated and what it is
+ * matched against the panel's selection by.
+ *
+ * The span's own coordinates travel with the id, so a selection another view
+ * reported for the same span under a different record id still marks this row
+ * (see `matchesPanelSelection`).
+ *
+ * @param event The span record.
+ * @returns The event reference `PanelActions.onSelectEvent` takes.
+ */
+function eventRefOf(event: TelemetryEvent): PanelEventRef {
+  return { eventId: event.id, spanId: event.spanId, traceId: event.traceId };
+}
+
+/**
+ * The key of the loaded row that stands for the panel's selected event.
+ *
+ * Only rows on screen can be marked: a selection whose event this table has not
+ * loaded — or never will, because its query does not select it — leaves every
+ * row unselected rather than inventing a mark, and the row is marked the moment
+ * a page that holds it arrives.
+ *
+ * @param rows The rows on screen, in the service's order: the first record that
+ *   matches keeps the mark under every view order.
+ * @param selection The panel's selection, or `undefined` for none.
+ * @returns The matching row's key, or `null` when no loaded row stands for it.
+ */
+function selectedRowKeyOf(
+  rows: readonly TelemetryEvent[],
+  selection: PanelSelection | undefined,
+): string | null {
+  if (selection === undefined) {
+    return null;
+  }
+
+  const match = rows.find((event) => matchesPanelSelection(selection, eventRefOf(event)));
+
+  return match === undefined ? null : rowKeyOf(match);
+}
+
+/**
  * The columns to render, in display order.
  *
  * Each column names the one event field it cannot render without, and is
@@ -494,6 +814,9 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
       // The row's header cell, so a reader hears the operation named as they
       // move across the row rather than hearing five unattributed values.
       rowHeader: true,
+      // A view order either way (module decision 2): A to Z first.
+      sortable: true,
+      defaultSortDirection: 'asc',
       cell: (event) => (
         <>
           <Text as="span" size="sm" truncate className="dg-span-table__name-cell">
@@ -506,7 +829,17 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
           ) : null}
           {showSource && event.source !== undefined ? (
             <span className="dg-span-table__source-cell" onClick={stopRowActivation}>
-              <SourceLink location={event.source} compact onOpenSource={onOpenSource} />
+              {/* `tabIndex={-1}`: the grid is ONE Tab stop, its active row, and its
+                  arrow keys move focus onto this chip (`primitives/DataTable`'s
+                  keyboard model). Left in the Tab order, every row would add a
+                  stop of its own. Pointer activation and Enter/Space on the
+                  focused chip are unchanged. */}
+              <SourceLink
+                location={event.source}
+                compact
+                onOpenSource={onOpenSource}
+                tabIndex={-1}
+              />
             </span>
           ) : null}
         </>
@@ -518,6 +851,10 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: KIND_COLUMN_KEY,
       header: KIND_HEADER,
+      width: KIND_COLUMN_TRACK,
+      // A view order either way, by the label the chip displays.
+      sortable: true,
+      defaultSortDirection: 'asc',
       cell: (event) => (
         <span className="dg-span-table__kind-cell">
           {/* The kind scale is spent on the chip's hairline, never on its label:
@@ -534,6 +871,11 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: TIER_COLUMN_KEY,
       header: TIER_HEADER,
+      width: TIER_COLUMN_TRACK,
+      // A view order either way: pipeline order (browser, server, database)
+      // first, then its reverse.
+      sortable: true,
+      defaultSortDirection: 'asc',
       cell: (event) => (
         <span className="dg-span-table__tier-cell">
           <Badge variant="outline" color={tierColorVar(event.tier)}>
@@ -549,8 +891,10 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
       key: START_COLUMN_KEY,
       header: START_HEADER,
       headerLabel: START_HEADER_LABEL,
+      width: START_COLUMN_TRACK,
       align: 'end',
       sortable: true,
+      // Earliest first is the service's `start_asc`; latest first is a view order.
       defaultSortDirection: 'asc',
       cell: (event) => (
         <Text as="span" size="sm" numeric>
@@ -564,9 +908,11 @@ function buildColumns(context: ColumnContext): readonly DataTableColumn<Telemetr
     columns.push({
       key: DURATION_COLUMN_KEY,
       header: DURATION_HEADER,
-      headerLabel: DURATION_HEADER_LABEL,
+      width: DURATION_COLUMN_TRACK,
       align: 'end',
       sortable: true,
+      // Longest first is the service's `duration_desc`; shortest first is a
+      // view order.
       defaultSortDirection: 'desc',
       cell: (event) => (
         // Severity - and the thresholds behind it - belong to `../utils/color`
@@ -658,6 +1004,45 @@ function describeUnreachable(remaining: number): string {
   )} ${spanNoun(remaining)} cannot be loaded here.`;
 }
 
+/**
+ * The sentence the footer adds while a view order is applied to rows that are
+ * not the whole result: a further page exists, the total is unknown, the node
+ * starts part-way through, or the total counts rows that are not loaded.
+ *
+ * A view order arranges only what is on screen (module decision 2), so without
+ * this sentence a reader would take the first row under "Kind, A to Z" or
+ * "Duration, shortest first" as the first of the whole capture — the silent
+ * re-ordering of a visible slice that `primitives/DataTable` refuses to do on
+ * its own. The sentence names the scope and the two orderings that do cover
+ * the full result, so the reader knows which header to use for a ranking of
+ * everything that matched.
+ *
+ * @param loaded How many rows the view order arranged; positive.
+ * @returns The footer's scope sentence.
+ */
+function describeViewOrderScope(loaded: number): string {
+  return `This order covers only the ${formatCount(loaded)} loaded ${spanNoun(
+    loaded,
+  )}; the service orders the full result only by longest duration or earliest start.`;
+}
+
+/**
+ * The sentence the footer adds while a further page is offered or loading: the
+ * page size each "Load more" request asks for.
+ *
+ * The node's `limit` is a page size, never a cap on the table (module decision
+ * 3), so a node authored with `limit: 10` shows ten rows first and "Load more"
+ * continues past them. Stating the size is what keeps that honest: without it
+ * a reader could take "Showing 10 of 115" for a table the panel meant to stop
+ * at ten.
+ *
+ * @param limit The page size the query requests; positive.
+ * @returns The footer's page-size sentence.
+ */
+function describePageSize(limit: number): string {
+  return `Each page holds up to ${formatCount(limit)} ${spanNoun(limit)}.`;
+}
+
 /** What the empty state says: an optional first line, and the sentence under it. */
 interface EmptyPageCopy {
   /** The short label above the sentence, or `undefined` for none. */
@@ -666,6 +1051,16 @@ interface EmptyPageCopy {
   /** The sentence itself. */
   readonly message: string;
 }
+
+/**
+ * The copy of the empty capture — nothing matched the query — as one frozen
+ * value, so the empty state recognises the case by reference and gives it the
+ * view's glyph. Every other empty page is a statement about paging.
+ */
+const NOTHING_CAPTURED_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_TITLE,
+  message: EMPTY_MESSAGE,
+});
 
 /**
  * The copy for a successful query that left no row on screen.
@@ -740,7 +1135,7 @@ function describeEmptyPage(
   }
 
   if (total === 0 || (total === undefined && pageOffset === DATA_QUERY_DEFAULT_OFFSET)) {
-    return { title: undefined, message: EMPTY_MESSAGE };
+    return NOTHING_CAPTURED_COPY;
   }
 
   const position = formatCount(pageOffset + FIRST_POSITION_OFFSET);
@@ -909,8 +1304,15 @@ export interface SpanTableProps {
  *
  * Data comes from the host's `DataProvider` through {@link useQuery} and
  * interactions leave through `PanelActions`; this component holds three pieces
- * of local state and nothing else — the ordering the reader asked for, the pages
- * they have loaded, and the row they last activated in this table.
+ * of local state and nothing else — the service ordering the reader asked for,
+ * the view order they asked for when the service has none (module decision 2),
+ * and the pages they have loaded. The selected row is the panel's shared
+ * selection, read through `useViewSelection`: under the panel host a selection
+ * made in any view or evidence chip marks the row for the same event here, and
+ * a row activated here marks the same event everywhere else (AAP 0.7.3).
+ * Outside a host the hook falls back to the row last activated in this table.
+ * A view order re-arranges rows, never which row is selected: the mark follows
+ * the event wherever the arrangement places it.
  *
  * @param props The props documented on {@link SpanTableProps}.
  * @returns The block, in whichever of its four states the query is in.
@@ -923,15 +1325,20 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const { node, nodeId, className } = props;
 
   const actions = usePanelActions();
+  // The panel's one selection, shared with every other view under the host, and
+  // the recorder this table calls on activation (a no-op under a host, which
+  // records the report itself; the table's own fallback outside one).
+  const { selection, markSelected } = useViewSelection();
 
   // The ordering the reader asked for, which overrides the node's own. Undefined
   // until they ask, so a panel's authored ordering is what they first see.
   const [sortOverride, setSortOverride] = useState<DataQuerySort | undefined>(undefined);
+  // The order the reader asked for that the service cannot apply, arranged over
+  // the loaded rows here; `null` while the rows are shown in the service's
+  // order. Not part of the query or of the page sequence's identity: it changes
+  // how the loaded rows are arranged, never which rows are loaded.
+  const [viewOrder, setViewOrder] = useState<SpanOrder | null>(null);
   const [pages, setPages] = useState<PageAccumulator | undefined>(undefined);
-  // The row this table last activated. Local by design: the host owns what a
-  // selection means elsewhere in the panel, and this is only the feedback that
-  // the click landed on the row the reader aimed at.
-  const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
 
   const identity = nodeId ?? node.id;
   const source = spanSourceOf(node.query.source);
@@ -989,7 +1396,8 @@ export function SpanTable(props: SpanTableProps): ReactElement {
     };
   }, [source, limit, offset, filter, appliedSort]);
 
-  const { status, data, error, total, nextOffset, retry } = useQuery<SpanSource>(query);
+  const { status, data, error, announcement, total, nextOffset, retry } =
+    useQuery<SpanSource>(query);
 
   // The page that resolved, or `undefined` while one is in flight or has failed.
   const pageRows = status === 'success' ? (data ?? NO_ROWS) : undefined;
@@ -1011,6 +1419,17 @@ export function SpanTable(props: SpanTableProps): ReactElement {
 
     return [...loaded, ...pageRows];
   }, [activePages, pageRows]);
+
+  // The rows as the grid draws them: the accumulated sequence in the service's
+  // order, or — while the reader has asked for an order the service cannot
+  // apply — that same sequence arranged in the view order (module decision 2).
+  // Derived here rather than held in state, so every page "Load more" appends is
+  // arranged with the rest in the same render it arrives in; `rows` itself stays
+  // in the service's order, because it is what the next page is appended to.
+  const displayRows = useMemo<readonly TelemetryEvent[]>(
+    () => (viewOrder === null ? rows : arrangeRows(rows, viewOrder)),
+    [rows, viewOrder],
+  );
 
   // The reference point for the relative start column: the earliest start among
   // the rows on screen. It moves when a later page brings an earlier row, which
@@ -1037,42 +1456,89 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const onOpenSource = actions?.onOpenSource;
 
   const columns = useMemo(() => buildColumns({ origin, onOpenSource }), [origin, onOpenSource]);
-  const displaySort = useMemo(() => displaySortFor(appliedSort), [appliedSort]);
-  // Serialised once, for the one consumer that needs it as text. `query` is
-  // undefined only when the node named a source this view cannot draw, and then
-  // the node's own query is the thing worth showing.
-  const serializedQuery = useMemo(() => stableJson(query ?? node.query), [query, node.query]);
+  // The order the header reports: the view order while one is applied, so the
+  // indicator and `aria-sort` describe the rows on screen, and otherwise the
+  // service ordering the query carries.
+  const displaySort = useMemo<DataTableSort | null>(
+    () => viewOrder ?? displaySortFor(appliedSort),
+    [viewOrder, appliedSort],
+  );
+
+  // The loaded row that stands for the panel's selected event, whichever view
+  // selected it. Re-derived when either the rows or the selection change, so a
+  // page that brings the selected event marks it as it arrives. Matched against
+  // the service-ordered `rows`, never `displayRows`: where a selection names
+  // only a trace and span that more than one loaded record carries, the mark
+  // stays on the same record whichever view order arranges them, instead of
+  // moving to whichever match the arrangement happens to place first.
+  const selectedRowKey = useMemo(() => selectedRowKeyOf(rows, selection), [rows, selection]);
 
   const handleRowActivate = useCallback(
     (event: TelemetryEvent): void => {
-      setSelectedRowKey(event.id);
-      actions?.onSelectEvent({
-        eventId: event.id,
-        spanId: event.spanId,
-        traceId: event.traceId,
-      });
+      const ref = eventRefOf(event);
+
+      // Recorded first, reported second: under the panel host the report is
+      // what moves the shared selection (the recorder is a no-op there), and
+      // outside one the recorder is what marks the row.
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
+    [actions, markSelected],
   );
 
   const handleSortRequest = useCallback(
     (proposed: DataTableSort): void => {
-      const requested = querySortFor(proposed);
+      const key = spanColumnKeyOf(proposed.key);
 
-      // A column outside the data layer's ordering vocabulary, or the ordering
-      // already applied: nothing to re-query, so nothing changes. The header
-      // keeps reporting the order the rows are actually in.
-      if (requested === undefined || requested === appliedSort) {
+      // A key this table never rendered as a column: there is nothing to order
+      // by, so nothing changes.
+      if (key === undefined) {
         return;
       }
 
-      setSortOverride(requested);
+      const requested: SpanOrder = { key, direction: proposed.direction };
+      const serviceSort = serviceSortFor(requested);
+
+      // An order the service cannot apply: arrange the loaded rows instead, with
+      // no re-query — the rows loaded are the same rows, only their arrangement
+      // changes. The primitive always proposes a change, so an unchanged view
+      // order is declined rather than reported twice.
+      if (serviceSort === undefined) {
+        if (
+          viewOrder !== null &&
+          viewOrder.key === requested.key &&
+          viewOrder.direction === requested.direction
+        ) {
+          return;
+        }
+
+        setViewOrder(requested);
+        actions?.onFilterChange?.(identity, { sort: sortReportFor(requested) });
+        return;
+      }
+
+      // The service ordering already applied: the accumulated rows are in that
+      // order as they stand, so returning to it — Duration shortest first back
+      // to longest first — clears the view order without a re-query. With no
+      // view order in force nothing would change, so nothing is reported.
+      if (serviceSort === appliedSort) {
+        if (viewOrder === null) {
+          return;
+        }
+
+        setViewOrder(null);
+        actions?.onFilterChange?.(identity, { sort: serviceSort });
+        return;
+      }
+
+      setSortOverride(serviceSort);
+      setViewOrder(null);
       // A new ordering is a new page sequence: rows accumulated under the old one
       // describe a different ranking and must not be carried into this one.
       setPages(undefined);
-      actions?.onFilterChange?.(identity, { sort: requested });
+      actions?.onFilterChange?.(identity, { sort: serviceSort });
     },
-    [actions, appliedSort, identity],
+    [actions, appliedSort, identity, viewOrder],
   );
 
   // The page the service says follows the one that resolved, when it named one
@@ -1118,13 +1584,30 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   const appending = status === 'loading' && loadedCount > 0;
   const pageFailed = status === 'error' && loadedCount > 0;
   const showLoadMore = canLoadMore || appending;
-  const showFooter =
-    showLoadMore || pageFailed || knownTotal === undefined || unreachable !== undefined;
-  const coverageText = describeCoverage(loadedCount, knownTotal, baseOffset);
-  const footerText =
-    unreachable === undefined
-      ? coverageText
-      : `${coverageText} ${describeUnreachable(unreachable)}`;
+  // Every row the query matched is on screen: the service reported a total, the
+  // node starts at the first item, the loaded rows reach that total, and no
+  // further page is offered or in flight. Only then does a view order cover the
+  // whole result; anything less and the footer says what the order covers.
+  const wholeResultLoaded =
+    knownTotal !== undefined &&
+    baseOffset === DATA_QUERY_DEFAULT_OFFSET &&
+    loadedCount >= knownTotal &&
+    !showLoadMore;
+  const scopeCaveat =
+    viewOrder !== null && loadedCount > 0 && !wholeResultLoaded
+      ? describeViewOrderScope(loadedCount)
+      : undefined;
+  // Drawn whenever rows are on screen, the complete case included (module
+  // decision 3): the count is how a reader knows the table is complete.
+  const showFooter = loadedCount > 0;
+  const footerText = [
+    describeCoverage(loadedCount, knownTotal, baseOffset),
+    unreachable === undefined ? undefined : describeUnreachable(unreachable),
+    showLoadMore ? describePageSize(limit) : undefined,
+    scopeCaveat,
+  ]
+    .filter((sentence): sentence is string => sentence !== undefined)
+    .join(' ');
 
   const blockClassName = clsx('dg-span-table', className);
   // The grid's accessible name. The node's title when it has one, and otherwise
@@ -1134,56 +1617,53 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   // A node whose query names a source that does not resolve to span records: a
   // validated specification cannot reach this state, so it is reported as the
   // failure it is rather than drawn as an empty table. No retry is offered,
-  // because re-issuing the same query cannot change the answer.
-  if (source === undefined) {
+  // because re-issuing the same query cannot change the answer, and the node's
+  // own query is the thing worth showing. `query` is undefined exactly when
+  // `source` is; testing both narrows it for the failure states below.
+  if (source === undefined || query === undefined) {
     return (
       <Stack className={blockClassName} gap={2}>
         <ErrorState
           className="dg-span-table__error"
-          message={UNSUPPORTED_SOURCE_MESSAGE}
-          query={serializedQuery}
+          {...unsupportedQueryProps(node.type, node.query)}
         />
       </Stack>
     );
   }
 
-  if (status === 'loading' && loadedCount === 0) {
-    return (
-      <Stack className={blockClassName} gap={2}>
-        <LoadingState className="dg-span-table__loading" variant="rows" />
-      </Stack>
-    );
-  }
+  // The state that stands in for rows while none are on screen, in decision 4's
+  // precedence; `undefined` once rows are on screen.
+  let inPlaceOfRows: ReactElement | undefined;
 
-  if (status === 'error' && loadedCount === 0) {
-    return (
-      <Stack className={blockClassName} gap={2}>
-        <ErrorState
-          className="dg-span-table__error"
-          message={error?.message ?? ERROR_MESSAGE}
-          code={error?.code}
-          query={serializedQuery}
-          onRetry={retry}
-        />
-      </Stack>
-    );
-  }
-
-  // Nothing loaded, nothing in flight and nothing failed: the query succeeded
-  // and left no row on screen. That is an empty capture only when nothing
-  // matched; a count-only query, a page past the end and a page the total says
-  // should hold rows are each described as what they are. When the service
-  // still named a forward page, the state carries the control that reaches it,
-  // so an empty page never strands the rows after it.
   if (loadedCount === 0) {
-    const emptyCopy = describeEmptyPage(limit, knownTotal, offset, canLoadMore);
+    if (status === 'loading') {
+      inPlaceOfRows = (
+        <LoadingState className="dg-span-table__loading" variant="rows" label={LOADING_LABEL} />
+      );
+    } else if (status === 'error') {
+      // The shared failure contract, with the query exactly as it was asked: the
+      // generic lead and the provider's own cause, its hint, its code and a retry.
+      inPlaceOfRows = (
+        <ErrorState
+          className="dg-span-table__error"
+          {...queryFailureProps({ error, announcement, retry }, query, { scope: 'view' })}
+        />
+      );
+    } else {
+      // Nothing loaded, nothing in flight and nothing failed: the query
+      // succeeded and left no row on screen. That is an empty capture only when
+      // nothing matched; a count-only query, a page past the end and a page the
+      // total says should hold rows are each described as what they are. When
+      // the service still named a forward page, the state carries the control
+      // that reaches it, so an empty page never strands the rows after it.
+      const emptyCopy = describeEmptyPage(limit, knownTotal, offset, canLoadMore);
 
-    return (
-      <Stack className={blockClassName} gap={2}>
+      inPlaceOfRows = (
         <EmptyState
           className="dg-span-table__empty"
           title={emptyCopy.title}
           message={emptyCopy.message}
+          icon={emptyCopy === NOTHING_CAPTURED_COPY ? <Timer className="dg-icon" /> : undefined}
           action={
             canLoadMore ? (
               <Button variant="secondary" size="sm" onClick={handleLoadMore}>
@@ -1192,6 +1672,25 @@ export function SpanTable(props: SpanTableProps): ReactElement {
             ) : undefined
           }
         />
+      );
+    }
+  }
+
+  // Where that state is drawn. Before the reader has asked for any order it
+  // replaces the grid, as on first load: there is no column context yet worth
+  // keeping. Once they have, a service re-query empties the accumulated rows,
+  // and replacing the grid then would unmount the very sort control they just
+  // activated and drop their focus to the document. So from then on the state
+  // is drawn in the grid's own empty slot — outside the grid's rows, where
+  // `primitives/DataTable` places it — and the header stays mounted with the
+  // new order already on its indicator. No row of the previous order is drawn
+  // under it: the accumulated rows were discarded with the old sequence.
+  const holdGrid = sortOverride !== undefined || viewOrder !== null;
+
+  if (inPlaceOfRows !== undefined && !holdGrid) {
+    return (
+      <Stack className={blockClassName} gap={2}>
+        {inPlaceOfRows}
       </Stack>
     );
   }
@@ -1199,7 +1698,7 @@ export function SpanTable(props: SpanTableProps): ReactElement {
   return (
     <Stack className={blockClassName} gap={2}>
       <DataTable
-        rows={rows}
+        rows={displayRows}
         columns={columns}
         rowKey={rowKeyOf}
         caption={caption}
@@ -1207,6 +1706,7 @@ export function SpanTable(props: SpanTableProps): ReactElement {
         onSortChange={handleSortRequest}
         selectedRowKey={selectedRowKey}
         onRowActivate={handleRowActivate}
+        empty={inPlaceOfRows}
       />
       {showFooter ? (
         <Stack
@@ -1217,7 +1717,9 @@ export function SpanTable(props: SpanTableProps): ReactElement {
           justify="between"
           wrap
         >
-          <Text as="p" size="xs" tone="muted">
+          {/* Polite, so a reader who pressed "Load more" hears how much of the
+              result is now on screen instead of nothing at all. */}
+          <Text as="p" size="xs" tone="muted" aria-live="polite" aria-atomic="true">
             {footerText}
           </Text>
           {showLoadMore ? (
@@ -1227,13 +1729,12 @@ export function SpanTable(props: SpanTableProps): ReactElement {
           ) : null}
         </Stack>
       ) : null}
+      {/* The rows already drawn stay above this failure, so it is scoped to the
+          page that failed, and its query is that page's, advanced offset and all. */}
       {pageFailed ? (
         <ErrorState
           className="dg-span-table__error"
-          message={error?.message ?? PAGE_ERROR_MESSAGE}
-          code={error?.code}
-          query={serializedQuery}
-          onRetry={retry}
+          {...queryFailureProps({ error, announcement, retry }, query, { scope: 'page' })}
         />
       ) : null}
     </Stack>

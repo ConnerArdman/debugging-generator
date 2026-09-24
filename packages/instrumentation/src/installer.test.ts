@@ -81,11 +81,13 @@ import {
   chmodSync,
   cpSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
   readdirSync,
   rmSync,
+  symlinkSync,
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -3792,6 +3794,234 @@ describe('records the journal holds that no adapter reported', () => {
 /* -------------------------------------------------------------------------------------------------
  * The suite's own footprint
  * ---------------------------------------------------------------------------------------------- */
+
+describe('a refusal from the backup store, named for what was observed', () => {
+  it('names a symbolic link planted at the backup path, which was refused rather than followed', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const before = treeDigests(workspace.projectRoot);
+
+    // The content-addressed path the store files this original under, with a
+    // link standing in it: `<debuggenHome>/backups/<session>/<digest>`, every
+    // directory private so the state-directory policy itself is satisfied.
+    const digest = sha256Hex(readFileSync(pathIn(workspace, TARGETS.cones.file)));
+    const backupsRoot = join(workspace.debuggenHome, 'backups');
+    const sessionBackups = join(backupsRoot, SESSION_ID);
+    const planted = join(sessionBackups, digest);
+    const decoy = join(workspace.root, 'planted-elsewhere.txt');
+
+    mkdirSync(sessionBackups, { recursive: true, mode: 0o700 });
+    chmodSync(backupsRoot, 0o700);
+    chmodSync(sessionBackups, 0o700);
+    writeFileSync(decoy, 'planted\n');
+    symlinkSync(decoy, planted);
+
+    const writer = reportingPatchAdapter('writer', calls);
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000901',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [writer.adapter], skipFeasibility: true },
+      ),
+    );
+    const reported = writer.reported();
+
+    // The patcher's own failure keeps its code, reason and errno, and says what
+    // it met: a planted link, refused, with the path and the errno named.
+    expect(reported?.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(reported?.error.details?.['reason']).toBe('backup-write-failed');
+    expect(reported?.error.details?.['errno']).toBe('ELOOP');
+    expect(reported?.error.message).toContain('symbolic link');
+    expect(reported?.error.message).toContain(planted);
+
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('action-failed');
+    expect(error.message).toContain('a symbolic link is planted');
+    expect(error.message).toContain('refused rather than followed (ELOOP)');
+    expect(error.hint).toContain(`Remove the symbolic link at '${planted}'`);
+    expect(error.hint).toContain('The project was not modified.');
+    expect(error.hint).not.toContain('is writable');
+
+    // Nothing was written anywhere: the project, the link and what it points
+    // at are all exactly as they were, and nothing was journaled.
+    expect(treeDigests(workspace.projectRoot)).toEqual(before);
+    expect(lstatSync(planted).isSymbolicLink()).toBe(true);
+    expect(readFileSync(decoy, 'utf8')).toBe('planted\n');
+    expect(journal.calls().filter((entry) => entry.op === 'append')).toEqual([]);
+  }, 30_000);
+
+  it('quotes the state-directory policy refusal instead of a generic writability hint', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const before = treeDigests(workspace.projectRoot);
+
+    // The backups directory is a link out of the state root: the policy of
+    // `@debuggen/shared/node` refuses it with its own message and hint.
+    const elsewhere = join(workspace.root, 'elsewhere-backups');
+
+    mkdirSync(elsewhere, { mode: 0o700 });
+    chmodSync(elsewhere, 0o700);
+    symlinkSync(elsewhere, join(workspace.debuggenHome, 'backups'), 'dir');
+
+    const writer = reportingPatchAdapter('writer', calls);
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000902',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        { adapters: [writer.adapter], skipFeasibility: true },
+      ),
+    );
+    const reported = writer.reported();
+    const refusal = reported?.error.cause;
+
+    expect(DebuggenError.is(refusal)).toBe(true);
+
+    if (!DebuggenError.is(refusal)) {
+      throw new Error('the patcher did not keep the policy refusal as its cause');
+    }
+
+    expect(refusal.code).toBe('FS_UNSAFE_PATH');
+    expect(reported?.error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(reported?.error.details?.['reason']).toBe('backup-write-failed');
+    expect(reported?.error.details?.['errno']).toBe('FS_UNSAFE_PATH');
+
+    // The refusal's own words reach the developer, in the headline and the
+    // hint, and nothing claims the directory merely needs to be writable.
+    expect(error.message).toContain(refusal.message.trim().replace(/[.!?]$/u, ''));
+    expect(refusal.hint).toBeTruthy();
+    expect(error.hint).toContain(refusal.hint?.trim().replace(/[.!?]$/u, '') ?? '\u0000');
+    expect(error.hint).toContain('The project was not modified.');
+    expect(error.hint).not.toContain('is writable');
+
+    expect(treeDigests(workspace.projectRoot)).toEqual(before);
+    expect(readdirSync(elsewhere)).toEqual([]);
+    expect(journal.calls().filter((entry) => entry.op === 'append')).toEqual([]);
+  }, 30_000);
+});
+
+describe('an adapter that rejects with a coded error', () => {
+  it('names a backup store built for another session instead of a generic adapter failure', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const before = treeDigests(workspace.projectRoot);
+    const otherSession = 'ses_installer_other_0001';
+    const context: InstrumentationContext = {
+      ...makeContext({ workspace, journal }),
+      // Scoped to a different session from the context's own: the production
+      // patcher refuses to be built over it, before it reads or writes a byte.
+      backups: createBackupStore({ debuggenHome: workspace.debuggenHome, sessionId: otherSession }),
+    };
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'writer',
+            id: 'act_0000000000000911',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        context,
+        { adapters: [patchingAdapter('writer', calls)], skipFeasibility: true },
+      ),
+    );
+    const rejection = error.cause;
+
+    expect(calls).toEqual(['writer']);
+    expect(DebuggenError.is(rejection)).toBe(true);
+
+    if (!DebuggenError.is(rejection)) {
+      throw new Error('the installer did not keep the adapter rejection as its cause');
+    }
+
+    expect(rejection.code).toBe('STORE_ERROR');
+    expect(rejection.message).toMatch(/backup store/iu);
+    expect(rejection.message).toMatch(/session/iu);
+
+    // The headline says what was observed — the store belongs to another
+    // session — after the adapter's name, and the hint is the rejection's own
+    // recovery, because the project came back (here: was never touched).
+    expect(error.code).toBe('INSTRUMENTATION_INSTALL_FAILED');
+    expect(error.details?.['reason']).toBe('adapter-failed');
+    expect(error.message).toContain(
+      `The adapter "writer" failed while installing its share of the plan: ${rejection.message}`,
+    );
+    expect(error.message).toContain('No file had been modified, so nothing had to be restored.');
+    expect(rejection.hint).toBeTruthy();
+    expect(error.hint).toBe(rejection.hint);
+
+    // Nothing was written: not the project, not the journal, and not the other
+    // session's backup directory.
+    expect(treeDigests(workspace.projectRoot)).toEqual(before);
+    expect(journal.calls().filter((entry) => entry.op === 'append')).toEqual([]);
+    expect(existsSync(join(workspace.debuggenHome, 'backups', otherSession))).toBe(false);
+    expect(existsSync(join(workspace.debuggenHome, 'backups', SESSION_ID))).toBe(false);
+  }, 30_000);
+
+  it('keeps an arbitrary exception out of the headline and the hint', async () => {
+    const workspace = makeWorkspace();
+    const journal = fakeJournal();
+    const calls: string[] = [];
+    const thrown = new Error('internal: stack detail an adapter did not write for anyone');
+
+    const error = expectErr(
+      await installPlan(
+        planWith([
+          action({
+            adapter: 'opaque',
+            id: 'act_0000000000000912',
+            type: 'function-timing',
+            mode: 'patch',
+            ...TARGETS.cones,
+          }),
+        ]),
+        makeContext({ workspace, journal }),
+        {
+          adapters: [
+            fakeAdapter('opaque', (): Promise<InstallResult> => {
+              calls.push('opaque');
+
+              return Promise.reject(thrown);
+            }),
+          ],
+          skipFeasibility: true,
+        },
+      ),
+    );
+
+    expect(calls).toEqual(['opaque']);
+    expect(error.details?.['reason']).toBe('adapter-failed');
+    expect(error.cause).toBe(thrown);
+    expect(error.message).toContain(
+      'The adapter "opaque" failed while installing its share of the plan.',
+    );
+    expect(error.message).not.toContain(thrown.message);
+    expect(error.hint).toBe(
+      'Nothing from this attempt remains in the project; ask the question again to install instrumentation afresh.',
+    );
+  }, 30_000);
+});
 
 describe('the suite\u2019s own footprint', () => {
   it('removed every temporary directory it created', () => {

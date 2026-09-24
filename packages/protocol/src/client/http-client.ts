@@ -215,6 +215,46 @@ const UNAUTHORIZED_FAMILY_CODES: readonly DebuggenErrorCode[] = [
   'UNAUTHORIZED',
 ];
 
+/** The recovery step for a credential the service would not accept, or for none. */
+const CREDENTIAL_REFUSED_HINT =
+  'The local service refused this credential. Pair this client again, or supply the rotated credential with setToken().';
+
+/** The recovery step for a refusal from the service's pairing rate limit. */
+const RATE_LIMITED_HINT =
+  'The local service is rate-limiting this client. Wait for the lockout to elapse before retrying.';
+
+/** The recovery step for a reply that says the service itself failed. */
+const SERVER_FAILURE_HINT =
+  'The local service failed while handling this request; its log names the stage that failed.';
+
+/**
+ * The recovery step for each refusal code whose remedy the code alone decides,
+ * whatever status it arrived with.
+ *
+ * Keyed on the code rather than the status because one status covers refusals
+ * with opposite remedies: a `403` is both a credential the service would not
+ * accept, which pairing again or rotating fixes, and a request from a web origin
+ * (`FORBIDDEN_ORIGIN`, AAP §0.5.6), which no credential fixes — advising a
+ * re-pair there sends the developer round a loop that cannot succeed. Every
+ * member of {@link UNAUTHORIZED_FAMILY_CODES} has an entry, and
+ * `resolveRefusalCode` keeps every `401`/`403` inside that family, so an
+ * authentication refusal always carries a hint.
+ *
+ * Each text is constant: none quotes the reply body, the credential or the base
+ * URL, so a hint can be rendered and logged anywhere (AAP §0.5.2). The pairing
+ * lifetime and lockout it names are the pairing rules of AAP §0.5.6.
+ */
+const REFUSAL_CODE_HINTS: Readonly<Partial<Record<DebuggenErrorCode, string>>> = {
+  FORBIDDEN_ORIGIN:
+    'The local service refuses every request whose Origin is an http: or https: web page, whatever credential it carries. Call it from the VS Code extension, the Debug Generator Chrome extension (a chrome-extension:// origin) or a local Node client that sends no web Origin; pairing again or supplying a new credential does not change this.',
+  PAIRING_EXPIRED:
+    'The pairing code is no longer valid: codes are single-use and expire five minutes after they are issued. Run "Debug Generator: Pair Chrome DevTools Panel" (debuggen.pairChrome) in VS Code for a new code.',
+  PAIRING_INVALID:
+    'The local service did not accept this pairing code. Enter the code VS Code shows exactly as displayed, or run "Debug Generator: Pair Chrome DevTools Panel" (debuggen.pairChrome) for a new one; five failed attempts lock pairing for 60 seconds.',
+  RATE_LIMITED: RATE_LIMITED_HINT,
+  UNAUTHORIZED: CREDENTIAL_REFUSED_HINT,
+};
+
 // ---------------------------------------------------------------------------
 // Section A.1 — the service origin both transports send their credential to
 //
@@ -2067,8 +2107,10 @@ function httpFailureError(operation: HttpOperation, status: number, body: unknow
  *
  * The error payload the service sends carries no `hint` — AAP §0.4.2 fixes that
  * shape at `{ code, message, ref? }` and `../messages/error.ts` holds the line
- * with a drift guard — so the recovery step is derived from the status family
- * here, which is the one thing a client knows that the payload does not say.
+ * with a drift guard — so the recovery step is derived here: from the resolved
+ * code first, which is what separates a web-origin refusal from a refused
+ * credential under one `403`, and from the status family only when that code has
+ * no remedy of its own (see `refusalHint`).
  *
  * @param operation The operation that was refused.
  * @param status The numeric HTTP status.
@@ -2092,13 +2134,10 @@ function refusalError(
 
   const reported = fields.message === undefined ? '' : `: ${fields.message}`;
   const message = `The ${operation} request failed (status ${String(status)})${reported}`;
-  const hint = refusalHint(status);
+  const code = resolveRefusalCode(status, fields.code);
+  const hint = refusalHint(code, status);
 
-  return new DebuggenError(
-    resolveRefusalCode(status, fields.code),
-    message,
-    hint === undefined ? { details } : { details, hint },
-  );
+  return new DebuggenError(code, message, hint === undefined ? { details } : { details, hint });
 }
 
 /**
@@ -2159,23 +2198,39 @@ function statusFamilyCode(status: number): DebuggenErrorCode {
 }
 
 /**
- * The recovery step for a status family, or `undefined` when the code and
- * message already say everything a client can act on.
+ * The recovery step for a refusal, or `undefined` when the code and message
+ * already say everything a client can act on.
  *
+ * The resolved code is consulted first, through {@link REFUSAL_CODE_HINTS},
+ * because it is the more precise of the two signals: a `403 FORBIDDEN_ORIGIN`
+ * needs the origin policy explained, a `401 PAIRING_EXPIRED` a fresh code, and a
+ * `401 UNAUTHORIZED` a new credential. The status family is the fallback for a
+ * code with no remedy of its own — a `429` whose body named some other code is
+ * still a rate limit, and any `5xx` is the service failing — and any other
+ * refusal (`404 SESSION_NOT_FOUND`, a bare `400`) carries none.
+ *
+ * @param code The code the refusal is reported with, as `resolveRefusalCode`
+ *   chose it.
  * @param status The numeric HTTP status.
  * @returns A developer-facing next step, or `undefined`.
+ * @example
+ * refusalHint('FORBIDDEN_ORIGIN', 403); // the origin-policy hint, never "pair again"
+ * refusalHint('INTERNAL', 429); // the rate-limit hint, from the status fallback
+ * refusalHint('SESSION_NOT_FOUND', 404); // undefined
  */
-function refusalHint(status: number): string | undefined {
-  if (UNAUTHORIZED_STATUSES.includes(status)) {
-    return 'The local service refused this credential. Pair this client again, or supply the rotated credential with setToken().';
+function refusalHint(code: DebuggenErrorCode, status: number): string | undefined {
+  const specific = REFUSAL_CODE_HINTS[code];
+
+  if (specific !== undefined) {
+    return specific;
   }
 
   if (status === RATE_LIMITED_STATUS) {
-    return 'The local service is rate-limiting this client. Wait for the lockout to elapse before retrying.';
+    return RATE_LIMITED_HINT;
   }
 
   if (status >= SERVER_ERROR_STATUS_FLOOR) {
-    return 'The local service failed while handling this request; its log names the stage that failed.';
+    return SERVER_FAILURE_HINT;
   }
 
   return undefined;

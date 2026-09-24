@@ -48,6 +48,13 @@
  *   unknown `type`, in a `client.hello` credential, in text that is not JSON —
  *   and assert it appears in no part of the resulting error: message, hint,
  *   details, stack, serialised form or the payload that crosses the wire.
+ * - **One frame names one session.** The service routes and authorizes by the
+ *   envelope's `sessionId` while a handler acts on the payload's own subject, so
+ *   a frame whose two answers differ is a confused-deputy request (AAP 0.5.6).
+ *   The routing cases refuse it on receive — for a payload `sessionId` and for a
+ *   `session.created` / `session.updated` record id alike — without naming
+ *   either id, and `createEnvelope` refuses to build it; an absent routing key,
+ *   and a routing key on a payload that names no session, stay valid.
  * - **The primitives underneath are what the envelope claims they are.**
  *   `../version.ts` supplies the wire version and its handshake predicate, the
  *   epoch-millisecond timestamp every frame carries, the leak-free issue
@@ -171,6 +178,12 @@ const MESSAGE_ID = 'msg_2f4h6k8m0p1r3t5v';
 
 /** The session every session-scoped fixture belongs to. */
 const SESSION_ID = 'ses_4k2p9dq7m1zx0c3v';
+
+/**
+ * A second, well-formed session id that no fixture payload names: the routing
+ * key a confused-deputy frame claims while its payload names {@link SESSION_ID}.
+ */
+const OTHER_SESSION_ID = 'ses_0z9y8x7w6v5u4t3s';
 
 /** The capture the telemetry fixtures were recorded during. */
 const CAPTURE_ID = 'cap_7f3q0m2zk1x8ab9c';
@@ -657,6 +670,22 @@ function expectNoEcho(error: DebuggenError, planted: string): void {
 }
 
 /**
+ * Runs a function that is expected to throw and hands back what it threw.
+ *
+ * @param fn The call under test.
+ * @returns The thrown value, or `undefined` when `fn` returned normally — which
+ * the caller's `toBeInstanceOf` assertion then reports as the failure.
+ */
+function thrownBy(fn: () => unknown): unknown {
+  try {
+    fn();
+  } catch (error: unknown) {
+    return error;
+  }
+  return undefined;
+}
+
+/**
  * Freezes a value and everything reachable from it, so a function handed it
  * throws on any write instead of mutating it quietly.
  *
@@ -1053,6 +1082,123 @@ describe('parseMessage — rejections are typed, total and silent about the valu
   });
 });
 
+// The service routes and authorizes by the envelope's `sessionId`, and a handler
+// acts on the payload's own subject. A devtools principal is authorized only for
+// the session bound to its tab (AAP 0.5.6), so a frame whose two answers differ
+// is a confused-deputy request and must be refused — without naming either id
+// (AAP 0.5.2).
+describe('parseMessage — the routing key agrees with the session the payload names', () => {
+  /** The session the QA reproduction's payload names. */
+  const REPRO_SUBJECT = 'ses_q4a2aaaaaaaaaaaa';
+
+  /** The different session its routing key claims. */
+  const REPRO_ROUTING = 'ses_otherxxxxxxxxxxx';
+
+  /** The reproduction, verbatim: a `target.request` routed to another session. */
+  const REPRO_FRAME = {
+    id: 'msg_q4a2aaaaaaaaaaaa',
+    type: 'target.request',
+    sessionId: REPRO_ROUTING,
+    ts: 1790231777931,
+    payload: { sessionId: REPRO_SUBJECT },
+  } as const;
+
+  /** The one rendering a routing contradiction has. */
+  const ROUTING_ISSUE =
+    'Invalid protocol message: sessionId (custom label=routing-matches-payload)';
+
+  it('refuses a routing key that contradicts the payload’s own sessionId, echoing neither', () => {
+    const parsed = parseMessage(REPRO_FRAME);
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(parsed.error.message).toBe(ROUTING_ISSUE);
+    expect(parsed.error.details).toStrictEqual({
+      issueCount: 1,
+      issues: [{ path: 'sessionId', code: 'custom' }],
+    });
+    // The hint states the rule, in constant text.
+    expect(parsed.error.hint).toContain('routing `sessionId` must equal the session the payload');
+    expectNoEcho(parsed.error, REPRO_ROUTING);
+    expectNoEcho(parsed.error, REPRO_SUBJECT);
+  });
+
+  it('accepts a routing key equal to the payload’s own sessionId', () => {
+    const parsed = parseMessage({ ...REPRO_FRAME, sessionId: REPRO_SUBJECT });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.value.sessionId).toBe(REPRO_SUBJECT);
+  });
+
+  it('accepts a frame with no routing key although its payload names a session', () => {
+    const { sessionId: routing, ...withoutRouting } = REPRO_FRAME;
+    const parsed = parseMessage(withoutRouting);
+
+    expect(routing).toBe(REPRO_ROUTING);
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect('sessionId' in parsed.value).toBe(false);
+  });
+
+  it.each(['session.created', 'session.updated'] as const)(
+    '%s refuses a routing key that differs from the record id, and accepts the record id',
+    (type) => {
+      const frame = { ...VALID_FRAMES[type], sessionId: OTHER_SESSION_ID };
+      const refused = parseMessage(frame);
+      const accepted = parseMessage({ ...frame, sessionId: SESSION_RECORD.id });
+
+      expect(refused.ok).toBe(false);
+      expect(accepted.ok).toBe(true);
+      if (refused.ok) {
+        return;
+      }
+      expect(refused.error.message).toBe(ROUTING_ISSUE);
+      expectNoEcho(refused.error, OTHER_SESSION_ID);
+      expectNoEcho(refused.error, SESSION_ID);
+    },
+  );
+
+  it.each([
+    'client.hello',
+    'agent.ready',
+    'tab.navigated',
+    'session.unbind',
+    'telemetry.event',
+    'error',
+  ] as const)('%s names no session, so any routing key is accepted', (type) => {
+    const parsed = parseMessage({ ...VALID_FRAMES[type], sessionId: OTHER_SESSION_ID });
+
+    expect(parsed.ok).toBe(true);
+    if (!parsed.ok) {
+      return;
+    }
+    expect(parsed.value.sessionId).toBe(OTHER_SESSION_ID);
+  });
+
+  it('reports a malformed payload by its own issues, without a routing issue beside them', () => {
+    // The agreement check judges only an otherwise valid frame. An empty id is a
+    // non-aborting length issue in Zod, which would not by itself skip an object
+    // check, so this is the case that pins the explicit guard.
+    const parsed = parseMessage({ ...REPRO_FRAME, payload: { sessionId: '' } });
+
+    expect(parsed.ok).toBe(false);
+    if (parsed.ok) {
+      return;
+    }
+    expect(parsed.error.message).toBe(
+      'Invalid protocol message: payload.sessionId (too_small origin=string min=1)',
+    );
+  });
+});
+
 describe('decodeMessage — text that is not JSON', () => {
   it('rejects malformed JSON without quoting it', () => {
     // V8's SyntaxError quotes the text around the fault, which here is the
@@ -1188,17 +1334,77 @@ describe('createEnvelope — deterministic, non-mutating, routable', () => {
     expect(frame.payload).toStrictEqual({ tabId: TAB_ID, url: PAGE_URL });
   });
 
-  it('prefers an explicitly supplied sessionId over the payload’s', () => {
-    const other = 'ses_0z9y8x7w6v5u4t3s';
+  it('refuses an explicit sessionId that contradicts the payload’s, echoing neither id', () => {
+    // Every receiver refuses such a frame (see the routing suite above), so
+    // building it is a bug at the call site and is reported there, with the
+    // constant message and hint and nothing but the message type in details.
+    const thrown = thrownBy(() =>
+      createEnvelope('session.progress', VALID_PAYLOADS['session.progress'], {
+        sessionId: OTHER_SESSION_ID,
+        id: MESSAGE_ID,
+        ts: SENT_AT,
+      }),
+    );
 
-    const frame = createEnvelope('session.progress', VALID_PAYLOADS['session.progress'], {
-      sessionId: other,
+    expect(thrown).toBeInstanceOf(DebuggenError);
+    if (!(thrown instanceof DebuggenError)) {
+      return;
+    }
+    expect(thrown.code).toBe('PROTOCOL_INVALID_MESSAGE');
+    expect(thrown.message).toBe(
+      'Cannot build a protocol frame: options.sessionId names a different session than the payload does',
+    );
+    expect(thrown.details).toStrictEqual({ type: 'session.progress' });
+    expectNoEcho(thrown, OTHER_SESSION_ID);
+    expectNoEcho(thrown, SESSION_ID);
+  });
+
+  it('refuses an explicit sessionId that contradicts a session record’s id', () => {
+    // `session.created` and `session.updated` name their subject as the record's
+    // `id`, not as a top-level `sessionId`, and the rule reads both spellings.
+    for (const type of ['session.created', 'session.updated'] as const) {
+      const thrown = thrownBy(() =>
+        createEnvelope(type, VALID_PAYLOADS[type], {
+          sessionId: OTHER_SESSION_ID,
+          id: MESSAGE_ID,
+          ts: SENT_AT,
+        }),
+      );
+
+      expect(thrown).toBeInstanceOf(DebuggenError);
+      if (!(thrown instanceof DebuggenError)) {
+        return;
+      }
+      expect(thrown.code).toBe('PROTOCOL_INVALID_MESSAGE');
+      expect(thrown.details).toStrictEqual({ type });
+      expectNoEcho(thrown, OTHER_SESSION_ID);
+      expectNoEcho(thrown, SESSION_ID);
+    }
+  });
+
+  it('accepts an explicit sessionId that restates the payload’s own session', () => {
+    const progress = createEnvelope('session.progress', VALID_PAYLOADS['session.progress'], {
+      sessionId: SESSION_ID,
+      id: MESSAGE_ID,
+      ts: SENT_AT,
+    });
+    const updated = createEnvelope('session.updated', VALID_PAYLOADS['session.updated'], {
+      sessionId: SESSION_RECORD.id,
       id: MESSAGE_ID,
       ts: SENT_AT,
     });
 
-    expect(frame.sessionId).toBe(other);
-    expect(frame.payload.sessionId).toBe(SESSION_ID);
+    expect(progress).toStrictEqual(frameFor('session.progress'));
+    expect(updated.sessionId).toBe(SESSION_ID);
+    expect(parseMessage(progress).ok).toBe(true);
+    expect(parseMessage(updated).ok).toBe(true);
+  });
+
+  it('still lifts only the payload’s own sessionId, never a session record’s id', () => {
+    // The routing key a frame receives is unchanged by the agreement rule: a
+    // session broadcast is routed only when its caller supplies the option.
+    expect('sessionId' in frameFor('session.updated')).toBe(false);
+    expect('sessionId' in frameFor('session.created')).toBe(false);
   });
 
   it('omits the sessionId key entirely when there is none', () => {

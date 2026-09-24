@@ -114,12 +114,20 @@
  *     disclosure are reported through the ambient actions, which may be absent —
  *     every call site chains optionally and an affordance that would lead nowhere
  *     is not rendered as a control.
- *   - **No measurement.** The time scale's range is a percentage interval, so
- *     bar geometry is relational and correct before layout: no
- *     `getBoundingClientRect`, no `ResizeObserver`, no `offsetWidth`. The
- *     colocated suite runs under happy-dom, where every measurement answers
- *     zero, and `host/registry.test.ts` renders this component against a
- *     recorded `spans` response — so it must work from data alone.
+ *   - **Bars are never measured; only the axis's tick density is.** The time
+ *     scale's range is a percentage interval, so every bar, every tick
+ *     position and every row is relational and correct before layout, with no
+ *     measurement behind it. The one decision that cannot be relational is how
+ *     MANY tick labels fit: six labels that read well across a wide panel run
+ *     together across a phone-width strip. So `WaterfallAxis` alone measures
+ *     its own `<svg>` — its inline size in a layout effect and again through a
+ *     `ResizeObserver`, its font size from the computed style — and thins the
+ *     tick target until the estimated label boxes no longer overlap (see
+ *     {@link fitAxisTicks}). Where nothing can be measured — the colocated
+ *     suite under happy-dom, where every measurement answers zero, and
+ *     `host/registry.test.ts`, which renders this component against a recorded
+ *     `spans` response — the axis keeps its full, unmeasured tick set, so the
+ *     view still works from data alone.
  *   - **Zero hardcoded CSS values.** Colour comes from `../utils/color` as token
  *     references, geometry from `../utils/scale` as unitless numbers, and the
  *     inline style of a bar is the `--dgc-*` custom properties the stylesheet's
@@ -181,9 +189,13 @@
  * The row's full description — the sentence its `aria-label` carries — is a
  * hover tooltip on the label for a pointer. The label is not focusable and must
  * not become a second stop, so for the KEYBOARD the same sentence is revealed
- * when the treeitem itself receives focus other than from a pointer press, in
- * the tooltip primitive's own open-state markup, with a Shift+Enter hint on a
- * row whose source can be opened. That bubble is `aria-hidden`: a screen reader
+ * when the treeitem itself receives focus other than from a pointer press, by
+ * the label's own `Tooltip` held open by the row (its controlled `open`), with
+ * a Shift+Enter hint on a row whose source can be opened. The primitive places
+ * that bubble exactly as it places a hovered one — measured against the label,
+ * re-measured on scroll and resize — because an open bubble is fixed to the
+ * viewport and one nobody placed is painted at its corner. It describes
+ * nothing (`describesTrigger={false}`, so it is `aria-hidden`): a screen reader
  * already hears the sentence as the row's name.
  *
  * The treeitem is the sole focus target of its row. The disclosure button and
@@ -213,8 +225,8 @@ import type {
   TelemetryTier,
 } from '@debuggen/telemetry';
 import clsx from 'clsx';
-import { ChevronDown, ChevronRight, Hourglass } from 'lucide-react';
-import { useCallback, useId, useMemo, useRef, useState } from 'react';
+import { ChartNoAxesGantt, ChevronDown, ChevronRight, Hourglass } from 'lucide-react';
+import { useCallback, useId, useMemo, useRef, useState, useLayoutEffect } from 'react';
 import type {
   CSSProperties,
   FocusEvent,
@@ -222,12 +234,14 @@ import type {
   MouseEvent,
   ReactElement,
   ReactNode,
+  RefObject,
 } from 'react';
 
 import { Stack } from '../layout/Stack';
 import { usePanelSessionId } from '../host/DataProvider';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import type { PanelSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
 import type { UseQueryResult } from '../host/useQuery';
 import { Badge } from '../primitives/Badge';
 import type { BadgeTone } from '../primitives/Badge';
@@ -240,18 +254,23 @@ import { Kbd } from '../primitives/Kbd';
 import { LoadingState } from '../primitives/LoadingState';
 import { Text } from '../primitives/Text';
 import { Tooltip } from '../primitives/Tooltip';
+import { DESIGN_TOKENS } from '../tokens/tokens';
 import { kindColorVar } from '../utils/color';
 import {
   NOT_AVAILABLE_LABEL,
+  countedNoun,
   formatBytes,
   formatCount,
+  formatCountOf,
   formatDuration,
   formatDurationCompact,
   formatKindLabel,
   formatStatusLabel,
   formatTierLabel,
   oneLinePreview,
+  pluralize,
 } from '../utils/format';
+import type { CountedNoun } from '../utils/format';
 import {
   DEFAULT_ROW_GUTTER,
   DEFAULT_ROW_HEIGHT,
@@ -340,12 +359,20 @@ const ORPHANED_PARENT_SPAN_ID_KEY = 'orphanedParentSpanId';
  * The time scale's pixel range is a *percentage* interval rather than a measured
  * width, which is what makes every bar correct without measuring anything: the
  * numbers `../utils/scale` returns are consumed as percentages of the track, the
- * track takes its width from the row's grid template, and the chart is right on
- * the first paint and after every resize with no observer involved.
+ * track takes its width from the row's grid template, and every bar and tick
+ * position is right on the first paint and after every resize with no observer
+ * involved. (The axis observes its own width for one decision only — how many
+ * tick labels fit — never for a position; see {@link fitAxisTicks}.)
  */
 const PERCENT_RANGE = 100;
 
-/** How many axis ticks to aim for; `generateAxisTicks` rounds to a nice step. */
+/**
+ * How many axis ticks to aim for; `generateAxisTicks` rounds to a nice step.
+ *
+ * The densest the axis gets, and the whole of it while the strip cannot be
+ * measured. A measured strip starts here and asks for fewer until its labels
+ * fit (see {@link fitAxisTicks}).
+ */
 const AXIS_TICK_TARGET = 6;
 
 /**
@@ -354,6 +381,53 @@ const AXIS_TICK_TARGET = 6;
  * in a hundred-unit range would cap the axis at two ticks.
  */
 const AXIS_TICK_MIN_SPACING = PERCENT_RANGE / AXIS_TICK_TARGET;
+
+/**
+ * The estimated advance of one tick-label character, in ems: 0.6.
+ *
+ * A tick label is a compact duration — digits, a decimal point, a space and a
+ * unit (`0 ms`, `470 µs`, `1.2 s`) — and 0.6 em is the advance of every glyph
+ * in a monospaced face and an upper bound on the average advance of those
+ * characters in the UI sans-serif stack, where only the `m` of `ms` is wider
+ * and the digits, the point and the space are narrower. Over-estimating is the
+ * safe direction: it can drop a tick that would just have fitted, never draw
+ * two labels into each other. An estimate rather than a text measurement
+ * because the candidate tick sets differ in their labels, and measuring each
+ * would mean rendering labels that are then thrown away.
+ */
+const AXIS_LABEL_GLYPH_EM = 0.6;
+
+/** The clear space kept between two neighbouring tick labels, in ems: one. */
+const AXIS_LABEL_GAP_EM = 1;
+
+/**
+ * The first pixel length in a CSS `font` shorthand — its font size, since the
+ * weight before it is unitless and the line height after it follows a slash.
+ */
+const FONT_SHORTHAND_SIZE = /(\d+(?:\.\d+)?)px/u;
+
+/**
+ * The font size of the `xs` type role the axis strip is set in, in pixels, read
+ * from the token table rather than restated: `DESIGN_TOKENS.dark.textXs` is the
+ * value `--dg-text-xs` is generated from, and the role is the same in every
+ * theme (AAP 0.6.3). The fallback for a host whose computed style reports no
+ * usable size; `undefined` only if the token stopped being a pixel shorthand,
+ * in which case the axis is treated as unmeasurable rather than guessed at.
+ */
+const XS_FONT_PX: number | undefined = fontPxOfShorthand(DESIGN_TOKENS.dark.textXs);
+
+/**
+ * The font size a CSS `font` shorthand declares, in pixels.
+ *
+ * @param shorthand A shorthand such as `400 11px/16px var(--dg-font-ui)`.
+ * @returns The size, or `undefined` when the shorthand carries no positive
+ * pixel size.
+ */
+function fontPxOfShorthand(shorthand: string): number | undefined {
+  const match = FONT_SHORTHAND_SIZE.exec(shorthand);
+  const size = match?.[1] === undefined ? Number.NaN : Number.parseFloat(match[1]);
+  return Number.isFinite(size) && size > 0 ? size : undefined;
+}
 
 /** The axis strip's height, in the same unitless SVG geometry as the row rhythm. */
 const AXIS_HEIGHT = DEFAULT_ROW_HEIGHT;
@@ -1376,11 +1450,6 @@ function queryIdentity(query: DataQuery, sessionId: string | undefined): string 
   ]);
 }
 
-/** The query as the error state reports it, so a failure names what failed. */
-function describeQuery(query: DataQuery, offset: number): string {
-  return JSON.stringify({ ...query, offset });
-}
-
 /* ---------------------------------------------------------------------------
  * Paging
  *
@@ -1560,6 +1629,60 @@ function describeOrphan(orphan: WaterfallOrphan): string {
     : `re-attached to the top level: ${orphanCause(orphan, 'this call')}`;
 }
 
+/*
+ * The nouns a row's copy counts in. Every figure a row prints beside a word —
+ * its badges, its description, its disclosure's name — goes through
+ * `formatCountOf`/`pluralize` from `../utils/format` with one of these, so a
+ * single call reads "1 call" and a single row "1 row", never "1 calls" or
+ * "1 rows".
+ */
+
+/** A captured call: a request, a server request, a statement. */
+const CALL_NOUN: CountedNoun = countedNoun('call');
+
+/** A call nested inside the row that was waiting on it. */
+const NESTED_CALL_NOUN: CountedNoun = countedNoun('nested call');
+
+/** A database row a statement touched — counted, never shown. */
+const ROW_NOUN: CountedNoun = countedNoun('row');
+
+/**
+ * How much of a row's label its disclosure button repeats in its name: the
+ * same bound the visible label uses, so the control names the call exactly as
+ * the row shows it.
+ */
+const DISCLOSURE_LABEL_PREVIEW_LENGTH = LABEL_PREVIEW_LENGTH;
+
+/**
+ * The accessible name of a row's disclosure button, in the state it would
+ * toggle to: what it opens or closes, how many, and which call they belong to.
+ *
+ * A generic "Expand nested calls" names neither the call nor the count, so in a
+ * list of such buttons a screen reader user hears the same name on every row.
+ * The phrasing is `FlameChart`'s ("Expand the 2 nested calls inside …") so the
+ * two nested views announce disclosure alike, and the call is named as the row
+ * shows it — its method chip, when it has one, then its label — followed by its
+ * kind ("… inside GET /example/resource (Fetch)"). The kind is what tells two
+ * disclosures apart when a browser request and the server request answering it
+ * share one method and URL, which is the ordinary shape of a correlated trace.
+ * A group row's children are the occurrences of one grouped request, not calls
+ * it waited on, so it says so.
+ *
+ * @param row The row the button belongs to.
+ * @param expanded Whether the row is expanded now.
+ * @returns The button's name.
+ */
+function disclosureName(row: WaterfallRow, expanded: boolean): string {
+  const verb = expanded ? 'Collapse' : 'Expand';
+  const label = oneLinePreview(rowLabel(row), DISCLOSURE_LABEL_PREVIEW_LENGTH);
+  const named = row.method === undefined ? label : `${row.method} ${label}`;
+  const call = `${named} (${formatKindLabel(row.kind)})`;
+  const count = row.children.length;
+  return row.occurrenceCount === undefined
+    ? `${verb} the ${formatCountOf(count, NESTED_CALL_NOUN)} inside ${call}`
+    : `${verb} the ${formatCountOf(count, CALL_NOUN)} grouped under ${call}`;
+}
+
 /**
  * The word a pending row's badge carries — the word the request table uses
  * for the same state, so one request reads the same in both views.
@@ -1588,8 +1711,7 @@ function describePending(row: WaterfallRow): string {
   if (row.pendingCount === undefined) {
     return 'still in flight when the capture ended; no response had arrived';
   }
-  const noun = row.pendingCount === 1 ? 'call' : 'calls';
-  return `${formatCount(row.pendingCount)} ${noun} still in flight when the capture ended`;
+  return `${formatCountOf(row.pendingCount, CALL_NOUN)} still in flight when the capture ended`;
 }
 
 /**
@@ -1619,7 +1741,7 @@ function rowDescription(row: WaterfallRow): string {
     parts.push(`status ${formatStatusLabel(row.status)}`);
   }
   if (row.rowCount !== undefined) {
-    parts.push(`${formatCount(row.rowCount)} rows touched`);
+    parts.push(`${formatCountOf(row.rowCount, ROW_NOUN)} touched`);
   }
   if (row.transferredBytes !== undefined) {
     parts.push(`transferred ${formatBytes(row.transferredBytes)}`);
@@ -1627,7 +1749,7 @@ function rowDescription(row: WaterfallRow): string {
     parts.push(`transferred ${NOT_AVAILABLE_LABEL}`);
   }
   if (row.occurrenceCount !== undefined) {
-    parts.push(`${formatCount(row.occurrenceCount)} calls in this group`);
+    parts.push(`${formatCountOf(row.occurrenceCount, CALL_NOUN)} in this group`);
   }
   if (row.lineageAmbiguous) {
     const candidates =
@@ -1856,9 +1978,222 @@ const OPEN_SOURCE_KEYS: readonly string[] = ['Shift', 'Enter'];
  * The time axis
  * ------------------------------------------------------------------------- */
 
+/** Where a tick's label sits against its tick: the SVG `text-anchor` values. */
+type TickAnchor = 'start' | 'middle' | 'end';
+
+/** One tick to draw, and where its label is anchored. */
+interface PlacedTick {
+  readonly tick: AxisTick;
+  readonly anchor: TickAnchor;
+}
+
+/** What the axis strip measured of itself: its inline size and its font size. */
+interface AxisMeasure {
+  /** The strip's inline size, in CSS pixels, rounded to a whole pixel; above zero. */
+  readonly widthPx: number;
+  /** The font size its tick labels are set in, in CSS pixels; above zero. */
+  readonly fontPx: number;
+}
+
+/**
+ * Whether two measurements are the same, so a resize that changed nothing the
+ * tick fit reads — a height change, a sub-pixel jitter — does not re-render.
+ */
+function sameAxisMeasure(left: AxisMeasure | undefined, right: AxisMeasure | undefined): boolean {
+  if (left === undefined || right === undefined) {
+    return left === right;
+  }
+  return left.widthPx === right.widthPx && left.fontPx === right.fontPx;
+}
+
+/**
+ * Reads the axis `<svg>`'s inline size and font size.
+ *
+ * The font size comes from the element's computed style — the `xs` type role
+ * of the strip it inherits from — and falls back to the same role's token
+ * value ({@link XS_FONT_PX}) when the host reports none.
+ *
+ * @param element The mounted axis graphic.
+ * @returns The measurement, or `undefined` while the strip has no width (not
+ * laid out, hidden, or a DOM that measures nothing) or no usable font size —
+ * the states in which the unmeasured tick set is drawn.
+ */
+function readAxisMeasure(element: SVGSVGElement): AxisMeasure | undefined {
+  const width = element.getBoundingClientRect().width;
+  if (!Number.isFinite(width) || width <= 0) {
+    return undefined;
+  }
+  const computed = Number.parseFloat(
+    element.ownerDocument.defaultView?.getComputedStyle(element).fontSize ?? '',
+  );
+  const fontPx = Number.isFinite(computed) && computed > 0 ? computed : XS_FONT_PX;
+  if (fontPx === undefined) {
+    return undefined;
+  }
+  const widthPx = Math.round(width);
+  return widthPx > 0 ? { widthPx, fontPx } : undefined;
+}
+
+/**
+ * The axis graphic's measurement, kept current across resizes.
+ *
+ * Measured once in a layout effect, before the first paint, so a narrow strip
+ * never flashes the dense tick set; then again whenever a `ResizeObserver`
+ * reports a change, re-reading the element rather than trusting the entry's
+ * box so the two paths cannot disagree. A host without `ResizeObserver` keeps
+ * the first reading. The observer is disconnected on unmount.
+ *
+ * @param ref The axis graphic.
+ * @returns The current measurement, or `undefined` while there is none.
+ */
+function useAxisMeasure(ref: RefObject<SVGSVGElement | null>): AxisMeasure | undefined {
+  const [measure, setMeasure] = useState<AxisMeasure | undefined>(undefined);
+
+  useLayoutEffect(() => {
+    const element = ref.current;
+    if (element === null) {
+      return undefined;
+    }
+    const update = (): void => {
+      const next = readAxisMeasure(element);
+      setMeasure((current) => (sameAxisMeasure(current, next) ? current : next));
+    };
+    update();
+    if (typeof ResizeObserver === 'undefined') {
+      return undefined;
+    }
+    const observer = new ResizeObserver(update);
+    observer.observe(element);
+    return () => {
+      observer.disconnect();
+    };
+  }, [ref]);
+
+  return measure;
+}
+
+/**
+ * The anchoring an unmeasured axis uses: the first label starts at its tick,
+ * the last ends at it, and every other is centred — the rule that keeps both
+ * end labels inside the strip whatever its width, at the price of setting
+ * them beside their ticks rather than under them.
+ */
+function anchorWithoutMeasure(ticks: readonly AxisTick[]): readonly PlacedTick[] {
+  const lastIndex = ticks.length - 1;
+  return ticks.map((tick, index) => ({
+    tick,
+    anchor: index === 0 ? 'start' : index === lastIndex ? 'end' : 'middle',
+  }));
+}
+
+/**
+ * The estimated inline extent of a tick label, in pixels: its code points at
+ * {@link AXIS_LABEL_GLYPH_EM} ems each.
+ */
+function estimateLabelWidth(label: string, fontPx: number): number {
+  return Array.from(label).length * AXIS_LABEL_GLYPH_EM * fontPx;
+}
+
+/**
+ * Places a tick set on a measured strip, or reports that it does not fit.
+ *
+ * Each label is centred under its tick, and anchored to its tick's start or
+ * end only when a centred label would cross the strip's own edge — so a label
+ * inside the strip sits under the tick it names. The set fits when every
+ * estimated label box lies inside `[0, width]` and each is at least
+ * {@link AXIS_LABEL_GAP_EM} ems clear of the one before it; ticks arrive in
+ * ascending order, so neighbours are the only pairs that can collide.
+ *
+ * @param ticks The candidate ticks, ascending.
+ * @param measure The strip's width and font size.
+ * @returns The placed ticks, or `undefined` when two labels would touch or one
+ * cannot fit inside the strip at all.
+ */
+function placeOnMeasuredStrip(
+  ticks: readonly AxisTick[],
+  measure: AxisMeasure,
+): readonly PlacedTick[] | undefined {
+  const { widthPx, fontPx } = measure;
+  const gap = AXIS_LABEL_GAP_EM * fontPx;
+  const placed: PlacedTick[] = [];
+  let previousEnd = Number.NEGATIVE_INFINITY;
+
+  for (const tick of ticks) {
+    const extent = estimateLabelWidth(tick.label, fontPx);
+    const x = (tick.offset / PERCENT_RANGE) * widthPx;
+    let anchor: TickAnchor = 'middle';
+    let start = x - extent / 2;
+    if (start < 0) {
+      anchor = 'start';
+      start = x;
+    } else if (start + extent > widthPx) {
+      anchor = 'end';
+      start = x - extent;
+    }
+    const end = start + extent;
+    if (start < 0 || end > widthPx || start - previousEnd < gap) {
+      return undefined;
+    }
+    placed.push({ tick, anchor });
+    previousEnd = end;
+  }
+
+  return placed;
+}
+
+/**
+ * The ticks the axis draws, and how each label is anchored.
+ *
+ * Unmeasured — no width yet, or a DOM that measures nothing — the axis draws
+ * the full {@link AXIS_TICK_TARGET} set with {@link anchorWithoutMeasure}'s
+ * anchoring, exactly as the percentage geometry alone would. Measured, it asks
+ * `generateAxisTicks` for that target and then for one fewer at a time — each
+ * request rounding to the scale's next "nice" step — and draws the first set
+ * whose labels fit the strip (see {@link placeOnMeasuredStrip}). If not even a
+ * single-tick request fits, the window's first tick is drawn alone: an axis
+ * with no label at all would carry no scale.
+ *
+ * The tick COUNT is the only thing measured. Every position is still the
+ * scale's percentage, so the ticks stay in register with the bars beneath
+ * them at every width.
+ *
+ * @param scale The shared time scale, over the percentage range.
+ * @param origin The instant offsets are measured from: the first drawn call.
+ * @param measure The strip's measurement, or `undefined` when there is none.
+ * @returns The ticks to draw, ascending, with their anchors.
+ */
+function fitAxisTicks(
+  scale: TimeScale,
+  origin: number,
+  measure: AxisMeasure | undefined,
+): readonly PlacedTick[] {
+  const ticksFor = (targetCount: number): readonly AxisTick[] =>
+    generateAxisTicks(scale, {
+      origin,
+      targetCount,
+      minSpacing: AXIS_TICK_MIN_SPACING,
+    }).ticks;
+
+  if (measure === undefined) {
+    return anchorWithoutMeasure(ticksFor(AXIS_TICK_TARGET));
+  }
+
+  for (let target = AXIS_TICK_TARGET; target >= 1; target -= 1) {
+    const placed = placeOnMeasuredStrip(ticksFor(target), measure);
+    if (placed !== undefined) {
+      return placed;
+    }
+  }
+
+  const [first] = ticksFor(1);
+  return first === undefined ? [] : [{ tick: first, anchor: 'start' }];
+}
+
 interface WaterfallAxisProps {
-  /** The ticks, already placed in the scale's percentage range. */
-  readonly ticks: readonly AxisTick[];
+  /** The shared time scale every bar is placed in, over the percentage range. */
+  readonly scale: TimeScale;
+  /** The instant tick offsets are measured from: the window's start. */
+  readonly origin: number;
   /** The window's extent, in milliseconds. */
   readonly windowMs: number;
 }
@@ -1869,7 +2204,11 @@ interface WaterfallAxisProps {
  *
  * Drawn as an SVG because a tick sits at a fraction of the track and text is the
  * only thing there is to place; the percentages come from the same scale the
- * bars use, so nothing here is measured either. The graphic is a single
+ * bars use, so no position here is measured either. What IS measured is how
+ * many labels the strip has room for: the graphic reads its own width and font
+ * size ({@link useAxisMeasure}) and draws the densest tick set whose labels do
+ * not run into each other ({@link fitAxisTicks}), falling back to the full set
+ * where it cannot measure. The graphic is a single
  * `role="img"` with a label that states the window it spans — its tick text is
  * a scale, not content to be read one label at a time — and its colours are
  * `currentColor`, inherited from the muted type role around it, so the axis
@@ -1894,8 +2233,10 @@ interface WaterfallAxisProps {
  * stylesheet's indentation from here, which is not this component's to override.
  */
 function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
-  const { ticks, windowMs } = props;
-  const lastIndex = ticks.length - 1;
+  const { scale, origin, windowMs } = props;
+  const graphicRef = useRef<SVGSVGElement>(null);
+  const measure = useAxisMeasure(graphicRef);
+  const ticks = useMemo(() => fitAxisTicks(scale, origin, measure), [scale, origin, measure]);
   return (
     <div className="dg-waterfall__row dg-waterfall__axis">
       <Text as="span" size="xs" tone="muted">
@@ -1903,6 +2244,7 @@ function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
       </Text>
       <Text as="div" size="xs" tone="muted" className="dg-waterfall__axis-strip">
         <svg
+          ref={graphicRef}
           width="100%"
           height={AXIS_HEIGHT}
           role="img"
@@ -1918,7 +2260,7 @@ function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
             strokeWidth={1}
             shapeRendering="crispEdges"
           />
-          {ticks.map((tick, index) => (
+          {ticks.map(({ tick, anchor }) => (
             <g key={`${String(tick.value)}-${String(tick.offset)}`}>
               <line
                 x1={percent(tick.offset)}
@@ -1932,7 +2274,7 @@ function WaterfallAxis(props: WaterfallAxisProps): ReactElement {
               <text
                 x={percent(tick.offset)}
                 y={AXIS_LABEL_BASELINE}
-                textAnchor={index === 0 ? 'start' : index === lastIndex ? 'end' : 'middle'}
+                textAnchor={anchor}
                 fill="currentColor"
               >
                 {tick.label}
@@ -1961,7 +2303,13 @@ interface WaterfallRowItemProps {
   /** Prefix for the child group's id, unique per mounted component. */
   readonly groupIdPrefix: string;
   readonly expandedIds: ReadonlySet<string>;
-  readonly selectedId: string | undefined;
+  /**
+   * The panel's shared selection. A row is marked when it stands for the
+   * selected event — by id, or by the trace and span it draws
+   * ({@link matchesPanelSelection}), so a selection made in a view that keys
+   * the span differently still lands here.
+   */
+  readonly selection: PanelSelection | undefined;
   /** The path key of the row this one is nested under; `undefined` at the top level. */
   readonly parentKey: string | undefined;
   /** The path key of the row holding the tree's single tab stop. */
@@ -1998,7 +2346,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     viewStart,
     groupIdPrefix,
     expandedIds,
-    selectedId,
+    selection,
     parentKey,
     tabStopKey,
     onRowFocus,
@@ -2009,7 +2357,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
 
   const hasChildren = row.children.length > 0;
   const expanded = hasChildren && expandedIds.has(row.eventId);
-  const selected = selectedId === row.eventId;
+  const selected = matchesPanelSelection(selection, row);
   const groupId = `${groupIdPrefix}-${row.eventId}`;
   const rowKey = rowKeyFor(parentKey, row.eventId);
   const label = rowLabel(row);
@@ -2023,9 +2371,9 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
   // Whether the row's description is revealed for KEYBOARD focus. The label's
   // `Tooltip` opens on hover and on focus of its own trigger, and its trigger —
   // a truncated label — is not focusable and must not become a second stop in
-  // the row; so while the treeitem itself holds keyboard focus the same
-  // sentence is shown here instead. Set by a keyboard focus of the row element,
-  // cleared by Escape and by the row losing focus.
+  // the row; so while the treeitem itself holds keyboard focus the row holds
+  // that same `Tooltip` open instead. Set by a keyboard focus of the row
+  // element, cleared by Escape and by the row losing focus.
   const [descriptionRevealed, setDescriptionRevealed] = useState(false);
 
   // Set by a pointer press on the row and consumed by the focus it causes, so
@@ -2189,8 +2537,8 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
     }
   };
 
-  // The label, in the type role its content calls for. Built once and placed
-  // in whichever of the two description forms below is active.
+  // The label, in the type role its content calls for: the trigger of the
+  // row's one description `Tooltip` below, in both of its forms.
   const labelElement =
     row.statement === undefined ? (
       <Text as="span" size="sm" truncate className="dg-waterfall__label">
@@ -2252,7 +2600,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
                   <ChevronRight aria-hidden="true" className="dg-icon" />
                 )
               }
-              aria-label={expanded ? 'Collapse nested calls' : 'Expand nested calls'}
+              aria-label={disclosureName(row, expanded)}
               aria-expanded={expanded}
               // Referenced only while the group exists: a control may not point
               // at an id that is not in the document.
@@ -2270,39 +2618,45 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
             </Badge>
           )}
           <span className="dg-waterfall__label-slot" style={LABEL_SLOT_STYLE}>
-            {descriptionRevealed ? (
-              // The keyboard form: the `Tooltip` primitive's own open-state
-              // structure and classes, so it looks exactly like the hover
-              // bubble, held open by this row's focus rather than by the
-              // primitive. `aria-hidden` because the treeitem's `aria-label`
-              // already carries the same sentence and a reader must not hear
-              // it twice; one `role="tooltip"` per label at all times, since
-              // the primitive is not mounted while this is.
-              <span className="dg-tooltip dg-tooltip--bottom dg-waterfall__tooltip">
-                <span className="dg-tooltip__trigger">{labelElement}</span>
-                <span
-                  role="tooltip"
-                  aria-hidden="true"
-                  className="dg-tooltip__bubble dg-is-open dg-tooltip--bottom"
-                >
-                  {description}
-                  {canOpenSource ? (
-                    <>
-                      {' · '}
-                      <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
-                    </>
-                  ) : null}
-                </span>
-              </span>
-            ) : (
-              <Tooltip content={description} className="dg-waterfall__tooltip">
-                {labelElement}
-              </Tooltip>
-            )}
+            {/* One `Tooltip` in two forms, so the label has exactly one
+                `role="tooltip"` at all times and is never remounted by the
+                switch. For a pointer it is the primitive's own: hover opens
+                it above the label. For the keyboard — the treeitem itself
+                focused — this row holds it open (`open`), below the label,
+                with the Shift+Enter hint where it applies; the primitive
+                measures and places it like the hovered form, so it opens at
+                the label and not at the viewport's corner, while the row's
+                own handler keeps Escape. It describes nothing then
+                (`describesTrigger`), because the treeitem's `aria-label`
+                already carries the sentence and a reader must not hear it
+                twice. */}
+            <Tooltip
+              className="dg-waterfall__tooltip"
+              open={descriptionRevealed ? true : undefined}
+              describesTrigger={!descriptionRevealed}
+              placement={descriptionRevealed ? 'bottom' : 'top'}
+              content={
+                descriptionRevealed ? (
+                  <>
+                    {description}
+                    {canOpenSource ? (
+                      <>
+                        {' · '}
+                        <Kbd keys={OPEN_SOURCE_KEYS} /> opens the source
+                      </>
+                    ) : null}
+                  </>
+                ) : (
+                  description
+                )
+              }
+            >
+              {labelElement}
+            </Tooltip>
           </span>
           {row.occurrenceCount === undefined ? null : (
             <Badge tone="info" variant="outline">
-              {`${formatCount(row.occurrenceCount)} calls`}
+              {formatCountOf(row.occurrenceCount, CALL_NOUN)}
             </Badge>
           )}
           {row.statusCode === undefined ? null : (
@@ -2332,7 +2686,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
           ) : null}
           {row.rowCount === undefined ? null : (
             <Badge tone="neutral" variant="outline">
-              {`${formatCount(row.rowCount)} rows`}
+              {formatCountOf(row.rowCount, ROW_NOUN)}
             </Badge>
           )}
           {row.orphan === undefined ? null : (
@@ -2396,7 +2750,7 @@ function WaterfallRowItem(props: WaterfallRowItemProps): ReactElement {
               viewStart={viewStart}
               groupIdPrefix={groupIdPrefix}
               expandedIds={expandedIds}
-              selectedId={selectedId}
+              selection={selection}
               parentKey={rowKey}
               tabStopKey={tabStopKey}
               onRowFocus={onRowFocus}
@@ -2430,13 +2784,31 @@ function describeDisjointKindFilter(): string {
   return `This node's kind filter selects no kind this view draws, so no captured records were requested. A waterfall draws these kinds: ${drawable}.`;
 }
 
+/** A captured record of any kind, drawn here or not. */
+const CAPTURED_RECORD_NOUN: CountedNoun = countedNoun('captured record');
+
+/**
+ * The verdict on loaded items that hold nothing this view draws, in the form
+ * that agrees with how many were loaded: one item is "it", several are "none
+ * of them".
+ */
+const UNDRAWN_VERDICT: CountedNoun = countedNoun(
+  'it is not a network or database call',
+  'none of them is a network or database call',
+);
+
+/** The verb of "… is loaded" / "… are loaded", agreeing with the loaded count. */
+const LOADED_VERB: CountedNoun = countedNoun('is', 'are');
+
 /**
  * The message for pages that were searched, held nothing this view draws, and
  * are not the end of the result: how much was searched, stated against the
  * total when the service reported one, and that more remains.
  *
  * The count is of the SOURCE records resolved so far — the figure the footer's
- * "loaded … of …" uses — never of drawn rows, of which there are none.
+ * "loaded … of …" uses — never of drawn rows, of which there are none. With a
+ * total, the noun agrees with the total it follows ("1 of 30 captured
+ * records"); without one, with the loaded count.
  *
  * @param loaded How many records the pages resolved so far hold.
  * @param total The total the service reported for the query, if it reported one.
@@ -2445,12 +2817,9 @@ function describeDisjointKindFilter(): string {
 function describeUndrawnPages(loaded: number, total: number | undefined): string {
   const counted =
     total === undefined
-      ? `${formatCount(loaded)} captured ${loaded === 1 ? 'record' : 'records'}`
-      : `${formatCount(loaded)} of ${formatCount(total)} captured ${total === 1 ? 'record' : 'records'}`;
-  const verdict =
-    loaded === 1
-      ? 'it is not a network or database call'
-      : 'none of them is a network or database call';
+      ? formatCountOf(loaded, CAPTURED_RECORD_NOUN)
+      : `${formatCount(loaded)} of ${formatCountOf(total, CAPTURED_RECORD_NOUN)}`;
+  const verdict = pluralize(loaded, UNDRAWN_VERDICT);
   return `Loaded ${counted} so far, and ${verdict}. More records remain to be searched.`;
 }
 
@@ -2477,15 +2846,16 @@ const COUNT_ONLY_TITLE = 'Count only';
 /** The heading of the state for a page that is empty while its query is not. */
 const EMPTY_PAGE_TITLE = 'Nothing on this page';
 
-/** A noun with its singular and plural forms, chosen by the count it follows. */
-interface CountedNoun {
-  readonly one: string;
-  readonly other: string;
-}
+/*
+ * The nouns each paged source counts its items in, agreed with their count
+ * through `../utils/format` like every other counted word in this view.
+ */
+const SPAN_NOUN: CountedNoun = countedNoun('span');
+const EVENT_NOUN: CountedNoun = countedNoun('event');
+const REQUEST_GROUP_NOUN: CountedNoun = countedNoun('request group');
 
-const SPAN_NOUN: CountedNoun = { one: 'span', other: 'spans' };
-const EVENT_NOUN: CountedNoun = { one: 'event', other: 'events' };
-const REQUEST_GROUP_NOUN: CountedNoun = { one: 'request group', other: 'request groups' };
+/** That the matched items are absent from this page: "it is not" for one, "none are" for more. */
+const NOT_SHOWN_ON_PAGE: CountedNoun = countedNoun('it is not shown', 'none are shown');
 
 /** What the empty state says: an optional heading and the sentence under it. */
 interface EmptyPageCopy {
@@ -2493,8 +2863,18 @@ interface EmptyPageCopy {
   readonly message: string;
 }
 
-/** The copy for a query that matched nothing, and for the unpaged tree. */
-const EMPTY_CAPTURE_COPY: EmptyPageCopy = { title: undefined, message: EMPTY_CAPTURE_MESSAGE };
+/** The heading of the empty-capture state: the short label above its sentence. */
+const EMPTY_CAPTURE_TITLE = 'No calls';
+
+/**
+ * The copy for a query that matched nothing, and for the unpaged tree. The one
+ * state whose absence is the capture's, so the one that carries the view's
+ * glyph — identified by reference where the state is drawn.
+ */
+const EMPTY_CAPTURE_COPY: EmptyPageCopy = Object.freeze({
+  title: EMPTY_CAPTURE_TITLE,
+  message: EMPTY_CAPTURE_MESSAGE,
+});
 
 /** The paging facts the empty state is chosen from. */
 interface EmptyPageFacts {
@@ -2527,29 +2907,22 @@ function pagedNounFor(source: DataQuery['source']): CountedNoun | undefined {
   }
 }
 
-/** `noun` in the form that agrees with `count`. */
-function nounForCount(noun: CountedNoun, count: number): string {
-  return count === 1 ? noun.one : noun.other;
-}
-
 /**
  * The sentence for loaded items that the kind filter removed in full, with the
- * reported total when there is one.
+ * reported total when there is one. The verb and the verdict agree with the
+ * loaded count; the noun with the figure it follows.
  */
 function filteredPageMessage(
   noun: CountedNoun,
   loadedItemCount: number,
   total: number | undefined,
 ): string {
-  const verb = loadedItemCount === 1 ? 'is' : 'are';
-  const outcome =
-    loadedItemCount === 1
-      ? 'it is not a network or database call'
-      : 'none of them is a network or database call';
+  const verb = pluralize(loadedItemCount, LOADED_VERB);
+  const outcome = pluralize(loadedItemCount, UNDRAWN_VERDICT);
   if (total === undefined) {
-    return `${formatCount(loadedItemCount)} ${nounForCount(noun, loadedItemCount)} ${verb} loaded, and ${outcome}; no total was reported for this query.`;
+    return `${formatCountOf(loadedItemCount, noun)} ${verb} loaded, and ${outcome}; no total was reported for this query.`;
   }
-  return `${formatCount(loadedItemCount)} of the ${formatCount(total)} ${nounForCount(noun, total)} that matched this query ${verb} loaded, and ${outcome}.`;
+  return `${formatCount(loadedItemCount)} of the ${formatCountOf(total, noun)} that matched this query ${verb} loaded, and ${outcome}.`;
 }
 
 /**
@@ -2591,7 +2964,7 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
       message:
         total === undefined
           ? 'This view requests a count without rows, and no total was reported for its query.'
-          : `This view requests a count without rows: ${formatCount(total)} ${nounForCount(noun, total)} matched its query.`,
+          : `This view requests a count without rows: ${formatCountOf(total, noun)} matched its query.`,
     };
   }
   if (total === 0 || (total === undefined && offset === 0 && loadedItemCount === 0)) {
@@ -2609,7 +2982,7 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
   if (offset >= total) {
     return {
       title: EMPTY_PAGE_TITLE,
-      message: `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCount(total)} ${nounForCount(noun, total)} that matched this query.`,
+      message: `This page starts at position ${formatCount(offset + 1)}, past the end of the ${formatCountOf(total, noun)} that matched this query.`,
     };
   }
   return {
@@ -2617,7 +2990,7 @@ function describeEmptyPage(facts: EmptyPageFacts): EmptyPageCopy {
     message:
       loadedItemCount > 0
         ? filteredPageMessage(noun, loadedItemCount, total)
-        : `${formatCount(total)} ${nounForCount(noun, total)} matched this query, but none are shown on this page.`,
+        : `${formatCountOf(total, noun)} matched this query, but ${pluralize(total, NOT_SHOWN_ON_PAGE)} on this page.`,
   };
 }
 
@@ -2674,7 +3047,10 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     initialPaging(identity, authoredBaseOffset(baseQuery)),
   );
   const [expandedIds, setExpandedIds] = useState<ReadonlySet<string>>(NO_EXPANDED_IDS);
-  const [selectedId, setSelectedId] = useState<string | undefined>(undefined);
+  // The panel's one shared selection (the host's under a panel, this view's
+  // own outside one): the row standing for the selected event is marked, so
+  // this chart agrees with every other view of the same trace.
+  const { selection, markSelected } = useViewSelection();
   // The row that last received focus, by path key. What actually holds the tab
   // stop is derived from it on every render (`resolveTabStop`), so a collapse or
   // a new page can never leave the tree without one.
@@ -2756,18 +3132,11 @@ export function Waterfall(props: WaterfallProps): ReactElement {
       ? reportedNextOffset
       : undefined;
 
+  // The axis ticks are chosen by the axis itself, against the scale and the
+  // width it measures of its own strip (see `WaterfallAxis`).
   const scale = useMemo(
     () => createTimeScale([model.viewStart, model.viewEnd], [0, PERCENT_RANGE]),
     [model.viewStart, model.viewEnd],
-  );
-  const axis = useMemo(
-    () =>
-      generateAxisTicks(scale, {
-        origin: model.viewStart,
-        targetCount: AXIS_TICK_TARGET,
-        minSpacing: AXIS_TICK_MIN_SPACING,
-      }),
-    [scale, model.viewStart],
   );
 
   const rowIndex = useMemo(() => indexRows(model.rows), [model.rows]);
@@ -2776,10 +3145,11 @@ export function Waterfall(props: WaterfallProps): ReactElement {
 
   const handleSelect = useCallback(
     (row: WaterfallRow): void => {
-      setSelectedId(row.eventId);
-      actions?.onSelectEvent({ eventId: row.eventId, spanId: row.spanId, traceId: row.traceId });
+      const ref = { eventId: row.eventId, spanId: row.spanId, traceId: row.traceId };
+      markSelected(ref);
+      actions?.onSelectEvent(ref);
     },
-    [actions],
+    [actions, markSelected],
   );
 
   const handleToggle = useCallback(
@@ -2822,7 +3192,12 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     }
   }, [carried, identity, nextOffset, requestsPage, requestsQuery, spanPage, spanQuery]);
 
-  const queryDescription = describeQuery(baseQuery, offset);
+  // The query the active hook was handed — the node's query at the offset this
+  // render requested — which is exactly what a failure reports as the failing
+  // query and what its retry asks again. The authored query stands in only when
+  // neither hook was handed one, which is the unsupported source, and that
+  // branch reports the authored query itself.
+  const activeQuery: DataQuery = spanQuery ?? requestsQuery ?? baseQuery;
   const hasRows = model.rowCount > 0;
   // Whether earlier pages of this sequence were resolved and are held in
   // state. The full-view loading and error states describe a sequence that
@@ -2837,14 +3212,12 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     // entry was consulted before any query was built, so none was issued. A
     // host that rendered an unvalidated node — one naming `events`, `trace` or
     // any other source — still gets a stated failure rather than an empty
-    // chart that would read as "nothing was captured".
+    // chart that would read as "nothing was captured". Nothing was asked, so
+    // the authored query is what is shown and no retry is offered; the wording
+    // is the shared contract's, composed from this node type's catalog entry.
     body = (
       <div className="dg-waterfall__error">
-        <ErrorState
-          title="This view cannot draw that data source"
-          message="The panel node asked for a source this view does not read. Regenerate the panel, or open the data in a view that reads it."
-          query={queryDescription}
-        />
+        <ErrorState {...unsupportedQueryProps(node.type, baseQuery)} />
       </div>
     );
   } else if (!kindsSelectable) {
@@ -2859,18 +3232,17 @@ export function Waterfall(props: WaterfallProps): ReactElement {
   } else if (result.status === 'loading' && !hasRows && !hasCarried) {
     body = (
       <div className="dg-waterfall__loading">
-        <LoadingState variant="chart" label="Loading captured calls" />
+        <LoadingState variant="chart" label="Loading captured calls…" />
       </div>
     );
   } else if (result.status === 'error' && !hasRows && !hasCarried) {
+    // Nothing is on screen yet, so the failure is the view's: the shared
+    // contract supplies the title, the generic lead with the provider's cause,
+    // the hint, the code, the failing query in the one format every node
+    // prints, the technical details, the announcement and the retry.
     body = (
       <div className="dg-waterfall__error">
-        <ErrorState
-          message="The captured calls could not be loaded."
-          code={result.error?.code}
-          query={queryDescription}
-          onRetry={result.retry}
-        />
+        <ErrorState {...queryFailureProps(result, activeQuery)} />
       </div>
     );
   } else if (
@@ -2906,13 +3278,13 @@ export function Waterfall(props: WaterfallProps): ReactElement {
           />
         </div>
         {failedMore ? (
+          // The view scope, deliberately: no row is drawn above this failure,
+          // so the page scope's "the rows already shown are unaffected" would
+          // describe rows that are not there. The statement above says what
+          // was searched, and the query shown is the page that failed, at the
+          // offset it was requested at.
           <div className="dg-waterfall__error">
-            <ErrorState
-              message="The next page of captured calls could not be loaded."
-              code={result.error?.code}
-              query={queryDescription}
-              onRetry={result.retry}
-            />
+            <ErrorState {...queryFailureProps(result, activeQuery)} />
           </div>
         ) : null}
       </>
@@ -2927,20 +3299,34 @@ export function Waterfall(props: WaterfallProps): ReactElement {
     });
     body = (
       <div className="dg-waterfall__empty">
-        <EmptyState title={emptyCopy.title} message={emptyCopy.message} />
+        <EmptyState
+          title={emptyCopy.title}
+          message={emptyCopy.message}
+          icon={
+            emptyCopy === EMPTY_CAPTURE_COPY ? <ChartNoAxesGantt className="dg-icon" /> : undefined
+          }
+        />
       </div>
     );
   } else {
     const loadingMore = result.status === 'loading';
     const failedMore = result.status === 'error';
     const total = result.total;
+    // Two different figures in two different units: the calls drawn, and the
+    // source items resolved against the service's total. Each names its own
+    // noun — "4 calls · loaded 9 of 9 spans" — so the second is never read as
+    // a count of calls.
+    const drawnText = formatCountOf(model.rowCount, CALL_NOUN);
     const countText =
       total === undefined
-        ? `${formatCount(model.rowCount)} calls`
-        : `${formatCount(model.rowCount)} calls · loaded ${formatCount(loadedItemCount)} of ${formatCount(total)}`;
+        ? drawnText
+        : `${drawnText} · loaded ${formatCount(loadedItemCount)} of ${formatCountOf(
+            total,
+            pagedNounFor(baseQuery.source) ?? CAPTURED_RECORD_NOUN,
+          )}`;
     body = (
       <>
-        <WaterfallAxis ticks={axis.ticks} windowMs={model.windowMs} />
+        <WaterfallAxis scale={scale} origin={model.viewStart} windowMs={model.windowMs} />
         <div
           className="dg-waterfall__rows"
           role="tree"
@@ -2955,7 +3341,7 @@ export function Waterfall(props: WaterfallProps): ReactElement {
               viewStart={model.viewStart}
               groupIdPrefix={domIdSeed}
               expandedIds={expandedIds}
-              selectedId={selectedId}
+              selection={selection}
               parentKey={undefined}
               tabStopKey={tabStopKey}
               onRowFocus={setActiveRowKey}
@@ -2987,13 +3373,11 @@ export function Waterfall(props: WaterfallProps): ReactElement {
           )}
         </Stack>
         {failedMore ? (
+          // The next page failed, the rows above it did not: the page scope
+          // says so in its title and lead, and its retry re-requests that
+          // same page, at the offset it failed at.
           <div className="dg-waterfall__error">
-            <ErrorState
-              message="The next page of captured calls could not be loaded."
-              code={result.error?.code}
-              query={queryDescription}
-              onRetry={result.retry}
-            />
+            <ErrorState {...queryFailureProps(result, activeQuery, { scope: 'page' })} />
           </div>
         ) : null}
       </>

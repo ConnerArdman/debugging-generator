@@ -11,7 +11,14 @@
  *    an import specifier written as a literal here (AAP §0.5.4).
  * 2. *Which functions would the plan name as its anchors?* — the enclosing
  *    functions the graph's `queries` edges start at, ranked deterministically
- *    against the problem understanding's own entities and search hints.
+ *    against the problem understanding's own entities and search hints. A
+ *    function in a seed, migration, script, test or configuration module is
+ *    never one of them (`@debuggen/code-analysis`'s `isToolingModulePath`):
+ *    that module runs in a process of its own, not in the dev server the
+ *    preload instruments, so its queries can never reach a capture. When the
+ *    question names or reaches any function, the anchors are drawn from the
+ *    strongest evidence alone — reachable ones by shortest path — and are
+ *    never padded with functions the question says nothing about.
  * 3. *Can the signal actually be collected here?* — decided **only** from the
  *    `server-agent` facts the service observed, because the driver's query
  *    spans are produced by `@opentelemetry/instrumentation-pg` inside the
@@ -73,6 +80,7 @@ import {
   toPosix,
 } from '@debuggen/shared';
 import type { Logger } from '@debuggen/shared';
+import { isToolingModulePath } from '@debuggen/code-analysis';
 import type {
   CodeGraph,
   CodeNode,
@@ -712,7 +720,11 @@ function collectPgQuerySiteOwners(graph: CodeGraph): readonly PgQuerySiteOwner[]
 /** An owner the understanding named, directly or through one of its call sites. */
 const EVIDENCE_TIER_NAMED = 0;
 
-/** An owner reachable from something the understanding named. */
+/**
+ * An owner reachable from something the understanding named: up its caller
+ * chain, or down a bounded path from a node the understanding resolved to.
+ * Ranked within the tier by the number of hops, shortest first.
+ */
 const EVIDENCE_TIER_REACHABLE = 1;
 
 /** An owner the understanding says nothing about. */
@@ -738,6 +750,34 @@ const MAX_CALLER_DEPTH = 3;
  * are asked for.
  */
 const MAX_CALLER_LOOKUPS = 64;
+
+/**
+ * How many evidence nodes a downstream reachability search starts from, at
+ * most.
+ *
+ * Roots are the evidence nodes other than call sites, in the order the
+ * understanding named them, so the same question always searches from the same
+ * roots. Eight covers every entity and hint a validated understanding carries
+ * in practice.
+ */
+const MAX_REACHABILITY_ROOTS = 8;
+
+/**
+ * The most `pathBetween` searches one proposal will run, shared across owners.
+ *
+ * Sixty-four owners from each of {@link MAX_REACHABILITY_ROOTS} roots. Each
+ * search is itself bounded by the query surface's depth and node budgets, so
+ * this bounds the whole pass; exhausting it leaves the remaining owners
+ * unnarrowed, which degrades the order rather than the correctness of a
+ * proposal.
+ */
+const MAX_PATH_SEARCHES = 64 * MAX_REACHABILITY_ROOTS;
+
+/**
+ * The distance of an owner one call below something the understanding named:
+ * the shortest a reachable owner can be without being the evidence itself.
+ */
+const DIRECT_CALLER_DISTANCE = 1;
 
 /**
  * The node kinds a name in the understanding is looked up against.
@@ -816,8 +856,38 @@ function resolveEvidenceNodeIds(
 }
 
 /**
- * Whether an owner is reachable from something the understanding named, within
- * {@link MAX_CALLER_DEPTH} hops up its caller chain.
+ * The evidence nodes a downstream reachability search starts from.
+ *
+ * Every evidence node except a call site — a `db-call` node is an expression
+ * with no downstream, and one of this driver's already names its owner — in
+ * the order the understanding named them, capped at
+ * {@link MAX_REACHABILITY_ROOTS}.
+ *
+ * @param evidence The node ids the understanding resolved to.
+ * @param graph The project's code graph.
+ * @returns The root node ids, in a stable order.
+ */
+function reachabilityRoots(evidence: ReadonlySet<string>, graph: CodeGraph): readonly string[] {
+  const roots: string[] = [];
+
+  for (const id of evidence) {
+    if (roots.length >= MAX_REACHABILITY_ROOTS) {
+      break;
+    }
+
+    const node = graph.nodeById(id);
+
+    if (node !== undefined && node.kind !== 'db-call') {
+      roots.push(id);
+    }
+  }
+
+  return roots;
+}
+
+/**
+ * How many hops up its caller chain an owner meets something the understanding
+ * named, within {@link MAX_CALLER_DEPTH}; `undefined` when it does not.
  *
  * Walks callers rather than callees: the question "is this query in the path of
  * what the developer asked about?" is answered by who calls the function, and
@@ -830,14 +900,15 @@ function resolveEvidenceNodeIds(
  * @param evidence The node ids the understanding resolved to.
  * @param queries The project's read-only query surface.
  * @param budget The mutable remaining lookup budget, shared across owners.
- * @returns `true` when a caller within the bound is one of the named nodes.
+ * @returns The number of caller hops to the first named node, or `undefined`
+ * when none lies within the bounds.
  */
-function isReachableFromEvidence(
+function callerDistanceFromEvidence(
   owner: PgQuerySiteOwner,
   evidence: ReadonlySet<string>,
   queries: CodeQueries,
   budget: { remaining: number },
-): boolean {
+): number | undefined {
   const visited = new Set<string>([owner.nodeId]);
   let frontier: { readonly file: string; readonly symbol: string }[] = [
     { file: owner.file, symbol: owner.symbol },
@@ -848,7 +919,7 @@ function isReachableFromEvidence(
 
     for (const target of frontier) {
       if (budget.remaining <= 0) {
-        return false;
+        return undefined;
       }
 
       budget.remaining -= 1;
@@ -857,7 +928,7 @@ function isReachableFromEvidence(
         const { caller } = reference;
 
         if (evidence.has(caller.nodeId)) {
-          return true;
+          return depth + 1;
         }
 
         if (visited.has(caller.nodeId)) {
@@ -872,7 +943,57 @@ function isReachableFromEvidence(
     frontier = next;
   }
 
-  return false;
+  return undefined;
+}
+
+/**
+ * How many hops a downstream path from an evidence root takes to reach an
+ * owner; `undefined` when no root reaches it.
+ *
+ * The complement of {@link callerDistanceFromEvidence}, and the search that
+ * connects a named route or component to a query site several calls below it:
+ * `pathBetween` in the query surface's default direction — downstream, so
+ * every hop points the way a request flows — within its own depth and node
+ * budgets, from each root in turn. The shortest path wins, and the loop stops
+ * at {@link DIRECT_CALLER_DISTANCE}, which no root can improve on.
+ *
+ * @param owner The candidate owner.
+ * @param roots The evidence nodes to search from.
+ * @param queries The project's read-only query surface.
+ * @param budget The mutable remaining search budget, shared across owners.
+ * @returns The shortest path depth found, or `undefined`.
+ */
+function pathDistanceFromRoots(
+  owner: PgQuerySiteOwner,
+  roots: readonly string[],
+  queries: CodeQueries,
+  budget: { remaining: number },
+): number | undefined {
+  let shortest: number | undefined;
+
+  for (const root of roots) {
+    if (budget.remaining <= 0) {
+      break;
+    }
+
+    budget.remaining -= 1;
+
+    const path = queries.pathBetween(root, owner.nodeId);
+
+    if (path === undefined) {
+      continue;
+    }
+
+    if (shortest === undefined || path.depth < shortest) {
+      shortest = path.depth;
+    }
+
+    if (shortest <= DIRECT_CALLER_DISTANCE) {
+      break;
+    }
+  }
+
+  return shortest;
 }
 
 /**
@@ -885,16 +1006,25 @@ function isReachableFromEvidence(
 interface RankedOwner {
   readonly owner: PgQuerySiteOwner;
   readonly tier: number;
+
+  /**
+   * The hops measured from the evidence, for an
+   * {@link EVIDENCE_TIER_REACHABLE} owner; `0` for every other tier, where no
+   * distance was measured.
+   */
+  readonly distance: number;
 }
 
 /**
  * Orders two ranked owners.
  *
- * Exactly the documented order — evidence tier, then project-relative file,
- * then declaration line, then symbol — with the owner's opaque node id as a
- * final, always-distinct tie-break. The last key is what makes the comparison a
- * total order, and therefore what makes two runs over the same graph produce
- * identical arrays rather than arrays that happen to agree.
+ * Exactly the documented order — evidence tier, then reachability distance
+ * (shorter first, which only differs inside the reachable tier), then
+ * project-relative file, then declaration line, then symbol — with the owner's
+ * opaque node id as a final, always-distinct tie-break. The last key is what
+ * makes the comparison a total order, and therefore what makes two runs over
+ * the same graph produce identical arrays rather than arrays that happen to
+ * agree.
  *
  * File, symbol and node id are compared by {@link compareText}, which orders by
  * code unit rather than by collation, so the result does not depend on the
@@ -907,6 +1037,10 @@ interface RankedOwner {
 function compareRankedOwners(left: RankedOwner, right: RankedOwner): number {
   if (left.tier !== right.tier) {
     return left.tier - right.tier;
+  }
+
+  if (left.distance !== right.distance) {
+    return left.distance - right.distance;
   }
 
   const byFile = compareText(left.owner.file, right.owner.file);
@@ -1334,35 +1468,72 @@ function resolveClock(
  * Proposals
  * ---------------------------------------------------------------------------------------------- */
 
+/** The evidence and the two shared budgets one proposal ranks its owners against. */
+interface RankingInputs {
+  /** The node ids the understanding resolved to. */
+  readonly evidence: ReadonlySet<string>;
+
+  /** The evidence nodes a downstream search starts from. */
+  readonly roots: readonly string[];
+
+  /** The project's read-only query surface. */
+  readonly queries: CodeQueries;
+
+  /** The remaining caller-lookup budget, shared across owners. */
+  readonly callerBudget: { remaining: number };
+
+  /** The remaining path-search budget, shared across owners. */
+  readonly pathBudget: { remaining: number };
+}
+
 /**
- * The evidence tier an owner earned for this question.
+ * The evidence tier an owner earned for this question, and its distance from
+ * the evidence when it earned the reachable tier.
+ *
+ * The caller walk runs first because it is the cheaper of the two routes; the
+ * downstream search runs only when the walk found nothing as close as
+ * {@link DIRECT_CALLER_DISTANCE}, and the shorter of the two distances is
+ * kept.
  *
  * @param owner The candidate owner.
- * @param evidence The node ids the understanding resolved to.
- * @param queries The project's read-only query surface.
- * @param budget The shared caller-lookup budget.
- * @returns {@link EVIDENCE_TIER_NAMED}, {@link EVIDENCE_TIER_REACHABLE} or
+ * @param inputs The evidence, the roots and the shared budgets.
+ * @returns The ranked owner: {@link EVIDENCE_TIER_NAMED},
+ * {@link EVIDENCE_TIER_REACHABLE} with its distance, or
  * {@link EVIDENCE_TIER_UNNARROWED}.
  */
-function evidenceTierOf(
-  owner: PgQuerySiteOwner,
-  evidence: ReadonlySet<string>,
-  queries: CodeQueries,
-  budget: { remaining: number },
-): number {
+function rankOwner(owner: PgQuerySiteOwner, inputs: RankingInputs): RankedOwner {
+  const { evidence } = inputs;
+
   if (evidence.size === 0) {
     // The understanding named nothing this project has, so nothing narrows the
     // candidate set and every owner is considered on equal terms.
-    return EVIDENCE_TIER_UNNARROWED;
+    return { owner, tier: EVIDENCE_TIER_UNNARROWED, distance: 0 };
   }
 
   if (evidence.has(owner.nodeId) || owner.callNodeIds.some((id) => evidence.has(id))) {
-    return EVIDENCE_TIER_NAMED;
+    return { owner, tier: EVIDENCE_TIER_NAMED, distance: 0 };
   }
 
-  return isReachableFromEvidence(owner, evidence, queries, budget)
-    ? EVIDENCE_TIER_REACHABLE
-    : EVIDENCE_TIER_UNNARROWED;
+  const byCallers = callerDistanceFromEvidence(
+    owner,
+    evidence,
+    inputs.queries,
+    inputs.callerBudget,
+  );
+  const byPath =
+    byCallers !== undefined && byCallers <= DIRECT_CALLER_DISTANCE
+      ? undefined
+      : pathDistanceFromRoots(owner, inputs.roots, inputs.queries, inputs.pathBudget);
+  const distance =
+    byCallers === undefined
+      ? byPath
+      : byPath === undefined
+        ? byCallers
+        : Math.min(byCallers, byPath);
+
+  return distance === undefined
+    ? { owner, tier: EVIDENCE_TIER_UNNARROWED, distance: 0 }
+    : { owner, tier: EVIDENCE_TIER_REACHABLE, distance };
 }
 
 /**
@@ -1503,7 +1674,12 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
      * Returns an empty array — never throws and never rejects — when the driver
      * is unused, when the question asks for no database or server-tier
      * evidence, when the graph records no addressable owner for a driver call
-     * site, or when the session was aborted. An empty proposal is an answer.
+     * site, when every such owner belongs to a tooling module, or when the
+     * session was aborted. An empty proposal is an answer.
+     *
+     * Owners are ranked named, then reachable (shortest path first), then
+     * unnarrowed, and the proposal is drawn from the strongest tier reached
+     * alone, up to the anchor budget.
      */
     createPlan(
       context: InstrumentationContext,
@@ -1545,9 +1721,9 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
         return Promise.resolve([]);
       }
 
-      const owners = collectPgQuerySiteOwners(context.graph);
+      const collected = collectPgQuerySiteOwners(context.graph);
 
-      if (owners.length === 0) {
+      if (collected.length === 0) {
         log.debug('proposing nothing: no addressable function encloses a driver call site', {
           sessionId: context.sessionId,
           callSites: pgCallSites(context.graph).length,
@@ -1556,17 +1732,47 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
         return Promise.resolve([]);
       }
 
-      const evidence = resolveEvidenceNodeIds(understanding, context.queries);
-      const budget = { remaining: MAX_CALLER_LOOKUPS };
-      const ranked = owners
-        .map((owner) => ({ owner, tier: evidenceTierOf(owner, evidence, context.queries, budget) }))
-        .sort(compareRankedOwners);
+      // A seed, migration, script, test or configuration module runs in a
+      // process of its own rather than in the dev server the preload
+      // instruments (AAP §0.5.1), so none of its queries can reach a capture
+      // and an anchor on it would promise evidence that never arrives.
+      const owners = collected.filter((owner) => !isToolingModulePath(owner.file));
+      const toolingOwners = collected.length - owners.length;
 
+      if (owners.length === 0) {
+        log.debug('proposing nothing: every driver query site belongs to a tooling module', {
+          sessionId: context.sessionId,
+          toolingOwners,
+        });
+
+        return Promise.resolve([]);
+      }
+
+      const evidence = resolveEvidenceNodeIds(understanding, context.queries);
+      const inputs: RankingInputs = {
+        evidence,
+        roots: reachabilityRoots(evidence, context.graph),
+        queries: context.queries,
+        callerBudget: { remaining: MAX_CALLER_LOOKUPS },
+        pathBudget: { remaining: MAX_PATH_SEARCHES },
+      };
+      const ranked = owners.map((owner) => rankOwner(owner, inputs)).sort(compareRankedOwners);
+
+      // The strongest tier any owner reached is the only tier drawn from: once
+      // the question names or reaches a function, padding the proposal with
+      // functions it says nothing about would dilute the anchors a developer
+      // reads. The unnarrowed fallback therefore applies only when nothing
+      // narrowed, which is when every owner is in that tier.
+      const bestTier = ranked[0]?.tier ?? EVIDENCE_TIER_UNNARROWED;
       const actions: InstrumentationAction[] = [];
       let unresolved = 0;
 
       for (const entry of ranked) {
-        if (actions.length >= resolved.maxTargets || isAborted(context)) {
+        if (
+          entry.tier !== bestTier ||
+          actions.length >= resolved.maxTargets ||
+          isAborted(context)
+        ) {
           break;
         }
 
@@ -1587,7 +1793,10 @@ export function createPostgresAdapter(options: PostgresAdapterOptions = {}): Pos
         databaseRequested,
         serverRequested,
         owners: owners.length,
+        toolingOwners,
         evidence: evidence.size,
+        roots: inputs.roots.length,
+        tier: bestTier,
         proposed: actions.length,
         unresolved,
         maxTargets: resolved.maxTargets,

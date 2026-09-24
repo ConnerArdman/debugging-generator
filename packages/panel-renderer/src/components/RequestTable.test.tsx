@@ -110,11 +110,14 @@ import type { Mock } from 'vitest';
 
 import { DataProviderContext, PanelSessionContext, createDataProvider } from '../host/DataProvider';
 import type { DataProvider, DataQueryResolver, DataQueryResponse } from '../host/DataProvider';
-import { PanelActionsContext } from '../host/PanelActions';
-import type { PanelActions, PanelEventRef } from '../host/PanelActions';
+import { PanelActionsContext, PanelSelectionContext } from '../host/PanelActions';
+import type { PanelActions, PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { PAGE_FAILURE_TITLE, formatDataQuery } from '../host/useQuery';
+import { FOCUS_KEY_ATTRIBUTE } from '../primitives/ErrorState';
 import {
   NOT_AVAILABLE_LABEL,
   formatBytes,
+  formatCompactPath,
   formatCount,
   formatDuration,
   formatOffset,
@@ -122,6 +125,7 @@ import {
   humanizeLabel,
 } from '../utils/format';
 import { RequestTable } from './RequestTable';
+import { sourceLinkAccessibleName } from './SourceLink';
 
 /*
  * ---------------------------------------------------------------------------
@@ -194,9 +198,35 @@ const PANEL_SOURCE: SourceLocation = {
   confidence: 0.9,
 };
 
-/** The accessible name a source chip announces (`SourceLink`'s own shape). */
-function chipName(location: SourceLocation): string {
-  return `Open ${location.file}:${String(location.line)}:${String(location.column)}`;
+/**
+ * The accessible name of an "Initiated by" chip, computed by `SourceLink`'s own
+ * exported rule from the props the component passes it: the location alone,
+ * with its symbol shown and the non-compact path, and NO `label` — the caption
+ * is derived from the place the chip opens, never from the caller's label.
+ */
+function initiatorChipName(location: SourceLocation): string {
+  return sourceLinkAccessibleName({ location, showSymbol: true });
+}
+
+/**
+ * The visible caption of an "Initiated by" chip: the location's symbol, then
+ * its compacted `file:line`, joined by the single space `SourceLink` renders
+ * between the two runs.
+ */
+function initiatorChipCaption(location: SourceLocation): string {
+  const path = `${formatCompactPath(location.file)}:${String(location.line)}`;
+
+  return location.symbol === undefined ? path : `${location.symbol} ${path}`;
+}
+
+/**
+ * The accessible name of an occurrence's source chip, computed by `SourceLink`'s
+ * own exported rule from the props the component passes it: the location in
+ * the compact form, and NO `label` — the caller's label, when shown, is plain
+ * text beside the chip.
+ */
+function occurrenceChipName(location: SourceLocation): string {
+  return sourceLinkAccessibleName({ location, compact: true });
 }
 
 /** The identity of the node under test, as the panel normaliser assigns one. */
@@ -216,6 +246,9 @@ const LONGEST_FIRST: DataQuerySort = 'duration_desc';
 /** The accessible name of the one sortable header control. */
 const COUNT_SORT_NAME = 'Occurrences';
 
+/** The accessible name of the toolbar's ordering select: unique across the tables of a panel. */
+const SORT_CONTROL_NAME = 'Order requests';
+
 /** The toolbar's own controls and indicators. */
 const TOOLBAR_NAME = 'Request ordering and filters';
 const DUPLICATES_ONLY_NAME = 'Duplicates only';
@@ -226,8 +259,26 @@ const MIXED_GROUPING_TEXT = 'Mixed grouping';
 const LOAD_MORE_NAME = 'Load more';
 const RETRY_NAME = 'Retry';
 
+/** The same paging control's name while the page it asked for is in flight. */
+const LOAD_MORE_BUSY_NAME = 'Loading more…';
+
+/** The focus key the paging control carries, so a host frame can find it again. */
+const LOAD_MORE_FOCUS_KEY = 'request-table-load-more';
+
 /** The accessible name `ErrorState` gives the serialised query it shows. */
 const FAILING_QUERY_NAME = 'Failing query';
+
+/**
+ * The package's one failure contract, as a reader meets it: the title and the
+ * generic lead of a view whose data failed (see `queryFailureProps` in
+ * `../host/useQuery`). Spelled out rather than imported, so these cases pin the
+ * words a reader hears rather than whatever the module currently holds.
+ */
+const VIEW_FAILURE_TITLE = 'Could not load this view';
+const VIEW_FAILURE_LEAD = 'The data for this view could not be loaded.';
+
+/** The focus key every error state's retry carries, for the host's node frame. */
+const RETRY_FOCUS_KEY = 'error-state-retry';
 
 /** The two grouping badges, in the component's own wording. */
 const KEYED_GROUPING_TEXT = humanizeLabel('request-key');
@@ -582,6 +633,76 @@ function pendingProvider(): StubProvider {
   return recordingProvider(() => new Promise<DataQueryResponse>(() => undefined));
 }
 
+/** A stub provider whose second page is held in flight until the case releases it. */
+interface HeldSecondPageProvider extends StubProvider {
+  /** Settles the second call with the given page; later calls answer with it too. */
+  readonly releaseSecondPage: (page: RequestPage) => void;
+}
+
+/**
+ * A provider that answers the first call at once and holds every later call
+ * until the case releases the second page.
+ *
+ * The paging-focus cases need a window in which the next page is observably in
+ * flight — the control's busy state and focus are asserted inside it — and a
+ * never-settling provider would give no way to land the page afterwards.
+ *
+ * @param first The page the first call resolves with.
+ * @returns The stub provider and the release for its second page.
+ */
+function heldSecondPageProvider(first: RequestPage): HeldSecondPageProvider {
+  let release: ((page: RequestPage) => void) | undefined;
+  const held = new Promise<RequestPage>((settle) => {
+    release = settle;
+  });
+
+  const stub = recordingProvider((_query, call) =>
+    (call === 1 ? Promise.resolve(first) : held).then((page): DataQueryResponse => ({
+      source: 'requests',
+      data: page.data,
+      ...(page.total === undefined ? {} : { total: page.total }),
+      ...(page.nextOffset === undefined ? {} : { nextOffset: page.nextOffset }),
+    })),
+  );
+
+  return {
+    ...stub,
+    releaseSecondPage: (page) => {
+      if (release === undefined) {
+        throw new Error('the held page promise was never constructed');
+      }
+
+      release(page);
+    },
+  };
+}
+
+/**
+ * Records every change to an element's `disabled` attribute from now on.
+ *
+ * A focused control that turns `disabled` loses focus in a real browser, so the
+ * paging cases assert it NEVER did — at no point in the flight, not merely at
+ * the instants a case happens to sample.
+ *
+ * @param element The control to watch.
+ * @returns A reader of the changes observed so far, which also stops watching.
+ */
+function watchDisabled(element: HTMLElement): () => readonly MutationRecord[] {
+  const seen: MutationRecord[] = [];
+  const observer = new MutationObserver((records) => {
+    seen.push(...records);
+  });
+
+  observer.observe(element, { attributes: true, attributeFilter: ['disabled'] });
+
+  return () => {
+    seen.push(...observer.takeRecords());
+    observer.disconnect();
+
+    return seen;
+  };
+}
+
 /**
  * A provider that rejects every query.
  *
@@ -776,20 +897,62 @@ function cellsOf(row: HTMLElement): {
 }
 
 /**
- * The text of every tooltip bubble inside an element.
+ * The text of every tooltip description inside an element, each opened the way
+ * a keyboard reader opens it — focus arriving on its trigger — read through the
+ * trigger's `aria-describedby`, and closed again as focus leaves.
  *
- * The tooltip primitive keeps its bubble mounted for the trigger's whole life —
- * `aria-describedby` has to resolve at the moment a reader reaches the trigger —
- * so its text is in the accessibility tree whether or not it is visible, which
- * is what lets a case assert on a description without hovering.
+ * The tooltip primitive keeps every bubble mounted, but `hidden` and out of the
+ * accessibility tree while it is closed, so a description counts here only once
+ * focus has actually shown it. A trigger whose tooltip is disabled never opens
+ * and contributes no text.
  *
  * @param scope The element to search.
- * @returns One string per bubble.
+ * @returns One string per description that opened, in document order.
  */
 function tooltipTexts(scope: HTMLElement): string[] {
-  return within(scope)
-    .queryAllByRole('tooltip')
-    .map((bubble) => bubble.textContent ?? '');
+  return [...scope.querySelectorAll<HTMLElement>('.dg-tooltip__trigger > *')].flatMap((trigger) => {
+    fireEvent.focus(trigger);
+    const texts = describingTooltips(trigger).map((bubble) => bubble.textContent ?? '');
+    fireEvent.blur(trigger);
+
+    return texts;
+  });
+}
+
+/**
+ * The tooltips a trigger is described by, open or closed, resolved the way an
+ * assistive technology resolves them: through the ids in its
+ * `aria-describedby`. Every id it names must resolve — a description pointing
+ * at nothing is a defect in itself. The tooltip primitive keeps its bubble
+ * mounted for the trigger's whole life (`hidden` while closed), so a closed
+ * tooltip is still named here: that is what keeps the trigger described.
+ *
+ * @param trigger The described element.
+ * @returns The `role="tooltip"` elements among its descriptions, possibly none.
+ */
+function namedTooltips(trigger: HTMLElement): HTMLElement[] {
+  const described = (trigger.getAttribute('aria-describedby') ?? '')
+    .split(/\s+/u)
+    .filter((id) => id.length > 0)
+    .map((id) => document.getElementById(id));
+
+  expect(described).not.toContain(null);
+
+  return described.filter(
+    (element): element is HTMLElement => element?.getAttribute('role') === 'tooltip',
+  );
+}
+
+/**
+ * The tooltips a trigger is showing right now: those among {@link namedTooltips}
+ * that are open, per {@link isShown}. A closed bubble is mounted but `hidden`,
+ * so a trigger at rest is described by its tooltip yet shows none.
+ *
+ * @param trigger The described element.
+ * @returns The shown `role="tooltip"` elements among its descriptions, possibly none.
+ */
+function describingTooltips(trigger: HTMLElement): HTMLElement[] {
+  return namedTooltips(trigger).filter(isShown);
 }
 
 /** The single query a stub provider received, failing on any other count. */
@@ -1025,12 +1188,25 @@ describe('RequestTable states', () => {
       expect(message.textContent).not.toContain(url);
     }
 
+    // Announced as the settled status, with its short title and a decorative
+    // glyph above the sentence, like every other view's empty capture.
+    const state = screen.getByRole('status');
+    expect(state.contains(message)).toBe(true);
+    expect(state.querySelector('.dg-empty-state__title')?.textContent).toBe(NOTHING_CAPTURED_TITLE);
+    expect(state.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden')).toBe('true');
+
     // An empty page is a success, so it is drawn as an absence and not as a
     // failure, and there is no grid to hold rows.
     expect(screen.queryByRole('alert')).toBeNull();
-    expect(screen.queryByRole('status')).toBeNull();
+    expect(screen.queryByRole('status', { busy: true })).toBeNull();
     expect(screen.queryAllByRole('row')).toHaveLength(0);
     expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // A settled empty capture with no narrowing of the reader's: an order of
+    // nothing and a duplicates filter over nothing cannot act, so the toolbar
+    // is not drawn over it.
+    expect(screen.queryByRole('group', { name: TOOLBAR_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: DUPLICATES_ONLY_NAME })).toBeNull();
   });
 
   it('renders an alert carrying the failed query, and retries it on request', async () => {
@@ -1044,15 +1220,12 @@ describe('RequestTable states', () => {
     const alert = await screen.findByRole('alert');
     expect(alert.classList.contains('dg-request-table__error')).toBe(true);
 
-    // The failure is stated in this view's own words — what could not be
-    // resolved, and that the capture is untouched — with the provider's code
-    // carried through so the reader can act on it. The provider's raw message is
-    // deliberately NOT shown as analysis (AAP 0.5.5): it is logged, not read
-    // back to the developer as a finding.
-    expect(alert.textContent).toContain(
-      'The grouped requests for this panel could not be resolved',
-    );
-    expect(alert.textContent).toContain('The capture is unchanged');
+    // The failure is stated in the package's one failure contract — the
+    // generic lead, then the provider's own cause — with the provider's code
+    // carried through so the reader can act on it (B2-F14). The cause stays
+    // inside the error box, never where an analysis goes (AAP 0.5.5).
+    expect(alert.textContent).toContain(VIEW_FAILURE_LEAD);
+    expect(alert.textContent).toContain('The channel to the service is closed.');
     expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
       true,
     );
@@ -1078,6 +1251,53 @@ describe('RequestTable states', () => {
 
     // No rows were invented behind the failure.
     expect(screen.queryAllByRole('row')).toHaveLength(0);
+  });
+
+  it('renders a provider rejection through the shared error contract', async () => {
+    const stub = rejectingProvider(
+      new DebuggenError('TRANSPORT_DISCONNECTED', 'The channel to the service is closed.', {
+        hint: 'Start the local service and reconnect.',
+      }),
+    );
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    // One design for every failed node (B2-F14, B1-F16), in its fixed order:
+    // the default glyph, the view-scope title, the generic lead followed by the
+    // provider's own cause, the provider's hint on a line of its own, the code
+    // as a chip, the query, and a retry.
+    const alert = await screen.findByRole('alert');
+    expect(alert.querySelector('.dg-error-state__icon svg')).not.toBeNull();
+    expect(
+      within(alert).getByText(VIEW_FAILURE_TITLE).classList.contains('dg-error-state__title'),
+    ).toBe(true);
+
+    const [message, hint] = Array.from(
+      alert.querySelectorAll('.dg-error-state__message'),
+      (line) => line.textContent ?? '',
+    );
+    expect(message?.startsWith(VIEW_FAILURE_LEAD)).toBe(true);
+    expect(message).toContain('The channel to the service is closed.');
+    expect(hint).toBe('Start the local service and reconnect.');
+    expect(within(alert).getByText('TRANSPORT_DISCONNECTED').classList.contains('dg-badge')).toBe(
+      true,
+    );
+
+    // The query asked, printed by the package's one formatter: pretty JSON with
+    // its members in the canonical order, so every node prints it alike.
+    const shown = within(alert).getByRole('group', { name: FAILING_QUERY_NAME });
+    const asked = {
+      source: 'requests',
+      sort: MOST_OCCURRENCES_FIRST,
+      offset: DATA_QUERY_DEFAULT_OFFSET,
+    };
+    expect(JSON.parse(shown.textContent ?? '')).toEqual(asked);
+    expect(shown.textContent).toBe(JSON.stringify(asked, null, 2));
+
+    // The retry carries the key the host's node frame returns focus by.
+    expect(
+      within(alert).getByRole('button', { name: RETRY_NAME }).getAttribute(FOCUS_KEY_ATTRIBUTE),
+    ).toBe(RETRY_FOCUS_KEY);
   });
 });
 
@@ -1465,7 +1685,9 @@ describe('RequestTable duplicate evidence', () => {
  *
  * The third is what proves a label without a location renders as text rather
  * than as a chip that leads nowhere, and the two that resolved are what prove
- * the column is never collapsed to its first entry (AAP 0.8.2).
+ * the column never loses a caller (AAP 0.8.2): the first is shown with its chip,
+ * the others are counted beside it and named in the count's description, and
+ * every one that resolved is a chip in the occurrence list.
  */
 const MIXED_INITIATOR_GROUP = makeRequestGroup({
   id: 'request-group-example-0051',
@@ -1509,8 +1731,78 @@ const MIXED_INITIATOR_GROUP = makeRequestGroup({
   ],
 });
 
+/**
+ * A caller label shaped like a source position, naming a file no occurrence
+ * resolved to. The producer records whatever string it saw as the initiator,
+ * so a label can look like a location and still not be the one the chip beside
+ * it opens.
+ */
+const PATH_SHAPED_INITIATOR = 'src/example/elsewhere.ts:1:1';
+
+/** One request whose only caller carries {@link PATH_SHAPED_INITIATOR} and resolved elsewhere. */
+const PATH_SHAPED_INITIATOR_GROUP = makeRequestGroup({
+  id: 'request-group-example-0055',
+  requestKey: 'request-key-example-0055',
+  method: METHOD_READ,
+  url: RESOURCE_URL,
+  path: RESOURCE_PATH,
+  count: 1,
+  statusCodes: [200],
+  initiators: [PATH_SHAPED_INITIATOR],
+  occurrences: [
+    makeOccurrence({
+      eventId: eventIdFor(5),
+      spanId: spanIdFor(5),
+      initiator: PATH_SHAPED_INITIATOR,
+      source: WIDGET_SOURCE,
+    }),
+  ],
+});
+
+/**
+ * The items of a `layout/Stack` rendered inside an element: the direct
+ * children of its first `.dg-stack__items` box, which is where the stack puts
+ * every child it was given, one element per child.
+ *
+ * @param scope The element holding the stack.
+ * @returns The stack's direct children, in order.
+ */
+function stackItemsOf(scope: Element): HTMLElement[] {
+  const items = scope.querySelector('.dg-stack__items');
+
+  if (items === null) {
+    throw new Error('the element holds no stack');
+  }
+
+  return Array.from(items.children).filter(
+    (child): child is HTMLElement => child instanceof HTMLElement,
+  );
+}
+
+/**
+ * The text a sighted reader sees in an element: its text content without the
+ * tooltip bubbles, which stay mounted — and therefore in `textContent` — while
+ * they are closed.
+ *
+ * @param element The element to read.
+ * @returns Its text, bubbles excluded.
+ */
+function visibleText(element: Element): string {
+  const copy = element.cloneNode(true);
+
+  if (!(copy instanceof Element)) {
+    throw new Error('an element cloned to a non-element');
+  }
+
+  for (const bubble of Array.from(copy.querySelectorAll('[role="tooltip"]'))) {
+    bubble.remove();
+  }
+
+  return copy.textContent ?? '';
+}
+
 describe('RequestTable callers and click-to-source', () => {
-  it('renders every distinct caller, linking the ones that resolved to a location', async () => {
+  it('shows the first caller beside the chip of its location, and counts every other one', async () => {
     const stub = resolvingProvider([MIXED_INITIATOR_GROUP]);
 
     renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
@@ -1524,24 +1816,188 @@ describe('RequestTable callers and click-to-source', () => {
     }
 
     const cell = cellsOf(row).initiators;
+    const [first, ...others] = MIXED_INITIATOR_GROUP.initiators;
 
-    // All three labels are on screen — the set is never collapsed to the first.
-    for (const initiator of MIXED_INITIATOR_GROUP.initiators) {
-      expect(within(cell).getByText(initiator)).toBeDefined();
+    if (first === undefined) {
+      throw new Error('the fixture group records no caller');
     }
 
-    // Exactly the two callers an occurrence resolved a location for are chips,
-    // each naming its own location.
-    expect(within(cell).getAllByRole('button')).toHaveLength(2);
-    expect(within(cell).getByRole('button', { name: chipName(WIDGET_SOURCE) })).toBeDefined();
-    expect(within(cell).getByRole('button', { name: chipName(PANEL_SOURCE) })).toBeDefined();
+    // One line of exactly two items: the first caller's slot and the count of
+    // the rest. A cell that wrapped its callers made every multi-caller row
+    // taller than its neighbours and truncated each chip to a few characters,
+    // so neither the cell nor the caller's own slot may wrap.
+    const stack = cell.querySelector('.dg-request-table__initiators');
+    expect(stack?.classList.contains('dg-stack--wrap')).toBe(false);
+    expect(cell.querySelector('.dg-stack--wrap')).toBeNull();
 
-    // The third is plain text rather than a dead link: no occurrence attributed
-    // to it carried a location, and a chip that opens nothing is the feature
-    // failing quietly.
-    const unlinked = within(cell).getByText(INITIATOR_SHELL);
-    expect(unlinked.classList.contains('dg-request-table__initiator')).toBe(true);
-    expect(unlinked.closest('button')).toBeNull();
+    const items = stackItemsOf(cell);
+    expect(items).toHaveLength(2);
+
+    // The first caller resolved a location, so it has the row's one chip, named
+    // — and captioned — by that location.
+    expect(within(cell).getAllByRole('button')).toHaveLength(1);
+    const chip = within(cell).getByRole('button', { name: initiatorChipName(PANEL_SOURCE) });
+
+    // The caption is exactly the location's symbol and compacted `file:line`,
+    // never the caller's label: what the chip says is where it goes.
+    expect(visibleText(chip)).toBe(initiatorChipCaption(PANEL_SOURCE));
+
+    // Label in name: the name begins with that caption and ends with the full
+    // `file:line:column` the chip opens.
+    const name = chip.getAttribute('aria-label') ?? '';
+
+    expect(name.startsWith(initiatorChipCaption(PANEL_SOURCE))).toBe(true);
+    expect(
+      name.endsWith(
+        `${PANEL_SOURCE.file}:${String(PANEL_SOURCE.line)}:${String(PANEL_SOURCE.column)}`,
+      ),
+    ).toBe(true);
+
+    // Out of the Tab order, like every control in the grid.
+    expect(chip.getAttribute('tabindex')).toBe('-1');
+
+    // The caller's label is still on screen, as plain text immediately before
+    // its chip rather than inside it, and the two share the first slot.
+    const label = within(cell).getByText(first);
+
+    expect(label.closest('button')).toBeNull();
+    expect(label.hasAttribute('tabindex')).toBe(false);
+    expect(label.nextElementSibling?.contains(chip)).toBe(true);
+    expect(items[0]?.contains(label)).toBe(true);
+    expect(items[0]?.contains(chip)).toBe(true);
+
+    // The number of callers is always visible — two callers is a different
+    // finding from one caller firing twice — and the badge's description names
+    // every caller the row does not show, in the order received.
+    const overflow = within(cell).getByText(`+${formatCount(others.length)}`);
+    expect(overflow.classList.contains('dg-badge')).toBe(true);
+    expect(items[1]?.contains(overflow)).toBe(true);
+    expect(overflow.getAttribute('tabindex')).toBe('-1');
+    const description = describingTooltip(overflow).textContent ?? '';
+    expect(description).toContain(`Also initiated by: ${others.join(', ')}.`);
+
+    // One of those callers resolved a location, and a tooltip holds no link, so
+    // the description says where it can be opened.
+    expect(description).toContain('Show the occurrences to open the source location');
+  });
+
+  it('keeps every caller with a location one activation away, in the occurrence list', async () => {
+    const stub = resolvingProvider([MIXED_INITIATOR_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(
+      screen.getByRole('button', { name: disclosureName(MIXED_INITIATOR_GROUP, false) }),
+    );
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    // The callers the row counted rather than drew are chips here, each named
+    // by its own location, with the caller's label as plain text before it.
+    for (const [initiator, location] of [
+      [INITIATOR_WIDGET, WIDGET_SOURCE],
+      [INITIATOR_PANEL, PANEL_SOURCE],
+    ] as const) {
+      const chip = within(detail).getByRole('button', { name: occurrenceChipName(location) });
+      const label = within(detail).getByText(initiator);
+
+      expect(chip.getAttribute('tabindex')).toBe('-1');
+      expect(label.closest('button')).toBeNull();
+      expect(label.nextElementSibling?.contains(chip)).toBe(true);
+    }
+  });
+
+  it('shows a first caller without a location as text, with its full label described', async () => {
+    const unlinkedFirst = makeRequestGroup({
+      id: 'request-group-example-0052',
+      requestKey: 'request-key-example-0052',
+      initiators: [INITIATOR_SHELL, INITIATOR_WIDGET],
+      occurrences: [makeOccurrence({ initiator: INITIATOR_SHELL })],
+    });
+    const row = await renderSoleGroup(unlinkedFirst);
+    const cell = cellsOf(row).initiators;
+
+    // Plain text rather than a dead link: no occurrence attributed to it carried
+    // a location, and a chip that opens nothing is the feature failing quietly.
+    expect(within(cell).queryAllByRole('button')).toHaveLength(0);
+
+    const label = cell.querySelector<HTMLElement>('code.dg-truncate');
+
+    if (label === null) {
+      throw new Error('the cell rendered no caller label');
+    }
+
+    expect(label.textContent).toBe(INITIATOR_SHELL);
+
+    // The cell truncates the label to its column, so the full text is always
+    // described rather than only when a string was shortened.
+    expect(describingTooltip(label).textContent).toBe(INITIATOR_SHELL);
+
+    // No caller after the first resolved a location, so the overflow badge
+    // names it and points nowhere.
+    const description =
+      describingTooltip(within(cell).getByText(`+${formatCount(1)}`)).textContent ?? '';
+    expect(description).toBe(`Also initiated by: ${INITIATOR_WIDGET}.`);
+  });
+
+  it('draws no count beside a group recorded with one caller', async () => {
+    const row = await renderSoleGroup(SINGLE_GROUP);
+    const cell = cellsOf(row).initiators;
+
+    expect(stackItemsOf(cell)).toHaveLength(1);
+    expect(within(cell).queryByText(/^\+/)).toBeNull();
+  });
+
+  it('folds two caller labels that resolve to one location into a single caller', async () => {
+    // A symbol name and the path it was declared at, attributed by different
+    // occurrences: two distinct labels, one place in the project.
+    const symbolLabel = 'fetchItemList';
+    const pathLabel = `${PANEL_SOURCE.file}:${String(PANEL_SOURCE.line)}:${String(PANEL_SOURCE.column)}`;
+    const oneLocation = makeRequestGroup({
+      id: 'request-group-example-0061',
+      requestKey: 'request-key-example-0061',
+      initiators: [symbolLabel, pathLabel],
+      occurrences: [
+        makeOccurrence({
+          eventId: eventIdFor(1),
+          spanId: spanIdFor(1),
+          initiator: symbolLabel,
+          source: PANEL_SOURCE,
+        }),
+        makeOccurrence({
+          eventId: eventIdFor(2),
+          spanId: spanIdFor(2),
+          initiator: pathLabel,
+          source: { ...PANEL_SOURCE },
+        }),
+      ],
+    });
+    const row = await renderSoleGroup(oneLocation);
+    const cell = cellsOf(row).initiators;
+
+    // One chip, opening that location, and no "+1" counting a second caller
+    // that does not exist.
+    expect(stackItemsOf(cell)).toHaveLength(1);
+    expect(within(cell).queryByText(/^\+/)).toBeNull();
+    expect(
+      within(cell).getAllByRole('button', { name: initiatorChipName(PANEL_SOURCE) }),
+    ).toHaveLength(1);
+
+    // The chip is captioned by the location; the caller kept is the first one
+    // received, shown as plain text before it, and the folded one is not shown.
+    const chip = within(cell).getByRole('button');
+    const label = within(cell).getByText(symbolLabel);
+
+    expect(visibleText(chip)).toBe(initiatorChipCaption(PANEL_SOURCE));
+    expect(label.closest('button')).toBeNull();
+    expect(label.nextElementSibling?.contains(chip)).toBe(true);
+    expect(within(cell).queryByText(pathLabel)).toBeNull();
   });
 
   it('hands the host the very location the activated caller resolved to', async () => {
@@ -1552,11 +2008,12 @@ describe('RequestTable callers and click-to-source', () => {
     // Taken BEFORE the render and compared afterwards: comparing the emitted
     // object's keys against the live fixture alone would be satisfied by a
     // component that added a field to it in place.
-    const expectedKeys = Object.keys({ ...WIDGET_SOURCE }).sort();
+    const expectedKeys = Object.keys({ ...PANEL_SOURCE }).sort();
 
     renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
 
-    const chip = await screen.findByRole('button', { name: chipName(WIDGET_SOURCE) });
+    // The row shows its first caller's chip; the others are counted beside it.
+    const chip = await screen.findByRole('button', { name: initiatorChipName(PANEL_SOURCE) });
 
     // Rendering a chip is not activating it: nothing opens an editor until the
     // developer asks.
@@ -1577,19 +2034,104 @@ describe('RequestTable callers and click-to-source', () => {
     // Equal, and the same key set: a dropped `symbol`, `resolvedBy` or
     // `confidence` and an invented extra field both fail here. Every hop after
     // this one acts on the object it is handed (AAP 0.4.2).
-    expect(received).toEqual(WIDGET_SOURCE);
+    expect(received).toEqual(PANEL_SOURCE);
     expect(Object.keys(received).sort()).toEqual(expectedKeys);
-    expect(received.file).toBe(WIDGET_SOURCE.file);
+    expect(received.file).toBe(PANEL_SOURCE.file);
     expect(received.file.startsWith('/')).toBe(false);
-    expect(received.line).toBe(WIDGET_SOURCE.line);
-    expect(received.column).toBe(WIDGET_SOURCE.column);
-    expect(received.symbol).toBe(WIDGET_SOURCE.symbol);
+    expect(received.line).toBe(PANEL_SOURCE.line);
+    expect(received.column).toBe(PANEL_SOURCE.column);
+    expect(received.symbol).toBe(PANEL_SOURCE.symbol);
 
     // Opening source is not selecting an occurrence, expanding a group or
     // changing a filter: the chip's activation stops at the chip.
     expect(spies.onSelectEvent).not.toHaveBeenCalled();
     expect(spies.onExpand).not.toHaveBeenCalled();
     expect(spies.onFilterChange).not.toHaveBeenCalled();
+  });
+
+  it('captions a chip by its location even when the caller label names another one', async () => {
+    const stub = resolvingProvider([PATH_SHAPED_INITIATOR_GROUP]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    const [row] = dataRows();
+
+    if (row === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    const cell = cellsOf(row).initiators;
+    const [chip, ...others] = within(cell).getAllByRole('button');
+
+    if (chip === undefined) {
+      throw new Error('the resolved caller rendered no chip');
+    }
+
+    expect(others).toHaveLength(0);
+
+    // The recorded label reads like a location, and it is not the one this
+    // chip opens: neither the caption nor the name may repeat it.
+    expect(chip.textContent).toBe(initiatorChipCaption(WIDGET_SOURCE));
+    expect(chip.getAttribute('aria-label')).toBe(initiatorChipName(WIDGET_SOURCE));
+    expect(chip.textContent).not.toContain(PATH_SHAPED_INITIATOR);
+    expect(chip.getAttribute('aria-label')).not.toContain(PATH_SHAPED_INITIATOR);
+
+    // The label is still shown, as the plain caller text it is and never as a
+    // control that could be mistaken for the link.
+    const label = within(cell).getByText(PATH_SHAPED_INITIATOR);
+
+    expect(label.closest('button')).toBeNull();
+    expect(label.hasAttribute('tabindex')).toBe(false);
+    expect(label.nextElementSibling?.contains(chip)).toBe(true);
+
+    // Activation opens exactly the place the caption names: the occurrence's
+    // own location, field for field.
+    await user.click(chip);
+
+    expect(spies.onOpenSource).toHaveBeenCalledTimes(1);
+    expect(spies.onOpenSource).toHaveBeenCalledWith(WIDGET_SOURCE);
+
+    const [call] = spies.onOpenSource.mock.calls;
+
+    if (call === undefined) {
+      throw new Error('the open-source handler recorded no call');
+    }
+
+    expect(Object.keys(call[0]).sort()).toEqual(Object.keys({ ...WIDGET_SOURCE }).sort());
+  });
+
+  it('keeps an occurrence label that names another place as text beside its own chip', async () => {
+    const user = userEvent.setup();
+
+    await renderSoleGroup(PATH_SHAPED_INITIATOR_GROUP);
+    await user.click(
+      screen.getByRole('button', { name: disclosureName(PATH_SHAPED_INITIATOR_GROUP, false) }),
+    );
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    // The chip names the occurrence's own location, compactly, and never the
+    // path-shaped label: that label is a different place from the one it opens.
+    const chip = within(detail).getByRole('button', { name: occurrenceChipName(WIDGET_SOURCE) });
+
+    expect(chip.textContent).not.toContain(PATH_SHAPED_INITIATOR);
+    expect(chip.getAttribute('aria-label')).not.toContain(PATH_SHAPED_INITIATOR);
+
+    // The label is a claim about the caller, so it is still shown: plain text,
+    // no control, immediately before the chip in the one initiator slot.
+    const label = within(detail).getByText(PATH_SHAPED_INITIATOR);
+
+    expect(label.closest('button')).toBeNull();
+    expect(label.hasAttribute('tabindex')).toBe(false);
+    expect(label.nextElementSibling?.contains(chip)).toBe(true);
   });
 });
 
@@ -1648,6 +2190,9 @@ function disclosureName(group: RequestGroup, expanded: boolean): string {
   return `${expanded ? 'Hide occurrences' : 'Show occurrences'}: ${group.method} ${group.path}`;
 }
 
+/** Every group's disclosure control, open or closed, by the shape of its name. */
+const DISCLOSURE_NAME_PATTERN = /^(Show|Hide) occurrences: /;
+
 /** The accessible name of one occurrence's selection control. */
 function occurrenceName(group: RequestGroup, occurrence: RequestOccurrence): string {
   return `Select the occurrence at ${formatOffset(occurrence.startTime, group.firstStartTime)}`;
@@ -1688,6 +2233,13 @@ describe('RequestTable occurrences', () => {
         name: occurrenceName(REPEATED_GROUP, occurrence),
       });
       expect(control).toBeDefined();
+
+      // Label in name (WCAG 2.5.3): what the button shows — the offset — is
+      // part of what it is called, so a speech-input user can say it.
+      const visibleText = control.textContent ?? '';
+
+      expect(visibleText).toBe(formatOffset(occurrence.startTime, REPEATED_GROUP.firstStartTime));
+      expect(control.getAttribute('aria-label') ?? '').toContain(visibleText);
       expect(within(detail).getByText(formatDuration(occurrence.durationMs))).toBeDefined();
 
       // The offset is relative, so no epoch reading is printed for it.
@@ -1814,6 +2366,70 @@ describe('RequestTable occurrences', () => {
     expect(cellsOf(row).count.textContent).toBe(formatCount(9));
   });
 
+  it('carries each disclosure state on its toggle, naming the detail row it opens', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // A `grid` row does not support `aria-expanded`, so no row reports it; the
+    // state lives on the one control that changes it, in every row.
+    for (const row of dataRows()) {
+      expect(row.hasAttribute('aria-expanded')).toBe(false);
+    }
+
+    const toggles = screen.getAllByRole('button', { name: DISCLOSURE_NAME_PATTERN });
+
+    expect(toggles).toHaveLength(PROVIDER_ORDER.length);
+
+    for (const toggle of toggles) {
+      expect(toggle.getAttribute('aria-expanded')).toBe('false');
+      // Nothing is controlled while nothing is rendered: a closed toggle names
+      // no element rather than one missing from the document.
+      expect(toggle.hasAttribute('aria-controls')).toBe(false);
+    }
+
+    await user.click(screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, false) }));
+
+    const opened = screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, true) });
+    const closed = screen.getByRole('button', { name: disclosureName(SINGLE_GROUP, false) });
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    // The open toggle says so, and names exactly the detail row it revealed.
+    expect(opened.getAttribute('aria-expanded')).toBe('true');
+
+    const controlled = document.getElementById(opened.getAttribute('aria-controls') ?? '');
+
+    expect(controlled).toBe(detail);
+    expect(controlled?.getAttribute('role')).toBe('row');
+    expect(
+      within(detail).getAllByRole('button', { name: /^Select the occurrence at / }),
+    ).toHaveLength(REPEATED_GROUP.occurrences.length);
+
+    // The other row is untouched, and still no row carries the state.
+    expect(closed.getAttribute('aria-expanded')).toBe('false');
+    expect(closed.hasAttribute('aria-controls')).toBe(false);
+
+    for (const row of dataRows()) {
+      expect(row.hasAttribute('aria-expanded')).toBe(false);
+    }
+
+    // Closing withdraws the reference along with the row it named.
+    await user.click(opened);
+
+    const reclosed = screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, false) });
+
+    expect(reclosed.getAttribute('aria-expanded')).toBe('false');
+    expect(reclosed.hasAttribute('aria-controls')).toBe(false);
+    expect(detailRows()).toHaveLength(0);
+  });
+
   it('explains an empty occurrence list rather than opening onto nothing', async () => {
     const withoutSamples = makeRequestGroup({
       id: 'request-group-example-0071',
@@ -1937,6 +2553,27 @@ describe('RequestTable ordering', () => {
     expect(stub.resolve).toHaveBeenCalledTimes(1);
     expect(renderedUrls()).toEqual([...PROVIDER_ORDER_URLS]);
   });
+
+  it('names its ordering control for what it orders, and re-queries from it', async () => {
+    const stub = pagingProvider([{ data: PROVIDER_ORDER }, { data: PROVIDER_ORDER }]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    // A panel can hold several tables with an ordering control each, so the
+    // name says what this one orders; a bare "Order" names none of them apart.
+    const select = screen.getByRole('combobox', { name: SORT_CONTROL_NAME });
+
+    expect(screen.queryByRole('combobox', { name: 'Order' })).toBeNull();
+    expect(screen.getAllByRole('combobox')).toEqual([select]);
+
+    await user.selectOptions(select, LONGEST_FIRST);
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).sort).toBe(LONGEST_FIRST);
+  });
 });
 
 /**
@@ -1982,6 +2619,15 @@ async function expectEmptyPage(title: string, message: string): Promise<void> {
   if (title !== NOTHING_CAPTURED_TITLE) {
     expect(screen.queryByText(NOTHING_CAPTURED_MESSAGE)).toBeNull();
   }
+
+  // Every settled empty state is the polite status, and only the empty
+  // capture carries the view's decorative glyph.
+  const state = shownTitle.closest('.dg-request-table__empty');
+  expect(screen.getByRole('status')).toBe(state);
+  expect(screen.queryByRole('status', { busy: true })).toBeNull();
+  expect(state?.querySelector('.dg-empty-state__icon')?.getAttribute('aria-hidden') ?? null).toBe(
+    title === NOTHING_CAPTURED_TITLE ? 'true' : null,
+  );
 
   // An empty page is a success: no failure is drawn and no rows are invented.
   expect(screen.queryByRole('alert')).toBeNull();
@@ -2035,6 +2681,181 @@ describe('RequestTable paging', () => {
     await waitFor(() => {
       expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
     });
+    expect(footerNote()).toBe(`Groups loaded: ${formatCount(2)} of ${formatCount(18)}.`);
+  });
+
+  it('announces the loaded and filtered counts through one polite live region', async () => {
+    const stub = pagingProvider([
+      { data: [SINGLE_GROUP], total: 18, nextOffset: 1 },
+      { data: [REPEATED_GROUP], total: 18, nextOffset: 2 },
+    ]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const region = await screen.findByText(
+      `Groups loaded: ${formatCount(1)} of ${formatCount(18)}.`,
+    );
+
+    // Polite, and text only: an update is spoken once the reader is idle and
+    // never re-announces a control.
+    expect(region.getAttribute('aria-live')).toBe('polite');
+    expect(region.querySelector('button, a[href], input, select, textarea, [tabindex]')).toBeNull();
+
+    // A region is announced when its content changes, so the counts must change
+    // INSIDE the same element rather than in a replacement for it.
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    await waitFor(() => {
+      expect(region.textContent).toBe(`Groups loaded: ${formatCount(2)} of ${formatCount(18)}.`);
+    });
+    expect(screen.getByText(/^Groups loaded:/)).toBe(region);
+
+    await user.click(screen.getByRole('button', { name: DUPLICATES_ONLY_NAME }));
+    await waitFor(() => {
+      expect(region.textContent).toContain(
+        `Matching the duplicates filter: ${formatCount(1)} of ${formatCount(2)}.`,
+      );
+    });
+    expect(screen.getByText(/^Groups loaded:/)).toBe(region);
+    expect(region.getAttribute('aria-live')).toBe('polite');
+  });
+
+  it('keeps focus on Load more, busy and never disabled, while the next page is in flight', async () => {
+    // B2-F12: the control used to unmount the moment the page it asked for went
+    // into flight, which hands a keyboard reader's focus to `<body>`.
+    const stub = heldSecondPageProvider({ data: [REPEATED_GROUP], total: 18, nextOffset: 1 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+    expect(loadMore.getAttribute(FOCUS_KEY_ATTRIBUTE)).toBe(LOAD_MORE_FOCUS_KEY);
+    expect(loadMore.getAttribute('aria-busy')).toBe('false');
+    const disabledChanges = watchDisabled(loadMore);
+
+    await user.click(loadMore);
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+
+    // In flight: the SAME element, still focused, reporting the flight by its
+    // label and `aria-busy` rather than by being disabled, with the groups
+    // already received still on screen above it.
+    expect(screen.getByRole('button', { name: LOAD_MORE_BUSY_NAME })).toBe(loadMore);
+    expect(document.activeElement).toBe(loadMore);
+    expect(loadMore.getAttribute('aria-busy')).toBe('true');
+    expect(loadMore.hasAttribute('disabled')).toBe(false);
+    expect(renderedUrls()).toEqual([REPEATED_GROUP.url]);
+    // The coverage stated for the pages on screen holds while the next one is
+    // in flight: the total already reported is not dropped.
+    expect(footerNote()).toBe(`Groups loaded: ${formatCount(1)} of ${formatCount(18)}.`);
+
+    // A press while busy asks for nothing: the page in flight is not requested twice.
+    await user.click(loadMore);
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(document.activeElement).toBe(loadMore);
+
+    // The page lands with a further page after it, so the same control stays,
+    // focused, and is ready again.
+    await act(async () => {
+      stub.releaseSecondPage({ data: [SINGLE_GROUP], total: 18, nextOffset: 2 });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    });
+    expect(screen.getByRole('button', { name: LOAD_MORE_NAME })).toBe(loadMore);
+    expect(document.activeElement).toBe(loadMore);
+    expect(loadMore.getAttribute('aria-busy')).toBe('false');
+    expect(disabledChanges()).toHaveLength(0);
+  });
+
+  it('keeps keyboard focus on Load more until the last page lands, then withdraws it', async () => {
+    const stub = heldSecondPageProvider({ data: [REPEATED_GROUP], total: 2, nextOffset: 1 });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    const loadMore = screen.getByRole('button', { name: LOAD_MORE_NAME });
+    const disabledChanges = watchDisabled(loadMore);
+
+    act(() => {
+      loadMore.focus();
+    });
+    await user.keyboard('{Enter}');
+
+    expect(stub.resolve).toHaveBeenCalledTimes(2);
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+    expect(document.activeElement).toBe(loadMore);
+    expect(loadMore.getAttribute('aria-busy')).toBe('true');
+    expect(loadMore.textContent).toBe(LOAD_MORE_BUSY_NAME);
+
+    // The last page: no next offset, so no control is offered past it. Where
+    // focus goes then is the host node frame's decision, not this view's.
+    await act(async () => {
+      stub.releaseSecondPage({ data: [SINGLE_GROUP], total: 2 });
+      await Promise.resolve();
+    });
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    });
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+    expect(screen.queryByRole('button', { name: LOAD_MORE_BUSY_NAME })).toBeNull();
+    expect(disabledChanges()).toHaveLength(0);
+  });
+
+  it('reports a failed next page below the groups already shown, and retries that page', async () => {
+    // Every paged view reports a failed further page in the page scope, below
+    // the rows it already drew; this one used to replace them with a failure
+    // titled for the whole view (B2-F14).
+    const stub = recordingProvider((_query, call) => {
+      if (call === 2) {
+        return Promise.reject(Object.assign(new Error('Service Unavailable'), { status: 503 }));
+      }
+
+      return Promise.resolve({
+        source: 'requests',
+        data: call === 1 ? [REPEATED_GROUP] : [SINGLE_GROUP],
+        total: 18,
+        nextOffset: call === 1 ? 1 : 2,
+      });
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+
+    const title = await screen.findByText(PAGE_FAILURE_TITLE);
+    const failure = title.closest<HTMLElement>('.dg-error-state');
+    if (failure === null) {
+      throw new Error('the page failure is not drawn as an error state');
+    }
+
+    // The groups already received stay on screen, with the coverage they had.
+    expect(renderedUrls()).toEqual([REPEATED_GROUP.url]);
+    expect(footerNote()).toBe(`Groups loaded: ${formatCount(1)} of ${formatCount(18)}.`);
+    expect(failure.textContent).toContain('The rows already shown are unaffected.');
+    expect(screen.queryByRole('button', { name: LOAD_MORE_NAME })).toBeNull();
+
+    // The block names the page that failed, in the one canonical format.
+    const printed =
+      within(failure).getByRole('group', { name: FAILING_QUERY_NAME }).textContent ?? '';
+    expect(printed).toBe(formatDataQuery(queryOfCall(stub, 2)));
+    expect(queryOfCall(stub, 2).offset).toBe(1);
+
+    // Its retry re-requests that page, and the page lands behind the carried groups.
+    await user.click(within(failure).getByRole('button', { name: RETRY_NAME }));
+    expect(stub.resolve).toHaveBeenCalledTimes(3);
+    expect(queryOfCall(stub, 3).offset).toBe(1);
+
+    await waitFor(() => {
+      expect(renderedUrls()).toEqual([REPEATED_GROUP.url, SINGLE_GROUP.url]);
+    });
+    expect(screen.queryByText(PAGE_FAILURE_TITLE)).toBeNull();
     expect(footerNote()).toBe(`Groups loaded: ${formatCount(2)} of ${formatCount(18)}.`);
   });
 
@@ -2360,6 +3181,18 @@ describe('RequestTable local duplicates filter', () => {
     expect(await screen.findByText(/none of the groups loaded so far/i)).toBeDefined();
     expect(screen.queryByText(/no network requests were captured/i)).toBeNull();
     expect(dataRows()).toHaveLength(0);
+
+    // The reader's own narrowing emptied the view, so the bar that made it
+    // stays, with the toggle still pressed and still able to release it.
+    const toggle = within(screen.getByRole('group', { name: TOOLBAR_NAME })).getByRole('button', {
+      name: DUPLICATES_ONLY_NAME,
+    });
+    expect(toggle.getAttribute('aria-pressed')).toBe('true');
+    expect(toggle.hasAttribute('disabled')).toBe(false);
+
+    await user.click(toggle);
+    await screen.findByRole('grid');
+    expect(dataRows()).toHaveLength(1);
   });
 });
 
@@ -2699,11 +3532,13 @@ describe('RequestTable pending requests', () => {
  * Keyboard access to tooltip descriptions
  *
  * A tooltip opens on focus, so a trigger that cannot take focus hides its
- * description from every keyboard reader. Each trigger below must be a plain
- * tab stop — no button role, no accessible-name override — whose focus opens
- * the bubble its `aria-describedby` names, and whose Escape and blur close it.
- * Focus is moved with `act(() => element.focus())` because React's `onFocus`
- * listens for `focusin`, which a synthetic `focus` event would not deliver.
+ * description from every keyboard reader. Each trigger below must be focusable
+ * yet outside the Tab order (`tabindex="-1"`) — the grid is one Tab stop and
+ * its arrow keys reach the trigger — with no button role and no accessible-name
+ * override, whose focus opens the bubble its `aria-describedby` names, and
+ * whose Escape and blur close it. Focus is moved with
+ * `act(() => element.focus())` because React's `onFocus` listens for
+ * `focusin`, which a synthetic `focus` event would not deliver.
  * ---------------------------------------------------------------------------
  */
 
@@ -2722,7 +3557,8 @@ const DISCLOSURE_PENDING_OCCURRENCE = pendingOccurrence(41, 40, 610);
 /**
  * A group that exercises every tooltip trigger the component draws at once: a
  * shortened URL, the fallback grouping, more status codes than the row shows,
- * a failure, duplicates, no exposed size and one occurrence still in flight.
+ * a failure, duplicates, no exposed size, one occurrence still in flight, and
+ * two callers — the first with no location, the second counted beside it.
  */
 const DISCLOSURE_GROUP = pendingGroup(
   {
@@ -2731,6 +3567,7 @@ const DISCLOSURE_GROUP = pendingGroup(
     groupedBy: 'method-path',
     url: LONG_URL,
     path: RESOURCE_PATH,
+    initiators: [INITIATOR_SHELL, INITIATOR_WIDGET],
     count: 5,
     duplicateCount: 2,
     hasDuplicates: true,
@@ -2754,18 +3591,16 @@ const DISCLOSURE_GROUP = pendingGroup(
 );
 
 /**
- * The tooltip bubble a trigger's `aria-describedby` resolves to.
+ * The tooltip bubble a trigger's `aria-describedby` resolves to, open or
+ * closed: the bubble stays mounted (`hidden` while closed), so a trigger at
+ * rest is already described by it. Whether it is shown is {@link isShown}'s
+ * question, asserted separately.
  *
  * @param trigger The focusable trigger.
  * @returns The one `role="tooltip"` element among the ids it names.
  */
 function describingTooltip(trigger: HTMLElement): HTMLElement {
-  const ids = (trigger.getAttribute('aria-describedby') ?? '')
-    .split(/\s+/)
-    .filter((id) => id.length > 0);
-  const bubbles = ids
-    .map((id) => document.getElementById(id))
-    .filter((element): element is HTMLElement => element?.getAttribute('role') === 'tooltip');
+  const bubbles = namedTooltips(trigger);
 
   expect(bubbles).toHaveLength(1);
 
@@ -2778,9 +3613,15 @@ function describingTooltip(trigger: HTMLElement): HTMLElement {
   return bubble;
 }
 
-/** Whether a tooltip bubble is currently shown. */
+/**
+ * Whether a tooltip bubble is currently shown: mounted, no longer `hidden`, and
+ * in the open state. A closed bubble keeps its place in the document but carries
+ * the `hidden` attribute, which takes it out of the accessibility tree.
+ */
 function isShown(bubble: HTMLElement): boolean {
-  return bubble.classList.contains('dg-is-open');
+  return (
+    bubble.isConnected && !bubble.hasAttribute('hidden') && bubble.classList.contains('dg-is-open')
+  );
 }
 
 /**
@@ -2790,26 +3631,37 @@ function isShown(bubble: HTMLElement): boolean {
  * @param expected Text the description must contain.
  */
 function expectKeyboardDisclosure(trigger: HTMLElement, expected: string): void {
-  // A plain tab stop: in the sequential order, and nothing more.
-  expect(trigger.tabIndex).toBe(0);
-  expect(trigger.getAttribute('tabindex')).toBe('0');
+  // Focusable and nothing more, and OUT of the Tab order: the grid is one Tab
+  // stop, its active row, and its arrow keys are what reach a trigger.
+  expect(trigger.tabIndex).toBe(-1);
+  expect(trigger.getAttribute('tabindex')).toBe('-1');
   expect(trigger.hasAttribute('role')).toBe(false);
   expect(trigger.hasAttribute('aria-label')).toBe(false);
 
-  const bubble = describingTooltip(trigger);
-  expect(bubble.textContent).toContain(expected);
-  expect(isShown(bubble)).toBe(false);
+  // Closed, the trigger is already described — its `aria-describedby` resolves
+  // to the one bubble, mounted but `hidden` — and it shows no bubble at all.
+  const closed = describingTooltip(trigger);
+  expect(closed.textContent).toContain(expected);
+  expect(isShown(closed)).toBe(false);
+  expect(describingTooltips(trigger)).toEqual([]);
 
-  // Focus opens the description at once.
+  // Focus opens the description at once: the very bubble it was described by,
+  // now the one it shows.
   act(() => {
     trigger.focus();
   });
   expect(document.activeElement).toBe(trigger);
+
+  const bubble = describingTooltip(trigger);
+  expect(bubble).toBe(closed);
+  expect(bubble.textContent).toContain(expected);
   expect(isShown(bubble)).toBe(true);
+  expect(describingTooltips(trigger)).toEqual([bubble]);
 
   // Escape dismisses it without moving focus.
   fireEvent.keyDown(trigger, { key: 'Escape' });
   expect(isShown(bubble)).toBe(false);
+  expect(describingTooltips(trigger)).toEqual([]);
   expect(document.activeElement).toBe(trigger);
 
   // Leaving and returning opens it again, and blur closes it.
@@ -2819,11 +3671,15 @@ function expectKeyboardDisclosure(trigger: HTMLElement, expected: string): void 
   act(() => {
     trigger.focus();
   });
-  expect(isShown(bubble)).toBe(true);
+
+  const reopened = describingTooltip(trigger);
+  expect(reopened.textContent).toContain(expected);
+  expect(isShown(reopened)).toBe(true);
   act(() => {
     trigger.blur();
   });
-  expect(isShown(bubble)).toBe(false);
+  expect(isShown(reopened)).toBe(false);
+  expect(describingTooltips(trigger)).toEqual([]);
 }
 
 /** One group-level tooltip trigger: how to find it and what it must describe. */
@@ -2836,6 +3692,30 @@ interface TriggerCase {
 
   /** Text the description must contain. */
   readonly expected: string;
+}
+
+/**
+ * Move keyboard focus onto a data row, the way a Tab into the grid or an arrow
+ * key does, so the row becomes the grid's active row — its one Tab stop.
+ *
+ * @param row The data row element.
+ */
+function focusRow(row: HTMLElement): void {
+  act(() => {
+    row.focus();
+  });
+  expect(document.activeElement).toBe(row);
+}
+
+/** The label of a group's first caller when it has no location. */
+function unlinkedCallerOf(row: HTMLElement): HTMLElement {
+  const label = cellsOf(row).initiators.querySelector<HTMLElement>('code.dg-truncate');
+
+  if (label === null) {
+    throw new Error('the row rendered no unlinked caller label');
+  }
+
+  return label;
 }
 
 /** The rendered URL element of a row, read off its row header. */
@@ -2888,11 +3768,21 @@ const GROUP_TRIGGERS: readonly TriggerCase[] = [
       within(within(row).getByRole('rowheader')).getByText(FALLBACK_GROUPING_BADGE_TEXT),
     expected: 'no request key was available',
   },
+  {
+    name: 'unlinked first caller',
+    find: unlinkedCallerOf,
+    expected: INITIATOR_SHELL,
+  },
+  {
+    name: 'caller overflow badge',
+    find: (row) => within(cellsOf(row).initiators).getByText(`+${formatCount(1)}`),
+    expected: `Also initiated by: ${INITIATOR_WIDGET}.`,
+  },
 ];
 
 describe('RequestTable keyboard access to tooltip descriptions', () => {
   it.each(GROUP_TRIGGERS)(
-    'makes the $name a tab stop whose focus opens its description',
+    'makes the $name focusable outside the Tab order, its focus opening its description',
     async ({ find, expected }) => {
       const row = await renderSoleGroup(DISCLOSURE_GROUP);
 
@@ -2905,10 +3795,15 @@ describe('RequestTable keyboard access to tooltip descriptions', () => {
     const url = urlElementOf(row);
 
     expect(url.textContent).not.toBe(LONG_URL);
+    expect(tooltipTexts(within(row).getByRole('rowheader'))).toContain(LONG_URL);
+
+    act(() => {
+      url.focus();
+    });
     expect(describingTooltip(url).textContent).toBe(LONG_URL);
   });
 
-  it('makes the occurrence Pending badge a tab stop whose focus opens its description', async () => {
+  it('makes the occurrence Pending badge focusable outside the Tab order, opening on focus', async () => {
     const user = userEvent.setup();
 
     await renderSoleGroup(DISCLOSURE_GROUP);
@@ -2936,38 +3831,561 @@ describe('RequestTable keyboard access to tooltip descriptions', () => {
     );
   });
 
-  it('leaves a URL shown in full out of the tab order', async () => {
+  it('describes a URL the row shows in full too, because the column may still cut it', async () => {
     const row = await renderSoleGroup(SINGLE_GROUP);
     const url = urlElementOf(row);
 
-    // Nothing is shortened, so the disabled tooltip has nothing to disclose and
-    // the element adds no stop that would open nothing.
+    // Nothing was shortened as a string, yet the column ellipsizes the URL with
+    // CSS at whatever width the panel gives it, which no string comparison can
+    // detect. So the full value is always described and always reachable.
     expect(url.textContent).toBe(SINGLE_GROUP.url);
-    expect(url.hasAttribute('tabindex')).toBe(false);
-    expect(url.tabIndex).toBe(-1);
+    expect(describingTooltip(url).textContent).toBe(SINGLE_GROUP.url);
 
-    // And were focus to arrive by any other route, the disabled tooltip still
-    // opens nothing.
-    act(() => {
-      url.focus();
-    });
-    expect(isShown(describingTooltip(url))).toBe(false);
+    expectKeyboardDisclosure(url, SINGLE_GROUP.url);
   });
 
-  it('keeps a focused trigger out of the grid row navigation', async () => {
-    const row = await renderSoleGroup(DISCLOSURE_GROUP);
-    const trigger = within(cellsOf(row).duplicates).getByText(formatCount(2));
+  it('describes every URL on the page with its full redacted value', async () => {
+    const stub = resolvingProvider([SINGLE_GROUP, REPEATED_GROUP, DISCLOSURE_GROUP]);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const urls = dataRows().map((row) => describingTooltip(urlElementOf(row)).textContent);
+
+    // One bubble per URL, resolved through the trigger's `aria-describedby`, and
+    // holding exactly the value as received: redacted upstream, never rewritten.
+    expect(urls).toEqual([SINGLE_GROUP.url, REPEATED_GROUP.url, DISCLOSURE_GROUP.url]);
+  });
+
+  it('keeps every URL focusable outside the Tab order, whichever row focus is on', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+
+    const urlTabIndexes = (): (string | null)[] =>
+      dataRows().map((row) => urlElementOf(row).getAttribute('tabindex'));
+    const everyUrlOutOfTabOrder = PROVIDER_ORDER.map(() => '-1');
+
+    // Every URL is a tooltip trigger in every row — reachable by the grid's
+    // arrow keys and by pointer — and none is a Tab stop, so the body is the
+    // one roving stop the grid owns: its active row.
+    expect(urlTabIndexes()).toEqual(everyUrlOutOfTabOrder);
+    expect(tabStopsIn(grid)).toEqual([dataRows()[0]]);
+
+    const [firstRow, secondRow] = dataRows();
+
+    if (firstRow === undefined || secondRow === undefined) {
+      throw new Error('the grid rendered fewer than two data rows');
+    }
+
+    // Moving between rows moves only the grid's own stop; no URL gains or
+    // loses anything as focus arrives in its row or leaves it.
+    focusRow(firstRow);
+    expect(urlTabIndexes()).toEqual(everyUrlOutOfTabOrder);
+    expect(tabStopsIn(grid)).toEqual([firstRow]);
+
+    focusRow(secondRow);
+    expect(urlTabIndexes()).toEqual(everyUrlOutOfTabOrder);
+    expect(tabStopsIn(grid)).toEqual([secondRow]);
+
+    // Nor does focus outside every data row, on the header's sort control.
+    act(() => {
+      screen.getByRole('button', { name: COUNT_SORT_NAME }).focus();
+    });
+    expect(urlTabIndexes()).toEqual(everyUrlOutOfTabOrder);
+  });
+
+  it('leaves a focused trigger for the next row with ArrowDown, and for its row with Escape', async () => {
+    const stub = resolvingProvider([DISCLOSURE_GROUP, SINGLE_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const [first, second] = dataRows();
+
+    if (first === undefined || second === undefined) {
+      throw new Error('the grid rendered fewer than two data rows');
+    }
+
+    const trigger = within(cellsOf(first).duplicates).getByText(formatCount(2));
 
     act(() => {
       trigger.focus();
     });
 
-    // The grid reads the row index off the focused element itself, so an arrow
-    // key pressed on a descendant is not consumed and focus stays put.
-    const notCancelled = fireEvent.keyDown(trigger, { key: 'ArrowDown' });
-    expect(notCancelled).toBe(true);
-    expect(document.activeElement).toBe(trigger);
+    // Focus on a control inside a row moves the roving stop to that row, and
+    // opens the trigger's description as a Tab would have.
     expect(isShown(describingTooltip(trigger))).toBe(true);
+    expect(first.getAttribute('tabindex')).toBe('0');
+
+    // The vertical keys are the grid's on a control too: consumed, and counted
+    // from the row the control belongs to.
+    const notCancelled = fireEvent.keyDown(trigger, { key: 'ArrowDown' });
+
+    expect(notCancelled).toBe(false);
+    expect(document.activeElement).toBe(second);
+    expect(second.getAttribute('tabindex')).toBe('0');
+    expect(first.getAttribute('tabindex')).toBe('-1');
+    expect(isShown(describingTooltip(trigger))).toBe(false);
+
+    // Escape composes in two presses: the first closes the open bubble and
+    // keeps focus on the trigger, the second returns to the trigger's row.
+    act(() => {
+      trigger.focus();
+    });
+    expect(isShown(describingTooltip(trigger))).toBe(true);
+
+    await user.keyboard('{Escape}');
+    expect(isShown(describingTooltip(trigger))).toBe(false);
+    expect(document.activeElement).toBe(trigger);
+
+    await user.keyboard('{Escape}');
+    expect(document.activeElement).toBe(first);
+  });
+
+  it('opens a group and reaches its controls with ArrowRight, and returns with ArrowLeft', async () => {
+    const stub = resolvingProvider([DISCLOSURE_GROUP, SINGLE_GROUP]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+
+    const [first] = dataRows();
+
+    if (first === undefined) {
+      throw new Error('the grid rendered no data row');
+    }
+
+    act(() => {
+      first.focus();
+    });
+
+    // The first ArrowRight opens the collapsed group, reported like a click,
+    // and leaves focus on the row.
+    await user.keyboard('{ArrowRight}');
+
+    const toggle = screen.getByRole('button', { name: disclosureName(DISCLOSURE_GROUP, true) });
+
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(spies.onExpand).toHaveBeenCalledWith(NODE_ID, DISCLOSURE_GROUP.id, true);
+    expect(document.activeElement).toBe(first);
+
+    // The next moves onto the row's first control, the disclosure toggle, and
+    // the one after onto the shortened URL, whose description opens on focus.
+    await user.keyboard('{ArrowRight}');
+    expect(document.activeElement).toBe(toggle);
+
+    await user.keyboard('{ArrowRight}');
+
+    const url = urlElementOf(first);
+
+    expect(document.activeElement).toBe(url);
+    expect(isShown(describingTooltip(url))).toBe(true);
+
+    // End reaches the last control of the scope, which runs on into the open
+    // occurrence list; Home comes back to the first.
+    await user.keyboard('{End}');
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    expect(detail.contains(document.activeElement)).toBe(true);
+
+    await user.keyboard('{Home}');
+    expect(document.activeElement).toBe(toggle);
+
+    // ArrowLeft from the first control returns to the row, and on the open
+    // row it then closes the group.
+    await user.keyboard('{ArrowLeft}');
+    expect(document.activeElement).toBe(first);
+
+    await user.keyboard('{ArrowLeft}');
+    expect(detailRows()).toHaveLength(0);
+    expect(
+      screen
+        .getByRole('button', { name: disclosureName(DISCLOSURE_GROUP, false) })
+        .getAttribute('aria-expanded'),
+    ).toBe('false');
+    expect(spies.onExpand).toHaveBeenLastCalledWith(NODE_ID, DISCLOSURE_GROUP.id, false);
+  });
+});
+
+/**
+ * Every element inside the grid that the Tab key can reach: anything focusable
+ * whose tab index is not negative, whether written as an attribute or implied
+ * by the element (a `<button>` with no `tabindex` is a Tab stop).
+ *
+ * @param grid The grid element.
+ * @returns The Tab stops, in document order.
+ */
+function tabStopsIn(grid: HTMLElement): HTMLElement[] {
+  return Array.from(
+    grid.querySelectorAll<HTMLElement>('a[href], button, input, select, textarea, [tabindex]'),
+  ).filter((element) => element.tabIndex >= 0);
+}
+
+describe('RequestTable one Tab stop per grid', () => {
+  it('is entered on its active row by one Tab and left by the next, whatever it holds', async () => {
+    // Every group open, so the toggles, the tooltip triggers, the caller chips
+    // and each occurrence's selection button and chip are all in the document,
+    // and a next page, so a control follows the grid in the Tab order.
+    const stub = resolvingProvider([DISCLOSURE_GROUP, REPEATED_GROUP, MIXED_INITIATOR_GROUP], {
+      total: 5,
+      nextOffset: 3,
+    });
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+
+    // Before any focus: exactly one Tab stop, and it is the first data row.
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+    expect(tabStopsIn(grid)).toEqual([dataRows()[0]]);
+
+    // Opened through each row's own toggle: the three groups share a method and
+    // a path, so their disclosure names are alike by design.
+    for (const row of dataRows()) {
+      await user.click(within(row).getByRole('button', { name: DISCLOSURE_NAME_PATTERN }));
+    }
+
+    expect(detailRows()).toHaveLength(3);
+
+    // Every control a cell or a detail row renders is focusable yet outside the
+    // Tab order, and the header's sort control leaves it too while rows exist.
+    const controls = Array.from(
+      grid.querySelectorAll<HTMLElement>('a[href], button, input, select, textarea, [tabindex]'),
+    ).filter((element) => element.getAttribute('role') !== 'row');
+    const toggles = within(grid).getAllByRole('button', { name: DISCLOSURE_NAME_PATTERN });
+    const selections = within(grid).getAllByRole('button', { name: /^Select the occurrence at / });
+    const chips = within(grid).getAllByRole('button', { name: /\bopen src\/example\//i });
+
+    expect(toggles).toHaveLength(3);
+    expect(selections).toHaveLength(
+      DISCLOSURE_GROUP.occurrences.length +
+        REPEATED_GROUP.occurrences.length +
+        MIXED_INITIATOR_GROUP.occurrences.length,
+    );
+    expect(chips.length).toBeGreaterThan(0);
+
+    for (const control of [...toggles, ...selections, ...chips]) {
+      expect(controls).toContain(control);
+    }
+
+    for (const control of controls) {
+      expect(control.getAttribute('tabindex')).toBe('-1');
+    }
+
+    // After focus has landed on a control of the last row, the roving stop has
+    // followed it there, and there is still exactly one.
+    const lastRow = dataRows()[2];
+
+    expect(tabStopsIn(grid)).toEqual([lastRow]);
+    expect(grid.querySelectorAll('[tabindex="0"]')).toHaveLength(1);
+
+    // One Tab from the control before the grid enters on that row; the next
+    // leaves the grid for the control after it; Shift+Tab comes back.
+    act(() => {
+      screen.getByRole('button', { name: DUPLICATES_ONLY_NAME }).focus();
+    });
+
+    await user.tab();
+    expect(document.activeElement).toBe(lastRow);
+
+    await user.tab();
+    expect(document.activeElement).toBe(screen.getByRole('button', { name: LOAD_MORE_NAME }));
+    expect(grid.contains(document.activeElement)).toBe(false);
+
+    await user.tab({ shift: true });
+    expect(document.activeElement).toBe(lastRow);
+  });
+});
+
+/*
+ * ---------------------------------------------------------------------------
+ * Layout contracts
+ *
+ * What happy-dom can decide without a layout engine: the column tracks the
+ * grid is handed, and the shape of the markup the stylesheet lays out. The
+ * resulting geometry — horizontal scrolling in a narrow panel, chips inside
+ * their cells, aligned occurrence columns — is what these structures produce in
+ * a browser, and is asserted there.
+ * ---------------------------------------------------------------------------
+ */
+
+/**
+ * Split a grid track list into its top-level tracks, keeping the spaces and
+ * commas inside a function such as `minmax(12ch, 1fr)` with the track they
+ * belong to.
+ *
+ * @param template A `grid-template-columns` value.
+ * @returns One string per track, in order.
+ */
+function topLevelTracks(template: string): string[] {
+  const tracks: string[] = [];
+  let depth = 0;
+  let current = '';
+
+  for (const character of template.trim()) {
+    if (character === '(') {
+      depth += 1;
+    } else if (character === ')') {
+      depth -= 1;
+    }
+
+    if (depth === 0 && /\s/u.test(character)) {
+      if (current.length > 0) {
+        tracks.push(current);
+      }
+      current = '';
+    } else {
+      current += character;
+    }
+  }
+
+  if (current.length > 0) {
+    tracks.push(current);
+  }
+
+  return tracks;
+}
+
+/**
+ * The guaranteed minimum of one track, in `ch`: the first argument of a
+ * `minmax()` or a bare `ch` track, and `undefined` for any track without one.
+ *
+ * @param track One top-level track.
+ * @returns Its minimum in `ch`, or `undefined`.
+ */
+function trackMinimumCh(track: string): number | undefined {
+  const match = /^minmax\((\d+(?:\.\d+)?)ch,/u.exec(track) ?? /^(\d+(?:\.\d+)?)ch$/u.exec(track);
+  const value = match?.[1];
+
+  return value === undefined ? undefined : Number(value);
+}
+
+/** A caller label that is itself the location its occurrence resolved to. */
+const LOCATION_LABEL = `${WIDGET_SOURCE.file}:${String(WIDGET_SOURCE.line)}:${String(
+  WIDGET_SOURCE.column,
+)}`;
+
+/** The compact form of that location, as a source chip draws it. */
+const WIDGET_CHIP_TEXT = `widget.tsx:${String(WIDGET_SOURCE.line)}`;
+
+/**
+ * One occurrence of every initiator shape the slot has to fill: a caller with
+ * a location, a caller without one, a location without a caller, neither, and
+ * a caller whose label is its own location.
+ */
+const SLOT_OCCURRENCES: readonly RequestOccurrence[] = [
+  makeOccurrence({
+    eventId: eventIdFor(51),
+    spanId: spanIdFor(51),
+    startTime: BASE_START_MS,
+    durationMs: 90,
+    initiator: INITIATOR_WIDGET,
+    source: WIDGET_SOURCE,
+  }),
+  makeOccurrence({
+    eventId: eventIdFor(52),
+    spanId: spanIdFor(52),
+    startTime: BASE_START_MS + 5,
+    durationMs: 95,
+    initiator: INITIATOR_SHELL,
+  }),
+  makeOccurrence({
+    eventId: eventIdFor(53),
+    spanId: spanIdFor(53),
+    startTime: BASE_START_MS + 10,
+    durationMs: 100,
+    source: PANEL_SOURCE,
+  }),
+  makeOccurrence({
+    eventId: eventIdFor(54),
+    spanId: spanIdFor(54),
+    startTime: BASE_START_MS + 15,
+    durationMs: 105,
+  }),
+  makeOccurrence({
+    eventId: eventIdFor(55),
+    spanId: spanIdFor(55),
+    startTime: BASE_START_MS + 20,
+    durationMs: 110,
+    initiator: LOCATION_LABEL,
+    source: WIDGET_SOURCE,
+  }),
+];
+
+/** The group holding {@link SLOT_OCCURRENCES}. */
+const SLOT_GROUP = makeRequestGroup({
+  id: 'request-group-example-0101',
+  requestKey: 'request-key-example-0101',
+  count: SLOT_OCCURRENCES.length,
+  lastStartTime: BASE_START_MS + 20,
+  initiators: [LOCATION_LABEL, INITIATOR_SHELL, INITIATOR_WIDGET],
+  occurrences: SLOT_OCCURRENCES,
+});
+
+describe('RequestTable layout contracts', () => {
+  it('gives every column a track with a readable minimum, so a narrow panel scrolls', async () => {
+    const stub = resolvingProvider(PROVIDER_ORDER);
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    const grid = await screen.findByRole('grid');
+    const template = grid.style.getPropertyValue('--dgc-columns');
+    const tracks = topLevelTracks(template);
+
+    // One track per column, and not one of them free to collapse: a
+    // `minmax(0, …)` track squeezed to its padding in a narrow panel, and the
+    // grouping chip then painted across the Status column beside it.
+    expect(tracks).toHaveLength(COLUMN_HEADERS.length);
+    expect(template).not.toContain('minmax(0');
+
+    const minimums = tracks.map((track) => trackMinimumCh(track));
+
+    for (const minimum of minimums) {
+      expect(minimum).toBeDefined();
+      expect(minimum ?? 0).toBeGreaterThan(0);
+    }
+
+    // The identity column, which holds the toggle, the method, the grouping
+    // chip and a readable run of the URL, needs the widest minimum of all.
+    const [requestMinimum = 0, ...otherMinimums] = minimums.map((minimum) => minimum ?? 0);
+    expect(requestMinimum).toBeGreaterThan(Math.max(...otherMinimums));
+
+    // The grid publishes every minimum as its floor, which is what makes a
+    // panel narrower than their sum scroll instead of squeeze.
+    expect(grid.style.getPropertyValue('--dgc-min-inline').match(/\d+ch/gu)).toHaveLength(
+      COLUMN_HEADERS.length,
+    );
+  });
+
+  it('lays each occurrence out as exactly four slots, in column order', async () => {
+    const user = userEvent.setup();
+
+    await renderSoleGroup(SLOT_GROUP);
+    await user.click(screen.getByRole('button', { name: disclosureName(SLOT_GROUP, false) }));
+
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    const occurrenceRows = Array.from(detail.querySelectorAll('.dg-request-table__occurrence-row'));
+    expect(occurrenceRows).toHaveLength(SLOT_OCCURRENCES.length);
+
+    // Four slots in every occurrence, whatever it carries: the list is one grid
+    // of four columns every occurrence adopts, and a slot left out shifted the
+    // ones after it and made the list ragged.
+    occurrenceRows.forEach((occurrenceRow, index) => {
+      const occurrence = SLOT_OCCURRENCES[index];
+
+      if (occurrence === undefined) {
+        throw new Error(`no fixture occurrence at index ${String(index)}`);
+      }
+
+      const slots = stackItemsOf(occurrenceRow);
+      expect(slots).toHaveLength(4);
+
+      const [offset, duration, status] = slots;
+
+      if (offset === undefined || duration === undefined || status === undefined) {
+        throw new Error('an occurrence rendered fewer than three leading slots');
+      }
+
+      // The slot IS the offset control, so it is read directly rather than
+      // searched inside.
+      expect(offset.tagName).toBe('BUTTON');
+      expect(offset.getAttribute('aria-label')).toBe(occurrenceName(SLOT_GROUP, occurrence));
+      expect(duration.textContent).toBe(formatDuration(occurrence.durationMs));
+      expect(status.textContent).toBe('200');
+    });
+
+    const initiatorSlot = (index: number): HTMLElement => {
+      const occurrenceRow = occurrenceRows[index];
+      const slot = occurrenceRow === undefined ? undefined : stackItemsOf(occurrenceRow)[3];
+
+      if (slot === undefined) {
+        throw new Error(`occurrence ${String(index)} rendered no initiator slot`);
+      }
+
+      return slot;
+    };
+
+    // A caller with a location: one compact chip, captioned and named by the
+    // location it opens, and the caller's label as plain text before it — both
+    // inside the one slot.
+    const linked = initiatorSlot(0);
+    expect(within(linked).getAllByRole('button')).toHaveLength(1);
+
+    const linkedChip = within(linked).getByRole('button', {
+      name: occurrenceChipName(WIDGET_SOURCE),
+    });
+    const linkedLabel = within(linked).getByText(INITIATOR_WIDGET);
+
+    expect(visibleText(linkedChip)).toBe(WIDGET_CHIP_TEXT);
+    expect(linkedChip.getAttribute('tabindex')).toBe('-1');
+    expect(linkedLabel.closest('button')).toBeNull();
+    expect(linkedLabel.nextElementSibling?.contains(linkedChip)).toBe(true);
+
+    // A caller without one: its label, truncated to the column.
+    const unlinked = initiatorSlot(1);
+    expect(within(unlinked).queryAllByRole('button')).toHaveLength(0);
+    expect(unlinked.classList.contains('dg-truncate')).toBe(true);
+    expect(unlinked.textContent).toBe(INITIATOR_SHELL);
+
+    // A location without a caller: the compact chip.
+    const anonymous = initiatorSlot(2);
+    expect(
+      within(anonymous).getByRole('button', { name: occurrenceChipName(PANEL_SOURCE) }),
+    ).toBeDefined();
+    expect(visibleText(anonymous)).toBe(`panel.tsx:${String(PANEL_SOURCE.line)}`);
+
+    // Neither: the unavailable label, so the slot is never empty.
+    expect(initiatorSlot(3).textContent).toBe(NOT_AVAILABLE_LABEL);
+  });
+
+  it('never shows an occurrence its own location twice', async () => {
+    const user = userEvent.setup();
+
+    await renderSoleGroup(SLOT_GROUP);
+    await user.click(screen.getByRole('button', { name: disclosureName(SLOT_GROUP, false) }));
+
+    const [detail] = detailRows();
+    const last = SLOT_OCCURRENCES[SLOT_OCCURRENCES.length - 1];
+
+    if (detail === undefined || last === undefined) {
+      throw new Error('the opened group rendered no detail row');
+    }
+
+    const occurrenceRow = within(detail)
+      .getByRole('button', { name: occurrenceName(SLOT_GROUP, last) })
+      .closest<HTMLElement>('.dg-request-table__occurrence-row');
+
+    if (occurrenceRow === null) {
+      throw new Error('no occurrence row holds the last occurrence');
+    }
+
+    // The caller's label is its location. It used to be printed as code AND as
+    // the compact chip beside it; now the one chip carries it, once.
+    const text = visibleText(occurrenceRow);
+    expect(text.split(WIDGET_CHIP_TEXT)).toHaveLength(2);
+    expect(within(occurrenceRow).queryByText(LOCATION_LABEL)).toBeNull();
+    expect(
+      within(occurrenceRow).getAllByRole('button', { name: occurrenceChipName(WIDGET_SOURCE) }),
+    ).toHaveLength(1);
   });
 });
 
@@ -2982,5 +4400,205 @@ describe('RequestTable pending signal provenance', () => {
     expect(telemetryKinds.length).toBeGreaterThan(0);
     expect(reads).toContain('inFlight');
     expect(reads).toContain('http.status_code');
+  });
+});
+
+describe('RequestTable shared selection', () => {
+  /**
+   * Which occurrences of the one open group are drawn as the selected event,
+   * one flag per occurrence in display order, each asserted to agree with its
+   * control's `aria-pressed`.
+   *
+   * @returns One flag per occurrence line.
+   */
+  function selectedFlags(): boolean[] {
+    const [detail] = detailRows();
+
+    if (detail === undefined) {
+      throw new Error('no group is open');
+    }
+
+    return REPEATED_GROUP.occurrences.map((occurrence) => {
+      const control = within(detail).getByRole('button', {
+        name: occurrenceName(REPEATED_GROUP, occurrence),
+      });
+      const line = control.closest('.dg-request-table__occurrence-row');
+
+      if (line === null) {
+        throw new Error('an occurrence control sits outside any occurrence line');
+      }
+
+      const selected = line.classList.contains('dg-is-selected');
+
+      expect(control.getAttribute('aria-pressed')).toBe(String(selected));
+
+      return selected;
+    });
+  }
+
+  /**
+   * One occurrence of the fixture group, by position.
+   *
+   * @param index The occurrence's position.
+   * @returns That occurrence.
+   */
+  function occurrenceAt(index: number): RequestOccurrence {
+    const occurrence = REPEATED_GROUP.occurrences[index];
+
+    if (occurrence === undefined) {
+      throw new Error(`the fixture group has no occurrence at ${String(index)}`);
+    }
+
+    return occurrence;
+  }
+
+  it('marks the occurrence a reader selects, and only that one, when no host is mounted', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: spies.actions });
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, false) }));
+
+    expect(selectedFlags()).toEqual([false, false, false, false]);
+
+    await user.click(
+      screen.getByRole('button', { name: occurrenceName(REPEATED_GROUP, occurrenceAt(2)) }),
+    );
+
+    // The view's own last selection outside a host, drawn by class and
+    // announced by `aria-pressed` together.
+    expect(selectedFlags()).toEqual([false, false, true, false]);
+
+    await user.click(
+      screen.getByRole('button', { name: occurrenceName(REPEATED_GROUP, occurrenceAt(0)) }),
+    );
+
+    expect(selectedFlags()).toEqual([true, false, false, false]);
+    expect(spies.onSelectEvent.mock.calls.map(([ref]) => ref.eventId)).toEqual([
+      occurrenceAt(2).eventId,
+      occurrenceAt(0).eventId,
+    ]);
+  });
+
+  it('follows the panel selection a host provides, and keeps no selection of its own', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP]);
+    const spies = makeActions();
+    const user = userEvent.setup();
+
+    /**
+     * The view, under a host whose shared selection is `selection`.
+     *
+     * @param selection The panel's current selection.
+     * @returns The element tree.
+     */
+    const tree = (selection: PanelSelection | undefined) => (
+      <DataProviderContext.Provider value={stub.provider}>
+        <PanelSessionContext.Provider value={PANEL_SESSION_ID}>
+          <PanelActionsContext.Provider value={spies.actions}>
+            <PanelSelectionContext.Provider value={{ selection }}>
+              <RequestTable node={makeNode()} />
+            </PanelSelectionContext.Provider>
+          </PanelActionsContext.Provider>
+        </PanelSessionContext.Provider>
+      </DataProviderContext.Provider>
+    );
+
+    const { rerender } = render(tree({ eventId: occurrenceAt(1).eventId }));
+
+    await screen.findByRole('grid');
+    await user.click(screen.getByRole('button', { name: disclosureName(REPEATED_GROUP, false) }));
+
+    expect(selectedFlags()).toEqual([false, true, false, false]);
+
+    // The same span named under another record's id is the same occurrence.
+    rerender(
+      tree({
+        eventId: 'event-example-other',
+        traceId: occurrenceAt(3).traceId,
+        spanId: occurrenceAt(3).spanId,
+      }),
+    );
+
+    expect(selectedFlags()).toEqual([false, false, false, true]);
+
+    // Activating an occurrence under a host reports it; the mark follows what
+    // the host records, not a copy kept here.
+    await user.click(
+      screen.getByRole('button', { name: occurrenceName(REPEATED_GROUP, occurrenceAt(0)) }),
+    );
+
+    expect(spies.onSelectEvent).toHaveBeenCalledTimes(1);
+    expect(selectedFlags()).toEqual([false, false, false, true]);
+
+    rerender(tree(undefined));
+
+    expect(selectedFlags()).toEqual([false, false, false, false]);
+  });
+});
+
+describe('RequestTable duplicates filter availability', () => {
+  /** The visible sentence that explains an unavailable duplicates filter. */
+  const UNAVAILABLE_NOTE = 'No request groups are loaded, so there are no duplicates to filter.';
+
+  /**
+   * The duplicates toggle, found inside the toolbar that owns it.
+   *
+   * @returns The toggle.
+   */
+  function duplicatesToggle(): HTMLElement {
+    return within(screen.getByRole('group', { name: TOOLBAR_NAME })).getByRole('button', {
+      name: DUPLICATES_ONLY_NAME,
+    });
+  }
+
+  it('says why the filter is unavailable while no group is loaded, and names that as its description', async () => {
+    // The first page is still in flight, so no group is loaded yet and the
+    // toolbar is on screen. (A settled capture with nothing in it omits the
+    // toolbar altogether: its controls would have nothing to act on.)
+    const stub = pendingProvider();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('group', { name: TOOLBAR_NAME });
+
+    const toggle = duplicatesToggle();
+
+    // Unavailable to the platform and to assistive technology alike.
+    expect(toggle.hasAttribute('disabled')).toBe(true);
+    expect(toggle.getAttribute('aria-disabled')).toBe('true');
+    expect(toggle.getAttribute('aria-pressed')).toBe('false');
+
+    // The reason is on screen as ordinary text — no hover needed — and it is
+    // the description the control announces.
+    const note = screen.getByText(UNAVAILABLE_NOTE);
+    expect(note.closest('[role="tooltip"]')).toBeNull();
+    expect(note.closest('.dg-visually-hidden')).toBeNull();
+    expect(toggle.getAttribute('aria-describedby')).toBe(note.id);
+    expect(note.id).not.toBe('');
+  });
+
+  it('drops the explanation, and the unavailable state, once a group is loaded', async () => {
+    const stub = resolvingProvider([REPEATED_GROUP]);
+    const user = userEvent.setup();
+
+    renderComponent(makeNode(), { provider: stub.provider, actions: makeActions().actions });
+
+    await screen.findByRole('grid');
+
+    const toggle = duplicatesToggle();
+
+    expect(toggle.hasAttribute('disabled')).toBe(false);
+    expect(toggle.getAttribute('aria-disabled')).toBeNull();
+    expect(toggle.getAttribute('aria-describedby')).toBeNull();
+    expect(screen.queryByText(UNAVAILABLE_NOTE)).toBeNull();
+
+    // Still the same toggle: pressed state announced and drawn together.
+    await user.click(toggle);
+
+    expect(duplicatesToggle().getAttribute('aria-pressed')).toBe('true');
+    expect(duplicatesToggle().classList.contains('dg-is-active')).toBe(true);
   });
 });

@@ -34,24 +34,37 @@
  *     single level of nodes dressed as a tree claims a structure nobody
  *     observed.
  *
- * And the datum carries **no per-node event reference**. A node is an aggregate
- * (its count is per component, across every position that component occupies),
- * so activating one never reports a selected event: doing so would require
- * inventing an event id, and a fabricated coordinate resolves to nothing or to
- * the wrong thing in a drawer the developer is reading as evidence. The one
- * legitimate event reference in the snapshot is the commit the structure came
- * from, which is a property of the whole view — so it is offered once, in the
- * toolbar, and only when the capture actually recorded it.
+ * A node's **event reference is the render that supplied its last trigger**. A
+ * node is an aggregate (its count is per component, across every position that
+ * component occupies), so the producer names one real, captured render to stand
+ * for it — `lastRenderEventId`, with that render's span and trace — and
+ * selecting the node reports exactly that reference, carrying only the
+ * coordinates the datum holds. A node that is structure alone never rendered
+ * during the capture and carries no reference; selecting it stays inside this
+ * view and reports nothing, because an invented id would resolve to nothing, or
+ * to the wrong thing, in a drawer the developer reads as evidence. The commit
+ * the structure came from is a property of the whole view rather than of a
+ * node, so it is offered once, in the toolbar, and only when the capture
+ * actually recorded it.
+ *
+ * The panel has one selected event, owned by the panel host and read here
+ * through `useViewSelection` (AAP 0.7.3). The commit control is drawn pressed
+ * while the commit is that event. A node the reader activated is still marked
+ * as the tree's selected row (`aria-selected`, or `aria-current` in a flat
+ * listing, with `dg-is-selected`) — but only until the panel's selection
+ * changes, so the tree never shows a selection that contradicts the event
+ * every other view and the details drawer show.
  *
  * ## Privacy (AAP 0.5.2)
  *
  * A node carries a display name, an optional instance key, counts, a duration,
- * the trigger of its most recent render and an optional source location. Prop
- * and state **values are structurally absent from the datum**, which is the
- * privacy guarantee rather than an omission — so this file adds no prop or
- * state inspector, and renders nothing it was not given. Names and keys are
- * length-bounded through `../utils/format` before they reach the DOM, because
- * they arrive from a page this product does not control.
+ * the trigger of its most recent render and that render's ids, and an optional
+ * source location. Prop and state **values are structurally absent from the
+ * datum**, which is the privacy guarantee rather than an omission — so this
+ * file adds no prop or state inspector, and renders nothing it was not given.
+ * The render ids are coordinates handed to the host, never text on screen.
+ * Names and keys are length-bounded through `../utils/format` before they
+ * reach the DOM, because they arrive from a page this product does not control.
  *
  * ## Accessibility (AAP 0.6.4)
  *
@@ -64,13 +77,22 @@
  *   - ArrowRight — expand a closed branch, then descend to its first child.
  *   - ArrowLeft — collapse an open branch, then ascend to the parent.
  *   - Home/End — the first and last visible row.
- *   - Enter/Space — activate: a branch toggles, and a leaf that resolved to
- *     source opens it.
+ *   - Enter/Space — select the row, and nothing else: it becomes the selected
+ *     row (`aria-selected` in a tree, `aria-current` in a flat listing) and,
+ *     when its node names a representative render, that event is reported to
+ *     the host with `onSelectEvent`. Selection never toggles a branch and never
+ *     opens a file. A pointer click on the row, outside its two controls, is
+ *     the same gesture.
  *   - Shift+Enter — open the row's source, on any row that resolved to one,
  *     branch or leaf alike, without toggling or selecting it. Offered only when
  *     the host can open a file, advertised on the row with
  *     `aria-keyshortcuts`, and stated once in the note above the tree with a
  *     `Kbd` hint. A row that cannot open anything leaves the key untouched.
+ *
+ * Selection and disclosure are separate gestures on purpose: a developer who
+ * selects a branch to read its evidence must not lose the rows beneath it. So
+ * disclosure belongs to ArrowRight/ArrowLeft, to the row's toggle and to the
+ * toolbar's Expand all/Collapse all, and to nothing else.
  *
  * The two controls a row may hold — the disclosure toggle and the source chip
  * — are `tabIndex={-1}`: still real buttons a pointer can press, but reached
@@ -79,8 +101,13 @@
  * that control; the row still takes the roving stop (its `focus` handler sees
  * the focus bubble up), the arrow keys still navigate from there, and Enter or
  * Space is left to the focused control's own activation instead of being read
- * as a row activation — so pressing Enter on a branch's chip opens the source
- * rather than toggling the branch.
+ * as a row selection — so pressing Enter on a branch's chip opens the source
+ * and selects nothing.
+ *
+ * A collapsed branch does not hide the finding inside it: when marked nodes sit
+ * beneath a closed row, the row carries a badge stating how many — an icon and
+ * words, never colour alone — and names that badge, together with its own
+ * mark, in its `aria-describedby`, so the count is announced with the row.
  *
  * Tab is never hijacked and focus is never trapped: a key this widget does not
  * own falls through untouched.
@@ -120,7 +147,12 @@ import type {
 } from 'react';
 
 import { PANEL_NODE_CATALOG, isSourceAllowedForNode } from '@debuggen/panel-schema';
-import type { DataQuery, ComponentTreeNode as ComponentTreeNodeSpec } from '@debuggen/panel-schema';
+import type {
+  DataQuery,
+  DataQuerySource,
+  ComponentTreeNode as ComponentTreeNodeSpec,
+} from '@debuggen/panel-schema';
+import { DebuggenError } from '@debuggen/shared';
 // `ComponentTreeNode` names two different things in this product: the panel
 // **spec** node that selects this component (imported above, aliased) and the
 // **telemetry** datum this component draws (imported below, unaliased). The
@@ -131,9 +163,10 @@ import type {
   ComponentTreeSnapshot,
 } from '@debuggen/telemetry';
 
-import type { PanelEventRef } from '../host/PanelActions';
-import { usePanelActions } from '../host/PanelActions';
-import { useQuery } from '../host/useQuery';
+import type { PanelEventRef, PanelSelection } from '../host/PanelActions';
+import { matchesPanelSelection, usePanelActions, useViewSelection } from '../host/PanelActions';
+import { queryFailureProps, unsupportedQueryProps, useQuery } from '../host/useQuery';
+import { REFUSED_RESPONSE_HINT, unreadableDataMessage } from '../host/DataProvider';
 import { Stack } from '../layout/Stack';
 import { Toolbar } from '../layout/Toolbar';
 import type { ToolbarAction, ToolbarStatus } from '../layout/Toolbar';
@@ -169,6 +202,9 @@ import { SourceLink } from './SourceLink';
 /** The node type this component draws, as the panel schema spells it. */
 const COMPONENT_TREE_NODE_TYPE = 'componentTree';
 
+/** The one data source this view reads, as the query vocabulary spells it. */
+const COMPONENT_TREE_SOURCE: DataQuerySource = 'componentTree';
+
 /**
  * This node type's entry in the single registry of node types.
  *
@@ -188,8 +224,22 @@ const LIST_LABEL = 'Captured components';
 const PROVENANCE_NOTE =
   'Structure as it stood at the last commit of the capture; render counts are cumulative for the whole capture.';
 
-/** Screen-reader unit for the render-count cell. */
-const RENDERS_UNIT_LABEL = 'renders';
+/**
+ * A counted unit with its singular and plural forms, chosen by the count it
+ * follows ({@link nounForCount}).
+ *
+ * Private to this file on purpose: the handful of units below are the only
+ * counted words this view prints, and each is stated once here with both
+ * spellings rather than derived by suffixing, which English does not support in
+ * general.
+ */
+interface CountedNoun {
+  readonly one: string;
+  readonly other: string;
+}
+
+/** Screen-reader unit for the render-count cell: "1 render", "3 renders". */
+const RENDERS_UNIT_LABEL: CountedNoun = Object.freeze({ one: 'render', other: 'renders' });
 
 /** Screen-reader unit for the cumulative-duration cell. */
 const RENDER_TIME_UNIT_LABEL = 'total render time';
@@ -200,14 +250,42 @@ const TRIGGER_PREFIX_LABEL = 'Last render trigger:';
 /** Screen-reader prefix for the instance-key badge. */
 const INSTANCE_KEY_PREFIX_LABEL = 'Instance key:';
 
-/** The non-colour half of the highlight: a word, beside an icon. */
-const ABOVE_THRESHOLD_LABEL = 'Above threshold';
+/**
+ * The non-colour half of the highlight: words, beside an icon.
+ *
+ * "At or above" because the rule is `renderCount ≥ threshold` — the field's own
+ * label says "≥" — and a mark that said "above" on a node exactly at the value
+ * would contradict the control that set it.
+ */
+const AT_OR_ABOVE_THRESHOLD_LABEL = 'At or above threshold';
+
+/**
+ * Suffix of the badge a collapsed branch carries when marked nodes sit beneath
+ * it; completed with how many, at every depth. Phrased with the count first so
+ * it reads correctly for one node and for many.
+ */
+const HIDDEN_MARKED_SUFFIX = 'hidden at or above threshold';
 
 /** Toolbar grouping name. */
 const TOOLBAR_LABEL = 'Component tree controls';
 
 /** Label of the threshold field. Visible: a hidden label would hide the control's meaning. */
 const THRESHOLD_LABEL = 'Mark at renders ≥';
+
+/**
+ * The threshold field's rejection, first half: what the field accepts.
+ * Completed with the default that applies meanwhile, so a rejected value never
+ * reads as the one in force. Announced with the field and through its live
+ * region; the toolbar shows the short form below.
+ */
+const THRESHOLD_REJECTED_PREFIX = 'Enter a whole number of at least';
+
+/**
+ * The visible short form of the rejection, a toolbar status pill completed
+ * with the default in force. Short on purpose: a status pill is one line and
+ * does not wrap, so it has to fit the narrowest panel beside the marked count.
+ */
+const THRESHOLD_DEFAULT_IN_FORCE_PREFIX = 'Using the default of';
 
 /** Loading announcement for the skeleton state. */
 const LOADING_LABEL = 'Loading the component tree…';
@@ -218,33 +296,46 @@ const EMPTY_MESSAGE = 'No component tree was captured for this interaction.';
 /** Empty state, second line: what to do about it. */
 const EMPTY_TITLE = 'Nothing to show';
 
-/** Error state title, shared by every failure path below. */
-const ERROR_TITLE = 'Could not load the component tree';
+/*
+ * Error copy is not written here. Every failure this view reports reaches
+ * `ErrorState` through the one contract in `../host/useQuery` — the shared
+ * title, a generic lead followed by the cause, the error's code, the query as
+ * `formatDataQuery` prints it and, where asking again can change the answer, a
+ * retry — so a failed component tree reads exactly like every other failed node
+ * of a panel (B1-F16, B2-F14). The host's response check
+ * (`../host/DataProvider`) already refuses a snapshot missing any member this
+ * view reads, so that refusal arrives here as an ordinary failed query; the
+ * shape guard below stays as defence in depth for a member present with the
+ * wrong type, and words its refusal with the host's own sentence and hint.
+ */
 
-/** Error state for a failed or unresolved data query. */
-const ERROR_MESSAGE =
-  'The component tree could not be read from the capture. Retry, or capture the interaction again.';
+/** The shape the guard requires, for the closed "Technical details" disclosure. */
+const SHAPE_FAILURE_EXPECTED =
+  'a component-tree snapshot: an object with a string origin, a boolean degraded, a numeric nodeCount and an array of roots';
 
 /**
- * Error state for a node whose query names a source this view cannot draw.
+ * The failure a payload this view cannot read is reported as.
  *
- * Unreachable through a validated panel — the node catalog constrains this node
- * type to the `componentTree` source and the schema rejects anything else — so
- * the copy is deliberately a product-bug message rather than advice a developer
- * could act on.
+ * The provider resolved, so `useQuery` has no error of its own to report, yet
+ * the answer is unusable — the same defect the host's response check refuses
+ * with `PROTOCOL_INVALID_MESSAGE` when it catches a malformed answer itself.
+ * It therefore carries that refusal's sentence and hint, and its diagnostics
+ * name the source and the required shape (never anything read out of the
+ * payload). Reported through `queryFailureProps`, it takes the same title,
+ * lead, code chip and query block as every other failure, and keeps its
+ * retry, because a provider can answer correctly when asked again. Never shown
+ * for `null`: that is the service's own answer for a capture that holds no
+ * render evidence, and it renders the empty state. Built once: it describes
+ * the failure handed to the contract, and it is never thrown.
  */
-const ERROR_SOURCE_MESSAGE =
-  'This view was configured with a data source it cannot draw. The panel that produced it is at fault, not the capture.';
-
-/**
- * Error state for a provider that answered with a non-null payload of the wrong
- * shape.
- *
- * Never shown for `null`: that is the service's own answer for a capture that
- * holds no render evidence to build a tree from, and it renders the empty state.
- */
-const ERROR_SHAPE_MESSAGE =
-  'The data provider answered with a payload this view cannot read. The provider that produced it is at fault, not the capture.';
+const SHAPE_FAILURE = new DebuggenError(
+  'PROTOCOL_INVALID_MESSAGE',
+  unreadableDataMessage(COMPONENT_TREE_SOURCE),
+  {
+    hint: REFUSED_RESPONSE_HINT,
+    details: { source: COMPONENT_TREE_SOURCE, field: 'data', expected: SHAPE_FAILURE_EXPECTED },
+  },
+);
 
 /** Expand-toggle name prefix; completed with the row's own display name. */
 const EXPAND_PREFIX_LABEL = 'Expand';
@@ -284,16 +375,25 @@ const COLLAPSE_ALL_LABEL = 'Collapse all';
 /** Toolbar action: select the commit event the structure was taken from. */
 const SHOW_COMMIT_LABEL = 'Show the commit';
 
-/** Toolbar status suffix: completed with how many nodes carry the mark. */
-const MARKED_STATUS_SUFFIX = 'above threshold';
+/**
+ * Toolbar status suffix: completed with how many nodes carry the mark. Count
+ * first, so one wording serves one node and many.
+ */
+const MARKED_STATUS_SUFFIX = 'at or above threshold';
 
 /** Unit in the statistics line: nodes the snapshot reports. */
-const NODES_LABEL = 'nodes';
+const NODES_LABEL: CountedNoun = Object.freeze({ one: 'node', other: 'nodes' });
 
 /** Unit in the statistics line: levels the snapshot reaches. */
-const LEVELS_LABEL = 'levels';
+const LEVELS_LABEL: CountedNoun = Object.freeze({ one: 'level', other: 'levels' });
 
-/** Unit in the statistics line: rows currently on screen. */
+/** Unit in the threshold explanation: components the median is taken over. */
+const COMPONENTS_LABEL: CountedNoun = Object.freeze({ one: 'component', other: 'components' });
+
+/**
+ * Suffix in the statistics line: rows currently on screen. A participle, so it
+ * has one form whatever the count.
+ */
 const SHOWN_LABEL = 'shown';
 
 /**
@@ -375,6 +475,26 @@ const THRESHOLD_MEDIAN_MULTIPLE = 2;
  * smallest count that can stand out from a single render.
  */
 const MINIMUM_THRESHOLD = 2;
+
+/**
+ * The lowest threshold a developer may enter, and the field's native `min`.
+ *
+ * Lower than {@link MINIMUM_THRESHOLD} on purpose: that floor keeps the
+ * *derived* default from marking a uniform capture, while a developer who asks
+ * to see every component that rendered at all is entitled to one. Zero is not a
+ * threshold — every count reaches it — so it is below the bound.
+ */
+const MINIMUM_ENTERED_THRESHOLD = 1;
+
+/** The field's native `step`: a render count is a whole number. */
+const THRESHOLD_STEP = 1;
+
+/**
+ * What an entered threshold must look like once trimmed: decimal digits and
+ * nothing else. No sign, no fraction, no exponent — each of those is either
+ * out of range or not a whole number of renders.
+ */
+const WHOLE_NUMBER_PATTERN = /^\d+$/;
 
 /** Characters of a display name or instance key that reach the DOM. */
 const MAX_NAME_LENGTH = 64;
@@ -575,6 +695,72 @@ function countTextOf(datum: ComponentTreeNode): string {
   return typeof count === 'number' ? formatCount(count) : NOT_AVAILABLE_LABEL;
 }
 
+/**
+ * `noun` in the form that agrees with `count`: singular for exactly one, plural
+ * for everything else — zero, many, and a count that could not be read, which
+ * prints as `n/a` and reads as "n/a renders".
+ */
+function nounForCount(noun: CountedNoun, count: number): string {
+  return count === 1 ? noun.one : noun.other;
+}
+
+/** The unit announced after a node's render count, agreeing with it. */
+function renderUnitOf(datum: ComponentTreeNode): string {
+  const count = datum.renderCount;
+
+  return nounForCount(RENDERS_UNIT_LABEL, typeof count === 'number' ? count : Number.NaN);
+}
+
+/**
+ * One identifier from a payload, trimmed, or `undefined` when it is absent or
+ * blank. Read over `unknown` because the payload crossed a transport.
+ */
+function presentIdOf(value: unknown): string | undefined {
+  const text = typeof value === 'string' ? value.trim() : '';
+
+  return text === '' ? undefined : text;
+}
+
+/**
+ * An event reference carrying only the coordinates that are present — never a
+ * key whose value is `undefined`, and never a reference without an event id.
+ *
+ * The single builder for both references this view reports, the commit's and a
+ * node's, so the two cannot follow different rules about absent coordinates.
+ */
+function eventRefOf(
+  eventId: unknown,
+  spanId: unknown,
+  traceId: unknown,
+): PanelEventRef | undefined {
+  const id = presentIdOf(eventId);
+
+  if (id === undefined) {
+    return undefined;
+  }
+
+  const span = presentIdOf(spanId);
+  const trace = presentIdOf(traceId);
+
+  return {
+    eventId: id,
+    ...(span === undefined ? {} : { spanId: span }),
+    ...(trace === undefined ? {} : { traceId: trace }),
+  };
+}
+
+/**
+ * A node's representative event: the render that supplied its last trigger, as
+ * the producer named it, or `undefined` for a node that never rendered.
+ *
+ * Nothing is derived here. The reference is the datum's own, so a node with no
+ * `lastRenderEventId` yields none rather than borrowing a neighbour's, the
+ * commit's, or an id built from the node's position.
+ */
+function representativeEventRefOf(datum: ComponentTreeNode): PanelEventRef | undefined {
+  return eventRefOf(datum.lastRenderEventId, datum.lastRenderSpanId, datum.lastRenderTraceId);
+}
+
 /** The node's cumulative render time, or `n/a` when it was not measured. */
 function durationTextOf(datum: ComponentTreeNode): string {
   const duration = datum.totalDurationMs;
@@ -610,11 +796,6 @@ function describeOrigin(origin: ComponentTreeOrigin): OriginDescription {
     detail: detail ?? ORIGIN_DETAILS['owner-chains'],
     tone: tone ?? ORIGIN_TONES['owner-chains'],
   };
-}
-
-/** The serialised query an error state shows, so a failure names its cause. */
-function serializeQuery(query: DataQuery): string {
-  return JSON.stringify(query);
 }
 
 /* ---------------------------------------------------------------------------
@@ -923,6 +1104,46 @@ function expandedByDefault(prepared: PreparedTree, threshold: number): ReadonlyS
 }
 
 /**
+ * How many marked nodes sit beneath each branch, at every depth.
+ *
+ * What a collapsed row states so that closing it never hides a finding: every
+ * descendant of a closed branch is off screen, so this count *is* the number
+ * of hidden marks behind it. Per position, like the toolbar's total, because
+ * each position is a row the developer would otherwise have to open to find.
+ *
+ * Only branches with at least one marked descendant are recorded, so a lookup
+ * that misses means zero. One post-order walk over the prepared tree — whose
+ * depth {@link prepareTree} already bounds — memoized on the tree and the
+ * threshold, like pass 2.
+ */
+function markedDescendantCounts(
+  prepared: PreparedTree,
+  threshold: number,
+): ReadonlyMap<string, number> {
+  const counts = new Map<string, number>();
+
+  const visit = (node: PreparedNode): number => {
+    let marked = 0;
+
+    for (const child of node.children) {
+      marked += visit(child) + (isAboveThreshold(child.datum, threshold) ? 1 : 0);
+    }
+
+    if (marked > 0) {
+      counts.set(node.key, marked);
+    }
+
+    return marked;
+  };
+
+  for (const root of prepared.roots) {
+    visit(root);
+  }
+
+  return counts;
+}
+
+/**
  * Pass 3 — the rows that are on screen, in the order the keyboard walks them.
  *
  * Returns both shapes the render needs: the nested form, which mirrors the
@@ -1037,53 +1258,129 @@ function deriveThreshold(counts: readonly number[]): number {
 }
 
 /**
- * The threshold in force: what the developer typed, or the derived default.
+ * The threshold a developer's text names, or `undefined` when it names none.
  *
- * An empty or unreadable field falls back to the default rather than to zero,
- * so clearing the control restores the derived mark instead of silently turning
- * the highlight off.
+ * The one rule every reading of the field goes through: once trimmed, the text
+ * must be decimal digits ({@link WHOLE_NUMBER_PATTERN}) naming a safe integer
+ * of at least {@link MINIMUM_ENTERED_THRESHOLD}. Anything else — an empty
+ * field, zero, a fraction, a sign, an exponent, a number past the safe-integer
+ * range, or text a number field could not hold — names no threshold. Leading
+ * zeros and surrounding space are spelling, not meaning: " 03" names three.
+ *
+ * There is no upper clamp. A value above the field's `max` is a whole number
+ * of renders no component reached, so it is honoured and marks nothing — which
+ * is what it says — rather than being rewritten into a value nobody typed.
  */
-function resolveThreshold(text: string | undefined, derived: number): number {
+function enteredThresholdOf(text: string | undefined): number | undefined {
   if (text === undefined) {
-    return derived;
+    return undefined;
   }
 
   const trimmed = text.trim();
 
-  if (trimmed === '') {
-    return derived;
+  if (!WHOLE_NUMBER_PATTERN.test(trimmed)) {
+    return undefined;
   }
 
   const parsed = Number.parseInt(trimmed, 10);
 
-  if (!Number.isFinite(parsed) || parsed < 0) {
-    return derived;
-  }
-
-  return parsed;
+  return Number.isSafeInteger(parsed) && parsed >= MINIMUM_ENTERED_THRESHOLD ? parsed : undefined;
 }
 
 /**
- * The one event reference a component-tree snapshot legitimately holds: the
- * commit the structure was taken from.
+ * The threshold in force: what the developer entered, or the derived default.
  *
- * A *node* never yields one. Its count is an aggregate over the whole capture
- * and over every position the component occupies, so there is no single event
- * it stands for — and inventing an id for it would put a coordinate that
- * resolves to nothing into a drawer the developer reads as evidence.
+ * Text that names no threshold ({@link enteredThresholdOf}) falls back to the
+ * default rather than to zero or to the bound, so clearing the control — or
+ * typing something it cannot read — restores the derived mark instead of
+ * silently turning the highlight off or marking every row.
+ */
+function resolveThreshold(text: string | undefined, derived: number): number {
+  return enteredThresholdOf(text) ?? derived;
+}
+
+/**
+ * What the threshold field reports to `PanelActions.onFilterChange`: the
+ * entered threshold in force, spelled canonically as a decimal integer (" 03"
+ * reports `"3"`), or `""` when no entered threshold is in force — the field was
+ * cleared, or holds text that names none — which means "the derived default".
+ *
+ * Never the raw text: a host that remembers the value and hands it back must
+ * get exactly the threshold that was applied, not a spelling of it.
+ */
+function thresholdFilterValueOf(text: string): string {
+  const entered = enteredThresholdOf(text);
+
+  return entered === undefined ? '' : String(entered);
+}
+
+/**
+ * The field's native `max`: the highest render count any component reached,
+ * or the derived default when that is higher.
+ *
+ * Past the highest count nothing more can be marked, so that is where the spin
+ * buttons stop; the derived default is included so the value the field starts
+ * at is always inside its own bounds.
+ */
+function thresholdMaximumOf(counts: readonly number[], derived: number): number {
+  const highest = counts.reduce((current, count) => Math.max(current, Math.ceil(count)), 0);
+
+  return Math.max(highest, derived, MINIMUM_ENTERED_THRESHOLD);
+}
+
+/**
+ * The event reference of the whole snapshot: the commit the structure was
+ * taken from, when the capture recorded it.
+ *
+ * A property of the view rather than of any node, so it is offered once, from
+ * the toolbar. A node's own reference is {@link representativeEventRefOf}; both
+ * are built by {@link eventRefOf}, carrying only the coordinates present.
  */
 function commitEventRefOf(snapshot: ComponentTreeSnapshot | undefined): PanelEventRef | undefined {
   if (snapshot === undefined) {
     return undefined;
   }
 
-  const eventId = typeof snapshot.commitEventId === 'string' ? snapshot.commitEventId.trim() : '';
+  return eventRefOf(snapshot.commitEventId, snapshot.commitSpanId, snapshot.traceId);
+}
 
-  if (eventId === '') {
-    return undefined;
+/**
+ * The node a reader activated, together with the panel's selection as it stood
+ * at that moment.
+ *
+ * A node stands for no event (see {@link commitEventRefOf}), so its selected
+ * state cannot be the panel's shared selection — but it must not contradict
+ * it either. Recording the selection it was made under is what lets the mark
+ * give way: the node stays marked only while the panel's selection is still the
+ * one it was activated beside, and the moment any view — or this view's own
+ * commit control — selects another event, the tree stops claiming a selection
+ * of its own.
+ */
+interface NodeSelection {
+  /** The activated node's key. */
+  readonly key: string;
+
+  /** The panel's selection when the node was activated, `undefined` for none. */
+  readonly under: PanelSelection | undefined;
+}
+
+/**
+ * Whether two readings of the panel's selection name the same event with the
+ * same coordinates.
+ *
+ * Compared field by field rather than by identity, so a host that re-delivers
+ * an equal selection as a new object does not clear a node's mark.
+ *
+ * @param a One reading, `undefined` for "nothing selected".
+ * @param b The other.
+ * @returns `true` when both are absent, or both name the same event alike.
+ */
+function sameSelection(a: PanelSelection | undefined, b: PanelSelection | undefined): boolean {
+  if (a === undefined || b === undefined) {
+    return a === b;
   }
 
-  return { eventId, spanId: snapshot.commitSpanId, traceId: snapshot.traceId };
+  return a.eventId === b.eventId && a.traceId === b.traceId && a.spanId === b.spanId;
 }
 
 /* ---------------------------------------------------------------------------
@@ -1111,12 +1408,18 @@ export interface ComponentTreeProps {
  * with how often that component rendered.
  *
  * See the module documentation for why the child groups are siblings tied with
- * `aria-owns`, why a node activation never reports a selected event, and why
- * the origin and the degradation of the snapshot are stated on screen.
+ * `aria-owns`, why selecting a node reports its representative render and
+ * never an invented one, why selection never toggles a branch, and why the
+ * origin and the degradation of the snapshot are stated on screen.
  */
 export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const { node, className } = props;
   const actions = usePanelActions();
+  // The panel's selected event: the host's shared selection, or this view's own
+  // last one when no host is mounted. Only the commit control can stand for an
+  // event, so only it is marked by the selection; a node's own mark gives way
+  // to it (see `NodeSelection`).
+  const { selection, markSelected } = useViewSelection();
   const baseId = useId();
 
   // The query is narrowed before it is handed to the hook: a node whose source
@@ -1141,6 +1444,10 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const prepared = useMemo(() => prepareTree(snapshot, hierarchical), [snapshot, hierarchical]);
   const counts = useMemo(() => componentCounts(prepared), [prepared]);
   const derivedThreshold = useMemo(() => deriveThreshold(counts), [counts]);
+  const thresholdMaximum = useMemo(
+    () => thresholdMaximumOf(counts, derivedThreshold),
+    [counts, derivedThreshold],
+  );
   const itemIds = useMemo(
     () => new Map(prepared.all.map((entry) => [entry.key, entry.itemId] as const)),
     [prepared],
@@ -1170,10 +1477,23 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     () => prepared.all.filter((entry) => isAboveThreshold(entry.datum, threshold)).length,
     [prepared, threshold],
   );
+  const markedBeneath = useMemo(
+    () => markedDescendantCounts(prepared, threshold),
+    [prepared, threshold],
+  );
 
   const [activeKey, setActiveKey] = useState<string | undefined>(undefined);
-  const [selectedKey, setSelectedKey] = useState<string | undefined>(undefined);
+  const [selectedNode, setSelectedNode] = useState<NodeSelection | undefined>(undefined);
   const rowElements = useRef<Map<string, HTMLDivElement>>(new Map());
+
+  // The node drawn as selected: the one last activated, for exactly as long as
+  // the panel's selection is the one it was activated beside. A selection made
+  // anywhere since supersedes it, so the tree never marks a node while the
+  // panel's selection — the event its details drawer shows — is another one.
+  const selectedKey =
+    selectedNode !== undefined && sameSelection(selectedNode.under, selection)
+      ? selectedNode.key
+      : undefined;
 
   const rows = projection.rows;
 
@@ -1231,20 +1551,24 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
   };
 
-  const activate = (row: TreeRow): void => {
+  /**
+   * Row selection — a click on the row, or Enter/Space on it — and nothing else.
+   *
+   * The row becomes the active and the selected one. When its node names a
+   * representative render, that reference goes to the host exactly as the datum
+   * holds it, with only the coordinates present; a node that never rendered has
+   * none, so the selection stays inside this view and nothing is reported. It
+   * never toggles a branch — disclosure is the toggle's and the arrow keys' —
+   * and never opens a file, which is the chip's and Shift+Enter's.
+   */
+  const selectRow = (row: TreeRow): void => {
     setActiveKey(row.node.key);
-    setSelectedKey(row.node.key);
+    setSelectedNode({ key: row.node.key, under: selection });
 
-    if (hierarchical && row.node.children.length > 0) {
-      applyExpansion(row, !row.expanded);
+    const reference = representativeEventRefOf(row.node.datum);
 
-      return;
-    }
-
-    const location = row.node.datum.source;
-
-    if (location !== undefined) {
-      openSource?.(location);
+    if (reference !== undefined) {
+      actions?.onSelectEvent(reference);
     }
   };
 
@@ -1252,10 +1576,11 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
    * The Shift+Enter row command: open the row's source and do nothing else.
    *
    * The keyboard route to the chip's intent, which is what lets the chip leave
-   * the Tab order. It works on a branch as well as a leaf — Enter on a branch
-   * toggles it, so without this a branch's source would be keyboard-unreachable
-   * — and it neither toggles, selects nor reports a disclosure. The location is
-   * handed over as the very object the datum holds, exactly as the chip does.
+   * the Tab order. It works on a branch as well as a leaf — Enter selects a row
+   * rather than opening anything, so without this no row's source would be
+   * reachable from the keyboard — and it neither toggles, selects nor reports a
+   * disclosure. The location is handed over as the very object the datum holds,
+   * exactly as the chip does.
    *
    * @returns Whether the row could open anything; only then is the key consumed.
    */
@@ -1274,12 +1599,12 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
   const handleRowClick = (event: ReactMouseEvent<HTMLDivElement>, row: TreeRow): void => {
     // A control inside the row — the toggle, or the source chip — has already
     // handled this gesture. Without the guard, clicking a chip would open the
-    // file and then activate the row that contains it.
+    // file and then select the row that contains it as well.
     if (nestedControlOf(event) !== undefined) {
       return;
     }
 
-    activate(row);
+    selectRow(row);
   };
 
   const handleRowKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>, row: TreeRow): void => {
@@ -1290,7 +1615,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
 
     // Checked before the switch so that Shift+Enter never reaches the plain
-    // Enter activation below. Consumed only when the row can actually open
+    // Enter selection below. Consumed only when the row can actually open
     // something; otherwise it falls through to the page untouched. Consuming it
     // also cancels the native activation of a focused toggle or chip, so one
     // press is one open, whichever element inside the row holds focus.
@@ -1305,8 +1630,8 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     // Focus can sit on the toggle or the chip after a pointer press. Enter and
     // Space then belong to that control's own activation — the chip opens the
     // source, the toggle toggles — rather than to the row, which would otherwise
-    // toggle a branch when its chip was the thing pressed. The arrow keys, Home
-    // and End still navigate from there.
+    // select the row as well when its chip was the thing pressed. The arrow
+    // keys, Home and End still navigate from there.
     if ((event.key === 'Enter' || event.key === ' ') && nestedControlOf(event) !== undefined) {
       return;
     }
@@ -1399,7 +1724,9 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
 
       case 'Enter':
       case ' ': {
-        activate(row);
+        // Selection only: a branch keeps its disclosure state, and a row with a
+        // source keeps it closed until the chip or Shift+Enter asks for it.
+        selectRow(row);
         break;
       }
 
@@ -1428,6 +1755,8 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     const groupId = `${baseId}-g${String(item.ordinal)}`;
     const nameElementId = `${baseId}-l${String(item.ordinal)}`;
     const metaId = `${baseId}-m${String(item.ordinal)}`;
+    const markId = `${baseId}-t${String(item.ordinal)}`;
+    const hiddenMarkId = `${baseId}-h${String(item.ordinal)}`;
 
     const name = displayNameOf(datum);
     const instanceKey = instanceKeyOf(datum);
@@ -1438,6 +1767,20 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     // The same two conditions `openRowSource` checks, so the row advertises the
     // command exactly when pressing it would do something.
     const opensSource = location !== undefined && openSource !== undefined;
+    // Every descendant of a closed branch is off screen, so the marks beneath
+    // it are exactly the marks it hides. An open branch hides none of its own:
+    // its children are rows, and a closed one among them states its own count.
+    const hiddenMarked = hasChildren && !row.expanded ? (markedBeneath.get(item.key) ?? 0) : 0;
+    // The count first, then each badge the row carries, in reading order — so
+    // a screen reader hears the mark and the hidden count with the row rather
+    // than only by walking into it.
+    const descriptionIds = [
+      metaId,
+      row.highlighted ? markId : undefined,
+      hiddenMarked > 0 ? hiddenMarkId : undefined,
+    ]
+      .filter((id): id is string => id !== undefined)
+      .join(' ');
 
     // The only inline style in this file, and the mechanism the stylesheet
     // expects: a unitless level it multiplies by one spacing token.
@@ -1466,7 +1809,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         aria-current={!hierarchical && isSelected ? true : undefined}
         aria-owns={hasChildren && row.expanded ? groupId : undefined}
         aria-labelledby={nameElementId}
-        aria-describedby={metaId}
+        aria-describedby={descriptionIds}
         aria-keyshortcuts={opensSource ? OPEN_SOURCE_KEYSHORTCUTS : undefined}
         onClick={(event) => {
           handleRowClick(event, row);
@@ -1522,7 +1865,7 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
 
         <span id={metaId} className="dg-component-tree__count">
           {countTextOf(datum)}
-          <span className="dg-visually-hidden">{` ${RENDERS_UNIT_LABEL}`}</span>
+          <span className="dg-visually-hidden">{` ${renderUnitOf(datum)}`}</span>
         </span>
 
         <span className="dg-component-tree__count">
@@ -1538,13 +1881,27 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         )}
 
         {row.highlighted ? (
-          // The mark is a word and an icon, never colour alone.
+          // The mark is words and an icon, never colour alone.
           <Badge
+            id={markId}
             tone="warning"
             variant="soft"
             icon={<TriangleAlert className="dg-icon" aria-hidden="true" />}
           >
-            {ABOVE_THRESHOLD_LABEL}
+            {AT_OR_ABOVE_THRESHOLD_LABEL}
+          </Badge>
+        ) : null}
+
+        {hiddenMarked > 0 ? (
+          // Outline rather than soft: it points at marks elsewhere rather than
+          // being this row's own, and the two must not read as the same badge.
+          <Badge
+            id={hiddenMarkId}
+            tone="warning"
+            variant="outline"
+            icon={<TriangleAlert className="dg-icon" aria-hidden="true" />}
+          >
+            {`${formatCount(hiddenMarked)} ${HIDDEN_MARKED_SUFFIX}`}
           </Badge>
         ) : null}
 
@@ -1599,13 +1956,11 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
 
   const renderBody = (): ReactElement => {
     if (!supported) {
+      // A defect in the panel rather than a failed request: worded from the
+      // node catalog, with no retry, because asking again cannot change it.
       return (
         <div className="dg-component-tree__error">
-          <ErrorState
-            title={ERROR_TITLE}
-            message={ERROR_SOURCE_MESSAGE}
-            query={serializeQuery(query)}
-          />
+          <ErrorState {...unsupportedQueryProps(node.type, query)} />
         </div>
       );
     }
@@ -1619,20 +1974,13 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
 
     if (result.status === 'error') {
-      const failure = result.error;
-
       return (
         <div className="dg-component-tree__error">
-          {/* Generic copy plus the error's code and the failing query. The
-              provider's own message is a diagnostic, not a finding, so it never
-              takes the place of an analysis on screen (AAP 0.5.5). */}
-          <ErrorState
-            title={ERROR_TITLE}
-            message={ERROR_MESSAGE}
-            code={failure?.code}
-            query={serializeQuery(query)}
-            onRetry={result.retry}
-          />
+          {/* The shared contract: the generic lead followed by the cause the
+              provider stated, its hint and code, the query as asked and a
+              retry. It reports what failed and never reads like an analysis
+              (AAP 0.5.5). */}
+          <ErrorState {...queryFailureProps(result, query)} />
         </div>
       );
     }
@@ -1644,13 +1992,15 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
     }
 
     if (snapshot === undefined) {
+      // An answer that arrived but cannot be read: the same contract as a
+      // failed request, carrying this view's own cause (see SHAPE_FAILURE).
       return (
         <div className="dg-component-tree__error">
           <ErrorState
-            title={ERROR_TITLE}
-            message={ERROR_SHAPE_MESSAGE}
-            query={serializeQuery(query)}
-            onRetry={result.retry}
+            {...queryFailureProps(
+              { error: SHAPE_FAILURE, announcement: undefined, retry: result.retry },
+              query,
+            )}
           />
         </div>
       );
@@ -1666,8 +2016,8 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
         ? snapshot.maxDepth + 1
         : Number.NaN;
     const statistics = [
-      `${formatCount(snapshot.nodeCount)} ${NODES_LABEL}`,
-      `${formatCount(levels)} ${LEVELS_LABEL}`,
+      `${formatCount(snapshot.nodeCount)} ${nounForCount(NODES_LABEL, snapshot.nodeCount)}`,
+      `${formatCount(levels)} ${nounForCount(LEVELS_LABEL, levels)}`,
       `${formatCount(rows.length)} ${SHOWN_LABEL}`,
     ].join(' · ');
 
@@ -1716,11 +2066,28 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
       toolbarActions.push({
         id: `${baseId}-commit`,
         label: SHOW_COMMIT_LABEL,
+        // Pressed exactly while the commit is the panel's selected event, from
+        // this control or from any view that drew the same event: the toolbar
+        // turns it into `aria-pressed` and the pressed surface together.
+        pressed: matchesPanelSelection(selection, commitRef),
         onSelect: () => {
+          // A no-op under a host, whose record of the report is what every
+          // view then marks; the view's own selection outside one.
+          markSelected(commitRef);
           actions.onSelectEvent(commitRef);
         },
       });
     }
+
+    // Text that names no threshold — zero, a sign, a fraction — is kept in the
+    // field so the developer can correct it, but the field is marked invalid
+    // and the toolbar says which default applies meanwhile, so a rejected value
+    // never reads as the one in force. An empty field is not an error: clearing
+    // it is the documented way back to the default.
+    const thresholdRejected =
+      thresholdText !== undefined &&
+      thresholdText.trim() !== '' &&
+      enteredThresholdOf(thresholdText) === undefined;
 
     const toolbarStatus: ToolbarStatus[] = [
       {
@@ -1729,7 +2096,26 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
       },
     ];
 
-    const thresholdExplanation = `Marks every component whose cumulative render count reaches this value. The default of ${formatCount(derivedThreshold)} is ${String(THRESHOLD_MEDIAN_MULTIPLE)}× the median render count of the ${formatCount(counts.length)} components in this capture, so it follows the capture rather than a fixed number. Clear the field to restore it.`;
+    if (thresholdRejected) {
+      // A short status pill rather than the field's own error line: the
+      // toolbar wraps between pills, so the pill takes the next free place,
+      // whereas an error line under the field would widen the field's column to
+      // the sentence and push every action beside it sideways. The full
+      // sentence is the field's description and live region below.
+      toolbarStatus.push({
+        label: `${THRESHOLD_DEFAULT_IN_FORCE_PREFIX} ${formatCount(derivedThreshold)}`,
+        tone: 'danger',
+      });
+    }
+
+    const thresholdRejection = thresholdRejected
+      ? `${THRESHOLD_REJECTED_PREFIX} ${formatCount(
+          MINIMUM_ENTERED_THRESHOLD,
+        )}. The default of ${formatCount(derivedThreshold)} applies until then.`
+      : '';
+    const thresholdRejectionId = `${baseId}-threshold-rejection`;
+
+    const thresholdExplanation = `Marks every component whose cumulative render count reaches this value. The default of ${formatCount(derivedThreshold)} is ${String(THRESHOLD_MEDIAN_MULTIPLE)}× the median render count of the ${formatCount(counts.length)} ${nounForCount(COMPONENTS_LABEL, counts.length)} in this capture, so it follows the capture rather than a fixed number. Clear the field, or enter anything but a whole number of at least ${formatCount(MINIMUM_ENTERED_THRESHOLD)}, to restore it.`;
 
     const noteId = `${baseId}-note`;
 
@@ -1787,13 +2173,39 @@ export function ComponentTree(props: ComponentTreeProps): ReactElement {
               label={THRESHOLD_LABEL}
               type="number"
               controlSize="sm"
+              // Bounds for the spin buttons and the arrow keys, not a clamp: the
+              // text is still read by `enteredThresholdOf`, which owns the rule.
+              min={MINIMUM_ENTERED_THRESHOLD}
+              max={thresholdMaximum}
+              step={THRESHOLD_STEP}
+              invalid={thresholdRejected}
+              // Merged by the tooltip with its own bubble id, so the field is
+              // described by the rule and, while rejected, by the reason.
+              aria-describedby={thresholdRejected ? thresholdRejectionId : undefined}
               value={thresholdText ?? String(derivedThreshold)}
               onValueChange={(next) => {
+                // The field keeps what the developer typed, mid-edit included;
+                // the host hears the threshold that is actually in force.
                 setThresholdText(next);
-                actions?.onFilterChange?.(node.id, { [THRESHOLD_FILTER_KEY]: next.trim() });
+                actions?.onFilterChange?.(node.id, {
+                  [THRESHOLD_FILTER_KEY]: thresholdFilterValueOf(next),
+                });
               }}
             />
           </Tooltip>
+          {/* Always mounted, so the change of its text is announced as the
+              developer types; visually hidden, so it takes no place in the
+              wrapping toolbar row. Empty while the value is accepted. A live
+              region without the `status` role, which the renderer reserves
+              for a view that is still loading. */}
+          <span
+            id={thresholdRejectionId}
+            className="dg-visually-hidden"
+            aria-live="polite"
+            aria-atomic="true"
+          >
+            {thresholdRejection}
+          </span>
         </Toolbar>
 
         <div

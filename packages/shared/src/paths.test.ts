@@ -1141,7 +1141,7 @@ describe('basenamePosix', () => {
     expect(basenamePosix(path, ext)).toBe(expected);
   });
 
-  it('never strips a name down to nothing', () => {
+  it('keeps the whole name when the suffix is the entire name, unlike path.posix.basename', () => {
     // The documented divergence from `path.posix.basename('.ts', '.ts')`, which
     // returns ''. A file name is never legitimately empty, and an empty one
     // travelling onward as an identity is worse than a name that kept its

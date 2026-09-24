@@ -186,6 +186,7 @@ import {
   type Result,
 } from '@debuggen/shared';
 import {
+  SECURE_DIR_MODE,
   SECURE_FILE_MODE,
   createFileExclusive,
   ensureSecureDir,
@@ -214,7 +215,7 @@ const SUBSYSTEM = 'store';
  * by no file".
  *
  * Recognised explicitly rather than pattern-matched, because every behaviour
- * that is skipped for it — creating and tightening a directory, securing and
+ * that is skipped for it — creating and verifying a directory, securing and
  * re-verifying the database file and its sidecars, expecting WAL mode — is
  * skipped because there *is* no file, and a path that merely looks like this
  * one would still have one.
@@ -1022,10 +1023,17 @@ export interface OpenStoreOptions {
    * Only the two members the store needs are required, so a caller never has to
    * assemble a whole {@link ServiceConfig} to open a database:
    * `databasePath` is `<debuggenHome>/sessions.sqlite`, and `debuggenHome` is
-   * the state root — the boundary whose whole chain is verified and tightened to
-   * `0700` before the file is created, and the tree the database file's
-   * canonical path must resolve inside before SQLite opens it. Mutually
-   * exclusive with {@link OpenStoreOptions.databasePath}.
+   * the state root — the boundary whose whole chain is created `0700`, or
+   * verified to be private already, before the file is created, and the tree
+   * the database file's canonical path must resolve inside before SQLite opens
+   * it. Mutually exclusive with {@link OpenStoreOptions.databasePath}.
+   *
+   * The containment is a precondition of this route, not a preference: a blank
+   * `debuggenHome`, or a `databasePath` whose directory is not lexically inside
+   * it, is refused as `CONFIG_INVALID` before any filesystem call, so a
+   * misassembled configuration neither creates a file nor changes a mode
+   * outside the state tree. A store that genuinely lives elsewhere is opened
+   * with {@link OpenStoreOptions.databasePath} alone.
    */
   readonly config?: Pick<ServiceConfig, 'databasePath' | 'debuggenHome'> | undefined;
 
@@ -1082,9 +1090,11 @@ interface StoreTarget {
   readonly path: string;
 
   /**
-   * The state root whose chain is verified and tightened, when the caller
-   * declared one and the database really sits inside it; `undefined` otherwise,
-   * in which case only the database's own directory is verified.
+   * The state root whose whole chain is created or verified, down to the
+   * database's directory. Always defined on the configuration route, where
+   * {@link resolvePath} has already proved that it lexically contains that
+   * directory; `undefined` on the `databasePath` route and for the in-memory
+   * store, where only the database's own directory is created or verified.
    */
   readonly stateRoot: string | undefined;
 }
@@ -1105,10 +1115,15 @@ interface StoreTarget {
  *
  * 1. Resolve the target and require **exactly one** of
  *    {@link OpenStoreOptions.databasePath} and {@link OpenStoreOptions.config}.
+ *    On the configuration route the database's directory must lie lexically
+ *    inside the state root, which is checked here, before any filesystem call.
  * 2. Create and verify the parent directory (`0700`) — skipped only when
- *    {@link OpenStoreOptions.ensureDirectory} is `false`. The directory being
- *    private and owned is what stops another account from swapping an entry
- *    inside it between the checks below and the uses they guard.
+ *    {@link OpenStoreOptions.ensureDirectory} is `false`. A directory that is
+ *    created is made `0700`; one that already exists must already be private
+ *    and owned, and is refused rather than tightened when it is not. The
+ *    directory being private and owned is what stops another account from
+ *    swapping an entry inside it between the checks below and the uses they
+ *    guard.
  * 3. Secure the database file **before SQLite sees it**, because
  *    `DatabaseSync` follows a symbolic link at the final component and takes no
  *    mode. The directory's canonical path must lie inside the state root, so a
@@ -1166,7 +1181,11 @@ interface StoreTarget {
  * logger, DDL source and directory switch.
  * @returns `Ok` with an open, migrated {@link Store}, or `Err` with a
  * {@link DebuggenError}: `CONFIG_INVALID` when the options do not name exactly
- * one target; `FS_UNSAFE_PATH` when the state directory is not private or is
+ * one target, or when a configuration's `debuggenHome` is blank or does not
+ * contain its `databasePath` (`details.reason` `empty-state-root`,
+ * `outside-state-root`); `FS_UNSAFE_PATH` when an existing directory of the
+ * state tree is not private (`group-or-other-permissions`, with the offending
+ * `details.path` and `details.mode`), is owned by another account or is
  * reached through a symbolic link, or when the database file or a sidecar is a
  * symbolic link, not a regular file, owned by another account or hard-linked
  * (`details.reason` `symlink-component`, `not-a-regular-file`, `foreign-owner`,
@@ -1368,7 +1387,7 @@ function resolveTarget(options: OpenStoreOptions): Result<StoreTarget, DebuggenE
   }
 
   if (config !== undefined) {
-    return resolvePath(config.databasePath, config.debuggenHome);
+    return resolvePath(config.databasePath, config);
   }
 
   return err(
@@ -1380,23 +1399,38 @@ function resolveTarget(options: OpenStoreOptions): Result<StoreTarget, DebuggenE
 }
 
 /**
- * Turns a configured database path — and the state root it may sit in — into a
- * {@link StoreTarget}.
+ * Turns a database path — and, on the configuration route, the state root it
+ * must sit in — into a {@link StoreTarget}.
  *
- * The state root is carried only when the database really lies inside it:
- * `ensureSecureDir` refuses a boundary that does not contain the directory it
- * is asked to create, and a configuration whose database was relocated out of
- * the state tree is a legitimate arrangement rather than a fault, so the
- * boundary is narrowed to the database's own directory instead of rejected.
+ * On the configuration route the state root is a precondition, checked before
+ * any filesystem call. The configuration derives the database path as
+ * `<debuggenHome>/sessions.sqlite`, and `OpenStoreOptions.config` promises
+ * that the whole chain from the state root down is created or verified private
+ * and that the database resolves inside that root. A configuration whose
+ * database is not inside its own state root — or whose state root is blank —
+ * has been assembled wrongly, and quietly narrowing the boundary to the
+ * database's own directory would create a file, and apply a mode, somewhere the
+ * product was never told it owns. It is therefore refused as `CONFIG_INVALID`.
+ * The containment test is the product's lexical gate on the two resolved paths;
+ * a directory that is lexically inside but reached through a symbolic link is
+ * refused later as `FS_UNSAFE_PATH` — by the directory walk
+ * (`symlink-component`), or on canonical paths (`outside-state-root`) when
+ * that walk is skipped.
+ *
+ * The `databasePath` route carries no state root, and the in-memory path is
+ * recognised on either route before anything else, since it names no file.
  *
  * @param databasePath The path to open.
- * @param debuggenHome The declared state root, when there is one.
- * @returns `Ok` with the target, or `Err` with `CONFIG_INVALID` for an empty
- * path.
+ * @param config The service configuration on the configuration route, or
+ * `undefined` on the `databasePath` route.
+ * @returns `Ok` with the target — whose `stateRoot` is always defined on the
+ * configuration route — or `Err` with `CONFIG_INVALID` for an empty database
+ * path, a blank state root (`details.reason` `empty-state-root`) or a database
+ * whose directory is not inside the state root (`outside-state-root`).
  */
 function resolvePath(
   databasePath: string,
-  debuggenHome: string | undefined,
+  config: Pick<ServiceConfig, 'debuggenHome'> | undefined,
 ): Result<StoreTarget, DebuggenError> {
   if (isInMemory(databasePath)) {
     return ok({ path: MEMORY_DATABASE_PATH, stateRoot: undefined });
@@ -1412,11 +1446,45 @@ function resolvePath(
   }
 
   const path = resolve(databasePath);
-  const root =
-    debuggenHome === undefined || debuggenHome.trim().length === 0
-      ? undefined
-      : resolve(debuggenHome);
-  const stateRoot = root !== undefined && isWithin(root, dirname(path)) ? root : undefined;
+  if (config === undefined) {
+    return ok({ path, stateRoot: undefined });
+  }
+
+  // Widened to `unknown` and tested for its type as well as its content: the
+  // configuration can reach here from a caller no compiler vouched for, and a
+  // missing state root must be refused rather than read as "no boundary".
+  const debuggenHome: unknown = config.debuggenHome;
+  if (typeof debuggenHome !== 'string' || debuggenHome.trim().length === 0) {
+    return err(
+      new DebuggenError(
+        'CONFIG_INVALID',
+        'The service configuration names no Debug Generator state directory for the session store.',
+        {
+          hint: 'Set DEBUGGEN_HOME to the directory the service should keep its state in, or pass `databasePath` alone to open a store outside the state directory.',
+          details: { subsystem: SUBSYSTEM, databasePath: path, reason: 'empty-state-root' },
+        },
+      ),
+    );
+  }
+
+  const stateRoot = resolve(debuggenHome);
+  if (!isWithin(stateRoot, dirname(path))) {
+    return err(
+      new DebuggenError(
+        'CONFIG_INVALID',
+        `The session store path ${path} is outside the Debug Generator state directory ${stateRoot}.`,
+        {
+          hint: `Leave the database path to the service configuration, which derives it inside ${stateRoot}, or pass \`databasePath\` alone to open a store outside the state directory.`,
+          details: {
+            subsystem: SUBSYSTEM,
+            databasePath: path,
+            debuggenHome: stateRoot,
+            reason: 'outside-state-root',
+          },
+        },
+      ),
+    );
+  }
 
   return ok({ path, stateRoot });
 }
@@ -1424,13 +1492,23 @@ function resolvePath(
 /**
  * Creates the database's parent directory as a private one, and proves it.
  *
- * `ensureSecureDir` creates every missing component non-recursively, refuses a
- * symbolic link, tightens the chain to `0700` and verifies the result, so a
- * successful return is a statement about the filesystem rather than about the
- * calls that were attempted. The declared state root is passed as the boundary
- * when there is one, which is what extends the guarantee from "the directory
- * this call created is private" to "every directory from the state root down is
- * private, and none of them is a link".
+ * `ensureSecureDir` creates every missing component non-recursively at `0700`,
+ * refuses a symbolic link, refuses an existing component that another account
+ * owns or that grants group or other access — without changing its mode — and
+ * verifies the result, so a successful return is a statement about the
+ * filesystem rather than about the calls that were attempted. The declared
+ * state root is passed as the boundary when there is one, which is what
+ * extends the guarantee from "the directory this call created is private" to
+ * "every directory from the state root down is private, and none of them is a
+ * link".
+ *
+ * A policy refusal keeps the diagnosis of the refusal it wraps: `details.path`
+ * is the offending directory (the outermost one, which may be the state root
+ * rather than the database's own directory), `details.reason` is its reason,
+ * and the hint names the developer's action on that exact path — `chmod 700`
+ * after checking its contents, or another `DEBUGGEN_HOME`, for a directory
+ * that is merely too open; removing or replacing it for a link or a directory
+ * another account owns.
  *
  * @param path The database path.
  * @param stateRoot The declared boundary, when the database sits inside one.
@@ -1451,7 +1529,11 @@ function prepareStoreDirectory(
     }
   } catch (cause) {
     const errno = errnoCodeOf(cause);
-    const unsafe = DebuggenError.from(cause, 'STORE_ERROR').code === 'FS_UNSAFE_PATH';
+    const failure = DebuggenError.from(cause, 'STORE_ERROR');
+    const unsafe = failure.code === 'FS_UNSAFE_PATH';
+    const offendingPath: unknown = failure.details?.path;
+    const offending = typeof offendingPath === 'string' ? offendingPath : directory;
+    const reason: unknown = failure.details?.reason;
 
     return err(
       new DebuggenError(
@@ -1460,13 +1542,13 @@ function prepareStoreDirectory(
           ? 'The Debug Generator state directory is not a private directory this account owns.'
           : 'Could not create the Debug Generator state directory for the session store.',
         {
-          hint: unsafe
-            ? `Remove or replace ${directory}: the session store's directory must be a real directory owned by this account with no group or other access, because it holds captured telemetry and the backups of every file this tool patches.`
-            : STATE_DIRECTORY_HINT,
+          hint: unsafe ? unsafeStoreDirectoryHint(offending, reason) : STATE_DIRECTORY_HINT,
           details: {
             subsystem: SUBSYSTEM,
             directory,
             ...(stateRoot === undefined ? {} : { stateRoot }),
+            ...(unsafe ? { path: offending } : {}),
+            ...(unsafe && typeof reason === 'string' ? { reason } : {}),
             errno: errno ?? 'unknown',
           },
           cause,
@@ -1476,6 +1558,28 @@ function prepareStoreDirectory(
   }
 
   return ok(undefined);
+}
+
+/**
+ * The hint on a state directory the store refused, naming the developer's
+ * action on the exact directory that failed.
+ *
+ * A directory that is merely too open is the developer's to judge — another
+ * account may already have read what it holds — so the action is to check it
+ * and remove the access, or to move the state elsewhere; the store never
+ * narrows the mode itself. A link, a foreign owner or a non-directory cannot be
+ * made safe in place, so the action there is to remove or replace it. Only
+ * the path and the required mode appear, never anything the directory holds.
+ *
+ * @param offending The directory the refusal named.
+ * @param reason The refusal's `details.reason`, as it was reported.
+ * @returns The hint text.
+ */
+function unsafeStoreDirectoryHint(offending: string, reason: unknown): string {
+  if (reason === 'group-or-other-permissions') {
+    return `${offending} grants group or other access, and the session store's directory tree must be private to this account because it holds captured telemetry and the backups of every file this tool patches. Check what it contains, then run 'chmod ${octal(SECURE_DIR_MODE)} ${offending}', or set DEBUGGEN_HOME to a private directory and start the service again.`;
+  }
+  return `Remove or replace ${offending}: the session store's directory must be a real directory owned by this account with no group or other access, because it holds captured telemetry and the backups of every file this tool patches.`;
 }
 
 /**

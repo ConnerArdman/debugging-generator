@@ -71,17 +71,29 @@
  * while being exactly what a screen-reader user navigates by. Outline decisions
  * belong to the components that own the surrounding structure (AAP 0.6.4).
  *
- * ## No live region, and why that is the accessible choice
+ * ## A polite status, and why that is the accessible choice
  *
- * This component declares no `role`, no `aria-live` and no `aria-busy`. It is
- * static content sitting inside a region the panel already labelled, and a
- * `role="status"` here would make every unrelated re-render of a panel announce
- * itself again. The three states divide that responsibility once, so exactly
- * one of them can speak at a time: `LoadingState` owns the busy announcement
- * while a query is in flight, `ErrorState` owns the assertive alert when one
- * fails, and this component stays silent and simply reads in place. A caller
- * with a genuine reason to announce an absence can still pass the ARIA
- * attributes through, which keeps the decision where the context is.
+ * The container is `role="status"` by default. An empty state is the answer a
+ * settled query gave — "this capture holds nothing of that kind" — and it
+ * replaces the loading state that stood in the same place a moment earlier. A
+ * screen-reader user who heard "loading" has to hear what the load resolved
+ * to, or the region falls silent and reads exactly like a component that
+ * failed without saying so. `status` is the polite live region: it waits for
+ * the reader to finish what they are listening to and never interrupts, and it
+ * has nothing new to say while its words stay the same — React leaves an
+ * unchanged node's text untouched — so an unrelated re-render of the panel
+ * around it stays silent.
+ *
+ * The three states divide the announcements once, so each speaks in its own
+ * register: `LoadingState` is the BUSY status (`aria-busy="true"`) while a
+ * query is in flight, this component is the settled status that follows it,
+ * and `ErrorState` owns the assertive `alert` when a query fails. No
+ * `aria-live`, `aria-atomic` or `aria-busy` is added on top of the role — the
+ * role implies the polite, atomic announcement already, and restating it would
+ * be a second place for the two to disagree. A caller that renders an empty
+ * state inside a region that already speaks for it — a filtered result inside
+ * a grid whose toolbar announces its own count, say — passes its own `role`,
+ * which wins over the default.
  *
  * ## Appearance is class names, and nothing else
  *
@@ -263,11 +275,13 @@ export interface EmptyStateProps extends ContainerAttributes {
  * parent deliberately: this package's own render behaviour is something the
  * product measures and reports on, so a primitive here does not smooth it over.
  *
- * Nothing is implied on the reader's behalf. No `role`, no `tabIndex`, no
- * `aria-live` and no `aria-hidden` is set on the container, and every attribute
- * the caller passes reaches it unchanged, so an empty state is never silently
- * renamed, hidden from assistive technology or made focusable. The one
- * `aria-hidden` this component does set is on the glyph box, where it belongs.
+ * The container carries one implied attribute, `role="status"` (see the module
+ * note), and a caller's own `role` replaces it. Nothing else is implied on the
+ * reader's behalf: no `tabIndex`, no `aria-live` and no `aria-hidden` is set on
+ * the container, and every other attribute the caller passes reaches it
+ * unchanged, so an empty state is never silently renamed, hidden from
+ * assistive technology or made focusable. The one `aria-hidden` this component
+ * does set is on the glyph box, where it belongs.
  *
  * @param props The props documented on {@link EmptyStateProps}.
  * @returns The container element with the parts the caller supplied — no
@@ -292,15 +306,18 @@ export interface EmptyStateProps extends ContainerAttributes {
  * <EmptyState message={nodeSpecificSentence} />
  */
 export function EmptyState(props: EmptyStateProps): ReactElement {
-  const { message, title, icon, action, className, ...rest } = props;
+  // `role` is taken out of the passthrough so its default can be written once,
+  // here: a caller that names a role gets exactly that role, and one that
+  // names none — or forwards `undefined` — gets the settled status.
+  const { message, title, icon, action, className, role = 'status', ...rest } = props;
 
   // The caller's attributes are spread first so a passthrough can never
-  // displace the composed class name, and the optional parts are guarded
-  // individually so an omitted one leaves no empty box behind (see
-  // `isRenderable`). The order below is the contract: glyph, title, message,
-  // action.
+  // displace the composed class name or the resolved role, and the optional
+  // parts are guarded individually so an omitted one leaves no empty box
+  // behind (see `isRenderable`). The order below is the contract: glyph,
+  // title, message, action.
   return (
-    <div {...rest} className={clsx('dg-empty-state', className)}>
+    <div {...rest} role={role} className={clsx('dg-empty-state', className)}>
       {isRenderable(icon) ? (
         <span className="dg-empty-state__icon" aria-hidden="true">
           {icon}
