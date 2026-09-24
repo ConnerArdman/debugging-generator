@@ -18,11 +18,12 @@
  *   `session.snapshot` answer it requests on connect and on every reconnect, and
  *   {@link setConnectionStatus} / {@link setBindingState} for the pill and the
  *   binding line.
- * - Three local dispatches that carry no protocol traffic: {@link selectEvent}
+ * - Four local dispatches that carry no protocol traffic: {@link selectEvent}
  *   (`../actions.ts`, from `PanelActions.onSelectEvent`), {@link setPendingTarget}
- *   (the optimistic element pick) and {@link setLastError} (a non-blocking
- *   failure the panel chrome surfaces, such as a click-to-source request that
- *   could not be delivered).
+ *   (the optimistic element pick), {@link setPickerActive} (the developer's
+ *   picker-mode toggle) and {@link setLastError} (a non-blocking failure the
+ *   panel chrome surfaces, such as a click-to-source request that could not be
+ *   delivered).
  * - {@link resetPanelStore}, on unbind or session end and in unit suites.
  *
  * ## What it deliberately does not do
@@ -256,14 +257,17 @@ export interface PanelCaptureSlice {
  *
  * Not a duplicate of `SessionRecord.target`, which is the confirmed target:
  * `pending` is the optimistic pick the panel shows immediately, cleared once a
- * session record confirms a target; `pickRequested` is the service asking the
- * bound panel to enter picker mode (`target.request`), cleared when a target is
- * set or the session ends.
+ * session record confirms a target; `pickRequested` is picker mode being on —
+ * the service asking the bound panel to enter it (`target.request`) or the
+ * developer's own toggle — cleared when a target is set or the session ends.
  */
 export interface PanelTargetSlice {
   /** The element the developer picked, not yet confirmed by the service. */
   readonly pending: SelectedTarget | undefined;
-  /** Whether the service asked this panel to enter picker mode. */
+  /**
+   * Whether picker mode is on: the service asked this panel to enter it
+   * (`target.request`), or the developer turned it on ({@link setPickerActive}).
+   */
   readonly pickRequested: boolean;
 }
 
@@ -1472,6 +1476,31 @@ export function setPendingTarget(target: SelectedTarget | undefined): void {
     return;
   }
   commit(withChanges(state, { target: Object.freeze({ pending, pickRequested }) }));
+}
+
+/**
+ * Turn picker mode on or off from the panel itself: the developer pressing
+ * "Pick element", and the worker's `target.pick` answer confirming or refusing
+ * it. Shares {@link PanelTargetSlice.pickRequested} with the service's
+ * `target.request`, so the toggle shows one state whichever route turned it on,
+ * and a confirmed target or the session ending clears it exactly as it clears a
+ * service request.
+ *
+ * Local only: no port traffic. Setting the state already held changes nothing
+ * and notifies nobody.
+ *
+ * @param active Whether picker mode is on.
+ */
+export function setPickerActive(active: boolean): void {
+  const current = state.target;
+  if (current.pickRequested === active) {
+    return;
+  }
+  commit(
+    withChanges(state, {
+      target: Object.freeze({ pending: current.pending, pickRequested: active }),
+    }),
+  );
 }
 
 /**

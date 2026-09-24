@@ -584,6 +584,11 @@ export function CaptureControls(props: CaptureControlsProps): ReactElement {
           size="sm"
           aria-disabled={slot.available ? undefined : true}
           aria-busy={slot.busy ? true : undefined}
+          // The design system's disabled treatment, coupled to the real
+          // `aria-disabled` state: `Button`'s declared `dg-is-disabled` state
+          // class (`.dg-button.dg-is-disabled`), so an unavailable control
+          // never looks operable while staying focusable for its tooltip.
+          className={slot.available ? undefined : 'dg-is-disabled'}
           onClick={handleActivate}
         >
           {slot.label}

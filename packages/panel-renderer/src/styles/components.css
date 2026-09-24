@@ -2208,11 +2208,20 @@
  * right trade for a surface as narrow as a docked DevTools panel: a readable
  * column beats three unreadable strips. The lever for anyone who wants the
  * panes to hold on longer is the basis unit below, never the weight
- * multiplication, which is what makes the proportions exact. */
+ * multiplication, which is what makes the proportions exact.
+ *
+ * The grow factor is the weight scaled by a constant, never the bare weight.
+ * Flexbox hands out only `Σgrow × F` of the free space when the factors on a
+ * line sum to less than one, so a pane with a fractional weight that wrapped
+ * onto a line of its own — a `[1, 0.6]` drawer in a collapsed column — would
+ * stop at 60 % of the row instead of filling it. Scaling every factor by the
+ * same constant leaves each pane's share `w / Σw` of the free space exactly as
+ * it was on a shared line, and guarantees the factors on any line sum to at
+ * least one, so a collapsed column is always full width. */
 .dg-split__pane {
   flex: 1 1 calc(var(--dg-space-7) * 20);
   flex-basis: calc(var(--dg-space-7) * 20 * var(--dgc-split-weight, 1));
-  flex-grow: var(--dgc-split-weight, 1);
+  flex-grow: calc(var(--dgc-split-weight, 1) * 1000);
   min-inline-size: 0;
   min-block-size: 0;
 }
