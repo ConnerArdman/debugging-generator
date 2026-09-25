@@ -144,6 +144,7 @@ import {
   type FollowUpAdditionalAction,
   type FollowUpDecision,
   type FollowUpDeltaRejectionReason,
+  type FollowUpPath,
   type FollowUpStageDeps,
   type FollowUpStageInput,
   type FollowUpStageResult,
@@ -904,6 +905,8 @@ interface HarnessOptions {
   readonly progress?: ProgressBehaviour;
   readonly registry?: AdapterRegistry;
   readonly maxRepairs?: number;
+  /** The installed plan version the ladder holds; plan version 1 unless given. */
+  readonly installedPlan?: InstrumentationPlan;
   readonly nextPlanVersion?: number;
   readonly latestPlanVersion?: number | undefined;
   readonly latestAnalysis?: AnalysisResult | undefined;
@@ -943,6 +946,10 @@ interface Harness {
   readonly history: Mock<FollowUpStageDeps['facts']['history']>;
   /** Every member name read on the modifications repository; only the chain-head lookup may appear. */
   readonly modificationReads: string[];
+  /** Every member name read on the session manager; no status-writing member may appear. */
+  readonly sessionManagerReads: string[];
+  /** Every member name read on the instrumentation service; only the context build and the install may appear. */
+  readonly instrumentationReads: string[];
 }
 
 /** The same object behind a proxy that records the name of every member read. */
@@ -973,10 +980,14 @@ function harness(options: HarnessOptions = {}): Harness {
   const progress = new RecordingProgress(options.progress ?? 'ok');
   const writeReads: string[] = [];
   const modificationReads: string[] = [];
-  const ladder: AnalysisResult[] = [ANALYSIS_V1];
+  const sessionManagerReads: string[] = [];
+  const instrumentationReads: string[] = [];
+  const ladder: AnalysisResult[] = [options.latestAnalysis ?? ANALYSIS_V1];
   const latestAnalysis = 'latestAnalysis' in options ? options.latestAnalysis : ANALYSIS_V1;
   const latestPanel = 'latestPanel' in options ? options.latestPanel : PANEL_V1;
-  const latestVersion = 'latestPlanVersion' in options ? options.latestPlanVersion : 1;
+  const installedPlan = options.installedPlan ?? PLAN_V1;
+  const latestVersion =
+    'latestPlanVersion' in options ? options.latestPlanVersion : installedPlan.planVersion;
 
   const buildContext = vi.fn<FollowUpStageDeps['instrumentation']['buildContext']>((input) =>
     ok(instrumentationContext(input, log.logger, writeReads)),
@@ -1023,10 +1034,10 @@ function harness(options: HarnessOptions = {}): Harness {
     ok(latestVersion),
   );
   const getPlan = vi.fn<FollowUpStageDeps['sessions']['getPlan']>((_sid, version) =>
-    ok(version === PLAN_V1.planVersion ? PLAN_V1 : undefined),
+    ok(version === installedPlan.planVersion ? installedPlan : undefined),
   );
   const nextPlanVersion = vi.fn<FollowUpStageDeps['sessions']['nextPlanVersion']>(() =>
-    ok(options.nextPlanVersion ?? PLAN_V1.planVersion + 1),
+    ok(options.nextPlanVersion ?? installedPlan.planVersion + 1),
   );
   const latestRecordForFile = vi.fn<FollowUpStageDeps['modifications']['latestRecordForFile']>(
     (_sid, file) => Promise.resolve(ok(options.chainHeads?.get(file))),
@@ -1047,10 +1058,10 @@ function harness(options: HarnessOptions = {}): Harness {
       const stored: InstrumentationPlan = {
         ...plan,
         sessionId,
-        planVersion: plan.planVersion ?? PLAN_V1.planVersion + 1,
+        planVersion: plan.planVersion ?? installedPlan.planVersion + 1,
       };
       return Promise.resolve(
-        ok({ session: sessionRecord({ plans: [PLAN_V1, stored] }), plan: stored }),
+        ok({ session: sessionRecord({ plans: [installedPlan, stored] }), plan: stored }),
       );
     },
   );
@@ -1076,7 +1087,7 @@ function harness(options: HarnessOptions = {}): Harness {
     facts: { history },
     analysisRegeneration: { run: analysisRun },
     panelRegeneration: { regenerate },
-    instrumentation: { buildContext, install },
+    instrumentation: accessRecorded({ buildContext, install }, instrumentationReads),
     registry: options.registry ?? fakeRegistry(),
     sessions: { latestPlanVersion, getPlan, nextPlanVersion },
     panels: {
@@ -1084,7 +1095,10 @@ function harness(options: HarnessOptions = {}): Harness {
       getLatestPanel: () => ok(latestPanel),
     },
     modifications: accessRecorded({ latestRecordForFile }, modificationReads),
-    sessionManager: { appendFollowUp, recordFollowUpOutcome, recordPlan },
+    sessionManager: accessRecorded(
+      { appendFollowUp, recordFollowUpOutcome, recordPlan },
+      sessionManagerReads,
+    ),
     progress,
     logger: log.logger,
     newActionId: actionIdMinter(),
@@ -1113,6 +1127,8 @@ function harness(options: HarnessOptions = {}): Harness {
     recordPlan,
     history,
     modificationReads,
+    sessionManagerReads,
+    instrumentationReads,
   };
 }
 
@@ -1168,6 +1184,32 @@ const FETCH_DECISION: FollowUpDecision = {
   additionalActions: [ADD_FETCH],
 };
 
+/** An authoring target: an addition of performance-entry tracking, targetless. */
+const ADD_PERF = Object.freeze({
+  file: TARGETLESS_FILE,
+  symbol: TARGETLESS_SYMBOL,
+  type: 'perf-tracking',
+  rationale: 'See whether long tasks overlap the refresh.',
+}) satisfies FollowUpAdditionalAction;
+
+/** Plan version 2's request tracking, installed by an earlier follow-up. */
+const INSTALLED_FETCH: InstrumentationAction = {
+  id: actionId(3),
+  file: TARGETLESS_FILE,
+  symbol: TARGETLESS_SYMBOL,
+  type: 'fetch-tracking',
+  adapter: WIRE_PROBE,
+  mode: RUNTIME,
+  rationale: 'See whether the totals request is repeated.',
+};
+
+/** An installed plan version 2: version 1 plus the request tracking an earlier follow-up added. */
+const PLAN_V2: InstrumentationPlan = instrumentationPlanSchema.parse({
+  ...PLAN_V1,
+  planVersion: 2,
+  instrumentationTargets: [...PLAN_V1.instrumentationTargets, INSTALLED_FETCH],
+});
+
 // ---------------------------------------------------------------------------
 // 1. The decision contract
 // ---------------------------------------------------------------------------
@@ -1205,6 +1247,36 @@ function listWithHole(value: unknown): unknown[] {
 /** A decision whose only addition is `addition`. */
 function decisionWith(addition: unknown): Record<string, unknown> {
   return { needsNewCapture: true, additionalActions: [addition] };
+}
+
+/**
+ * A length far beyond every string bound the upstream action schemas enforce.
+ * The bounds themselves are module-private to `@debuggen/instrumentation`, so
+ * the suite exceeds them by a wide margin instead of restating them.
+ */
+const EXCESSIVE_LENGTH = 10_000;
+
+/** `unit` repeated {@link EXCESSIVE_LENGTH} times. */
+function excessive(unit: string): string {
+  return unit.repeat(EXCESSIVE_LENGTH);
+}
+
+/** A project-relative path spelled with Windows separators. */
+function windowsSpelling(path: string): string {
+  return path.replaceAll('/', '\\');
+}
+
+/**
+ * A value no member of `vocabulary` equals: every member joined, which is
+ * longer than any one of them. Derived from the imported vocabulary so the
+ * suite never restates it.
+ */
+function outsideOf(vocabulary: readonly string[]): string {
+  const value = vocabulary.join('+');
+  if (vocabulary.includes(value)) {
+    throw new Error('Expected a value outside the vocabulary.');
+  }
+  return value;
 }
 
 describe('isFollowUpDecision and followUpDecisionSchema', () => {
@@ -1245,6 +1317,7 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
   // Each variant differs from a valid decision in exactly one checked condition.
   const decisionVariants: readonly (readonly [string, unknown])[] = [
     ['null', null],
+    ['undefined', undefined],
     ['an array', [EXISTING_EVIDENCE_DECISION]],
     ['a string', JSON.stringify(EXISTING_EVIDENCE_DECISION)],
     ['a number', 1],
@@ -1259,6 +1332,8 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
     ['a missing needsNewCapture', withField(FETCH_DECISION, 'needsNewCapture', undefined)],
     ['a truthy string needsNewCapture', withField(FETCH_DECISION, 'needsNewCapture', 'true')],
     ['a numeric needsNewCapture', withField(FETCH_DECISION, 'needsNewCapture', 1)],
+    ['an object needsNewCapture', withField(FETCH_DECISION, 'needsNewCapture', {})],
+    ['a null needsNewCapture', withField(FETCH_DECISION, 'needsNewCapture', null)],
     ['a missing additionalActions', withField(FETCH_DECISION, 'additionalActions', undefined)],
     [
       'an object additionalActions',
@@ -1276,6 +1351,7 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
       'a hole in additionalActions',
       withField(FETCH_DECISION, 'additionalActions', listWithHole(ADD_FETCH)),
     ],
+    ['a string additionalActions', withField(FETCH_DECISION, 'additionalActions', 'none')],
     ['an unknown top-level key', { ...FETCH_DECISION, removeActions: [actionId(1)] }],
     [
       'a getter for needsNewCapture',
@@ -1305,8 +1381,27 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
     ['has no type', withField(ADD_SPAN_ON_TIMED_FILE, 'type', undefined)],
     ['has a blank rationale', withField(ADD_SPAN_ON_TIMED_FILE, 'rationale', ' ')],
     ['has a non-string rationale', withField(ADD_SPAN_ON_TIMED_FILE, 'rationale', 3)],
+    [
+      'has a traversing file spelled with backslashes',
+      withField(ADD_SPAN_ON_TIMED_FILE, 'file', `..\\${windowsSpelling(INDEXED_FILE)}`),
+    ],
+    [
+      'has a drive-letter file',
+      withField(ADD_SPAN_ON_TIMED_FILE, 'file', `C:\\${windowsSpelling(INDEXED_FILE)}`),
+    ],
+    ['has an empty file', withField(ADD_SPAN_ON_TIMED_FILE, 'file', '')],
+    ['has an empty symbol', withField(ADD_SPAN_ON_TIMED_FILE, 'symbol', '')],
+    ['has an empty rationale', withField(ADD_SPAN_ON_TIMED_FILE, 'rationale', '')],
+    [
+      'has an over-long file',
+      withField(ADD_SPAN_ON_TIMED_FILE, 'file', `src/${excessive('f')}.ts`),
+    ],
+    ['has an over-long symbol', withField(ADD_SPAN_ON_TIMED_FILE, 'symbol', excessive('s'))],
+    ['has an over-long rationale', withField(ADD_SPAN_ON_TIMED_FILE, 'rationale', excessive('r'))],
     ['is a string', `${INDEXED_FILE}#${INDEXED_SYMBOL}`],
     ['is null', null],
+    ['is an array', [INDEXED_FILE, INDEXED_SYMBOL, 'server-span']],
+    ['is a number', 7],
   ];
 
   it.each(targetVariants)('rejects an authoring target that %s', (_label, addition) => {
@@ -1326,6 +1421,23 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
     ['has a file outside its normal form', withField(RESOLVED_ADDITION, 'file', `./${OTHER_FILE}`)],
     ['has an unknown type', withField(RESOLVED_ADDITION, 'type', 'heap-snapshot')],
     ['has an unknown key', { ...RESOLVED_ADDITION, priority: 1 }],
+    ['has no id', withField(RESOLVED_ADDITION, 'id', undefined)],
+    ['has no file', withField(RESOLVED_ADDITION, 'file', undefined)],
+    ['has no symbol', withField(RESOLVED_ADDITION, 'symbol', undefined)],
+    ['has no type', withField(RESOLVED_ADDITION, 'type', undefined)],
+    ['has an absolute file', withField(RESOLVED_ADDITION, 'file', `/${OTHER_FILE}`)],
+    ['has a traversing file', withField(RESOLVED_ADDITION, 'file', `../${OTHER_FILE}`)],
+    [
+      'has a file spelled with backslashes',
+      withField(RESOLVED_ADDITION, 'file', windowsSpelling(OTHER_FILE)),
+    ],
+    ['has a blank symbol', withField(RESOLVED_ADDITION, 'symbol', ' ')],
+    ['has a blank rationale', withField(RESOLVED_ADDITION, 'rationale', ' ')],
+    ['has an over-long symbol', withField(RESOLVED_ADDITION, 'symbol', excessive('s'))],
+    ['has an over-long adapter', withField(RESOLVED_ADDITION, 'adapter', excessive('a'))],
+    ['has an over-long rationale', withField(RESOLVED_ADDITION, 'rationale', excessive('r'))],
+    ['has an over-long id', withField(RESOLVED_ADDITION, 'id', `act_${excessive('0')}`)],
+    ['is a null-prototype object', Object.assign(Object.create(null) as object, RESOLVED_ADDITION)],
   ];
 
   it.each(resolvedVariants)('rejects a resolved action that %s', (_label, addition) => {
@@ -1355,6 +1467,135 @@ describe('isFollowUpDecision and followUpDecisionSchema', () => {
     expect(() => isFollowUpDecision(hostile)).not.toThrow();
     expect(isFollowUpDecision(hostile)).toBe(false);
     expect(isFollowUpDecision(decisionWith(hostile))).toBe(false);
+  });
+
+  it('refuses an action type or install mode outside the imported vocabularies', () => {
+    const unknownType = outsideOf(INSTRUMENTATION_ACTION_TYPES);
+    const unknownMode = outsideOf(INSTRUMENTATION_MODES);
+    // The literal variants of the tables above are outside the vocabularies too, so each of
+    // those rejections is attributable to the vocabulary rule rather than to a typo.
+    const typeValues: readonly string[] = INSTRUMENTATION_ACTION_TYPES;
+    const modeValues: readonly string[] = INSTRUMENTATION_MODES;
+    expect(typeValues.includes('heap-snapshot')).toBe(false);
+    expect(modeValues.includes('hotpatch')).toBe(false);
+
+    const [firstType] = INSTRUMENTATION_ACTION_TYPES;
+    const [firstMode] = INSTRUMENTATION_MODES;
+    const refusedTypes = [unknownType, firstType.toUpperCase(), ` ${firstType}`, ''];
+    for (const type of refusedTypes) {
+      expect(isFollowUpAdditionalAction({ file: OTHER_FILE, symbol: OTHER_SYMBOL, type })).toBe(
+        false,
+      );
+      expect(isFollowUpAdditionalAction({ ...RESOLVED_ADDITION, type })).toBe(false);
+      expect(isFollowUpDecision(decisionWith({ ...RESOLVED_ADDITION, type }))).toBe(false);
+    }
+    for (const mode of [unknownMode, firstMode.toUpperCase(), '']) {
+      expect(isFollowUpAdditionalAction({ ...RESOLVED_ADDITION, mode })).toBe(false);
+      expect(isFollowUpDecision(decisionWith({ ...RESOLVED_ADDITION, mode }))).toBe(false);
+    }
+  });
+
+  it('accepts a Windows-spelled authoring path, which the authoring schema tolerates as cosmetic, but never in a resolved action', () => {
+    const spelled = { ...ADD_SPAN_ON_TIMED_FILE, file: windowsSpelling(INDEXED_FILE) };
+    expect(isFollowUpAdditionalAction(spelled)).toBe(true);
+    expect(isFollowUpDecision(decisionWith(spelled))).toBe(true);
+    // A resolved action must already be in its normal form: it is matched on identity as is.
+    expect(
+      isFollowUpAdditionalAction({ ...RESOLVED_ADDITION, file: windowsSpelling(OTHER_FILE) }),
+    ).toBe(false);
+  });
+
+  it('is total: false, never a throw, for cyclic, accessor-laden, deeply nested and very long values', () => {
+    const cyclicDecision: Record<string, unknown> = { needsNewCapture: true };
+    cyclicDecision['additionalActions'] = [cyclicDecision];
+
+    const cyclicTarget: Record<string, unknown> = {
+      file: OTHER_FILE,
+      symbol: OTHER_SYMBOL,
+      type: 'function-timing',
+    };
+    cyclicTarget['rationale'] = cyclicTarget;
+
+    const selfListing: unknown[] = [];
+    selfListing.push(selfListing);
+
+    const throwingTopLevel = Object.defineProperty({ needsNewCapture: true }, 'additionalActions', {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must not run');
+      },
+    });
+    const throwingIndex = Object.defineProperty([] as unknown[], 0, {
+      enumerable: true,
+      get: () => {
+        throw new Error('getter must not run');
+      },
+    });
+    const throwingDescriptor = new Proxy(
+      { needsNewCapture: true, additionalActions: [] },
+      {
+        getOwnPropertyDescriptor: () => {
+          throw new Error('hostile descriptor');
+        },
+      },
+    );
+
+    let deepObject: unknown = ADD_FETCH;
+    let deepList: unknown = [ADD_FETCH];
+    for (let depth = 0; depth < EXCESSIVE_LENGTH; depth += 1) {
+      deepObject = { nested: deepObject };
+      deepList = [deepList];
+    }
+
+    const hostile: readonly unknown[] = [
+      cyclicDecision,
+      decisionWith(cyclicTarget),
+      { needsNewCapture: false, additionalActions: selfListing },
+      throwingTopLevel,
+      { needsNewCapture: true, additionalActions: throwingIndex },
+      throwingDescriptor,
+      decisionWith(deepObject),
+      { needsNewCapture: true, additionalActions: deepList },
+      { needsNewCapture: excessive('t'), additionalActions: [] },
+      { [excessive('k')]: true, needsNewCapture: true, additionalActions: [] },
+      decisionWith({ ...ADD_FETCH, rationale: excessive('r ') }),
+      decisionWith({
+        file: `${excessive('d/')}x.ts`,
+        symbol: OTHER_SYMBOL,
+        type: 'function-timing',
+      }),
+    ];
+    for (const value of hostile) {
+      expect(() => isFollowUpDecision(value)).not.toThrow();
+      expect(isFollowUpDecision(value)).toBe(false);
+      expect(() => followUpDecisionSchema.safeParse(value)).not.toThrow();
+      expect(followUpDecisionSchema.safeParse(value).success).toBe(false);
+    }
+  });
+
+  it('wires the schema to the guard: the two agree on every value, and a parse returns the value itself', () => {
+    const corpus: readonly unknown[] = [
+      EXISTING_EVIDENCE_DECISION,
+      FETCH_DECISION,
+      decisionWith(RESOLVED_ADDITION),
+      decisionWith({ ...ADD_SPAN_ON_TIMED_FILE, file: windowsSpelling(INDEXED_FILE) }),
+      ...decisionVariants.map(([, value]) => value),
+      ...targetVariants.map(([, addition]) => decisionWith(addition)),
+      ...resolvedVariants.map(([, addition]) => decisionWith(addition)),
+    ];
+    let accepted = 0;
+    for (const value of corpus) {
+      const guarded = isFollowUpDecision(value);
+      const parsed = followUpDecisionSchema.safeParse(value);
+      expect(parsed.success).toBe(guarded);
+      if (parsed.success) {
+        accepted += 1;
+        expect(parsed.data).toBe(value);
+      }
+    }
+    // Both verdicts occur, so the agreement is not vacuous.
+    expect(accepted).toBe(4);
+    expect(corpus.length - accepted).toBeGreaterThan(accepted);
   });
 
   it('names the artifact in its rejection, and the stage labels its repair turn with the schema name', () => {
@@ -1430,6 +1671,7 @@ describe('diffAdditionalActions', () => {
       },
       { ...INSTALLED_TIMING, rationale: 'Resolved and identical but for the rationale.' },
       { file: TARGETLESS_FILE, symbol: TARGETLESS_SYMBOL, type: 'interaction-tracking' },
+      { file: windowsSpelling(INDEXED_FILE), symbol: INDEXED_SYMBOL, type: 'function-timing' },
     ];
     for (const proposal of spellings) {
       const rejection = onlyRejection(proposal);
@@ -1515,6 +1757,50 @@ describe('diffAdditionalActions', () => {
       symbol: ADD_SPAN_ON_TIMED_FILE.symbol,
       type: ADD_SPAN_ON_TIMED_FILE.type,
     });
+  });
+
+  it('follows actionIdentityKey equality: each reason matches its relation to the collided installed action', () => {
+    const installedKeys = new Set(installed.map((action) => actionIdentityKey(action)));
+    const byId = new Map(installed.map((action) => [action.id, action]));
+    const proposals: readonly InstrumentationAction[] = [
+      { ...INSTALLED_TIMING, rationale: 'Restated.' },
+      { ...INSTALLED_TIMING, id: actionId(78) },
+      { ...INSTALLED_TIMING, adapter: WIRE_PROBE },
+      { ...INSTALLED_TIMING, mode: RUNTIME },
+      { ...INSTALLED_TIMING, file: OTHER_FILE, symbol: OTHER_SYMBOL },
+      { ...INSTALLED_TIMING, type: 'server-span' },
+      { ...RESOLVED_ADDITION },
+    ];
+
+    const verdicts = proposals.map((proposal) => {
+      const delta = diffAdditionalActions(installed, [proposal]);
+      const [rejection] = delta.rejected;
+      const collided =
+        rejection?.installedActionId === undefined
+          ? undefined
+          : byId.get(rejection.installedActionId);
+      return {
+        reason: rejection?.reason,
+        accepted: delta.accepted.length,
+        sameKey:
+          collided === undefined
+            ? undefined
+            : actionIdentityKey(collided) === actionIdentityKey(proposal),
+        sameId: collided?.id === proposal.id,
+      };
+    });
+
+    expect(verdicts).toStrictEqual([
+      { reason: RE_EMISSION, accepted: 0, sameKey: true, sameId: true },
+      { reason: REPLACEMENT, accepted: 0, sameKey: true, sameId: false },
+      { reason: REPLACEMENT, accepted: 0, sameKey: true, sameId: true },
+      { reason: RE_SCOPE, accepted: 0, sameKey: true, sameId: true },
+      { reason: REMOVAL, accepted: 0, sameKey: false, sameId: true },
+      { reason: RE_SCOPE, accepted: 0, sameKey: false, sameId: true },
+      { reason: undefined, accepted: 1, sameKey: undefined, sameId: false },
+    ]);
+    // The accepted addition is exactly the proposal whose key no installed action has.
+    expect(installedKeys.has(actionIdentityKey(RESOLVED_ADDITION))).toBe(false);
   });
 
   it('is pure: frozen inputs are untouched, the verdict is frozen and repeatable', () => {
@@ -1720,6 +2006,46 @@ describe('createFollowUpStage — the existing-evidence path', () => {
     ]);
     expect(h.progress.foreign).toStrictEqual([]);
     expect(h.provider.structured).toHaveBeenCalledTimes(1);
+  });
+
+  it('touches no file and mutates no stored artifact: the stored rows are read frozen and only new versions appear', async () => {
+    // Deep-frozen copies: an in-place write by the stage would throw in strict mode and fail the run.
+    const storedPlan = deepFreeze(structuredClone(PLAN_V1));
+    const storedAnalysis = deepFreeze(structuredClone(ANALYSIS_V1));
+    const storedPanel = deepFreeze(structuredClone(PANEL_V1));
+    const storedSession = deepFreeze(structuredClone(sessionRecord()));
+    const h = harness({
+      outcomes: [answer(EXISTING_EVIDENCE_DECISION)],
+      installedPlan: storedPlan,
+      latestAnalysis: storedAnalysis,
+      latestPanel: storedPanel,
+      session: storedSession,
+    });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'existing-evidence',
+    );
+
+    expect(storedPlan).toStrictEqual(PLAN_V1);
+    expect(storedAnalysis).toStrictEqual(ANALYSIS_V1);
+    expect(storedPanel).toStrictEqual(PANEL_V1);
+    expect(storedSession).toStrictEqual(sessionRecord());
+
+    // A new analysis row beside the untouched previous one, and a new panel with its own id.
+    expect(h.ladder).toHaveLength(2);
+    expect(h.ladder[0]).toBe(storedAnalysis);
+    expect(value.analysis.id).not.toBe(storedAnalysis.id);
+    expect(value.analysis.analysisVersion).toBe(storedAnalysis.analysisVersion + 1);
+    expect(value.panel.id).not.toBe(storedPanel.id);
+    expect(value.panel.panelVersion).toBe(storedPanel.panelVersion + 1);
+
+    // No journal, backup or modification-repository access and no instrumentation call at all.
+    expect(h.modificationReads).toStrictEqual([]);
+    expect(h.writeReads).toStrictEqual([]);
+    expect(h.instrumentationReads).toStrictEqual([]);
+    expect(new Set(h.sessionManagerReads)).toStrictEqual(
+      new Set(['appendFollowUp', 'recordFollowUpOutcome']),
+    );
   });
 
   it('asks the builder for the seven placeholders of the follow-up prompt, with the session’s recorded version', async () => {
@@ -1986,6 +2312,98 @@ describe('createFollowUpStage — the new-capture path', () => {
     expect(value.chainedFiles).toBe(0);
   });
 
+  it('numbers plan n + 1 from the store: an installed version 2 becomes version 3, every installed id kept', async () => {
+    const h = harness({
+      outcomes: [answer({ needsNewCapture: true, additionalActions: [ADD_PERF] })],
+      installedPlan: PLAN_V2,
+      nextPlanVersion: 3,
+      session: sessionRecord({ plans: [PLAN_V1, PLAN_V2] }),
+    });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'new-capture',
+    );
+
+    // The installed version and the next number are both the store's answers.
+    expect(h.latestPlanVersion).toHaveBeenCalledWith(SESSION_ID);
+    expect(h.getPlan).toHaveBeenCalledWith(SESSION_ID, PLAN_V2.planVersion);
+    expect(h.nextPlanVersion).toHaveBeenCalledTimes(1);
+    expect(value.previousPlanVersion).toBe(2);
+    expect(value.planVersion).toBe(3);
+    expect(value.plan.planVersion).toBe(3);
+    expect(vi.mocked(normalizePlan).mock.calls[0]?.[1].planVersion).toBe(3);
+    expect(h.buildContext.mock.calls[0]?.[0].plan.planVersion).toBe(3);
+    const request = installRequestOf(h);
+    expect(request.plan.planVersion).toBe(3);
+    expect(request.previousPlanVersion).toBe(2);
+    expect(request.previousActions).toBe(PLAN_V2.instrumentationTargets);
+    expect(h.recordPlan.mock.calls[0]?.[1].planVersion).toBe(3);
+
+    // Previous plus delta: nothing dropped, nothing reordered, every installed id kept.
+    const targets = value.plan.instrumentationTargets;
+    expect(targets).toHaveLength(PLAN_V2.instrumentationTargets.length + 1);
+    expect(targets.slice(0, PLAN_V2.instrumentationTargets.length)).toStrictEqual(
+      PLAN_V2.instrumentationTargets,
+    );
+    expect(targets.map((action) => action.id).slice(0, 3)).toStrictEqual([
+      INSTALLED_INTERACTION.id,
+      INSTALLED_TIMING.id,
+      INSTALLED_FETCH.id,
+    ]);
+    expect(value.delta.map((action) => actionIdentityKey(action))).toStrictEqual([
+      actionIdentityKey(ADD_PERF),
+    ]);
+    expect(value.delta[0]?.adapter).toBe(PAGE_PROBE);
+  });
+
+  it('hands the installer a delta descriptor naming only the accepted additions', async () => {
+    const h = harness({
+      outcomes: [
+        answer({
+          needsNewCapture: true,
+          additionalActions: [ADD_FETCH, { ...INSTALLED_TIMING, id: actionId(77) }, ADD_PERF],
+        }),
+      ],
+    });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'new-capture',
+    );
+    const request = installRequestOf(h);
+    const previous = request.previousActions ?? [];
+    const previousIds = new Set(previous.map((action) => action.id));
+    const previousKeys = new Set(previous.map((action) => actionIdentityKey(action)));
+
+    // The descriptor: the previous version, its actions, and a plan whose other actions are the delta.
+    expect(request.previousPlanVersion).toBe(PLAN_V1.planVersion);
+    expect(previous).toStrictEqual(PLAN_V1.instrumentationTargets);
+    expect(request.skipFeasibility).toBeUndefined();
+    const described = request.plan.instrumentationTargets.filter(
+      (action) => !previousIds.has(action.id),
+    );
+    expect(described.map((action) => action.id)).toStrictEqual(
+      value.delta.map((action) => action.id),
+    );
+    expect(described.map((action) => actionIdentityKey(action))).toStrictEqual(
+      value.decision.acceptedActions.map((target) => actionIdentityKey(target)),
+    );
+    expect(described).toHaveLength(2);
+
+    // No installed action is named in it, by id or by identity; the refused replacement is absent.
+    const describedIds = described.map((action) => action.id);
+    for (const installed of PLAN_V1.instrumentationTargets) {
+      expect(describedIds).not.toContain(installed.id);
+    }
+    for (const action of described) {
+      expect(previousKeys.has(actionIdentityKey(action))).toBe(false);
+    }
+    expect(describedIds).not.toContain(actionId(77));
+    expect(value.decision.rejectedActions.map((rejection) => rejection.reason)).toStrictEqual([
+      REPLACEMENT,
+    ]);
+    expect(new Set(h.instrumentationReads)).toStrictEqual(new Set(['buildContext', 'install']));
+  });
+
   it('takes the new-capture path for a new capture with no additions, installing the unchanged plan as n + 1', async () => {
     const h = harness({ outcomes: [answer({ needsNewCapture: true, additionalActions: [] })] });
     const value = expectPath(
@@ -2086,7 +2504,13 @@ describe('createFollowUpStage — the new-capture path', () => {
     const [applied] = value.installation.applied;
     expect(applied?.previousRecordId).toBe(RECORD_V1.id);
     expect(applied?.originalHash).toBe(RECORD_V1.instrumentedHash);
+    expect(applied?.file).toBe(RECORD_V1.file);
     expect(h.recordPlan).toHaveBeenCalledTimes(1);
+
+    // The stage wrote no record itself: one install call, no journal or backup access.
+    expect(h.install).toHaveBeenCalledTimes(1);
+    expect(h.writeReads).toStrictEqual([]);
+    expect(value.installation.applied).toStrictEqual([recordV2]);
   });
 
   it('does not count a reverted chain head as a live chain', async () => {
@@ -2149,6 +2573,14 @@ describe('createFollowUpStage — the new-capture path', () => {
     expect(stageOf(error)).toBe(INSTRUMENT);
     expect(h.recordPlan).not.toHaveBeenCalled();
     expect(h.recordFollowUpOutcome).not.toHaveBeenCalled();
+    // No rollback of its own: the installer reverse-restores what it applied. One install call,
+    // no journal or backup access, and no other instrumentation member reached for.
+    expect(h.install).toHaveBeenCalledTimes(1);
+    expect(h.writeReads).toStrictEqual([]);
+    expect(h.modificationReads).toStrictEqual([]);
+    expect(new Set(h.instrumentationReads)).toStrictEqual(new Set(['buildContext', 'install']));
+    expect(h.sessionManagerReads).not.toContain('recordPlan');
+    expect(h.nextPlanVersion).toHaveBeenCalledTimes(1);
     // The install's failure row is the instrumentation service's own.
     expect(h.progress.trail).toStrictEqual([
       `stageStarted:${FOLLOWUP}`,
@@ -2227,6 +2659,107 @@ describe('createFollowUpStage — the new-capture path', () => {
     );
     expect(error.code).toBe('SESSION_INVALID_STATE');
     expect(h.install).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// 4c. The path choice: total and exclusive, observed through a whole run
+// ---------------------------------------------------------------------------
+
+describe('createFollowUpStage — the path choice is total and exclusive', () => {
+  /** An addition the additive-only rule refuses: a re-emission of an installed identity. */
+  const REFUSED: FollowUpAdditionalAction = {
+    file: INDEXED_FILE,
+    symbol: INDEXED_SYMBOL,
+    type: 'function-timing',
+  };
+  const [EXISTING, NEW_CAPTURE] = FOLLOW_UP_PATHS;
+
+  interface TruthRow {
+    readonly label: string;
+    readonly needsNewCapture: boolean;
+    readonly additionalActions: readonly FollowUpAdditionalAction[];
+    readonly expected: FollowUpPath;
+  }
+
+  const rows: readonly TruthRow[] = [
+    {
+      label: 'no capture, empty delta',
+      needsNewCapture: false,
+      additionalActions: [],
+      expected: EXISTING,
+    },
+    {
+      label: 'no capture, only refused proposals',
+      needsNewCapture: false,
+      additionalActions: [REFUSED],
+      expected: EXISTING,
+    },
+    {
+      label: 'no capture, a non-empty accepted delta',
+      needsNewCapture: false,
+      additionalActions: [ADD_FETCH],
+      expected: NEW_CAPTURE,
+    },
+    {
+      label: 'a capture, empty delta',
+      needsNewCapture: true,
+      additionalActions: [],
+      expected: NEW_CAPTURE,
+    },
+    {
+      label: 'a capture, only refused proposals',
+      needsNewCapture: true,
+      additionalActions: [REFUSED],
+      expected: NEW_CAPTURE,
+    },
+    {
+      label: 'a capture, a non-empty accepted delta',
+      needsNewCapture: true,
+      additionalActions: [ADD_FETCH],
+      expected: NEW_CAPTURE,
+    },
+  ];
+
+  it.each(rows)('$label → exactly the $expected path', async (row) => {
+    const h = harness({
+      outcomes: [
+        answer({ needsNewCapture: row.needsNewCapture, additionalActions: row.additionalActions }),
+      ],
+    });
+    const chosen: FollowUpPath[] = [];
+    const value = expectOk(
+      await h.stage.run(
+        h.context,
+        followUpInput({
+          onPathChosen: (path) => {
+            chosen.push(path);
+            return Promise.resolve(ok(undefined));
+          },
+        }),
+      ),
+    );
+
+    expect(value.path).toBe(row.expected);
+    expect(chosen).toStrictEqual([row.expected]);
+    expect(
+      followUpPathFor(row.needsNewCapture, {
+        accepted: value.decision.acceptedActions,
+        rejected: value.decision.rejectedActions,
+      }),
+    ).toBe(row.expected);
+
+    // What each path touches, and that the other path's collaborators were never reached.
+    const regenerated = h.analysisRun.mock.calls.length + h.regenerate.mock.calls.length;
+    const installed = h.install.mock.calls.length + h.recordPlan.mock.calls.length;
+    if (row.expected === EXISTING) {
+      expect([regenerated, installed]).toStrictEqual([2, 0]);
+      expect(h.buildContext).not.toHaveBeenCalled();
+      expect(h.nextPlanVersion).not.toHaveBeenCalled();
+    } else {
+      expect([regenerated, installed]).toStrictEqual([0, 2]);
+      expect(h.install).toHaveBeenCalledTimes(1);
+    }
   });
 });
 
@@ -2325,6 +2858,10 @@ describe('createFollowUpStage — the gate and its failures', () => {
     expect(reasonOf(error)).toBe('aborted');
     expect(h.latestPlanVersion).not.toHaveBeenCalled();
     expect(h.provider.structured).not.toHaveBeenCalled();
+    expect(h.install).not.toHaveBeenCalled();
+    expect(h.analysisRun).not.toHaveBeenCalled();
+    expect(h.regenerate).not.toHaveBeenCalled();
+    expect(h.appendFollowUp).not.toHaveBeenCalled();
     expect(h.progress.calls).toStrictEqual([]);
   });
 
@@ -2394,6 +2931,51 @@ describe('createFollowUpStage — the gate and its failures', () => {
 });
 
 // ---------------------------------------------------------------------------
+// Session status belongs to the manager and the orchestrator
+// ---------------------------------------------------------------------------
+
+describe('createFollowUpStage — session status', () => {
+  /** The session manager's members that write or move a session's status. */
+  const STATUS_WRITERS: readonly string[] = [
+    'transitionTo',
+    'patch',
+    'fail',
+    'retry',
+    'startCapture',
+    'stopCapture',
+    'end',
+    'create',
+  ];
+
+  it.each([
+    ['existing-evidence', EXISTING_EVIDENCE_DECISION, ['appendFollowUp', 'recordFollowUpOutcome']],
+    ['new-capture', FETCH_DECISION, ['appendFollowUp', 'recordPlan', 'recordFollowUpOutcome']],
+  ] as const)(
+    'writes no status on the %s path: it records the question, the outcome and plan versions only',
+    async (_path, decision, expected) => {
+      const h = harness({ outcomes: [answer(decision)] });
+      const value = expectOk(await h.stage.run(h.context, followUpInput()));
+      expect(new Set(h.sessionManagerReads)).toStrictEqual(new Set(expected));
+      for (const writer of STATUS_WRITERS) {
+        expect(h.sessionManagerReads).not.toContain(writer);
+      }
+      // The record the stage hands back is the store's, in the status the orchestrator left it.
+      expect(value.session.status).toBe(h.context.session.status);
+    },
+  );
+
+  it('writes no status on a failure either: the orchestrator files it', async () => {
+    const h = harness({
+      outcomes: [answer(FETCH_DECISION)],
+      installAnswer: () =>
+        err(new DebuggenError('INSTRUMENTATION_INSTALL_FAILED', 'Not installed.')),
+    });
+    expectErr(await h.stage.run(h.context, followUpInput()));
+    expect(h.sessionManagerReads).toStrictEqual(['appendFollowUp']);
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Privacy
 // ---------------------------------------------------------------------------
 
@@ -2417,6 +2999,105 @@ describe('createFollowUpStage — privacy', () => {
     const error = expectErr(await h.stage.run(h.context, followUpInput()));
     expect(error.code).toBe('MODEL_OUTPUT_INVALID');
     expect(everythingSurfaced(h, error)).not.toContain(SENTINEL);
+  });
+
+  it('logs no statement of the stored or the regenerated analysis', async () => {
+    const statement = `The totals request repeated within one interaction ${SENTINEL}.`;
+    const withFact: AnalysisResult = {
+      ...ANALYSIS_V1,
+      observed: [{ statement, evidence: [{ eventId: 'evt-suite-0001' }] }],
+    };
+    const h = harness({
+      outcomes: [answer(EXISTING_EVIDENCE_DECISION)],
+      latestAnalysis: withFact,
+      analysisAnswer: (input) => {
+        const regenerated: AnalysisResult = {
+          ...nextAnalysis(input),
+          observed: [{ statement, evidence: [{ eventId: 'evt-suite-0002' }] }],
+        };
+        h.ladder.push(regenerated);
+        return ok({
+          analysis: regenerated,
+          analysisVersion: regenerated.analysisVersion,
+          promptVersion: RECORDED_PROMPT_VERSIONS.analyze,
+          repairs: 0,
+          attempts: 1,
+          providerId: 'scripted-test-provider',
+          model: 'scripted-model',
+          verification: VERIFICATION,
+          summary: CAPTURE_SUMMARY,
+          truncated: [],
+        });
+      },
+    });
+    const value = expectPath(
+      expectOk(await h.stage.run(h.context, followUpInput())),
+      'existing-evidence',
+    );
+    // The statement travels through the stage to the panel port verbatim, and nowhere else.
+    expect(h.regenerate.mock.calls[0]?.[0].analysis.observed[0]?.statement).toBe(statement);
+    expect(value.analysis.observed[0]?.statement).toBe(statement);
+    expect(h.log.records.length).toBeGreaterThan(0);
+    expect(everythingSurfaced(h)).not.toContain(SENTINEL);
+  });
+
+  it('logs no diff, hash, backup path, file, symbol, rationale, URL, root or token on the chained install', async () => {
+    vi.mocked(checkPlanFeasibility).mockImplementationOnce((plan) => ({
+      feasible: [...plan.instrumentationTargets],
+      rejected: [],
+    }));
+    // Token-shaped, assembled at runtime so no secret-shaped literal is committed.
+    const token = ['Bearer', ['tok', 'suite', 'x'.repeat(24)].join('_')].join(' ');
+    const recordV2: ModificationRecord = {
+      ...RECORD_V1,
+      id: 'mod_000000000000000b',
+      planVersion: 2,
+      originalHash: RECORD_V1.instrumentedHash,
+      instrumentedHash: 'c'.repeat(64),
+      backupPath: `${DEBUGGEN_HOME}/backups/${SESSION_ID}/${RECORD_V1.instrumentedHash}`,
+      previousRecordId: RECORD_V1.id,
+      diff: '--- totals\n+++ totals\n@@ -1 +1 @@\n-const refreshTotals\n+const refreshTotals\n',
+    };
+    const h = harness({
+      outcomes: [answer({ needsNewCapture: true, additionalActions: [ADD_SPAN_ON_TIMED_FILE] })],
+      chainHeads: new Map([[INDEXED_FILE, RECORD_V1]]),
+      installAnswer: (request) => ok(outcomeFor(request, [recordV2])),
+    });
+    const value = expectPath(
+      expectOk(
+        await h.stage.run(
+          h.context,
+          followUpInput({ followUpQuestion: `${FOLLOW_UP_QUESTION} ${token}` }),
+        ),
+      ),
+      'new-capture',
+    );
+    expect(value.chainedFiles).toBe(1);
+
+    const surfaced = everythingSurfaced(h);
+    const forbidden: readonly string[] = [
+      SENTINEL,
+      token,
+      RECORD_V1.diff,
+      recordV2.diff,
+      RECORD_V1.originalHash,
+      RECORD_V1.instrumentedHash,
+      recordV2.instrumentedHash,
+      RECORD_V1.backupPath,
+      recordV2.backupPath,
+      INDEXED_FILE,
+      INDEXED_SYMBOL,
+      ADD_SPAN_ON_TIMED_FILE.rationale,
+      INSTALLED_TIMING.rationale,
+      PLAN_V1.objective,
+      DEV_SERVER_URL,
+      PROJECT_ROOT,
+      PROMPT_MARKER,
+    ];
+    for (const fragment of forbidden) {
+      // Compared in its JSON-escaped spelling, which is how a record carrying it would read.
+      expect(surfaced).not.toContain(JSON.stringify(fragment).slice(1, -1));
+    }
   });
 
   it('logs no message a collaborator threw', async () => {
@@ -2467,9 +3148,35 @@ describe('followup.ts source boundaries', () => {
     }
   });
 
+  it('never branches on the follow-up question: it is only ever passed on as a value', () => {
+    // Code only: block comments and whole-line comments removed, so prose about the rule is not
+    // mistaken for a use of the value.
+    const code = source.replace(/\/\*[\s\S]*?\*\//gu, '').replace(/^\s*\/\/.*$/gmu, '');
+    const reads = [
+      ...code.matchAll(
+        /\b(?:input|context|stageContext)\.(?:followUpQuestion|question)\b(?<after>\s*\S)/gu,
+      ),
+    ];
+    expect(reads.length).toBeGreaterThan(0);
+    for (const read of reads) {
+      // Followed by an argument or property separator: never a receiver, an operand or a pattern.
+      expect([',', ')']).toContain(read.groups?.['after']?.trim());
+    }
+    // Never compared, never searched, never switched on, never bound to a local of its own.
+    expect(code).not.toMatch(/(?:===|!==|==|!=)\s*(?:\w+\.)?(?:followUpQuestion|question)\b/u);
+    expect(code).not.toMatch(/\b(?:followUpQuestion|question)\s*(?:===|!==|==|!=)/u);
+    expect(code).not.toMatch(/\b(?:followUpQuestion|question)\s*\??\.\s*[A-Za-z]/u);
+    expect(code).not.toMatch(
+      /\.(?:includes|match|matchAll|test|exec|search|startsWith|endsWith|indexOf)\(\s*(?:\w+\.)?(?:followUpQuestion|question)\b/u,
+    );
+    expect(code).not.toMatch(/\bswitch\s*\(\s*(?:\w+\.)?(?:followUpQuestion|question)\b/u);
+    expect(code).not.toMatch(/(?<![.'\w])followUpQuestion(?!\s*\??:|')/u);
+  });
+
   it('writes no analysis or panel row itself and names no application route', () => {
     expect(source).not.toMatch(/\binsert(Panel|Analysis)\b/u);
-    expect(source).not.toContain('apps/demo-app');
+    // Assembled at runtime so this suite itself carries no reference to the demo application.
+    expect(source).not.toContain(['apps', 'demo-app'].join('/'));
     expect(source).not.toMatch(/['"`]\/api\//u);
   });
 });

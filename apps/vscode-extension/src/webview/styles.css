@@ -79,13 +79,17 @@ body {
 
 .dgv-view {
   display: flex;
-  /* Fills a flex parent (`PanelShell`) and a definite-height parent (`#root`)
-   * alike; against an indefinite parent the percentage resolves to `auto`, so
-   * neither declaration can collapse the other. */
+  /* Fills a flex parent and a definite-height parent alike, and GROWS with its
+   * content: inside `PanelShell`'s scrolling viewport a definite
+   * `block-size: 100%` would pin the view to one screen and let the body
+   * overflow past its own bottom padding, so the last card would sit flush
+   * against the viewport edge. A minimum of the parent's height keeps a short
+   * view full-height while a long one extends the scroll range, padding
+   * included (measured in Chromium at 360px: 0px → one space step below the
+   * last card). Against an indefinite parent the percentage resolves to `auto`. */
   flex: 1 1 auto;
   flex-direction: column;
-  block-size: 100%;
-  min-block-size: 0;
+  min-block-size: 100%;
   min-inline-size: 0;
 }
 
@@ -112,6 +116,21 @@ body {
   min-block-size: 0;
   min-inline-size: 0;
   padding: var(--dg-space-4);
+}
+
+/*
+ * A section wrapper `App` moves focus to or scrolls into view: the question,
+ * the modifications, the analysis and the follow-up for the host's `focus`
+ * message (`tabIndex={-1}`, so only script focuses it), and the pairing code
+ * when one is issued. The ring itself is the design system's `:focus-visible`
+ * rule in `base.css`; this block only lets the wrapper shrink with the view,
+ * rounds the ring to the card it surrounds and keeps a revealed section clear
+ * of the viewport edge.
+ */
+.dgv-view__anchor {
+  min-inline-size: 0;
+  border-radius: var(--dg-radius-md);
+  scroll-margin-block: var(--dg-space-4);
 }
 
 /* ==========================================================================
