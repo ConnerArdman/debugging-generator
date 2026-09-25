@@ -61,6 +61,8 @@ test-results/
 apps/demo-app/src/generated/
 apps/demo-app/next-env.d.ts
 apps/chrome-extension/public/agent.iife.js
+# copy of the root LICENSE staged for vsce by `esbuild.mjs --package` (vscode:prepublish)
+apps/vscode-extension/LICENSE
 
 # captured telemetry - the curated, redacted fixtures under
 # packages/telemetry/test/fixtures/ are committed; live captures never are. These are

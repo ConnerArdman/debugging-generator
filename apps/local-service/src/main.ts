@@ -405,6 +405,17 @@ export interface ServiceHandle {
   /** The session manager, for suites that drive a session without HTTP. */
   readonly manager: SessionManager;
 
+  /**
+   * The service's own access boundary — the instance every HTTP route and the
+   * WebSocket handshake authorize through, wired to the client registry as its
+   * revoker. Exposed so an integration suite can mint the `devtools` and
+   * `server-agent` credentials, start pairing and rotate every credential
+   * through the real lifecycle: a second `AuthService` over the same store
+   * would share the credential rows but not the revoker, so its rotation could
+   * not close the sockets this one tracks (AAP §0.5.6).
+   */
+  readonly auth: AuthService;
+
   /** What the start-up maintenance found. */
   readonly startup: StartupReport;
 
@@ -2011,6 +2022,7 @@ export async function startService(
       loggers,
       store,
       manager: sessionManager,
+      auth,
       startup: {
         editorCredentialCreated: editor.value.created,
         reconciliation: reconciled.value,
@@ -2030,6 +2042,7 @@ interface ServiceHandleInput {
   readonly loggers: ServiceLoggers;
   readonly store: Store;
   readonly manager: SessionManager;
+  readonly auth: AuthService;
   readonly startup: StartupReport;
   readonly parts: ServiceParts;
 }
@@ -2069,6 +2082,7 @@ function createServiceHandle(input: ServiceHandleInput): ServiceHandle {
     logger: loggers.root,
     store: input.store,
     manager: input.manager,
+    auth: input.auth,
     startup: Object.freeze(input.startup),
     close: (): Promise<void> => {
       closing ??= shutdown();
