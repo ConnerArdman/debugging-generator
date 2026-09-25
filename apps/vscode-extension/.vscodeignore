@@ -1,0 +1,33 @@
+# Packaging filter for `vsce package --no-dependencies` / `vsce ls`.
+#
+# The VSIX carries only the runtime artefact: the manifest, the changelog, the
+# license, the icons and the bundles under dist/. Everything else (src/**,
+# test/**, node_modules/**, tsconfig*.json, esbuild.mjs, vite.config.ts,
+# .vscode-test*, .tsbuild/**, .env*, *.sqlite*, logs) is excluded by the first
+# rule and never re-included.
+#
+# vsce does NOT apply these rules in order: a file ships when it matches no
+# exclusion OR matches any `!` rule. A later exclusion cannot cut a path back
+# out of a broader `!` rule, so dist/ is re-included subtree by subtree (the
+# names are the layout contract of esbuild.mjs and vite.config.ts), and
+# dist/test/** (the compiled extension-host suites) is simply never listed.
+
+# exclude everything
+**
+
+# ship only the runtime artefact
+!package.json
+!CHANGELOG.md
+# generated copy of the repository-root LICENSE, staged by `esbuild.mjs --package`;
+# vsce warns and asks whether to continue when no license is packaged
+!LICENSE
+!media/**
+# extension host bundle, main in package.json
+!dist/extension.js
+!dist/extension.js.map
+# embedded coordination service: bundle, ESM marker, prompts, store DDL
+!dist/service/**
+# Node preload plus its vendored dependency closure (dist/telemetry/node_modules)
+!dist/telemetry/**
+# webview bundle and stylesheet written by vite build
+!dist/webview/**

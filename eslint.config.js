@@ -4,7 +4,10 @@
 // `pnpm lint` is `eslint . --max-warnings 0` (AAP 0.8.5): a blocking step of
 // `pnpm verify` where a WARNING fails the run exactly like an error. Every rule
 // enabled below therefore has to be satisfiable by the code in this repository;
-// nothing here is advisory.
+// nothing here is advisory. The script runs ESLint's bin under
+// `node --max-old-space-size=8192`: type-aware linting holds every project's
+// TypeScript program in one process and peaks near 5.6 GB, above Node's
+// default ~4 GB heap, which otherwise aborts the run with a heap OOM.
 //
 // Three layers, in order of importance:
 //

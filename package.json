@@ -18,7 +18,7 @@
     "build": "pnpm demo:generate && pnpm -r build",
     "dev": "pnpm --filter @debuggen/local-service dev",
     "typecheck": "pnpm demo:generate && tsc -b",
-    "lint": "eslint . --max-warnings 0",
+    "lint": "node --max-old-space-size=8192 node_modules/eslint/bin/eslint.js . --max-warnings 0",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "test": "vitest run --coverage",

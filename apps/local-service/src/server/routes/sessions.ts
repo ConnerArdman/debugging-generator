@@ -135,6 +135,7 @@
  * | unreadable, non-JSON or off-schema body | `400` | `PROTOCOL_INVALID_MESSAGE` |
  * | another session holds the project's capture | `409` | `CAPTURE_ALREADY_ACTIVE`, plus `owningSessionId` |
  * | a request the session's state does not admit, a busy pipeline | `409` | `SESSION_INVALID_STATE` |
+ * | a capture refused by the readiness gate: no bound tab, no page agent, no preload | `409` | `TAB_NOT_BOUND`, `AGENT_NOT_READY`, `SERVER_AGENT_NOT_READY` |
  * | a stage's model, plan, panel or patch output refused | `422` | the stage's code |
  * | no dev-server URL, the model provider or a signal unavailable | `503` | the failure's code |
  * | store failure, cleanup failure, subsystem defect, response drift | `500` | the failure's code, fixed message |
@@ -734,7 +735,13 @@ type DescribedStatus = 400 | 404 | 409 | 422 | 502 | 503;
  * - `404` — the session or the project does not exist.
  * - `409` — the session's state does not admit the request: a refused
  *   transition or a busy pipeline, a capture conflict, readiness not yet
- *   reached, an instrumented file the developer edited.
+ *   reached, an instrumented file the developer edited. "Readiness not yet
+ *   reached" covers all three codes the capture stage's blocked readiness
+ *   gate raises, one per remediation it names: `TAB_NOT_BOUND` (bind the
+ *   tab), `AGENT_NOT_READY` (reload the page) and `SERVER_AGENT_NOT_READY`
+ *   (relaunch the dev server). The `TAB_NOT_BOUND` an access-boundary refusal
+ *   raises for a DevTools caller never reaches this table: it carries its
+ *   `details.reason` and is answered `403` by `../auth.ts`'s table first.
  * - `422` — a stage refused what it was given to apply: model output that
  *   failed its schema, a plan, a panel, a patch target.
  * - `502` — the project's dev server could not be launched.
@@ -759,6 +766,7 @@ const STATUS_BY_CODE: ReadonlyMap<DebuggenErrorCode, DescribedStatus> = new Map<
   ['SESSION_INVALID_STATE', 409],
   ['CAPTURE_ALREADY_ACTIVE', 409],
   ['CAPTURE_EMPTY', 409],
+  ['TAB_NOT_BOUND', 409],
   ['AGENT_NOT_READY', 409],
   ['SERVER_AGENT_NOT_READY', 409],
   ['MODIFICATION_CONFLICT', 409],

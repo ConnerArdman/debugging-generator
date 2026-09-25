@@ -1,0 +1,379 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "build",
+      "detail": "Root gate `pnpm run build`: `prisma generate` for the demo app, then every workspace in topological order (`pnpm -r build`).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "build"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "build", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "build: vscode-extension",
+      "detail": "preLaunchTask of the \"Run Extension\" launch configuration. Builds the extension host (esbuild.mjs --production: dist/extension.js, the embedded service, prompts, schema and preload) and the webview (vite: dist/webview/main.{js,css}). Filters by directory because the extension's package name is `debug-generator`: `--filter @debuggen/vscode-extension` matches no project and exits 0 without building anything.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["--filter", "./apps/vscode-extension", "run", "build"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": [
+        "$tsc",
+        {
+          "owner": "esbuild",
+          "source": "esbuild",
+          "fileLocation": ["relative", "${workspaceFolder}/apps/vscode-extension"],
+          "pattern": [
+            { "regexp": "^\\s*[✘▲] \\[(ERROR|WARNING)\\] (.+)$", "severity": 1, "message": 2 },
+            { "regexp": "^\\s*$" },
+            { "regexp": "^\\s+([^\\s:][^:]*):(\\d+):(\\d+):$", "file": 1, "line": 2, "column": 3 }
+          ]
+        },
+        {
+          "owner": "vite",
+          "source": "vite",
+          "severity": "error",
+          "fileLocation": ["relative", "${workspaceFolder}/apps/vscode-extension"],
+          "pattern": [
+            { "regexp": "^\\s*\\[([^\\]\\s]+)\\] (.+)$", "code": 1, "message": 2 },
+            {
+              "regexp": "^\\s*╭─\\[\\s*(.+?):(\\d+):(\\d+)\\s*\\]\\s*$",
+              "file": 1,
+              "line": 2,
+              "column": 3
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "label": "build: local-service",
+      "detail": "tsup build of @debuggen/local-service to apps/local-service/dist/main.js, which `node dist/main.js` and the Playwright webServer run.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["--filter", "@debuggen/local-service", "run", "build"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "build",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "watch: extension host",
+      "detail": "esbuild.mjs --watch for the extension host. Ready when esbuild.mjs prints `host built in N ms` (or `rebuilt` / `build failed` / `rebuild failed`). esbuild.mjs prints no per-rebuild start line, so a fixed rebuild error stays in Problems until this task restarts.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["--filter", "./apps/vscode-extension", "run", "watch"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "clear": true,
+        "group": "watch: vscode-extension"
+      },
+      "problemMatcher": {
+        "owner": "esbuild",
+        "source": "esbuild",
+        "fileLocation": ["relative", "${workspaceFolder}/apps/vscode-extension"],
+        "pattern": [
+          { "regexp": "^\\s*[✘▲] \\[(ERROR|WARNING)\\] (.+)$", "severity": 1, "message": 2 },
+          { "regexp": "^\\s*$" },
+          { "regexp": "^\\s+([^\\s:][^:]*):(\\d+):(\\d+):$", "file": 1, "line": 2, "column": 3 }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^esbuild\\.mjs: watch\\s+watching host",
+          "endsPattern": "^esbuild\\.mjs: host\\s+(?:re)?buil(?:t|d failed)\\b|^esbuild\\.mjs: error: "
+        }
+      }
+    },
+    {
+      "label": "watch: webview",
+      "detail": "vite build --watch for the webview. Each cycle starts at vite's `build started...` and ends at `built in N ms.` or `Build failed with N error(s):` (not at `watching for file changes...`, which vite prints before the first build).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["--filter", "./apps/vscode-extension", "run", "watch:webview"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": {
+        "reveal": "silent",
+        "panel": "dedicated",
+        "clear": true,
+        "group": "watch: vscode-extension"
+      },
+      "problemMatcher": {
+        "owner": "vite",
+        "source": "vite",
+        "severity": "error",
+        "fileLocation": ["relative", "${workspaceFolder}/apps/vscode-extension"],
+        "pattern": [
+          { "regexp": "^\\s*\\[([^\\]\\s]+)\\] (.+)$", "code": 1, "message": 2 },
+          {
+            "regexp": "^\\s*╭─\\[\\s*(.+?):(\\d+):(\\d+)\\s*\\]\\s*$",
+            "file": 1,
+            "line": 2,
+            "column": 3
+          }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^\\s*build started\\.\\.\\.",
+          "endsPattern": "\\bbuilt in \\d+(?:\\.\\d+)?\\s?m?s\\b|\\b[Bb]uild failed with \\d+ errors?\\b"
+        }
+      }
+    },
+    {
+      "label": "watch: vscode-extension",
+      "detail": "Starts `watch: extension host` and `watch: webview` in parallel and resolves once both have finished their first build.",
+      "dependsOn": ["watch: extension host", "watch: webview"],
+      "dependsOrder": "parallel",
+      "group": "build",
+      "presentation": { "reveal": "silent", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "typecheck",
+      "detail": "Root gate `pnpm run typecheck`: `prisma generate`, then `tsc -b` over the solution tsconfig.json.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "typecheck"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": ["$tsc"]
+    },
+    {
+      "label": "lint",
+      "detail": "Root gate `pnpm run lint`: `eslint . --max-warnings 0` with ESLint's default stylish formatter.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "lint"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": ["$eslint-stylish"]
+    },
+    {
+      "label": "format:check",
+      "detail": "Root gate `pnpm run format:check`: `prettier --check .`. Each unformatted file is listed in Problems; fix with `pnpm format`.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "format:check"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "prettier",
+        "source": "prettier",
+        "severity": "warning",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^\\[warn\\] (?!Code style issues )(\\S.*)$",
+          "kind": "file",
+          "file": 1,
+          "message": 1
+        }
+      }
+    },
+    {
+      "label": "test",
+      "detail": "Root gate `pnpm run test`: `vitest run --coverage` over every Vitest project, including the guard-script tests.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "test"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": { "kind": "test", "isDefault": true },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "test:integration",
+      "detail": "Root gate `pnpm run test:integration`: the local-service-integration Vitest project (in-process service, deterministic provider).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "test:integration"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "test:vscode",
+      "detail": "Extension-host suite (`vscode-test` via @vscode/test-cli, preceded by its pretest build). Needs a display; CI wraps it in `xvfb-run -a`.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "test:vscode"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "test:browser",
+      "detail": "Playwright `browser` project. Needs the built Chrome extension (apps/chrome-extension/dist) and the built local service.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "test:browser"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "test:e2e",
+      "detail": "Playwright `e2e` project. Needs the built Chrome extension, the built local service and a migrated, seeded PostgreSQL (DATABASE_URL).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "test:e2e"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "verify",
+      "detail": "Aggregate gate `pnpm run verify`: build, typecheck, lint, format:check, test, test:integration and the three check:* guard scripts.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "verify"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "group": "test",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": ["$tsc", "$eslint-stylish"]
+    },
+    {
+      "label": "demo:db",
+      "detail": "`docker compose up -d postgres`: starts the demo's PostgreSQL 18 container (the only service in docker-compose.yml).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:db"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "demo:generate",
+      "detail": "`prisma generate` for the demo app (writes apps/demo-app/src/generated/prisma; needs no database).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:generate"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "demo:migrate",
+      "detail": "Checks the committed migrations, then `prisma migrate deploy` against DATABASE_URL.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:migrate"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "demo:seed",
+      "detail": "`prisma db seed`: loads the Lumen Supply catalog, warehouses, inventory movements and orders into DATABASE_URL.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:seed"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "demo: reset database",
+      "detail": "Runs demo:db, demo:migrate and demo:seed in order, stopping at the first failing step (the order docs/DEMO.md uses).",
+      "dependsOn": ["demo:db", "demo:migrate", "demo:seed"],
+      "dependsOrder": "sequence",
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": []
+    },
+    {
+      "label": "demo:dev",
+      "detail": "`next dev` for the demo app on http://localhost:3000 (or $PORT). Ready at Next.js's `✓ Ready in` line; compile errors (`⨯ ./path:line:col`) go to Problems.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:dev"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "nextjs",
+        "source": "next",
+        "severity": "error",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": [
+          {
+            "regexp": "^\\s*⨯ (?:\\./)?([^\\s:][^:]*):(\\d+):(\\d+)\\s*$",
+            "file": 1,
+            "line": 2,
+            "column": 3
+          },
+          { "regexp": "^\\s*(?:[A-Za-z]*Error: )?(\\S.*)$", "message": 1 }
+        ],
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "Restarting the server",
+          "endsPattern": "✓ Ready in \\d"
+        }
+      }
+    },
+    {
+      "label": "demo:instrumented",
+      "detail": "scripts/dev-instrumented.mjs: asks the running local service to launch the demo's dev server with the telemetry preload (POST /dev-server/launch). Needs the local service running (it writes the editor credential $DEBUGGEN_HOME/auth.json), the Debug Generator VS Code extension connected to it with this repository open (the service accepts that credential only for announced workspace folders), and packages/telemetry built so dist/node/register.mjs exists. Ready at `the service launched`. Stop it with Ctrl-C in its terminal (SIGINT asks the service to stop the dev server); Terminate Task hangs the terminal up (SIGHUP), which leaves that dev server running.",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["run", "demo:instrumented"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "dev-instrumented",
+        "source": "dev-instrumented",
+        "severity": "error",
+        "fileLocation": ["relative", "${workspaceFolder}"],
+        "pattern": {
+          "regexp": "^dev-instrumented: (?!the service |SIG[A-Z]+ received)((.+?):? ((?:apps|packages|scripts|tests)/\\S+))$",
+          "kind": "file",
+          "file": 3,
+          "message": 1
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "^dev-instrumented: (?:SIGINT|SIGTERM) received",
+          "endsPattern": "^dev-instrumented: the service (?:launched|stopped)"
+        }
+      }
+    },
+    {
+      "label": "service: dev",
+      "detail": "`tsx watch src/main.ts` for @debuggen/local-service (restarts on change; no inspector — use the \"Debug service\" launch configuration to debug). Ready when the service logs `the Debug Generator service is listening`. Stop it with Ctrl-C (SIGINT, which the service handles) rather than Terminate Task (SIGHUP, which it does not).",
+      "type": "shell",
+      "command": "pnpm",
+      "args": ["--filter", "@debuggen/local-service", "run", "dev"],
+      "options": { "cwd": "${workspaceFolder}" },
+      "isBackground": true,
+      "presentation": { "reveal": "always", "panel": "dedicated", "clear": true },
+      "problemMatcher": {
+        "owner": "tsx",
+        "source": "tsx",
+        "severity": "error",
+        "fileLocation": ["autoDetect", "${workspaceFolder}/apps/local-service"],
+        "pattern": {
+          "regexp": "^(.+?):(\\d+):(\\d+): ERROR: (.+)$",
+          "file": 1,
+          "line": 2,
+          "column": 3,
+          "message": 4
+        },
+        "background": {
+          "activeOnStart": true,
+          "beginsPattern": "\\[tsx\\] .*(?:Restarting|Rerunning)\\.\\.\\.",
+          "endsPattern": "the Debug Generator service is listening|^debuggen: [A-Z_]+: |^Node\\.js v\\d+"
+        }
+      }
+    }
+  ]
+}

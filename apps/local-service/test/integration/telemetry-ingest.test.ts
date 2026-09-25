@@ -1,0 +1,1953 @@
+/**
+ * `telemetry-ingest` — the integration suite for the service's evidence entry
+ * point (AAP §0.8.3, §0.5.2, §0.4.2).
+ *
+ * `src/telemetry/ingest.test.ts` already pins the pipeline's call order with
+ * spies and fake ports. This suite proves the same order **by outcome**, across
+ * the real transports and the real store: a batch goes in over the bound tab's
+ * `telemetry.event` WebSocket frame and over `POST /telemetry/ingest`, and every
+ * claim is then checked against what the service *kept* — the `telemetry_events`
+ * rows read back through `TelemetryRepo` and as raw column text, the
+ * `telemetry.tail` frames the DevTools client received, every service log
+ * record and every HTTP response body.
+ *
+ * ## What is proven
+ *
+ * - **Redaction before persistence and before the tail.** Each assertion of
+ *   `ingest-redaction-expected.json` is interpreted against the persisted row,
+ *   and no credential material this file substituted survives anywhere the
+ *   service writes or sends. A value that survives anywhere means redaction ran
+ *   too late.
+ * - **`request_key` from the unredacted URL.** Byte-identical requests share a
+ *   key, requests differing only in a query value do not — although all of them
+ *   are stored as `…?trailId=?` — and a digest recomputed over the *masked* URL
+ *   never equals the stored key. That last comparison is the one that fails if
+ *   the order were inverted, because a key computed after masking still looks
+ *   plausible.
+ * - **Attribution.** Browser batches belong to the session bound to the tab,
+ *   server batches to the capture owner of the credential's scoped project, and
+ *   only inside an open capture window; everything else is dropped under the
+ *   closed `DROP_REASONS` vocabulary, as a count.
+ * - **`ingestSeq`.** Store-assigned, strictly increasing across batches and
+ *   producers, untouched by an idempotent replay, and the final tie-break of a
+ *   deterministic canonical order.
+ *
+ * ## The sentinel protocol (AAP §0.10 — no committed secrets)
+ *
+ * The input fixture carries only neutral `{{SENTINEL}}` tokens. This suite owns
+ * the substitution material: every value is assembled at run time from short
+ * fragments and `node:crypto` randomness (through the harness's
+ * {@link randomSecretLike} where a shape exists), so `scripts/check-secrets.mjs`
+ * finds nothing in this tracked file. Material is chosen by each sentinel's
+ * `ruleId`, and before any of it is used the suite proves that it really
+ * matches that deny-list rule — a substitution that did not would make the
+ * redaction assertions pass vacuously. Substitution happens on a parsed copy in
+ * memory; the committed fixtures are only read, and their bytes are re-hashed
+ * at teardown.
+ *
+ * ## Why not `redacted === true`
+ *
+ * The event schema defines `redacted` as the list of attribute paths the
+ * redactor replaced, absent when nothing needed replacing, and both event
+ * schemas are strict — no boolean marker can exist (see `live-tail.ts`,
+ * "Why not a `redacted === true` flag"). The tail's defence-in-depth guard is
+ * therefore checked in its faithful form: every tailed event parses as a
+ * *persisted* event of the session (a one-based, store-assigned `ingestSeq` is
+ * the evidence it crossed the privacy boundary), equals the stored row, and
+ * carries a non-empty `redacted` list exactly where the fixture says one is due.
+ *
+ * ## `MAX_EVENTS_PER_BATCH`
+ *
+ * The transport ceiling protocol calls `MAX_EVENTS_PER_BATCH` is module-local to
+ * protocol on purpose (`@debuggen/telemetry` exports a different number, the
+ * agent's 200-event flush trigger, under that name). Ingest reads the ceiling
+ * from protocol's two batch schemas and exports it as `MAX_INGEST_BATCH`, which
+ * is what the over-size cases below exceed by one.
+ *
+ * @module
+ */
+
+import { createHash, randomBytes } from 'node:crypto';
+import { readFileSync } from 'node:fs';
+
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+
+import { isMessageOfType } from '@debuggen/protocol';
+import type { ProtocolMessage, SessionRecord } from '@debuggen/protocol';
+import { isErr, newEventId, newProducerId, newSpanId, newTraceId } from '@debuggen/shared';
+import {
+  DEFAULT_DUPLICATE_WINDOW_MS,
+  MAX_PREVIEW_LENGTH,
+  REDACTION_MARKER,
+  REDACTION_MASK,
+  REDACTION_RULE_IDS,
+  REQUEST_KEY_SESSION_KEY_PATTERN,
+  createRequestKeyHasher,
+  findDeniedRules,
+  isHighEntropySecret,
+  parseTelemetryEvent,
+  parseTelemetryEventIngress,
+} from '@debuggen/telemetry';
+import type { RedactionRuleId, TelemetryEvent, TelemetryEventIngress } from '@debuggen/telemetry';
+
+import { TELEMETRY_QUERY_MAX_LIMIT } from '../../src/store/telemetry-repo.js';
+import { DROP_REASONS, TIER_BY_ORIGIN, isDropReason } from '../../src/telemetry/attribute.js';
+import type { DropReason } from '../../src/telemetry/attribute.js';
+import {
+  INGEST_REQUEST_KEY_ATTRIBUTE,
+  INGEST_SUBSYSTEM,
+  MAX_INGEST_BATCH,
+} from '../../src/telemetry/ingest.js';
+import { TAIL_CLIENT_KINDS } from '../../src/telemetry/live-tail.js';
+import {
+  HARNESS_TIMEOUTS,
+  fixturePath,
+  randomSecretLike,
+  readFixtureJson,
+  startHarness,
+} from './harness.js';
+import type { CapturedLogRecord, Harness, HarnessWsClient } from './harness.js';
+
+/* -------------------------------------------------------------------------------------------------
+ * Fixture names and suite constants
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The batch whose `{{SENTINEL}}` tokens this suite substitutes. */
+const INPUT_FIXTURE = 'ingest-redaction-input.json';
+
+/** The expectation document that drives every redaction assertion. */
+const EXPECTED_FIXTURE = 'ingest-redaction-expected.json';
+
+/** The inspected tab the DevTools client speaks for. */
+const TAB_ID = 4_217;
+
+/** The pattern of one sentinel token as it appears in the committed input. */
+const SENTINEL_TOKEN_PATTERN = /\{\{[A-Z0-9_]+\}\}/gu;
+
+/**
+ * The shortest leak fingerprint accepted. A fingerprint is searched for as a
+ * substring of large haystacks, so a short one could match by accident and a
+ * test that "found a leak" would be wrong; every material below yields
+ * fingerprints well above this bound.
+ */
+const MIN_FINGERPRINT_LENGTH = 12;
+
+/**
+ * The key of the standard `subsystem` binding on every service log record
+ * (`src/logging.ts` `LOG_BINDING_KEYS.subsystem`), which is how the ingest
+ * module's own records are told apart from the rest of the log.
+ */
+const SUBSYSTEM_FIELD = 'subsystem';
+
+/** The deny-list rules classified by *position* (a header slot, a query slot), not by content. */
+const POSITIONAL_RULES: ReadonlySet<RedactionRuleId> = new Set<RedactionRuleId>([
+  'sensitive-header',
+  'url-query-value',
+]);
+
+/* -------------------------------------------------------------------------------------------------
+ * Small, total utilities
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Whether a value is a plain, non-array object. */
+function isRecord(value: unknown): value is Readonly<Record<string, unknown>> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/** Joins fragments; the split points are why this tracked file holds no credential literal. */
+function assemble(...fragments: readonly string[]): string {
+  return fragments.join('');
+}
+
+/** `bytes` random bytes as base64url. */
+function randomBase64Url(bytes: number): string {
+  return randomBytes(bytes).toString('base64url');
+}
+
+/** `bytes` random bytes as lowercase hex. */
+function randomHex(bytes: number): string {
+  return randomBytes(bytes).toString('hex');
+}
+
+/** The SHA-256 of a committed fixture's bytes, to prove the suite never wrote one. */
+function fixtureDigest(name: string): string {
+  return createHash('sha256')
+    .update(readFileSync(fixturePath(name)))
+    .digest('hex');
+}
+
+/** Every string leaf of a JSON-shaped value, depth-first. */
+function stringLeaves(value: unknown): string[] {
+  if (typeof value === 'string') {
+    return [value];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((element: unknown) => stringLeaves(element));
+  }
+  if (isRecord(value)) {
+    return Object.values(value).flatMap((element) => stringLeaves(element));
+  }
+  return [];
+}
+
+/** Returns a deep copy of a JSON-shaped value with `replace` applied to every string leaf. */
+function mapStrings(value: unknown, replace: (text: string) => string): unknown {
+  if (typeof value === 'string') {
+    return replace(value);
+  }
+  if (Array.isArray(value)) {
+    return value.map((element: unknown) => mapStrings(element, replace));
+  }
+  if (isRecord(value)) {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, element]) => [key, mapStrings(element, replace)]),
+    );
+  }
+  return value;
+}
+
+/** Counts code points, which is how the preview bound is measured. */
+function codePointLength(text: string): number {
+  return Array.from(text).length;
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Attribute paths — the fixture's key resolution rule
+ * ---------------------------------------------------------------------------------------------- */
+
+/** One step of a path: an object key or an array index. */
+type PathSegment = string | number;
+
+/** Where a fixture key resolved, and to what. */
+interface Resolved {
+  readonly found: boolean;
+  readonly value: unknown;
+}
+
+/** Splits `a.b[0].c` into `['a', 'b', 0, 'c']`. */
+function parsePath(key: string): PathSegment[] {
+  const segments: PathSegment[] = [];
+  for (const match of key.matchAll(/([^.[\]]+)|\[(\d+)\]/gu)) {
+    const [, name, index] = match;
+    if (index !== undefined) {
+      segments.push(Number(index));
+    } else if (name !== undefined) {
+      segments.push(name);
+    }
+  }
+  return segments;
+}
+
+/** Walks `segments` from `root`. */
+function walk(root: unknown, segments: readonly PathSegment[]): Resolved {
+  let current: unknown = root;
+  for (const segment of segments) {
+    if (typeof segment === 'number') {
+      if (!Array.isArray(current) || segment >= current.length) {
+        return { found: false, value: undefined };
+      }
+      current = current[segment];
+    } else {
+      if (!isRecord(current) || !Object.hasOwn(current, segment)) {
+        return { found: false, value: undefined };
+      }
+      current = current[segment];
+    }
+  }
+  return { found: true, value: current };
+}
+
+/**
+ * Resolves a fixture `key` against an attribute bag the way the expectation
+ * document defines it: by exact key first, and only then as a path of
+ * dot-separated keys and `[index]` elements.
+ */
+function resolveAttribute(attributes: unknown, key: string): Resolved {
+  if (isRecord(attributes) && Object.hasOwn(attributes, key)) {
+    return { found: true, value: attributes[key] };
+  }
+  return walk(attributes, parsePath(key));
+}
+
+/** A path rendered for a failure message. */
+function describePath(path: readonly PathSegment[]): string {
+  return path
+    .map((segment) => (typeof segment === 'number' ? `[${String(segment)}]` : `.${segment}`))
+    .join('')
+    .replace(/^\./u, '');
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * The expectation document, validated by hand (no schema library is a dependency here)
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The closed assertion vocabulary of `ingest-redaction-expected.json`. */
+const EXPECTATION_KINDS = Object.freeze([
+  'equals',
+  'marker',
+  'mask',
+  'unchanged',
+  'absent',
+  'maxLength',
+  'excludesSubstitutedSentinel',
+  'elementCount',
+] as const);
+
+/** One member of {@link EXPECTATION_KINDS}. */
+type ExpectationKind = (typeof EXPECTATION_KINDS)[number];
+
+/** One attribute assertion: a key and exactly one vocabulary entry with its argument. */
+interface AttributeExpectation {
+  readonly key: string;
+  readonly kind: ExpectationKind;
+  readonly argument: unknown;
+}
+
+/** Everything the document asserts about one redacted event. */
+interface EventExpectation {
+  readonly id: string;
+  readonly redactedMarker: boolean;
+  readonly attributes: readonly AttributeExpectation[];
+  readonly absentAttributes: readonly string[];
+}
+
+/** The class a sentinel's slot collapses to. */
+type SentinelFate = 'marker' | 'mask' | 'scrubbed';
+
+/** One sentinel: its token, the rule its material must match, and its fate. */
+interface SentinelSpec {
+  readonly token: string;
+  readonly ruleId: RedactionRuleId | null;
+  readonly fate: SentinelFate;
+}
+
+/** The whole expectation document. */
+interface ExpectedDocument {
+  readonly markers: {
+    readonly redacted: string;
+    readonly mask: string;
+    readonly maxPreviewLength: number;
+  };
+  readonly sentinels: readonly SentinelSpec[];
+  readonly events: readonly EventExpectation[];
+  readonly mustGroup: readonly (readonly string[])[];
+  readonly mustNotGroup: readonly (readonly string[])[];
+}
+
+/** Throws a fixture-drift error naming the expectation document. */
+function drift(message: string): never {
+  throw new Error(`${EXPECTED_FIXTURE} drifted: ${message}`);
+}
+
+/** Reads a string property or fails. */
+function requireString(record: Readonly<Record<string, unknown>>, key: string): string {
+  const value = record[key];
+  return typeof value === 'string' ? value : drift(`"${key}" must be a string`);
+}
+
+/** Reads a list of id tuples or fails. */
+function requireIdTuples(value: unknown, label: string): (readonly string[])[] {
+  if (!Array.isArray(value)) {
+    return drift(`"${label}" must be an array of id tuples`);
+  }
+  return value.map((tuple: unknown) => {
+    if (!Array.isArray(tuple) || tuple.length < 2 || !tuple.every((id) => typeof id === 'string')) {
+      return drift(`"${label}" must hold tuples of at least two event ids`);
+    }
+    return tuple.map(String);
+  });
+}
+
+/** Whether a string names a deny-list rule. */
+function isRuleId(value: unknown): value is RedactionRuleId {
+  return REDACTION_RULE_IDS.some((rule) => rule === value);
+}
+
+/** Whether a string names an assertion of the closed vocabulary. */
+function isExpectationKind(value: string): value is ExpectationKind {
+  return EXPECTATION_KINDS.some((kind) => kind === value);
+}
+
+/** Validates one attribute assertion: exactly one vocabulary entry, with a sound argument. */
+function parseAttributeExpectation(value: unknown, eventId: string): AttributeExpectation {
+  if (!isRecord(value) || !isRecord(value.expect)) {
+    return drift(`an attribute assertion of ${eventId} must be { key, expect }`);
+  }
+  const key = requireString(value, 'key');
+  const entries = Object.entries(value.expect);
+  const [entry] = entries;
+  if (entries.length !== 1 || entry === undefined) {
+    return drift(`${eventId} ${key}: "expect" must carry exactly one assertion`);
+  }
+  const [kind, argument] = entry;
+  if (!isExpectationKind(kind)) {
+    return drift(`${eventId} ${key}: "${kind}" is not in the closed vocabulary`);
+  }
+  const flag = kind === 'marker' || kind === 'mask' || kind === 'unchanged' || kind === 'absent';
+  if ((flag || kind === 'excludesSubstitutedSentinel') && argument !== true) {
+    return drift(`${eventId} ${key}: "${kind}" takes the argument true`);
+  }
+  if (
+    (kind === 'maxLength' || kind === 'elementCount') &&
+    (typeof argument !== 'number' || !Number.isSafeInteger(argument) || argument < 0)
+  ) {
+    return drift(`${eventId} ${key}: "${kind}" takes a non-negative integer`);
+  }
+  return { key, kind, argument };
+}
+
+/** Validates the whole expectation document. */
+function parseExpectedDocument(value: unknown): ExpectedDocument {
+  if (!isRecord(value)) {
+    return drift('the document must be an object');
+  }
+  const { markers, sentinels, events, requestKeyGroups } = value;
+  if (
+    !isRecord(markers) ||
+    typeof markers.redacted !== 'string' ||
+    typeof markers.mask !== 'string' ||
+    typeof markers.maxPreviewLength !== 'number'
+  ) {
+    return drift('"markers" must be { redacted, mask, maxPreviewLength }');
+  }
+  if (!Array.isArray(sentinels) || sentinels.length === 0) {
+    return drift('"sentinels" must be a non-empty array');
+  }
+  const parsedSentinels = sentinels.map((sentinel: unknown): SentinelSpec => {
+    if (!isRecord(sentinel)) {
+      return drift('every sentinel must be an object');
+    }
+    const token = requireString(sentinel, 'token');
+    const ruleId = sentinel.ruleId;
+    const fate = sentinel.expect;
+    if (ruleId !== null && !isRuleId(ruleId)) {
+      return drift(`${token}: ruleId must be null or a member of REDACTION_RULE_IDS`);
+    }
+    if (fate !== 'marker' && fate !== 'mask' && fate !== 'scrubbed') {
+      return drift(`${token}: expect must be marker, mask or scrubbed`);
+    }
+    return { token, ruleId, fate };
+  });
+  if (!Array.isArray(events) || events.length === 0) {
+    return drift('"events" must be a non-empty array');
+  }
+  const parsedEvents = events.map((event: unknown): EventExpectation => {
+    if (!isRecord(event) || typeof event.redactedMarker !== 'boolean') {
+      return drift('every event entry must be { id, redactedMarker, attributes }');
+    }
+    const id = requireString(event, 'id');
+    if (!Array.isArray(event.attributes)) {
+      return drift(`${id}: "attributes" must be an array`);
+    }
+    const absent = event.absentAttributes ?? [];
+    if (!Array.isArray(absent) || !absent.every((key) => typeof key === 'string')) {
+      return drift(`${id}: "absentAttributes" must be an array of keys`);
+    }
+    return {
+      id,
+      redactedMarker: event.redactedMarker,
+      attributes: event.attributes.map((entry: unknown) => parseAttributeExpectation(entry, id)),
+      absentAttributes: absent.map(String),
+    };
+  });
+  if (!isRecord(requestKeyGroups)) {
+    return drift('"requestKeyGroups" must be an object');
+  }
+  return {
+    markers: {
+      redacted: markers.redacted,
+      mask: markers.mask,
+      maxPreviewLength: markers.maxPreviewLength,
+    },
+    sentinels: parsedSentinels,
+    events: parsedEvents,
+    mustGroup: requireIdTuples(requestKeyGroups.mustGroup, 'mustGroup'),
+    mustNotGroup: requireIdTuples(requestKeyGroups.mustNotGroup, 'mustNotGroup'),
+  };
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Substitution material — assembled at run time, never committed
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The material substituted for one sentinel, and the fragments of it that
+ * must never survive anywhere the service writes or sends.
+ *
+ * `fingerprints` always include the whole value; shapes that are only partly
+ * secret (a connection string keeps its scheme and host, a bearer value keeps
+ * its scheme word) add the secret parts, so a leak of the part alone is caught
+ * too.
+ */
+interface Substitution {
+  readonly spec: SentinelSpec;
+  readonly value: string;
+  readonly fingerprints: readonly string[];
+}
+
+/** The PEM delimiter dashes, built rather than written. */
+const PEM_DASHES = '-'.repeat(5);
+
+/** A private-key block: delimiters from fragments, a random body. */
+function randomPrivateKeyBlock(): { readonly value: string; readonly body: string } {
+  const label = assemble('PRIVATE', ' ', 'KEY');
+  const body = randomBytes(48).toString('base64');
+  const value = [
+    assemble(PEM_DASHES, 'BEGIN ', label, PEM_DASHES),
+    body,
+    assemble(PEM_DASHES, 'END ', label, PEM_DASHES),
+  ].join('\n');
+  return { value, body };
+}
+
+/** An opaque, high-entropy credential under a key-like name: retried until it clears the bar. */
+function randomHighEntropyValue(): string {
+  for (let attempt = 0; attempt < 32; attempt += 1) {
+    const candidate = randomBase64Url(36);
+    if (isHighEntropySecret(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error('No high-entropy candidate was drawn in 32 attempts.');
+}
+
+/**
+ * Assembles fresh material for one sentinel, chosen by its `ruleId` — so a new
+ * sentinel with an existing rule is a fixture edit, not new code.
+ *
+ * - `sensitive-header` and `bearer-token`: an `Authorization`-shaped bearer
+ *   value; a denied header is masked by position whatever its value.
+ * - `url-query-value`: an opaque, URL-safe token.
+ * - `provider-key`, `jwt`, `connection-string`: the harness's shapes.
+ * - `private-key`: a PEM block.
+ * - `entropy`: a dense opaque value above the entropy threshold.
+ * - `null` (positional, any material): a neutral random literal free of quotes.
+ */
+function materialFor(spec: SentinelSpec): Substitution {
+  switch (spec.ruleId) {
+    case 'sensitive-header':
+    case 'bearer-token': {
+      const value = randomSecretLike('bearer');
+      const body = value.slice(value.indexOf(' ') + 1);
+      return { spec, value, fingerprints: [value, body] };
+    }
+    case 'url-query-value': {
+      const value = randomBase64Url(24);
+      return { spec, value, fingerprints: [value] };
+    }
+    case 'provider-key': {
+      const value = randomSecretLike('provider-key');
+      return { spec, value, fingerprints: [value, value.slice(-24)] };
+    }
+    case 'jwt': {
+      const value = randomSecretLike('jwt');
+      const [, payload = '', signature = ''] = value.split('.');
+      return { spec, value, fingerprints: [value, payload, signature] };
+    }
+    case 'connection-string': {
+      const value = randomSecretLike('connection-string');
+      const parsed = new URL(value);
+      return {
+        spec,
+        value,
+        fingerprints: [
+          value,
+          decodeURIComponent(parsed.username),
+          decodeURIComponent(parsed.password),
+        ],
+      };
+    }
+    case 'private-key': {
+      const block = randomPrivateKeyBlock();
+      return { spec, value: block.value, fingerprints: [block.value, block.body] };
+    }
+    case 'entropy': {
+      const value = randomHighEntropyValue();
+      return { spec, value, fingerprints: [value] };
+    }
+    case null: {
+      const value = assemble('observer-', randomHex(8));
+      return { spec, value, fingerprints: [value] };
+    }
+  }
+}
+
+/**
+ * Every form a fingerprint could take in a haystack: verbatim, JSON-escaped
+ * once (a stored `event` column, a frame, a log line) and URL-encoded.
+ */
+function needlesOf(fingerprint: string): string[] {
+  return [
+    ...new Set([
+      fingerprint,
+      JSON.stringify(fingerprint).slice(1, -1),
+      encodeURIComponent(fingerprint),
+    ]),
+  ];
+}
+
+/** Every needle of every fingerprint of `substitutions`. */
+function allNeedles(substitutions: readonly Substitution[]): { token: string; needle: string }[] {
+  return substitutions.flatMap((substitution) =>
+    substitution.fingerprints.flatMap((fingerprint) =>
+      needlesOf(fingerprint).map((needle) => ({ token: substitution.spec.token, needle })),
+    ),
+  );
+}
+
+/** The tokens of `substitutions` any of whose needles occur in `text`. */
+function leakedTokens(text: string, substitutions: readonly Substitution[]): string[] {
+  return [
+    ...new Set(
+      allNeedles(substitutions)
+        .filter(({ needle }) => text.includes(needle))
+        .map(({ token }) => token),
+    ),
+  ];
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Fixture loading — synchronous, so the table-driven cases exist at collection time
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The committed fixtures' bytes at load, re-checked at teardown. */
+const FIXTURE_DIGESTS: ReadonlyMap<string, string> = new Map(
+  [INPUT_FIXTURE, EXPECTED_FIXTURE].map((name) => [name, fixtureDigest(name)]),
+);
+
+/** The expectation document, validated. */
+const EXPECTED: ExpectedDocument = parseExpectedDocument(
+  readFixtureJson<unknown>(EXPECTED_FIXTURE),
+);
+
+/** The input batch as committed: sentinel tokens, never material. */
+const RAW_INPUT: unknown = readFixtureJson<unknown>(INPUT_FIXTURE);
+
+/** One substitution per sentinel, built once for the whole file. */
+const SUBSTITUTIONS: readonly Substitution[] = EXPECTED.sentinels.map(materialFor);
+
+/** Sentinel token → its substitution. */
+const SUBSTITUTION_BY_TOKEN: ReadonlyMap<string, Substitution> = new Map(
+  SUBSTITUTIONS.map((substitution) => [substitution.spec.token, substitution]),
+);
+
+/** Replaces every sentinel token inside one string. */
+function substitute(text: string): string {
+  let result = text;
+  for (const substitution of SUBSTITUTIONS) {
+    result = result.split(substitution.spec.token).join(substitution.value);
+  }
+  return result;
+}
+
+/** Parses one element through the owning strict schema, re-exported by `@debuggen/telemetry`. */
+function parseIngress(value: unknown, label: string): TelemetryEventIngress {
+  const parsed = parseTelemetryEventIngress(value);
+  if (isErr(parsed)) {
+    throw new Error(`${INPUT_FIXTURE} ${label} does not parse as ingress: ${parsed.error.message}`);
+  }
+  return parsed.value;
+}
+
+if (!Array.isArray(RAW_INPUT)) {
+  throw new Error(`${INPUT_FIXTURE} must be a bare array of ingress events.`);
+}
+
+/** The committed events, parsed: the source of every sentinel slot. */
+const ORIGINAL_EVENTS: readonly TelemetryEventIngress[] = RAW_INPUT.map(
+  (element: unknown, index: number) => parseIngress(element, `[${String(index)}]`),
+);
+
+/** The substituted events, re-validated after substitution: what the transports carry. */
+const SUBSTITUTED_EVENTS: readonly TelemetryEventIngress[] = RAW_INPUT.map(
+  (element: unknown, index: number) =>
+    parseIngress(mapStrings(element, substitute), `[${String(index)}] after substitution`),
+);
+
+/** Id → committed event. */
+const ORIGINAL_BY_ID: ReadonlyMap<string, TelemetryEventIngress> = new Map(
+  ORIGINAL_EVENTS.map((event) => [event.id, event]),
+);
+
+/** Id → substituted event. */
+const SUBSTITUTED_BY_ID: ReadonlyMap<string, TelemetryEventIngress> = new Map(
+  SUBSTITUTED_EVENTS.map((event) => [event.id, event]),
+);
+
+/** The browser-tier events: the page agent's share, relayed over the tab's WebSocket. */
+const BROWSER_EVENTS: readonly TelemetryEventIngress[] = SUBSTITUTED_EVENTS.filter((event) =>
+  TIER_BY_ORIGIN['browser-agent'].includes(event.tier),
+);
+
+/** The server- and database-tier events: the preload's share, posted over HTTP. */
+const SERVER_EVENTS: readonly TelemetryEventIngress[] = SUBSTITUTED_EVENTS.filter((event) =>
+  TIER_BY_ORIGIN['server-agent'].includes(event.tier),
+);
+
+/** One place a sentinel token sits in the committed input. */
+interface SentinelSlot {
+  readonly token: string;
+  readonly eventId: string;
+  /** The path from the event's root: `['name']` or `['attributes', …]`. */
+  readonly path: readonly PathSegment[];
+  /** The committed string that held the token. */
+  readonly template: string;
+}
+
+/** Every string leaf under `value`, with its path. */
+function stringSlots(
+  value: unknown,
+  path: readonly PathSegment[],
+): { path: PathSegment[]; text: string }[] {
+  if (typeof value === 'string') {
+    return [{ path: [...path], text: value }];
+  }
+  if (Array.isArray(value)) {
+    return value.flatMap((element: unknown, index: number) =>
+      stringSlots(element, [...path, index]),
+    );
+  }
+  if (isRecord(value)) {
+    return Object.entries(value).flatMap(([key, element]) => stringSlots(element, [...path, key]));
+  }
+  return [];
+}
+
+/** Every sentinel slot of the committed input, across the name and the attribute bag. */
+const SENTINEL_SLOTS: readonly SentinelSlot[] = ORIGINAL_EVENTS.flatMap((event) =>
+  [...stringSlots(event.name, ['name']), ...stringSlots(event.attributes, ['attributes'])].flatMap(
+    ({ path, text }) =>
+      [...text.matchAll(SENTINEL_TOKEN_PATTERN)].map(([token]) => ({
+        token,
+        eventId: event.id,
+        path,
+        template: text,
+      })),
+  ),
+);
+
+/* -------------------------------------------------------------------------------------------------
+ * Suite state and service-side helpers
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Everything the setup establishes once for the file. */
+interface SuiteState {
+  readonly harness: Harness;
+  readonly projectRoot: string;
+  readonly sessionId: string;
+  readonly devServerUrl: string;
+  readonly devtools: HarnessWsClient;
+  readonly editor: HarnessWsClient;
+  readonly serverAgent: HarnessWsClient;
+  readonly serverToken: string;
+}
+
+let suite: SuiteState | undefined;
+let openCaptureId: string | undefined;
+
+/** Every HTTP response body the suite received, verbatim or re-serialised: a leak haystack. */
+const httpBodies: string[] = [];
+
+/** Every ingest request body the suite posted: the proof that the material was actually sent. */
+const postedBodies: string[] = [];
+
+/** The state, or a failure naming the setup that did not run. */
+function current(): SuiteState {
+  if (suite === undefined) {
+    throw new Error('The suite setup did not complete.');
+  }
+  return suite;
+}
+
+/** The open capture's id, or a failure naming the step that did not run. */
+function captureIdOf(): string {
+  if (openCaptureId === undefined) {
+    throw new Error('The capture window was not opened.');
+  }
+  return openCaptureId;
+}
+
+/** Records a response for the leak search and returns it unchanged. */
+function recordResponse<T>(value: T): T {
+  httpBodies.push(JSON.stringify(value));
+  return value;
+}
+
+/** What one `POST /telemetry/ingest` answered. */
+interface IngestResponse {
+  readonly status: number;
+  readonly json: unknown;
+}
+
+/**
+ * Posts a batch to `POST /telemetry/ingest` as the dev-server preload would,
+ * through the raw transport so the verbatim response body joins the leak
+ * haystacks and a deliberately refused body (over-size, out of scope) can be
+ * sent at all.
+ */
+async function postIngest(
+  token: string,
+  projectRoot: string,
+  events: readonly unknown[],
+): Promise<IngestResponse> {
+  const body = { projectRoot, events: [...events] };
+  postedBodies.push(JSON.stringify(body));
+  const response = await current().harness.rawFetch('telemetry.event', { token, body });
+  httpBodies.push(response.text);
+  return { status: response.status, json: response.json };
+}
+
+/** Relays a batch over the bound tab's DevTools connection and requires the service to have handled it. */
+async function relay(events: readonly TelemetryEventIngress[]): Promise<readonly string[]> {
+  const outcome = await current().harness.ingestFromAgent(current().devtools, events);
+  expect(outcome.sent.ok, 'the telemetry.event frame was written').toBe(true);
+  expect(outcome.settled, 'the service processed the frame before the barrier').toBe(true);
+  return outcome.errors.map((error) => error.code);
+}
+
+/** How many rows the whole `telemetry_events` table holds, across every session. */
+function tableRowCount(): number {
+  const row: unknown = current()
+    .harness.store.statement('SELECT COUNT(*) AS count FROM telemetry_events')
+    .get();
+  if (!isRecord(row) || typeof row.count !== 'number') {
+    throw new Error('The telemetry_events row count could not be read.');
+  }
+  return row.count;
+}
+
+/** Every column of every `telemetry_events` row as raw text: the stored side of the leak search. */
+function tableText(): string {
+  const rows: unknown[] = current().harness.store.statement('SELECT * FROM telemetry_events').all();
+  return rows
+    .map((row) =>
+      isRecord(row)
+        ? Object.values(row)
+            .map((cell) => String(cell))
+            .join('\t')
+        : '',
+    )
+    .join('\n');
+}
+
+/** The raw columns of one stored event, or `undefined` when the table has no such row. */
+interface RawRow {
+  readonly ingestSeq: number;
+  readonly sessionId: string;
+  readonly captureId: string;
+  readonly requestKey: string | null;
+  readonly event: string;
+}
+
+/** Reads one row's raw columns by event id. */
+function rawRow(id: string): RawRow | undefined {
+  const row: unknown = current()
+    .harness.store.statement(
+      'SELECT ingest_seq, session_id, capture_id, request_key, event FROM telemetry_events WHERE id = ?',
+    )
+    .get(id);
+  if (row === undefined) {
+    return undefined;
+  }
+  if (
+    !isRecord(row) ||
+    typeof row.ingest_seq !== 'number' ||
+    typeof row.session_id !== 'string' ||
+    typeof row.capture_id !== 'string' ||
+    typeof row.event !== 'string' ||
+    (row.request_key !== null && typeof row.request_key !== 'string')
+  ) {
+    throw new Error(`The stored row of ${id} has an unexpected shape.`);
+  }
+  return {
+    ingestSeq: row.ingest_seq,
+    sessionId: row.session_id,
+    captureId: row.capture_id,
+    requestKey: row.request_key,
+    event: row.event,
+  };
+}
+
+/** The open capture's events as `TelemetryRepo` reads them back, keyed by id. */
+function storedEvents(): ReadonlyMap<string, TelemetryEvent> {
+  const { harness, sessionId } = current();
+  const page = harness.repos.telemetry.listByCapture(sessionId, captureIdOf(), {
+    limit: TELEMETRY_QUERY_MAX_LIMIT,
+  });
+  if (isErr(page)) {
+    throw new Error(`TelemetryRepo refused the capture read: ${page.error.message}`);
+  }
+  expect(page.value.skipped, 'every stored row reconstructs as an event').toBeUndefined();
+  return new Map(page.value.rows.map((event) => [event.id, event]));
+}
+
+/** One stored event, required. */
+function requireStored(id: string): TelemetryEvent {
+  const event = storedEvents().get(id);
+  if (event === undefined) {
+    throw new Error(`${id} was not persisted in the open capture.`);
+  }
+  return event;
+}
+
+/** Every event the DevTools client received on `telemetry.tail`, in arrival order. */
+function tailedEvents(client: HarnessWsClient): TelemetryEvent[] {
+  return client.received.flatMap((message) =>
+    isMessageOfType(message, 'telemetry.tail') ? message.payload.events : [],
+  );
+}
+
+/** Whether a message is a `telemetry.tail` frame. */
+function isTailFrame(message: ProtocolMessage): boolean {
+  return isMessageOfType(message, 'telemetry.tail');
+}
+
+/** The service log records the ingest module wrote, from index `from` on. */
+function ingestRecords(from = 0): CapturedLogRecord[] {
+  return current()
+    .harness.logger.records.slice(from)
+    .filter((record) => record.fields[SUBSYSTEM_FIELD] === INGEST_SUBSYSTEM);
+}
+
+/** The ingest module's batch-level drop records from index `from` on. */
+function dropRecords(from = 0): CapturedLogRecord[] {
+  return ingestRecords(from).filter((record) => typeof record.fields.reason === 'string');
+}
+
+/** The ingest module's per-batch summary records (counts only) from index `from` on. */
+function summaryRecords(from = 0): CapturedLogRecord[] {
+  return ingestRecords(from).filter(
+    (record) =>
+      typeof record.fields.inserted === 'number' && typeof record.fields.skipped === 'number',
+  );
+}
+
+/** The reasons of the drop records from index `from` on. */
+function dropReasonsSince(from: number): DropReason[] {
+  return dropRecords(from).flatMap((record) => {
+    const reason = record.fields.reason;
+    return isDropReason(reason) ? [reason] : [];
+  });
+}
+
+/**
+ * Copies events with fresh identities — new event ids, span ids and one new
+ * trace id — so a batch can be sent again without colliding with stored rows,
+ * while every value the redactor judges stays exactly as substituted.
+ */
+function freshCopies(events: readonly TelemetryEventIngress[]): TelemetryEventIngress[] {
+  const traceId = newTraceId();
+  return events.map((event) => {
+    // The new trace has no parent span, so the parent link is left out.
+    const unparented = Object.fromEntries(
+      Object.entries(event).filter(([key]) => key !== 'parentSpanId'),
+    );
+    return parseIngress(
+      { ...unparented, id: newEventId(), spanId: newSpanId(), traceId },
+      event.id,
+    );
+  });
+}
+
+/** Every leak haystack the service could have written a value to, labelled. */
+function haystacks(): { readonly label: string; readonly text: string }[] {
+  const { harness, devtools, editor, serverAgent } = current();
+  return [
+    { label: 'telemetry_events rows (every column)', text: tableText() },
+    { label: 'telemetry.tail frames', text: JSON.stringify(devtools.received.filter(isTailFrame)) },
+    {
+      label: 'WebSocket frames received by every client, error replies included',
+      text: [devtools, editor, serverAgent]
+        .map((client) => JSON.stringify(client.received))
+        .join('\n'),
+    },
+    { label: 'service log records', text: harness.logger.text() },
+    { label: 'HTTP response bodies', text: httpBodies.join('\n') },
+  ];
+}
+
+/** Fails naming every haystack a substituted value survived in. */
+function expectNoSubstitutedMaterialAnywhere(): void {
+  const leaks = haystacks().flatMap(({ label, text }) =>
+    leakedTokens(text, SUBSTITUTIONS).map((token) => `${token} survived in ${label}`),
+  );
+  expect(leaks, 'redaction ran before every sink').toEqual([]);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Setup and teardown — one harness for the file
+ * ---------------------------------------------------------------------------------------------- */
+
+beforeAll(async () => {
+  const harness = await startHarness();
+  const projectRoot = harness.requireProject().root;
+
+  const launched = recordResponse(await harness.launchDevServer(projectRoot));
+  if (isErr(launched)) {
+    throw new Error(`The stand-in dev server did not launch: ${launched.error.message}`);
+  }
+
+  const session = recordResponse(
+    await harness.createSession({ projectRoot, question: 'Why is the report slow to load?' }),
+  );
+  const devServerUrl = session.devServerUrl;
+
+  const { client: devtools } = await harness.connectDevtools({ tabId: TAB_ID });
+  const bound = await harness.bindTab(devtools, {
+    tabId: TAB_ID,
+    url: devServerUrl,
+    origin: new URL(devServerUrl).origin,
+  });
+  if (isErr(bound)) {
+    throw new Error(`The tab was not bound (${bound.error.code}): ${bound.error.message}`);
+  }
+
+  // The page agent announces its document through the tab's connection, which
+  // is what the readiness gate waits for before "Ready to capture".
+  const ready = devtools.send('agent.ready', {
+    tabId: TAB_ID,
+    documentId: assemble('doc-', randomHex(8)),
+    producerId: newProducerId(),
+    url: devServerUrl,
+    installedBeforeReact: true,
+    reactDetected: true,
+  });
+  if (!(await devtools.flush()) || devtools.errorsFor(ready.id).length > 0) {
+    throw new Error(`agent.ready was refused: ${devtools.describe()}`);
+  }
+
+  // The preload's credential is scoped to exactly this project; its control
+  // connection is the server agent's presence for readiness.
+  const serverToken = harness.issueServerAgentCredential(projectRoot).token;
+  const serverAgent = await harness.ws({
+    client: 'server-agent',
+    projectRoot,
+    token: serverToken,
+  });
+  const editor = await harness.editor(projectRoot);
+
+  const settled = await harness.waitForSession(
+    session.id,
+    (record: SessionRecord) => record.status === 'ready' || record.status === 'failed',
+  );
+  if (settled.status !== 'ready') {
+    throw new Error(`The session settled in "${settled.status}" instead of "ready".`);
+  }
+
+  suite = {
+    harness,
+    projectRoot,
+    sessionId: session.id,
+    devServerUrl,
+    devtools,
+    editor,
+    serverAgent,
+    serverToken,
+  };
+});
+
+afterAll(async () => {
+  try {
+    await suite?.harness.assertNoLeaks();
+  } finally {
+    // Substitution happened in memory only: the committed fixtures are unchanged.
+    for (const [name, digest] of FIXTURE_DIGESTS) {
+      expect(fixtureDigest(name), `${name} is byte-identical after the run`).toBe(digest);
+    }
+  }
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * The fixture contract
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('the fixture contract', () => {
+  it('pins the marker, the mask and the preview bound to the constants that own them', () => {
+    expect(EXPECTED.markers).toEqual({
+      redacted: REDACTION_MARKER,
+      mask: REDACTION_MASK,
+      maxPreviewLength: MAX_PREVIEW_LENGTH,
+    });
+  });
+
+  it('declares every sentinel token of the input exactly once, each with at least one slot', () => {
+    const declared = EXPECTED.sentinels.map((sentinel) => sentinel.token);
+    const used = [...new Set(JSON.stringify(RAW_INPUT).match(SENTINEL_TOKEN_PATTERN) ?? [])].sort();
+
+    expect(new Set(declared).size, 'no token is declared twice').toBe(declared.length);
+    expect([...declared].sort()).toEqual(used);
+    for (const token of declared) {
+      expect(
+        SENTINEL_SLOTS.some((slot) => slot.token === token),
+        `${token} occupies a name or attribute slot`,
+      ).toBe(true);
+    }
+  });
+
+  it('has one expectation entry per input event, and no entry for an event it does not hold', () => {
+    const expectedIds = EXPECTED.events.map((event) => event.id).sort();
+    const inputIds = ORIGINAL_EVENTS.map((event) => event.id).sort();
+
+    expect(expectedIds).toEqual(inputIds);
+    expect(new Set(inputIds).size, 'input event ids are unique').toBe(inputIds.length);
+  });
+
+  it('references only input events in its request-key groups', () => {
+    for (const tuple of [...EXPECTED.mustGroup, ...EXPECTED.mustNotGroup]) {
+      for (const id of tuple) {
+        expect(ORIGINAL_BY_ID.has(id), `${id} is an input event`).toBe(true);
+      }
+    }
+  });
+
+  it.each(SUBSTITUTIONS.map((substitution) => [substitution.spec.token, substitution] as const))(
+    'substitutes run-time material for %s that matches its declared deny-list rule',
+    (_token, substitution) => {
+      const { spec, value, fingerprints } = substitution;
+
+      if (spec.ruleId === null) {
+        // Positional: removal holds for any material, so only its neutrality is checked.
+        expect(findDeniedRules(value)).toEqual([]);
+      } else if (POSITIONAL_RULES.has(spec.ruleId)) {
+        expect(REDACTION_RULE_IDS).toContain(spec.ruleId);
+      } else if (spec.ruleId === 'entropy') {
+        expect(isHighEntropySecret(value), 'the material clears the entropy threshold').toBe(true);
+      } else {
+        expect(findDeniedRules(value), `the material matches ${spec.ruleId}`).toContain(
+          spec.ruleId,
+        );
+      }
+
+      expect(value).not.toMatch(SENTINEL_TOKEN_PATTERN);
+      for (const fingerprint of fingerprints) {
+        expect(
+          fingerprint.length,
+          'a fingerprint long enough to be unambiguous',
+        ).toBeGreaterThanOrEqual(MIN_FINGERPRINT_LENGTH);
+      }
+      // Fresh per run: the committed fixture never holds the material.
+      expect(JSON.stringify(RAW_INPUT)).not.toContain(value);
+    },
+  );
+
+  it('validates the substituted batch through the strict ingress schema, which refuses service-assigned fields', () => {
+    expect(SUBSTITUTED_EVENTS).toHaveLength(ORIGINAL_EVENTS.length);
+    expect(JSON.stringify(SUBSTITUTED_EVENTS)).not.toMatch(SENTINEL_TOKEN_PATTERN);
+    expect(BROWSER_EVENTS.length + SERVER_EVENTS.length).toBe(SUBSTITUTED_EVENTS.length);
+    expect(BROWSER_EVENTS.length).toBeGreaterThan(0);
+    expect(SERVER_EVENTS.length).toBeGreaterThan(0);
+
+    for (const event of SUBSTITUTED_EVENTS) {
+      for (const field of ['sessionId', 'captureId', 'ingestSeq']) {
+        expect(Object.hasOwn(event, field), `${event.id} carries no ${field}`).toBe(false);
+      }
+      // A producer cannot supply the store's arrival number: the schema is strict.
+      expect(isErr(parseTelemetryEventIngress({ ...event, ingestSeq: 1 }))).toBe(true);
+    }
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Outside a capture window
+ * ---------------------------------------------------------------------------------------------- */
+
+describe('outside a capture window', () => {
+  it('drops a bound tab batch and a scoped server batch under no-active-capture, storing nothing', async () => {
+    const { harness, projectRoot, serverToken } = current();
+    const rowsBefore = tableRowCount();
+    const mark = harness.logger.records.length;
+
+    const browserErrors = await relay(BROWSER_EVENTS);
+    expect(browserErrors, 'a drop is an honest report, never an error').toEqual([]);
+
+    const posted = await postIngest(serverToken, projectRoot, SERVER_EVENTS);
+    expect(posted.status).toBe(202);
+    expect(posted.json).toEqual({ accepted: 0, rejected: SERVER_EVENTS.length });
+
+    expect(tableRowCount(), 'nothing was stored outside the capture window').toBe(rowsBefore);
+    expect(dropReasonsSince(mark)).toEqual(['no-active-capture', 'no-active-capture']);
+    expect(dropRecords(mark).map((record) => record.fields.received)).toEqual([
+      BROWSER_EVENTS.length,
+      SERVER_EVENTS.length,
+    ]);
+    expect(tailedEvents(current().devtools), 'nothing was tailed either').toEqual([]);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * Inside the capture window
+ * ---------------------------------------------------------------------------------------------- */
+
+/** Every id of the substituted batch. */
+const BATCH_IDS: readonly string[] = SUBSTITUTED_EVENTS.map((event) => event.id);
+
+/** The substituted batch's events whose kind carries a `request_key`. */
+function requestEvents(): TelemetryEventIngress[] {
+  return SUBSTITUTED_EVENTS.filter((event) => event.kind === 'fetch' || event.kind === 'xhr');
+}
+
+/** A string attribute of an ingress event, required. */
+function stringAttribute(event: TelemetryEventIngress, key: string): string {
+  const value = event.attributes[key];
+  if (typeof value !== 'string') {
+    throw new Error(`${event.id} carries no string "${key}" attribute.`);
+  }
+  return value;
+}
+
+/** The persisted `request_key` of one event: the column, which must equal the attribute. */
+function storedRequestKey(id: string): string {
+  const row = rawRow(id);
+  expect(row, `${id} is stored`).toBeDefined();
+  const key = row?.requestKey ?? undefined;
+  if (key === undefined) {
+    throw new Error(`${id} was stored without a request_key.`);
+  }
+  if (INGEST_REQUEST_KEY_ATTRIBUTE === undefined) {
+    throw new Error('Ingest names no request_key attribute.');
+  }
+  expect(
+    requireStored(id).attributes[INGEST_REQUEST_KEY_ATTRIBUTE],
+    `${id} attribute = column`,
+  ).toBe(key);
+  return key;
+}
+
+/** The sentinel tokens a committed attribute slot holds. */
+function tokensInSlot(eventId: string, key: string): string[] {
+  const original = ORIGINAL_BY_ID.get(eventId);
+  const resolved = original === undefined ? undefined : resolveAttribute(original.attributes, key);
+  const texts = resolved?.found === true ? stringLeaves(resolved.value) : [];
+  return [...new Set(texts.flatMap((text) => text.match(SENTINEL_TOKEN_PATTERN) ?? []))];
+}
+
+/** The substitutions of `tokens`. */
+function substitutionsOf(tokens: readonly string[]): Substitution[] {
+  return tokens.flatMap((token) => {
+    const substitution = SUBSTITUTION_BY_TOKEN.get(token);
+    return substitution === undefined ? [] : [substitution];
+  });
+}
+
+/**
+ * The interpreter of the closed assertion vocabulary: applies one fixture
+ * assertion to the **persisted** event.
+ */
+function applyAttributeExpectation(
+  expectation: AttributeExpectation,
+  eventId: string,
+  persisted: TelemetryEvent,
+): void {
+  const label = `${eventId} ${expectation.key} (${expectation.kind})`;
+  const actual = resolveAttribute(persisted.attributes, expectation.key);
+  const input = SUBSTITUTED_BY_ID.get(eventId);
+  const sent =
+    input === undefined ? undefined : resolveAttribute(input.attributes, expectation.key);
+
+  switch (expectation.kind) {
+    case 'absent':
+      expect(actual.found, label).toBe(false);
+      return;
+    case 'equals':
+      expect(actual.found, label).toBe(true);
+      expect(actual.value, label).toEqual(expectation.argument);
+      return;
+    case 'marker':
+      expect(actual.value, label).toBe(REDACTION_MARKER);
+      return;
+    case 'mask': {
+      const tokens = tokensInSlot(eventId, expectation.key);
+      expect(typeof actual.value, label).toBe('string');
+      expect(String(actual.value), label).toContain(REDACTION_MASK);
+      expect(leakedTokens(JSON.stringify(actual.value), substitutionsOf(tokens)), label).toEqual(
+        [],
+      );
+      return;
+    }
+    case 'unchanged':
+      expect(sent?.found, `${label}: the input holds the key`).toBe(true);
+      expect(actual.found, label).toBe(true);
+      expect(actual.value, label).toEqual(sent?.value);
+      return;
+    case 'maxLength': {
+      const bound = Number(expectation.argument);
+      const strings = stringLeaves(actual.value);
+      expect(actual.found, label).toBe(true);
+      expect(strings.length, `${label}: the value holds text`).toBeGreaterThan(0);
+      for (const text of strings) {
+        expect(codePointLength(text), label).toBeLessThanOrEqual(bound);
+      }
+      return;
+    }
+    case 'excludesSubstitutedSentinel': {
+      const tokens = tokensInSlot(eventId, expectation.key);
+      expect(tokens.length, `${label}: the committed slot holds a sentinel`).toBeGreaterThan(0);
+      expect(actual.found, label).toBe(true);
+      expect(leakedTokens(JSON.stringify(actual.value), substitutionsOf(tokens)), label).toEqual(
+        [],
+      );
+      return;
+    }
+    case 'elementCount': {
+      const count = Number(expectation.argument);
+      expect(Array.isArray(sent?.value) ? sent.value.length : -1, `${label}: input length`).toBe(
+        count,
+      );
+      expect(Array.isArray(actual.value), label).toBe(true);
+      const elements: unknown[] = Array.isArray(actual.value) ? actual.value : [];
+      expect(elements, label).toHaveLength(count);
+      for (const element of elements) {
+        expect(element, label).toBe(REDACTION_MARKER);
+      }
+      return;
+    }
+  }
+}
+
+/** The persisted event minus what attribution and the store add, for an unchanged-event comparison. */
+function withoutServiceFields(event: TelemetryEvent, keepSource: boolean): unknown {
+  // `sessionId` and `captureId` come from attribution and `ingestSeq` from the
+  // store; `source` may be placed by the ingest locator when the producer sent none.
+  const omitted = new Set([
+    'sessionId',
+    'captureId',
+    'ingestSeq',
+    ...(keepSource ? [] : ['source']),
+  ]);
+  const kept = Object.fromEntries(Object.entries(event).filter(([key]) => !omitted.has(key)));
+  const attributes = Object.fromEntries(
+    Object.entries(event.attributes).filter(([key]) => key !== INGEST_REQUEST_KEY_ATTRIBUTE),
+  );
+  return { ...kept, attributes };
+}
+
+describe('inside the capture window', () => {
+  /** The arrival order of the redaction batch: browser frame first, then the server request. */
+  let arrival: readonly string[] = [];
+
+  beforeAll(async () => {
+    const { harness, sessionId, projectRoot, serverToken, devtools } = current();
+
+    const started = recordResponse(await harness.startCapture(sessionId));
+    if (isErr(started)) {
+      throw new Error(
+        `The capture did not start (${started.error.code}): ${started.error.message}`,
+      );
+    }
+    openCaptureId = started.value.captureId;
+
+    // The real paths: the page agent's share over the bound tab's WebSocket,
+    // the preload's share over HTTP under its scoped credential.
+    const browserErrors = await relay(BROWSER_EVENTS);
+    if (browserErrors.length > 0) {
+      throw new Error(`The browser batch was refused: ${browserErrors.join(', ')}`);
+    }
+    const posted = await postIngest(serverToken, projectRoot, SERVER_EVENTS);
+    if (posted.status !== 202) {
+      throw new Error(`The server batch was answered ${String(posted.status)}.`);
+    }
+    arrival = [...BROWSER_EVENTS, ...SERVER_EVENTS].map((event) => event.id);
+
+    // The tail coalesces; wait until every event of the batch has been delivered.
+    await devtools.until(
+      () => {
+        const tailed = new Set(tailedEvents(devtools).map((event) => event.id));
+        return BATCH_IDS.every((id) => tailed.has(id)) ? true : undefined;
+      },
+      HARNESS_TIMEOUTS.capture,
+      () => `The tail did not deliver the whole batch: ${devtools.describe()}`,
+    );
+  });
+
+  describe('redaction before persistence', () => {
+    it('persists every event, attributed to the bound session and its open capture', () => {
+      const { sessionId } = current();
+      const stored = storedEvents();
+
+      expect([...stored.keys()].sort()).toEqual([...BATCH_IDS].sort());
+      for (const id of BATCH_IDS) {
+        const row = rawRow(id);
+        expect(row?.sessionId, `${id} session_id`).toBe(sessionId);
+        expect(row?.captureId, `${id} capture_id`).toBe(captureIdOf());
+        expect(stored.get(id)?.sessionId).toBe(sessionId);
+        expect(stored.get(id)?.captureId).toBe(captureIdOf());
+      }
+    });
+
+    it.each(EXPECTED.events.map((expectation) => [expectation.id, expectation] as const))(
+      '%s satisfies every fixture assertion as persisted',
+      (id, expectation) => {
+        const persisted = requireStored(id);
+        const input = SUBSTITUTED_BY_ID.get(id);
+
+        if (expectation.redactedMarker) {
+          expect(persisted.redacted, `${id} carries a non-empty redacted path list`).toEqual(
+            expect.arrayContaining([expect.any(String)]),
+          );
+        } else {
+          expect(persisted.redacted, `${id} was not touched by the redactor`).toBeUndefined();
+        }
+
+        for (const key of expectation.absentAttributes) {
+          expect(
+            input === undefined ? false : resolveAttribute(input.attributes, key).found,
+            `${id} ${key} was sent`,
+          ).toBe(true);
+          expect(resolveAttribute(persisted.attributes, key).found, `${id} ${key} is dropped`).toBe(
+            false,
+          );
+        }
+
+        for (const attributeExpectation of expectation.attributes) {
+          applyAttributeExpectation(attributeExpectation, id, persisted);
+        }
+      },
+    );
+
+    it.each(SUBSTITUTIONS.map((substitution) => [substitution.spec.token, substitution] as const))(
+      'collapses every slot of %s to its declared fate',
+      (token, substitution) => {
+        const slots = SENTINEL_SLOTS.filter((slot) => slot.token === token);
+        expect(slots.length).toBeGreaterThan(0);
+
+        for (const slot of slots) {
+          const label = `${token} at ${slot.eventId} ${describePath(slot.path)}`;
+          const dropped =
+            EXPECTED.events
+              .find((event) => event.id === slot.eventId)
+              ?.absentAttributes.includes(String(slot.path[1])) === true;
+          const resolved = walk(requireStored(slot.eventId), slot.path);
+          if (dropped) {
+            expect(resolved.found, `${label} is dropped with its key`).toBe(false);
+            continue;
+          }
+
+          expect(resolved.found, `${label} still exists`).toBe(true);
+          expect(typeof resolved.value, label).toBe('string');
+          const text = String(resolved.value);
+          expect(leakedTokens(JSON.stringify(text), [substitution]), label).toEqual([]);
+
+          switch (substitution.spec.fate) {
+            case 'marker':
+              if (slot.template === token) {
+                expect(text, label).toBe(REDACTION_MARKER);
+              } else {
+                expect(text, label).toContain(REDACTION_MARKER);
+              }
+              break;
+            case 'mask':
+              expect(text, label).toContain(REDACTION_MASK);
+              break;
+            case 'scrubbed': {
+              // Replaced in place: the text around a lone token survives.
+              const tokenCount = slot.template.match(SENTINEL_TOKEN_PATTERN)?.length ?? 0;
+              if (tokenCount === 1) {
+                for (const fragment of slot.template.split(token)) {
+                  if (fragment.trim().length > 0) {
+                    expect(text, `${label} keeps its surrounding text`).toContain(fragment);
+                  }
+                }
+              }
+              break;
+            }
+          }
+        }
+      },
+    );
+
+    it('passes an event the redactor has nothing to do for through unchanged', () => {
+      const untouched = EXPECTED.events.filter((expectation) => !expectation.redactedMarker);
+      expect(untouched.length, 'the fixture declares at least one benign event').toBeGreaterThan(0);
+
+      for (const { id } of untouched) {
+        const input = SUBSTITUTED_BY_ID.get(id);
+        const persisted = requireStored(id);
+        expect(input, `${id} was sent`).toBeDefined();
+        expect(withoutServiceFields(persisted, input?.source !== undefined), id).toEqual(input);
+      }
+    });
+
+    it('round-trips every start time and duration exactly, sub-millisecond part included', () => {
+      for (const event of SUBSTITUTED_EVENTS) {
+        const persisted = requireStored(event.id);
+        expect(Object.is(persisted.startTime, event.startTime), `${event.id} startTime`).toBe(true);
+        expect(Object.is(persisted.duration, event.duration), `${event.id} duration`).toBe(true);
+      }
+      expect(
+        SUBSTITUTED_EVENTS.some((event) => !Number.isInteger(event.startTime)),
+        'the batch exercises fractional milliseconds',
+      ).toBe(true);
+    });
+
+    it('proves the order by outcome: no substituted material survives in any row, frame, record or body', () => {
+      const { devtools } = current();
+      // Non-vacuity: every value really was sent on the transport that carried its event.
+      const sent = [JSON.stringify(devtools.sent), ...postedBodies].join('\n');
+      expect(leakedTokens(sent, SUBSTITUTIONS).sort()).toEqual(
+        SUBSTITUTIONS.map((substitution) => substitution.spec.token).sort(),
+      );
+
+      expectNoSubstitutedMaterialAnywhere();
+    });
+
+    it('tails to the DevTools client only, every tailed event a persisted event of the session equal to its row', () => {
+      const { devtools, editor, serverAgent, sessionId } = current();
+      expect(TAIL_CLIENT_KINDS).toEqual(['devtools']);
+
+      const tailed = tailedEvents(devtools);
+      const stored = storedEvents();
+      expect(tailed.length).toBeGreaterThanOrEqual(BATCH_IDS.length);
+      for (const event of tailed) {
+        const parsed = parseTelemetryEvent(event);
+        expect(isErr(parsed), `${event.id} parses as a persisted event`).toBe(false);
+        expect(event.sessionId).toBe(sessionId);
+        expect(Number.isSafeInteger(event.ingestSeq) && event.ingestSeq >= 1).toBe(true);
+        expect(event, `${event.id} as tailed equals its stored row`).toEqual(stored.get(event.id));
+      }
+      for (const expectation of EXPECTED.events) {
+        const copy = tailed.find((event) => event.id === expectation.id);
+        expect(
+          (copy?.redacted?.length ?? 0) > 0,
+          `${expectation.id} carries its redaction record on the tail`,
+        ).toBe(expectation.redactedMarker);
+      }
+
+      expect(editor.received.filter(isTailFrame), 'the editor never receives the tail').toEqual([]);
+      expect(serverAgent.received.filter(isTailFrame), 'the preload never receives it').toEqual([]);
+    });
+  });
+
+  describe('request_key from the unredacted URL', () => {
+    it('keys every request-kind event and nothing else', () => {
+      for (const event of SUBSTITUTED_EVENTS) {
+        const row = rawRow(event.id);
+        if (event.kind === 'fetch' || event.kind === 'xhr') {
+          expect(storedRequestKey(event.id)).toMatch(/^[0-9a-f]{64}$/u);
+        } else {
+          expect(row?.requestKey, `${event.id} is not a request`).toBeNull();
+        }
+      }
+    });
+
+    it('collides byte-identical requests and separates requests differing only in a query value', () => {
+      for (const tuple of EXPECTED.mustGroup) {
+        const keys = tuple.map(storedRequestKey);
+        expect(new Set(keys).size, `${tuple.join(' + ')} share one key`).toBe(1);
+      }
+      for (const tuple of EXPECTED.mustNotGroup) {
+        const keys = tuple.map(storedRequestKey);
+        expect(new Set(keys).size, `${tuple.join(' + ')} keep distinct keys`).toBe(tuple.length);
+        // …although they are stored, and would be displayed, identically.
+        const urls = tuple.map((id) => requireStored(id).attributes.url);
+        expect(new Set(urls).size, `${tuple.join(' + ')} share a masked URL`).toBe(1);
+      }
+    });
+
+    it('is the digest of the unredacted URL, and never the digest of the masked one', async () => {
+      const { harness, sessionId } = current();
+      const secret = harness.repos.sessions.getOrCreateRequestKeySecret(sessionId);
+      if (isErr(secret)) {
+        throw new Error(`The session secret could not be read: ${secret.error.message}`);
+      }
+      const hasher = createRequestKeyHasher(secret.value);
+      if (isErr(hasher)) {
+        throw new Error(`The hasher refused the session secret: ${hasher.error.message}`);
+      }
+
+      const maskedDigests = new Map<string, string>();
+      for (const event of requestEvents()) {
+        const method = stringAttribute(event, 'http.method');
+        const unredacted = stringAttribute(event, 'url');
+        const masked = requireStored(event.id).attributes.url;
+        if (typeof masked !== 'string') {
+          throw new Error(`${event.id} was stored without a URL.`);
+        }
+        if (unredacted.includes('?')) {
+          expect(masked, `${event.id} was stored with its query values masked`).not.toBe(
+            unredacted,
+          );
+        }
+
+        const fromUnredacted = await hasher.value.compute(method, unredacted);
+        const fromMasked = await hasher.value.compute(method, masked);
+        if (isErr(fromUnredacted) || isErr(fromMasked)) {
+          throw new Error(`${event.id}: a digest could not be computed.`);
+        }
+        const stored = storedRequestKey(event.id);
+        expect(stored, `${event.id} key = HMAC(unredacted)`).toBe(fromUnredacted.value);
+        if (masked !== unredacted) {
+          // The assertion an inverted pipeline fails: a post-mask key looks plausible but differs.
+          expect(stored, `${event.id} key ≠ HMAC(masked)`).not.toBe(fromMasked.value);
+        }
+        maskedDigests.set(event.id, fromMasked.value);
+      }
+
+      // Had the key been taken after masking, the different-parameter controls would have merged.
+      for (const tuple of EXPECTED.mustNotGroup) {
+        expect(new Set(tuple.map((id) => maskedDigests.get(id))).size).toBe(1);
+      }
+    });
+
+    it('keeps the per-session secret inside the store: no response, frame, record, row or record field carries it', async () => {
+      const { harness, sessionId } = current();
+      const secret = harness.repos.sessions.getOrCreateRequestKeySecret(sessionId);
+      if (isErr(secret)) {
+        throw new Error(`The session secret could not be read: ${secret.error.message}`);
+      }
+      expect(secret.value).toMatch(REQUEST_KEY_SESSION_KEY_PATTERN);
+
+      const fetched = await harness.rawFetch({
+        operation: 'session.get',
+        params: { id: sessionId },
+      });
+      httpBodies.push(fetched.text);
+      expect(fetched.status).toBe(200);
+      expect(isRecord(fetched.json) ? fetched.json.id : undefined).toBe(sessionId);
+      expect(fetched.text, 'the serialized SessionRecord').not.toContain(secret.value);
+
+      for (const { label, text } of haystacks()) {
+        expect(text.includes(secret.value), `the session secret is absent from ${label}`).toBe(
+          false,
+        );
+      }
+    });
+
+    it('forms the duplicate group end to end through the requests panel-data source', async () => {
+      const { harness, sessionId } = current();
+      const answered = recordResponse(
+        await harness.http().request('panel.data', {
+          params: { id: sessionId },
+          body: { source: 'requests' },
+        }),
+      );
+      if (isErr(answered)) {
+        throw new Error(
+          `panel.data was refused (${answered.error.code}): ${answered.error.message}`,
+        );
+      }
+      const result = answered.value;
+      if (result.source !== 'requests') {
+        throw new Error(`panel.data answered the "${result.source}" source.`);
+      }
+      const groupOf = (id: string) => {
+        const key = storedRequestKey(id);
+        const group = result.requests.find((candidate) => candidate.requestKey === key);
+        expect(group, `${id} has a request group`).toBeDefined();
+        return group;
+      };
+
+      for (const tuple of EXPECTED.mustGroup) {
+        const [first] = tuple;
+        const group = first === undefined ? undefined : groupOf(first);
+        expect(group?.count, `${tuple.join(' + ')} form one group`).toBe(tuple.length);
+        expect(group?.url).toBe(
+          first === undefined ? undefined : requireStored(first).attributes.url,
+        );
+        const starts = tuple.map((id) => requireStored(id).startTime);
+        if (Math.max(...starts) - Math.min(...starts) <= DEFAULT_DUPLICATE_WINDOW_MS) {
+          expect(group?.hasDuplicates, 'a burst inside the duplicate window').toBe(true);
+          expect(group?.duplicateCount).toBe(tuple.length - 1);
+        }
+      }
+      for (const tuple of EXPECTED.mustNotGroup) {
+        const groups = tuple.map(groupOf);
+        expect(
+          new Set(groups.map((group) => group?.id)).size,
+          `${tuple.join(' + ')} are separate`,
+        ).toBe(tuple.length);
+        expect(new Set(groups.map((group) => group?.url)).size, 'under one displayed URL').toBe(1);
+      }
+    });
+  });
+
+  describe('ingestSeq', () => {
+    it('is assigned by the store and strictly increases across batches and across both producers', () => {
+      const stored = storedEvents();
+      const sequence = arrival.map((id) => stored.get(id)?.ingestSeq ?? Number.NaN);
+
+      expect(sequence.every((value) => Number.isSafeInteger(value) && value >= 1)).toBe(true);
+      for (let index = 1; index < sequence.length; index += 1) {
+        expect(
+          (sequence[index] ?? Number.NaN) > (sequence[index - 1] ?? Number.NaN),
+          `${arrival[index] ?? ''} arrived after ${arrival[index - 1] ?? ''}`,
+        ).toBe(true);
+      }
+      for (const id of arrival) {
+        expect(rawRow(id)?.ingestSeq, `${id} column = document field`).toBe(
+          stored.get(id)?.ingestSeq,
+        );
+      }
+    });
+
+    it('treats a replayed batch as idempotent: no new row, no new arrival number, reported as skipped', async () => {
+      const { harness, projectRoot, serverToken } = current();
+      const before = new Map([...storedEvents()].map(([id, event]) => [id, event.ingestSeq]));
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+
+      expect(await relay(BROWSER_EVENTS), 'the reconnecting agent replay is not an error').toEqual(
+        [],
+      );
+      const posted = await postIngest(serverToken, projectRoot, SERVER_EVENTS);
+      expect(posted.status).toBe(202);
+      expect(posted.json).toEqual({ accepted: SERVER_EVENTS.length });
+
+      expect(tableRowCount()).toBe(rowsBefore);
+      const after = new Map([...storedEvents()].map(([id, event]) => [id, event.ingestSeq]));
+      expect(after).toEqual(before);
+
+      const summaries = summaryRecords(mark).map((record) => ({
+        inserted: record.fields.inserted,
+        skipped: record.fields.skipped,
+      }));
+      expect(summaries).toEqual([
+        { inserted: 0, skipped: BROWSER_EVENTS.length },
+        { inserted: 0, skipped: SERVER_EVENTS.length },
+      ]);
+    });
+
+    it('orders two producers sharing a start time deterministically: startTime, producerId/seq, then ingestSeq', async () => {
+      const { harness, projectRoot, serverToken, sessionId } = current();
+      const traceId = newTraceId();
+      const startTime =
+        Math.max(...SUBSTITUTED_EVENTS.map((event) => event.startTime)) + 1_000.123_456_7;
+      const duration = 1.000_000_1;
+      // Producer ids chosen so the canonical order is NOT the arrival order.
+      const pageProducer = assemble('prd_', 'z', randomHex(8));
+      const serverProducer = assemble('prd_', 'a', randomHex(8));
+      const tieProducer = assemble('prd_', 'm', randomHex(8));
+
+      const pageEvent = parseIngress(
+        {
+          id: newEventId(),
+          traceId,
+          spanId: newSpanId(),
+          kind: 'perf.longtask',
+          name: 'longtask',
+          startTime,
+          duration,
+          tier: 'browser',
+          attributes: { attribution: 'window', blockingTime: 0.5 },
+          status: 'unset',
+          producerId: pageProducer,
+          seq: 0,
+        },
+        'tie probe (page)',
+      );
+      const serverEvent = (producerId: string, seq: number, message: string) =>
+        parseIngress(
+          {
+            id: newEventId(),
+            traceId,
+            spanId: newSpanId(),
+            kind: 'log',
+            name: message,
+            startTime,
+            duration,
+            tier: 'server',
+            attributes: { 'log.level': 'info', 'log.message': message, 'logger.name': 'probe' },
+            status: 'unset',
+            producerId,
+            seq,
+          },
+          `tie probe (${message})`,
+        );
+      // Sent seq 1 before seq 0, and two events tied on everything but arrival.
+      const serverBatch = [
+        serverEvent(serverProducer, 1, 'second by seq'),
+        serverEvent(serverProducer, 0, 'first by seq'),
+        serverEvent(tieProducer, 7, 'tied, arrived first'),
+        serverEvent(tieProducer, 7, 'tied, arrived second'),
+      ];
+
+      expect(await relay([pageEvent])).toEqual([]);
+      const posted = await postIngest(serverToken, projectRoot, serverBatch);
+      expect(posted.json).toEqual({ accepted: serverBatch.length });
+
+      const read = () => {
+        const page = harness.repos.telemetry.listByTrace(sessionId, traceId, {
+          captureId: captureIdOf(),
+        });
+        if (isErr(page)) {
+          throw new Error(`listByTrace refused: ${page.error.message}`);
+        }
+        return page.value.rows;
+      };
+      const rows = read();
+      const byArrival = [...rows].sort((left, right) => left.ingestSeq - right.ingestSeq);
+      expect(byArrival.map((event) => event.id)).toEqual(
+        [pageEvent, ...serverBatch].map((e) => e.id),
+      );
+
+      const canonical = [...rows].sort(
+        (left, right) =>
+          left.startTime - right.startTime ||
+          (left.producerId < right.producerId ? -1 : left.producerId > right.producerId ? 1 : 0) ||
+          left.seq - right.seq ||
+          left.ingestSeq - right.ingestSeq,
+      );
+      expect(
+        rows.map((event) => event.id),
+        'the store reads the canonical order',
+      ).toEqual(canonical.map((event) => event.id));
+      expect(rows.map((event) => event.name)).toEqual([
+        'first by seq',
+        'second by seq',
+        'tied, arrived first',
+        'tied, arrived second',
+        'longtask',
+      ]);
+      expect(
+        read().map((event) => event.id),
+        'and reads it again identically',
+      ).toEqual(rows.map((event) => event.id));
+      for (const event of rows) {
+        expect(Object.is(event.startTime, startTime), `${event.id} startTime`).toBe(true);
+        expect(Object.is(event.duration, duration), `${event.id} duration`).toBe(true);
+      }
+    });
+  });
+
+  describe('attribution and refusals', () => {
+    it('refuses a batch naming another project, a descendant or a prefix sibling, storing nothing', async () => {
+      const { harness, projectRoot, serverToken } = current();
+      const other = await harness.copyFixtureProject();
+      const rowsBefore = tableRowCount();
+      const batch = freshCopies(SERVER_EVENTS);
+
+      for (const claimed of [other.root, `${projectRoot}/src`, `${projectRoot}-sibling`]) {
+        const posted = await postIngest(serverToken, claimed, batch);
+        expect(posted.status, `a batch claiming ${claimed} is an authorization refusal`).toBe(403);
+        expect(isRecord(posted.json) ? posted.json.code : undefined).toBe('PATH_OUTSIDE_PROJECT');
+      }
+      expect(tableRowCount()).toBe(rowsBefore);
+      for (const event of batch) {
+        expect(rawRow(event.id), `${event.id} was not stored`).toBeUndefined();
+      }
+    });
+
+    it('takes the scope from the credential, never the body: another project stores nothing in this capture', async () => {
+      const { harness } = current();
+      const other = await harness.copyFixtureProject();
+      const otherToken = harness.issueServerAgentCredential(other.root).token;
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+      const batch = freshCopies(SERVER_EVENTS);
+
+      // Self-consistent claim, but that project holds no capture: this session's
+      // open window is not reachable through a credential scoped elsewhere.
+      const posted = await postIngest(otherToken, other.root, batch);
+      expect(posted.status).toBe(202);
+      expect(posted.json).toEqual({ accepted: 0, rejected: batch.length });
+      expect(dropReasonsSince(mark)).toEqual(['no-active-capture']);
+      expect(tableRowCount()).toBe(rowsBefore);
+    });
+
+    it('drops, per event, a tier its producer may not report', async () => {
+      const { harness, projectRoot, serverToken } = current();
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+      const [forgedByPage] = freshCopies(SERVER_EVENTS.filter((event) => event.tier === 'db'));
+      const [forgedByServer] = freshCopies(BROWSER_EVENTS.slice(0, 1));
+      if (forgedByPage === undefined || forgedByServer === undefined) {
+        throw new Error('The batch holds no database-tier or browser-tier event to forge.');
+      }
+
+      expect(await relay([forgedByPage]), 'a page cannot report a database span').toEqual([]);
+      const posted = await postIngest(serverToken, projectRoot, [forgedByServer]);
+      expect(posted.json, 'a dev server cannot report a browser event').toEqual({
+        accepted: 0,
+        rejected: 1,
+      });
+
+      expect(tableRowCount()).toBe(rowsBefore);
+      expect(
+        summaryRecords(mark).map((record) => [record.fields.dropped, record.fields.persisted]),
+      ).toEqual([
+        [1, 0],
+        [1, 0],
+      ]);
+      expect(DROP_REASONS).toContain('tier-not-permitted');
+    });
+
+    it('refuses a batch over the transport ceiling on both transports, storing nothing', async () => {
+      const { projectRoot, serverToken } = current();
+      expect(MAX_INGEST_BATCH).toBeGreaterThan(0);
+      const rowsBefore = tableRowCount();
+      const oversize = (template: TelemetryEventIngress): TelemetryEventIngress[] =>
+        Array.from({ length: MAX_INGEST_BATCH + 1 }, (_, seq) => ({
+          ...template,
+          id: newEventId(),
+          spanId: newSpanId(),
+          seq,
+        }));
+      const [pageTemplate] = freshCopies(
+        BROWSER_EVENTS.filter((event) => event.kind === 'perf.longtask'),
+      );
+      const [serverTemplate] = freshCopies(
+        SERVER_EVENTS.filter((event) => event.kind === 'db.query'),
+      );
+      if (pageTemplate === undefined || serverTemplate === undefined) {
+        throw new Error('The batch holds no template event for the over-size cases.');
+      }
+
+      expect(await relay(oversize(pageTemplate)), 'the frame is refused whole').toEqual([
+        'PROTOCOL_INVALID_MESSAGE',
+      ]);
+      const posted = await postIngest(serverToken, projectRoot, oversize(serverTemplate));
+      expect(posted.status, 'the request is refused whole').toBe(400);
+      expect(isRecord(posted.json) ? posted.json.code : undefined).toBe('PROTOCOL_INVALID_MESSAGE');
+
+      expect(tableRowCount(), 'never truncated, never partially stored').toBe(rowsBefore);
+    });
+
+    it('drops a batch from a tab whose binding ended under no-binding, storing nothing', async () => {
+      const { harness, devtools } = current();
+      const unbind = devtools.send('session.unbind', { tabId: TAB_ID });
+      expect(await devtools.flush()).toBe(true);
+      expect(devtools.errorsFor(unbind.id)).toEqual([]);
+      const binding = harness.repos.sessions.getBindingByTab(TAB_ID);
+      expect(isErr(binding) ? 'unreadable' : binding.value, 'the binding is gone').toBeUndefined();
+
+      const rowsBefore = tableRowCount();
+      const mark = harness.logger.records.length;
+      const batch = freshCopies(BROWSER_EVENTS);
+
+      expect(await relay(batch)).toEqual([]);
+      expect(dropReasonsSince(mark)).toEqual(['no-binding']);
+      expect(dropRecords(mark).map((record) => record.fields.received)).toEqual([batch.length]);
+      expect(tableRowCount()).toBe(rowsBefore);
+    });
+
+    it('reports every drop as a count under the closed DROP_REASONS vocabulary, never as event content', () => {
+      const drops = dropRecords();
+      const observed = new Set(drops.map((record) => record.fields.reason));
+      expect([...observed].sort()).toEqual(['no-active-capture', 'no-binding']);
+
+      // Content a drop record must never carry: names, trace ids and every
+      // string value the batches held.
+      const content = [
+        ...new Set(
+          SUBSTITUTED_EVENTS.flatMap((event) => [
+            event.name,
+            event.traceId,
+            ...stringLeaves(event.attributes),
+          ]).filter((text) => text.length >= 8),
+        ),
+      ];
+      for (const record of drops) {
+        expect(isDropReason(record.fields.reason), record.line).toBe(true);
+        expect(DROP_REASONS).toContain(record.fields.reason);
+        expect(typeof record.fields.received, 'the drop is a count').toBe('number');
+        expect(
+          content.filter((text) => record.line.includes(text)),
+          'no event content',
+        ).toEqual([]);
+      }
+    });
+
+    it('leaves no substituted material anywhere after every path ran', () => {
+      expectNoSubstitutedMaterialAnywhere();
+    });
+  });
+});
