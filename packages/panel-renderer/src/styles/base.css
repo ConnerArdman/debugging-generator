@@ -231,6 +231,18 @@ body {
   scrollbar-color: var(--dg-border-strong) var(--dg-surface-base);
 }
 
+/* The document inset. The user-agent body margin is a length no token governs,
+ * and because it sits outside the `min-height: 100%` box above it made every
+ * document one margin taller than its viewport, so a panel whose content fits
+ * still showed a scrollbar. A token padding inside the border box replaces it:
+ * the inset comes from the spacing scale and the surface fits the viewport
+ * exactly. A host that composes its own body box (the VS Code webview) resets
+ * both declarations in its own stylesheet. */
+body {
+  margin: 0;
+  padding: var(--dg-space-3);
+}
+
 /* Code, statements, paths and numeric columns. The `font` shorthand resets
  * `font-variant`, so tabular figures are declared after it — that ordering is
  * required, not stylistic. */

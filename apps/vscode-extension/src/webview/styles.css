@@ -23,8 +23,9 @@
  * Restating any of those here would fork the design system, so what is left is
  * only what a VS Code webview specifically needs:
  *
- *   - the host's own body margin and padding, which `base.css` does not reset
- *     because it resets no `body` box at all;
+ *   - a `body` box of its own: the host injects a body margin and padding, and
+ *     `base.css` gives `body` the DevTools panel's token inset, and neither
+ *     belongs on this surface, which lays out its own spacing;
  *   - a definite height to hang `#root` and `.dgv-view` from, since `base.css`
  *     sets `min-block-size` rather than a definite `block-size` on `body`;
  *   - `overflow: hidden` on the document, so the single `PanelShell` viewport
