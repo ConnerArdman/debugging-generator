@@ -331,6 +331,16 @@ const DUPLICATE_GROUP_MIN_COUNT = 2;
 /** Renders with unchanged inputs before the pattern counts as present. */
 const UNCHANGED_RENDER_MIN_COUNT = 2;
 
+/**
+ * Context-triggered renders per own-state update of one component before that
+ * component is suggested as the publisher of the changing context value.
+ *
+ * Two is the smallest fan-out that is a cascade rather than a coincidence: each
+ * of the component's own updates was followed, on average, by at least two
+ * renders of consumers whose only changed input was a context value.
+ */
+const CONTEXT_PUBLISHER_MIN_FAN_OUT = 2;
+
 /** Statements of one shape before the repetition counts as a pattern. */
 const REPEATED_QUERY_MIN_COUNT = 2;
 
@@ -1933,6 +1943,10 @@ interface RenderView {
   readonly unchanged: number;
   /** Renders whose trigger could not be determined. */
   readonly unknownTrigger: number;
+  /** Renders triggered by a change of the component's own hook state. */
+  readonly stateTriggered: number;
+  /** Renders triggered by a change of a context value the component consumes. */
+  readonly contextTriggered: number;
 }
 
 /**
@@ -2004,7 +2018,10 @@ function readSpans(aggregates: JsonObject): readonly SpanView[] {
  * The two qualified counts are read separately and never conflated: an
  * undetermined trigger means one of the three conditions could not be
  * evaluated, which is not the same as having evaluated all three and found
- * nothing changed.
+ * nothing changed. The `state` and `context` members of the trigger histogram
+ * are read too, when the context carries one, because they are what tells a
+ * component that changed its own state apart from the consumers that merely
+ * re-rendered with it; a statistic without a histogram reads as zero for both.
  *
  * @param aggregates The capture-aggregate bag.
  * @returns The statistics, in the order the context carried them.
@@ -2017,6 +2034,7 @@ function readRenders(aggregates: JsonObject): readonly RenderView[] {
     if (count === undefined) {
       continue;
     }
+    const triggers = readObjectField(node, 'triggers', 'triggerCounts');
     renders.push({
       node,
       component: asString(readField(node, 'component', 'displayName', 'name')) ?? '',
@@ -2027,6 +2045,8 @@ function readRenders(aggregates: JsonObject): readonly RenderView[] {
         asCount(
           readField(node, 'renderTriggerUnknownCount', 'unknownTriggerCount', 'triggerUnknown'),
         ) ?? 0,
+      stateTriggered: asCount(triggers?.['state']) ?? 0,
+      contextTriggered: asCount(triggers?.['context']) ?? 0,
     });
   }
   return renders;
@@ -3975,6 +3995,41 @@ function factCandidates(
 }
 
 /**
+ * The component a capture's context-triggered renders most likely came from.
+ *
+ * A context value changes only when the component providing it renders with a
+ * new value, and a provider renders on its own schedule only when its own hook
+ * state changes. So when consumers re-rendered because a consumed context value
+ * changed, the component whose own-state updates were each followed by at
+ * least {@link CONTEXT_PUBLISHER_MIN_FAN_OUT} such renders is the likely
+ * publisher. Among several, the one with the most own-state updates wins, and
+ * the component name breaks a tie; only a statistic the capture located can be
+ * suggested, because the answer is a place to open.
+ *
+ * Counts only, never names: nothing here knows which components provide a
+ * context — the trigger histogram of each statistic is the whole input.
+ *
+ * @param renders The capture's render statistics.
+ * @returns The likely publisher, or `undefined` when the capture shows no
+ * context-triggered cascade.
+ */
+function contextPublisher(renders: readonly RenderView[]): RenderView | undefined {
+  const contextRenders = renders.reduce((total, render) => total + render.contextTriggered, 0);
+  return [...renders]
+    .filter(
+      (render) =>
+        render.stateTriggered > 0 &&
+        contextRenders >= render.stateTriggered * CONTEXT_PUBLISHER_MIN_FAN_OUT &&
+        readSourceLocation(render.node) !== undefined,
+    )
+    .sort((left, right) =>
+      left.stateTriggered === right.stateTriggered
+        ? compareStrings(left.component, right.component)
+        : right.stateTriggered - left.stateTriggered,
+    )[0];
+}
+
+/**
  * Detects the evidence patterns a capture's numbers form.
  *
  * Every detection is numeric: a duplicate group above its threshold, an
@@ -4016,7 +4071,8 @@ function causeDetections(
     });
   }
 
-  const unchanged = [...readRenders(aggregates)]
+  const renders = readRenders(aggregates);
+  const unchanged = [...renders]
     .filter((render) => render.unchanged >= UNCHANGED_RENDER_MIN_COUNT)
     .sort((left, right) =>
       left.unchanged === right.unchanged
@@ -4024,13 +4080,25 @@ function causeDetections(
         : right.unchanged - left.unchanged,
     )[0];
   if (unchanged !== undefined) {
-    const location = readSourceLocation(unchanged.node);
+    // The frame names the consumer whose inputs held; the location points at
+    // where the change came from when the capture shows one: a component whose
+    // own state updates fanned out into context-triggered renders elsewhere is
+    // the likely publisher of the value, and a developer fixes the publisher,
+    // not the consumer.
+    const publisher = contextPublisher(renders);
+    const location =
+      (publisher === undefined ? undefined : readSourceLocation(publisher.node)) ??
+      readSourceLocation(unchanged.node);
+    const references = [
+      ...evidenceOf(unchanged.node),
+      ...(publisher === undefined ? [] : evidenceOf(publisher.node)),
+    ];
     detections.push({
       pattern: 'unchanged-input-renders',
       component: unchanged.component,
       unchanged: unchanged.unchanged,
       steps: unchanged.unchanged - 1,
-      references: evidenceOf(unchanged.node),
+      references: [...new Set(references)],
       ...(location !== undefined ? { location } : {}),
     });
   }
@@ -4176,12 +4244,31 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
  *
  * The node types of a generated panel come from the node catalog the context
  * carries and from nowhere else. A catalog entry becomes a candidate only when
- * the capture reports material for a source that entry declares, which is what
- * makes two materially different captures produce materially different panels:
- * a latency capture populates the trace, span and query sources while a
- * rendering capture populates the render, component-tree and state-transition
- * ones, so the emitted node-type sets diverge without this module knowing
- * anything about either question.
+ * the capture reports material for a source that entry declares.
+ *
+ * Materiality alone does not make two panels differ, because a real capture
+ * populates nearly every source: every render event is also a span of the
+ * event log, every commit opens a trace, and a page with a ticking provider
+ * renders during a checkout as well as while idle. So the capture is read
+ * through one of two **evidence lenses**, chosen from its own numbers
+ * ({@link panelLens}):
+ *
+ * - the **timing** lens — traces, spans, requests and queries — for a capture
+ *   whose evidence crossed the network (it holds requests or queries), or
+ *   whose measured time is dominated by one operation while no render pattern
+ *   was found;
+ * - the **component** lens — renders, the component tree, state transitions,
+ *   the dependency graph and the event log — for a capture that rendered
+ *   without crossing the network.
+ *
+ * An entry is emitted only when its *primary* declared source belongs to the
+ * active lens, so a latency capture and a rendering capture compose disjoint
+ * visualization bodies (AAP §0.6.5) and share only the metric cards and the
+ * source link, whose content is lens-specific too. A detected pattern may
+ * admit one further source into the timing lens: duplicated requests bring in
+ * the render statistics of the components that issued them. None of this
+ * reads a question: the lens is a function of the capture's source counts and
+ * detected patterns.
  * ---------------------------------------------------------------------------------------------- */
 
 /** One node catalog entry, as the context declared it. */
@@ -4309,28 +4396,222 @@ function readNodeCatalog(root: JsonObject): readonly CatalogEntryView[] {
 }
 
 /**
+ * The evidence lens a panel is composed through; see the section comment.
+ */
+type PanelLens = 'timing' | 'component';
+
+/**
+ * The lens each known data source belongs to.
+ *
+ * The metrics source belongs to neither — the metric-card node is shared, and
+ * its *content* is what the lens selects ({@link METRIC_LENS}). A source this
+ * table does not know belongs to both, so a catalog that grows a source is
+ * still served by whichever lens is active instead of being silently dropped.
+ */
+const SOURCE_LENS: Readonly<Record<string, PanelLens>> = Object.freeze({
+  trace: 'timing',
+  spans: 'timing',
+  requests: 'timing',
+  queries: 'timing',
+  renders: 'component',
+  componentTree: 'component',
+  stateTransitions: 'component',
+  graph: 'component',
+  events: 'component',
+});
+
+/**
+ * The lens each computed metric belongs to, so the cards of a timing panel
+ * measure time and traffic and the cards of a component panel measure
+ * rendering and main-thread work (AAP §0.6.5: the four duration cards against
+ * `render_count`, `unchanged_render_count`, `render_trigger_unknown_count` and
+ * `blocking_time`). Keyed by {@link ComputedMetricId} and therefore total: a
+ * metric added to the computed tuple without a lens is a compile error.
+ */
+const METRIC_LENS: Readonly<Record<ComputedMetricId, PanelLens>> = Object.freeze({
+  total_duration: 'timing',
+  frontend_duration: 'timing',
+  backend_duration: 'timing',
+  database_duration: 'timing',
+  render_count: 'component',
+  unchanged_render_count: 'component',
+  render_trigger_unknown_count: 'component',
+  request_count: 'timing',
+  query_count: 'timing',
+  transferred_bytes: 'timing',
+  blocking_time: 'component',
+  duplicate_request_count: 'timing',
+  long_task_count: 'component',
+  error_count: 'timing',
+});
+
+/**
+ * Sources a detected pattern admits into the lens it is read through, beyond
+ * the lens's own. Duplicated requests are issued by components, so their panel
+ * also shows the render statistics of the initiators (AAP §0.6.5, third case).
+ * Keyed by {@link EvidencePattern}, so a new pattern without an entry is a
+ * compile error.
+ */
+const PATTERN_ADMITTED_SOURCES: Readonly<Record<EvidencePattern, readonly string[]>> =
+  Object.freeze({
+    'duplicate-requests': ['renders'],
+    'unchanged-input-renders': [],
+    'dominant-span': [],
+    'repeated-query-shape': [],
+  });
+
+/** The aggregate fields a leaf's location is read from under each lens, in probe order. */
+const LENS_LOCATION_FIELDS: Readonly<Record<PanelLens, readonly string[]>> = Object.freeze({
+  timing: ['spans', 'topSpans', 'queries', 'requests'],
+  component: ['renders', 'stateTransitions'],
+});
+
+/**
+ * The lens a capture is read through.
+ *
+ * The component lens when the capture rendered — its render, component-tree
+ * or state-transition source is material — without crossing the network — no
+ * request and no query is material — and without one operation dominating its
+ * measured time while no render pattern was found; the timing lens otherwise,
+ * including for a capture with no material at all.
+ *
+ * @param counts The per-source counts of the context.
+ * @param patterns The evidence patterns the capture exhibits.
+ * @returns The lens.
+ */
+function panelLens(
+  counts: ReadonlyMap<string, number>,
+  patterns: readonly EvidencePattern[],
+): PanelLens {
+  const crossedNetwork =
+    isMaterialSource('requests', counts) || isMaterialSource('queries', counts);
+  const rendered =
+    isMaterialSource('renders', counts) ||
+    isMaterialSource('componentTree', counts) ||
+    isMaterialSource('stateTransitions', counts);
+  const timingDominates =
+    patterns.includes('dominant-span') && !patterns.includes('unchanged-input-renders');
+  return rendered && !crossedNetwork && !timingDominates ? 'component' : 'timing';
+}
+
+/**
+ * Whether a data source may feed a node under the active lens.
+ *
+ * @param source A data source name from a catalog entry.
+ * @param lens The active lens.
+ * @param admitted Sources the detected patterns admit in addition.
+ * @returns `true` when the source is the lens's own, admitted, or unknown here.
+ */
+function lensAdmits(source: string, lens: PanelLens, admitted: ReadonlySet<string>): boolean {
+  const owner = SOURCE_LENS[source];
+  return owner === undefined || owner === lens || admitted.has(source);
+}
+
+/**
+ * The key two locations share when they name the same line of the same file.
+ *
+ * @param location A validated location.
+ * @returns `file:line`.
+ */
+function locationLineKey(location: SourceLocation): string {
+  return `${location.file}:${String(location.line)}`;
+}
+
+/**
+ * Event kinds that record component work rather than time spent elsewhere.
+ *
+ * A capture's slowest-operation list is kind-indifferent, so it can hold a
+ * render — a provider's render measures its whole subtree and is often the
+ * longest one. Such a row is evidence for the component lens, never timing
+ * evidence, which is what {@link timingLocatedNodes} excludes it for.
+ */
+const COMPONENT_WORK_KINDS: ReadonlySet<string> = new Set(['render', 'commit', 'state']);
+
+/**
+ * The located nodes of the timing lens's aggregates, in probe order: every
+ * operation, query and request the context carries a location for, except
+ * operations of a {@link COMPONENT_WORK_KINDS} kind.
+ *
+ * @param aggregates The capture-aggregate bag.
+ * @returns The locations, first probed first.
+ */
+function timingLocatedNodes(aggregates: JsonObject): readonly SourceLocation[] {
+  const locations: SourceLocation[] = [];
+  for (const field of LENS_LOCATION_FIELDS.timing) {
+    for (const node of asObjectArray(aggregates[field]) ?? []) {
+      const kind = asString(node.kind);
+      if (kind !== undefined && COMPONENT_WORK_KINDS.has(kind)) {
+        continue;
+      }
+      const location = readSourceLocation(node);
+      if (location !== undefined) {
+        locations.push(location);
+      }
+    }
+  }
+  return locations;
+}
+
+/**
+ * The lines the capture's timing evidence is located at.
+ *
+ * @param aggregates The capture-aggregate bag.
+ * @returns The `file:line` keys of {@link timingLocatedNodes}.
+ */
+function timingEvidenceLines(aggregates: JsonObject): ReadonlySet<string> {
+  return new Set(timingLocatedNodes(aggregates).map(locationLineKey));
+}
+
+/**
+ * The lens a suggested location belongs to.
+ *
+ * A location the capture's timing evidence corroborates — a located
+ * operation, query or request sits on the same line — is about timing; any
+ * other suggestion is about what the capture rendered. Corroboration rather
+ * than a name match, because the context lists only the most-rendered
+ * components while a cause may point at a component that rendered rarely —
+ * the publisher of a context value, for instance.
+ *
+ * @param location The suggested location.
+ * @param timingLines The lines {@link timingEvidenceLines} reports.
+ * @returns The lens.
+ */
+function locationLens(location: SourceLocation, timingLines: ReadonlySet<string>): PanelLens {
+  return timingLines.has(locationLineKey(location)) ? 'timing' : 'component';
+}
+
+/**
  * The location a leaf node would point at, when the context supplies a usable
- * one.
+ * one for the active lens.
  *
  * The analysis is asked first, because a location it suggested has already been
- * chosen as the most useful place to send a developer; failing that, the
- * aggregates are read in a fixed order so the answer does not depend on which
- * bag happened to be probed first.
+ * chosen as the most useful place to send a developer — but only a location of
+ * the lens the panel is composed through, so a latency panel never sends the
+ * developer to a component that merely re-rendered during the interaction and a
+ * rendering panel never to a query. Failing that, the lens's own aggregates are
+ * read in a fixed order so the answer does not depend on which bag happened to
+ * be probed first.
  *
  * @param root The structured context.
+ * @param lens The active lens.
  * @returns The validated location, or `undefined`.
  */
-function readSuggestedLocation(root: JsonObject): SourceLocation | undefined {
+function readSuggestedLocation(root: JsonObject, lens: PanelLens): SourceLocation | undefined {
+  const aggregates = aggregatesBag(root);
+  const timingLines = timingEvidenceLines(aggregates);
+
   const analysis = analysisBag(root);
   for (const cause of asObjectArray(readField(analysis ?? root, 'likelyCauses', 'causes')) ?? []) {
     const location = readSourceLocation(cause);
-    if (location !== undefined) {
+    if (location !== undefined && locationLens(location, timingLines) === lens) {
       return location;
     }
   }
 
-  const aggregates = aggregatesBag(root);
-  for (const field of ['spans', 'topSpans', 'renders', 'requests', 'queries', 'stateTransitions']) {
+  if (lens === 'timing') {
+    return timingLocatedNodes(aggregates)[0];
+  }
+  for (const field of LENS_LOCATION_FIELDS.component) {
     for (const node of asObjectArray(aggregates[field]) ?? []) {
       const location = readSourceLocation(node);
       if (location !== undefined) {
@@ -4368,11 +4649,12 @@ const PATTERN_METRIC_IDS: Readonly<Record<EvidencePattern, readonly ComputedMetr
 /**
  * The metric ids a card node should name.
  *
- * The first {@link MAX_METRIC_CARDS} reported ids of {@link COMPUTED_METRIC_IDS}
+ * Only the active lens's metrics ({@link METRIC_LENS}) are candidates. The
+ * first {@link MAX_METRIC_CARDS} reported ones of {@link COMPUTED_METRIC_IDS}
  * — intersected with the entry's own constraint where it declares one — are
- * the headline row, in the tuple's order. Every further reported id that
- * quantifies an evidence pattern the capture exhibits follows, still in the
- * tuple's order, so a finding is never crowded out of its own cards by the
+ * the headline row, in the tuple's order. Every further reported candidate
+ * that quantifies an evidence pattern the capture exhibits follows, still in
+ * the tuple's order, so a finding is never crowded out of its own cards by the
  * headline: a capture of duplicated requests shows its request counts, one of
  * unchanged renders its render counts, whatever the tuple puts first. Identical
  * captures give identical rows, and a metric the capture did not report is
@@ -4381,16 +4663,21 @@ const PATTERN_METRIC_IDS: Readonly<Record<EvidencePattern, readonly ComputedMetr
  * @param entry The catalog entry for the card node.
  * @param reading The metric reading.
  * @param patterns The evidence patterns the capture exhibits.
+ * @param lens The active lens.
  * @returns The metric ids.
  */
 function metricCardIds(
   entry: CatalogEntryView,
   reading: MetricReading,
   patterns: readonly EvidencePattern[],
+  lens: PanelLens,
 ): readonly string[] {
   const permitted = new Set(entry.metrics);
   const reported = COMPUTED_METRIC_IDS.filter(
-    (id) => reading.values.has(id) && (permitted.size === 0 || permitted.has(id)),
+    (id) =>
+      METRIC_LENS[id] === lens &&
+      reading.values.has(id) &&
+      (permitted.size === 0 || permitted.has(id)),
   );
   const chosen = new Set<string>(reported.slice(0, MAX_METRIC_CARDS));
   const quantifying = new Set<string>(patterns.flatMap((pattern) => PATTERN_METRIC_IDS[pattern]));
@@ -4438,8 +4725,9 @@ function filterKindsFor(entry: CatalogEntryView, root: JsonObject): readonly str
  * the panel's non-evidentiary headline, and a string can never become an
  * observed fact — the panel's facts and causes are copied by the panel
  * normaliser from the validated analysis, which is what keeps the evidence rule
- * intact across the boundary. The layout is the catalog entries whose declared
- * sources the capture has material for, in the catalog's own order.
+ * intact across the boundary. The layout is the catalog entries of the
+ * capture's evidence lens ({@link panelLens}) whose declared sources the
+ * capture has material for, in the catalog's own order.
  *
  * @param input The structured context of a panel-generation request.
  * @returns The specification in its authoring shape, or `undefined` when the
@@ -4460,6 +4748,8 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   // The patterns the capture's numbers form, detected exactly as the analysis
   // detects them, so the metric cards quantify what the analysis explains.
   const patterns = causeDetections(root, spans, totalMs).map((detection) => detection.pattern);
+  const lens = panelLens(counts, patterns);
+  const admitted = new Set(patterns.flatMap((pattern) => PATTERN_ADMITTED_SOURCES[pattern]));
 
   const catalog = [...readNodeCatalog(root)].sort((left, right) =>
     left.index === right.index ? compareStrings(left.type, right.type) : left.index - right.index,
@@ -4475,10 +4765,26 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       continue;
     }
 
-    const source = entry.sources.find((candidate) => isMaterialSource(candidate, counts));
+    // An entry belongs to the lens of the source it is designed around — its
+    // first declared one — and reads only sources the lens admits, so a view
+    // whose fallback source happens to be populated (a span table over the
+    // event log, say) cannot cross into the other lens's panel.
+    const primary = entry.sources[0];
+    if (
+      primary !== undefined &&
+      primary !== METRICS_SOURCE &&
+      !lensAdmits(primary, lens, admitted)
+    ) {
+      continue;
+    }
+    const source = entry.sources.find(
+      (candidate) =>
+        isMaterialSource(candidate, counts) &&
+        (candidate === METRICS_SOURCE || lensAdmits(candidate, lens, admitted)),
+    );
 
     if (source === METRICS_SOURCE) {
-      const metrics = metricCardIds(entry, reading, patterns);
+      const metrics = metricCardIds(entry, reading, patterns, lens);
       if (metrics.length === 0) {
         continue;
       }
@@ -4491,7 +4797,7 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
       if (!entry.wantsLocation) {
         continue;
       }
-      const location = readSuggestedLocation(root);
+      const location = readSuggestedLocation(root, lens);
       if (location === undefined) {
         continue;
       }
@@ -4518,10 +4824,11 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   }
 
   const material = [...counts.keys()].some((source) => isMaterialSource(source, counts));
+  // The headline counts what the cards measure: the active lens's counts.
   const countedNouns: CountedNoun[] = [];
   for (const id of COMPUTED_METRIC_IDS) {
     const value = reading.values.get(id);
-    if (value === undefined || !Object.hasOwn(METRIC_COUNT_NOUNS, id)) {
+    if (value === undefined || METRIC_LENS[id] !== lens || !Object.hasOwn(METRIC_COUNT_NOUNS, id)) {
       continue;
     }
     if (countedNouns.length >= MAX_METRIC_CARDS) {

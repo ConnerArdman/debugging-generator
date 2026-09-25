@@ -916,7 +916,17 @@ export async function revealLocationInEditor(
   // that cannot be scrolled is an editor the developer is not looking at the
   // right part of, and `RevealOutcome.editor` would hand back a dead one — so
   // it fails the reveal instead of being logged and passed over.
+  //
+  // The selection is assigned again here, explicitly, because
+  // `TextDocumentShowOptions.selection` is typed as a `Range`: the editor
+  // applies it with the anchor at the range's start and the cursor at its
+  // end, discarding the direction `deriveSelection` gave it. For an `endLine`
+  // selection that would leave the cursor at the end of the symbol's range
+  // rather than on the requested line and column, and `RevealOutcome.selection`
+  // would disagree with `editor.selection`. Assigning the `Selection` itself
+  // keeps its anchor and active positions exactly as derived.
   const revealed = tryCatch(() => {
+    editor.selection = selection;
     editor.revealRange(
       selection,
       options?.revealType ?? vscode.TextEditorRevealType.InCenterIfOutsideViewport,

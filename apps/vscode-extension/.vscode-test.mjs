@@ -698,6 +698,11 @@ export default defineConfig({
     // passes it as well; it is stated here so the requirement does not depend
     // on that implementation detail.
     '--no-sandbox',
+    // Containers default `/dev/shm` to 64 MB, which Chromium's renderer
+    // outgrows mid-run and then dies ("renderer process gone … code: 133"),
+    // failing the suite at random. Shared memory then goes to the temp
+    // directory instead, as it must for any Chromium inside a container.
+    '--disable-dev-shm-usage',
     // No usage data leaves the machine during a test run.
     '--disable-telemetry',
     // A fresh profile per run, inside the throwaway directory, instead of the

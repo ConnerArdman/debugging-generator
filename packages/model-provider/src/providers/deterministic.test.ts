@@ -1918,6 +1918,458 @@ describe('property 4: generated panels genuinely differ between two captures', (
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * property 4b — panels differ for service-shaped captures, which populate nearly every source
+ *
+ * The fixtures of property 4 are idealised: the latency capture carries no
+ * render material and the render capture no trace. A capture the service
+ * summarises is never that clean. `apps/local-service/src/panels/generate.ts`
+ * counts the kind-indifferent span and event sources as the whole event count
+ * and the trace source as the trace count, so a capture that only rendered
+ * still reports traces, spans, events and a graph; and a page with a ticking
+ * provider renders during a checkout too. The panels must still differ as AAP
+ * §0.6.5 fixes: disjoint visualization bodies, lens-specific cards and links.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The component whose own state updates publish the changing context value. */
+const PUBLISHER_FILE = 'src/widgets/tally-clock.tsx';
+const PUBLISHER_SYMBOL = 'TallyClock';
+
+/** A leaf component that re-renders with its parent, inputs unchanged. */
+const BADGE_FILE = 'src/widgets/tally-badge.tsx';
+const BADGE_SYMBOL = 'TallyBadge';
+
+/** The evidence of the publisher's own-state renders and of the badge's renders. */
+const PUBLISHER_EVENT = 'ev-clock-01';
+const BADGE_EVENT = 'ev-badge-01';
+
+/**
+ * The node catalog as the service hands it over: the real catalog's fallback
+ * sources included, so a span table can read the event log and a waterfall the
+ * request aggregate when their primary source is empty.
+ */
+const SERVICE_NODE_CATALOG: readonly JsonObject[] = NODE_CATALOG.map((entry) => {
+  if (entry.type === 'table') {
+    return { ...entry, sources: ['spans', 'events'] };
+  }
+  if (entry.type === 'waterfall') {
+    return { ...entry, sources: ['spans', 'requests'] };
+  }
+  return entry;
+});
+
+/** A trigger histogram with every classification present. */
+function triggerHistogram(counts: Partial<Record<string, number>>): JsonObject {
+  return {
+    props: counts.props ?? 0,
+    state: counts.state ?? 0,
+    context: counts.context ?? 0,
+    unchanged: counts.unchanged ?? 0,
+    unknown: counts.unknown ?? 0,
+  };
+}
+
+/** Metric values in the service's list carrier. */
+function metricList(values: Readonly<Record<string, number>>): JsonValue {
+  return Object.entries(values).map(([id, value]) => ({ id, value }));
+}
+
+/**
+ * A capture of an idle page that renders on its own schedule, shaped as the
+ * service's panel context: every kind-indifferent source populated, no request
+ * and no query, and the analysis's cause pointing at the publisher.
+ */
+function serviceRenderPanelInput(): JsonObject {
+  return {
+    analysis: {
+      observed: [
+        { statement: 'TallyTile rendered 480 times.', evidence: [{ eventId: RENDER_EVENT }] },
+      ],
+      likelyCauses: [
+        {
+          statement: 'Renders with unchanged inputs follow a context value that changes.',
+          evidence: [{ eventId: BADGE_EVENT }],
+          confidence: 'high',
+          suggestedLocation: {
+            ...sourceLocation(PUBLISHER_FILE, 12, 3, 'code-graph'),
+            symbol: PUBLISHER_SYMBOL,
+          },
+        },
+      ],
+    },
+    nodeCatalog: [...SERVICE_NODE_CATALOG],
+    populatedSources: {
+      trace: 6,
+      spans: 900,
+      events: 900,
+      renders: 886,
+      componentTree: 886,
+      requests: 0,
+      queries: 0,
+      stateTransitions: 0,
+      graph: 900,
+      metrics: 10,
+    },
+    capture: {
+      primaryTraceId: TRACE_ID,
+      traceCount: 6,
+      eventCount: 900,
+      kindCounts: { render: 880, commit: 6, navigation: 1 },
+      spans: [
+        { name: 'navigation', durationMs: 600, tier: 'browser', kind: 'navigation' },
+        // A provider's render measures its whole subtree, so it is among the
+        // slowest rows — and it is component work, not timing evidence.
+        {
+          name: PUBLISHER_SYMBOL,
+          durationMs: 40,
+          tier: 'browser',
+          kind: 'render',
+          source: sourceLocation(PUBLISHER_FILE, 12, 3, 'code-graph'),
+        },
+      ],
+      renders: [
+        {
+          component: TILE_SYMBOL,
+          renderCount: 480,
+          unchangedRenderCount: 0,
+          unknownTriggerCount: 0,
+          triggers: triggerHistogram({ context: 480 }),
+        },
+        {
+          component: BADGE_SYMBOL,
+          renderCount: 400,
+          unchangedRenderCount: 400,
+          unknownTriggerCount: 0,
+          triggers: triggerHistogram({ unchanged: 400 }),
+        },
+      ],
+      requests: [],
+      queries: [],
+      metrics: metricList({
+        total_duration: 6000,
+        frontend_duration: 700,
+        backend_duration: 0,
+        database_duration: 0,
+        render_count: 886,
+        unchanged_render_count: 400,
+        render_trigger_unknown_count: 0,
+        transferred_bytes: 20000,
+        blocking_time: 12,
+        long_task_count: 1,
+      }),
+    },
+  };
+}
+
+/** How the service-shaped latency capture may be varied. */
+interface ServiceLatencyOptions {
+  /** Occurrences of the one request group; two or more is a duplicate group. */
+  readonly requestCount?: number;
+}
+
+/**
+ * A cross-tier interaction on a page that also renders on a schedule, shaped
+ * as the service's panel context: request and query material, render material
+ * with unchanged-input renders, and an analysis whose *first* cause points at
+ * a re-rendered component while a later one is corroborated by a located span.
+ */
+function serviceLatencyPanelInput(options: ServiceLatencyOptions = {}): JsonObject {
+  const requests = options.requestCount ?? 1;
+  return {
+    analysis: {
+      observed: [{ statement: 'The route took 1300 ms.', evidence: [{ eventId: HANDLER_EVENT }] }],
+      likelyCauses: [
+        {
+          statement: 'Renders with unchanged inputs follow a context value that changes.',
+          evidence: [{ eventId: BADGE_EVENT }],
+          confidence: 'high',
+          suggestedLocation: {
+            ...sourceLocation(BADGE_FILE, 30, 3, 'code-graph'),
+            symbol: BADGE_SYMBOL,
+          },
+        },
+        {
+          statement: 'One statement covers most of the interaction.',
+          evidence: [{ eventId: SCAN_EVENT }],
+          confidence: 'medium',
+          suggestedLocation: sourceLocation(STORE_FILE, 42, 7, 'code-graph'),
+        },
+      ],
+    },
+    nodeCatalog: [...SERVICE_NODE_CATALOG],
+    populatedSources: {
+      trace: 4,
+      spans: 400,
+      events: 400,
+      renders: 150,
+      componentTree: 150,
+      requests,
+      queries: 12,
+      stateTransitions: 0,
+      graph: 400,
+      metrics: 12,
+    },
+    capture: {
+      primaryTraceId: TRACE_ID,
+      traceCount: 4,
+      eventCount: 400,
+      kindCounts: {
+        interaction: 1,
+        fetch: requests,
+        'http.server': 1,
+        'db.query': 12,
+        render: 150,
+      },
+      spans: [
+        {
+          name: 'POST /tally',
+          durationMs: 1300,
+          tier: 'server',
+          kind: 'http.server',
+          source: sourceLocation(ROUTE_FILE, 9, 1, 'route-map'),
+        },
+        {
+          name: 'SELECT tally_rows',
+          durationMs: 640,
+          tier: 'db',
+          kind: 'db.query',
+          source: sourceLocation(STORE_FILE, 42, 7, 'code-graph'),
+        },
+        // A render at the first cause's own line corroborates nothing about timing.
+        {
+          name: BADGE_SYMBOL,
+          durationMs: 25,
+          tier: 'browser',
+          kind: 'render',
+          source: sourceLocation(BADGE_FILE, 30, 3, 'code-graph'),
+        },
+      ],
+      renders: [
+        {
+          component: BADGE_SYMBOL,
+          renderCount: 150,
+          unchangedRenderCount: 150,
+          unknownTriggerCount: 0,
+          triggers: triggerHistogram({ unchanged: 150 }),
+        },
+      ],
+      requests: [{ method: 'POST', url: '/tally', count: requests, duplicateCount: requests - 1 }],
+      queries: [{ statement: 'SELECT id FROM tally_rows WHERE bucket = $1', executionCount: 12 }],
+      metrics: metricList({
+        total_duration: 2000,
+        frontend_duration: 200,
+        backend_duration: 1300,
+        database_duration: 640,
+        render_count: 150,
+        unchanged_render_count: 150,
+        render_trigger_unknown_count: 0,
+        request_count: requests,
+        query_count: 12,
+        transferred_bytes: 4000,
+        blocking_time: 30,
+        long_task_count: 1,
+      }),
+    },
+  };
+}
+
+/** The render-side and duration-side metric ids AAP §0.6.5 assigns to the two panels. */
+const RENDER_CARD_IDS: readonly string[] = [
+  'render_count',
+  'unchanged_render_count',
+  'render_trigger_unknown_count',
+  'blocking_time',
+];
+const DURATION_CARD_IDS: readonly string[] = [
+  'total_duration',
+  'frontend_duration',
+  'backend_duration',
+  'database_duration',
+];
+
+/** The visualization bodies of a component-lens panel, and of a timing-lens one. */
+const COMPONENT_BODIES: readonly string[] = [
+  'renderTable',
+  'componentTree',
+  'stateTransitions',
+  'dependencyGraph',
+  'eventLog',
+];
+const TIMING_BODIES: readonly string[] = [
+  'timeline',
+  'waterfall',
+  'flame',
+  'table',
+  'requestTable',
+  'queryTable',
+];
+
+/** The `file` of a panel's source-link leaf, or `undefined` when it has none. */
+function sourceLinkFile(answer: Record<string, unknown>): unknown {
+  const link = layoutNodes(answer).find((node) => node.type === 'sourceLink');
+  return link === undefined ? undefined : asObject(link.location).file;
+}
+
+describe('property 4b: service-shaped captures still compose disjoint panels', () => {
+  it('reads a capture that rendered without crossing the network through the component lens', async () => {
+    const types = layoutTypes(await answerFor('generate-panel', serviceRenderPanelInput()));
+
+    for (const body of ['renderTable', 'componentTree', 'dependencyGraph', 'eventLog']) {
+      expect(types).toContain(body);
+    }
+    for (const body of TIMING_BODIES) {
+      expect(types).not.toContain(body);
+    }
+    // No state transition was captured, so no empty viewer is laid out for one.
+    expect(types).not.toContain('stateTransitions');
+  });
+
+  it('reads a cross-tier capture that also rendered through the timing lens', async () => {
+    const types = layoutTypes(await answerFor('generate-panel', serviceLatencyPanelInput()));
+
+    for (const body of ['timeline', 'waterfall', 'flame', 'table', 'requestTable', 'queryTable']) {
+      expect(types).toContain(body);
+    }
+    for (const body of COMPONENT_BODIES) {
+      expect(types).not.toContain(body);
+    }
+  });
+
+  it('overlaps the two panels only in the permitted shared nodes', async () => {
+    const renders = new Set(
+      layoutTypes(await answerFor('generate-panel', serviceRenderPanelInput())),
+    );
+    const latency = new Set(
+      layoutTypes(await answerFor('generate-panel', serviceLatencyPanelInput())),
+    );
+
+    const shared = [...renders].filter((type) => latency.has(type)).sort();
+    expect(shared).toEqual([...SHAREABLE_NODE_TYPES].sort());
+  });
+
+  it('selects disjoint metric cards: render and main-thread counts against durations and traffic', async () => {
+    const renders = metricCardIds(await answerFor('generate-panel', serviceRenderPanelInput()));
+    const latency = metricCardIds(await answerFor('generate-panel', serviceLatencyPanelInput()));
+
+    for (const id of RENDER_CARD_IDS) {
+      expect(renders).toContain(id);
+      expect(latency).not.toContain(id);
+    }
+    for (const id of DURATION_CARD_IDS) {
+      expect(latency).toContain(id);
+      expect(renders).not.toContain(id);
+    }
+    expect(renders.filter((id) => latency.includes(id))).toEqual([]);
+  });
+
+  it('points each source link at a location of its own lens', async () => {
+    const renders = await answerFor('generate-panel', serviceRenderPanelInput());
+    const latency = await answerFor('generate-panel', serviceLatencyPanelInput());
+
+    // The render panel keeps the analysis's suggestion: nothing timing-related
+    // corroborates the publisher, and that is where the change comes from.
+    expect(sourceLinkFile(renders)).toBe(PUBLISHER_FILE);
+    // The latency panel skips the first cause — a component that merely
+    // re-rendered — for the one a located span corroborates.
+    expect(sourceLinkFile(latency)).toBe(STORE_FILE);
+  });
+
+  it('admits the initiators of duplicated requests into a timing panel', async () => {
+    const single = layoutTypes(await answerFor('generate-panel', serviceLatencyPanelInput()));
+    const duplicated = layoutTypes(
+      await answerFor('generate-panel', serviceLatencyPanelInput({ requestCount: 3 })),
+    );
+
+    expect(single).not.toContain('renderTable');
+    expect(duplicated).toContain('renderTable');
+    expect(duplicated).toContain('requestTable');
+    expect(duplicated).not.toContain('componentTree');
+  });
+});
+
+/** How the cascade analysis context may be varied. */
+interface CascadeOptions {
+  /** Drops the consumers' context-triggered renders, so there is no cascade to explain. */
+  readonly withoutContextRenders?: boolean;
+}
+
+/**
+ * The analysis context of an idle page: a leaf re-rendering with unchanged
+ * inputs, a consumer re-rendering on a context change, and the component whose
+ * own-state updates preceded both.
+ */
+function cascadeAnalyzeInput(options: CascadeOptions = {}): JsonObject {
+  const contextRenders = options.withoutContextRenders === true ? 0 : 480;
+  return {
+    aggregates: {
+      totalDurationMs: 6000,
+      renders: [
+        {
+          component: BADGE_SYMBOL,
+          renderCount: 400,
+          unchangedRenderCount: 400,
+          renderTriggerUnknownCount: 0,
+          triggers: triggerHistogram({ unchanged: 400 }),
+          evidence: [BADGE_EVENT],
+          source: { ...sourceLocation(BADGE_FILE, 30, 3, 'code-graph'), symbol: BADGE_SYMBOL },
+        },
+        {
+          component: TILE_SYMBOL,
+          renderCount: 480,
+          unchangedRenderCount: 0,
+          renderTriggerUnknownCount: 0,
+          triggers: triggerHistogram({ context: contextRenders, props: 480 - contextRenders }),
+          evidence: [RENDER_EVENT],
+          source: sourceLocation(TILE_FILE, 18, 3, 'react-owner'),
+        },
+        {
+          component: PUBLISHER_SYMBOL,
+          renderCount: 6,
+          unchangedRenderCount: 0,
+          renderTriggerUnknownCount: 0,
+          triggers: triggerHistogram({ state: 6 }),
+          evidence: [PUBLISHER_EVENT],
+          source: {
+            ...sourceLocation(PUBLISHER_FILE, 12, 3, 'code-graph'),
+            symbol: PUBLISHER_SYMBOL,
+          },
+        },
+      ],
+      metrics: { total_duration: 6000, render_count: 886, unchanged_render_count: 400 },
+    },
+  };
+}
+
+/** The unchanged-input render cause of an analysis: the one citing the badge's renders. */
+function unchangedRenderCause(analysis: Record<string, unknown>): Record<string, unknown> {
+  const cause = asArray(analysis.likelyCauses).find((entry) =>
+    citedEvidence(entry).includes(BADGE_EVENT),
+  );
+  expect(cause).toBeDefined();
+  return asObject(cause);
+}
+
+describe('the unchanged-input render cause points at the publisher of a changing context', () => {
+  it('suggests the component whose own-state updates fanned out into context-triggered renders', async () => {
+    const cause = unchangedRenderCause(await answerFor('analyze', cascadeAnalyzeInput()));
+
+    // The sentence still names the consumer whose inputs held.
+    expect(asString(cause.statement)).toContain(BADGE_SYMBOL);
+    expect(asObject(cause.suggestedLocation).file).toBe(PUBLISHER_FILE);
+    // The publisher's own renders are cited next to the consumer's.
+    expect(citedEvidence(cause)).toContain(PUBLISHER_EVENT);
+  });
+
+  it('keeps the consumer as the location when no context-triggered render was captured', async () => {
+    const cause = unchangedRenderCause(
+      await answerFor('analyze', cascadeAnalyzeInput({ withoutContextRenders: true })),
+    );
+
+    expect(asObject(cause.suggestedLocation).file).toBe(BADGE_FILE);
+    expect(citedEvidence(cause)).not.toContain(PUBLISHER_EVENT);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * service-shaped aggregates
  *
  * The fixtures above state a request group's evidence on the group itself. The
