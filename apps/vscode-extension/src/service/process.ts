@@ -1042,6 +1042,26 @@ export interface ServiceListenAddress {
 const IPV4_LOOPBACK = /^127(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 
 /**
+ * The "bad ports" of the WHATWG Fetch Standard's port-blocking rule: a
+ * `fetch()` to one of them fails with `bad port` before any connection is
+ * attempted. The extension reaches the service only through `fetch` — the
+ * protocol `HttpClient` behind the health probe and every route — so a service
+ * listening on one of these ports could never answer this window: the start
+ * would end in the start-up timeout with a child nobody can talk to.
+ *
+ * The list matches the one Node 24's bundled undici enforces, which refuses
+ * every port listed here (port `0` is not a bad port; the range check in
+ * {@link parseLoopbackServiceUrl} already refuses it).
+ */
+const FETCH_BLOCKED_PORTS: ReadonlySet<number> = new Set([
+  1, 7, 9, 11, 13, 15, 17, 19, 20, 21, 22, 23, 25, 37, 42, 43, 53, 69, 77, 79, 87, 95, 101, 102,
+  103, 104, 109, 110, 111, 113, 115, 117, 119, 123, 135, 137, 139, 143, 161, 179, 389, 427, 465,
+  512, 513, 514, 515, 526, 530, 531, 532, 540, 548, 554, 556, 563, 587, 601, 636, 989, 990, 993,
+  995, 1719, 1720, 1723, 2049, 3659, 4045, 4190, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668,
+  6669, 6679, 6697, 10080,
+]);
+
+/**
  * Derives the service's listen address from `debuggen.serviceUrl`, so the
  * spawned service binds exactly the address the health probe and the client
  * reach.
@@ -1049,7 +1069,11 @@ const IPV4_LOOPBACK = /^127(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
  * Only a plain-HTTP loopback URL can name a service this module starts: the
  * service speaks HTTP on a loopback interface (its configuration refuses any
  * other bind, AAP §0.5.6). A URL without an explicit port means the scheme's
- * port, 80, which is what every client of that URL would connect to.
+ * port, 80, which is what every client of that URL would connect to. A port
+ * the Fetch Standard blocks ({@link FETCH_BLOCKED_PORTS}) is refused too:
+ * whether the operating system would let the service bind it (a root account,
+ * a container with `net.ipv4.ip_unprivileged_port_start=0`) or not, the
+ * extension's own client could never reach it, so nothing is spawned for it.
  *
  * The rejected value is never echoed: a URL can carry credentials.
  *
@@ -1059,6 +1083,26 @@ const IPV4_LOOPBACK = /^127(?:\.(?:25[0-5]|2[0-4]\d|1?\d?\d)){3}$/;
 export function parseServiceListenAddress(
   serviceUrl: string,
 ): Result<ServiceListenAddress, DebuggenError> {
+  const address = parseLoopbackServiceUrl(serviceUrl);
+  if (isOk(address) && FETCH_BLOCKED_PORTS.has(address.value.port)) {
+    return err(
+      invalidServiceUrl(
+        'its port is one the Fetch standard blocks, so this extension could never reach a service listening there',
+      ),
+    );
+  }
+  return address;
+}
+
+/**
+ * The plain-HTTP loopback address a URL names, without the reachability rule
+ * {@link parseServiceListenAddress} adds: what a message may display as the
+ * URL's origin, and what a running child's address is compared against.
+ *
+ * @param serviceUrl The configured URL.
+ * @returns The address, or a `CONFIG_INVALID` failure.
+ */
+function parseLoopbackServiceUrl(serviceUrl: string): Result<ServiceListenAddress, DebuggenError> {
   let url: URL;
   try {
     url = new URL(serviceUrl.trim());
@@ -1585,7 +1629,7 @@ function describeExit(exit: ChildExit): string {
 
 /** The origin of a service URL for a message, never its credentials or path. */
 function describeServiceUrl(serviceUrl: string): string {
-  const address = parseServiceListenAddress(serviceUrl);
+  const address = parseLoopbackServiceUrl(serviceUrl);
   return isOk(address) ? address.value.origin : 'the configured debuggen.serviceUrl';
 }
 
@@ -2161,7 +2205,9 @@ class EmbeddedServiceProcess implements ServiceProcess {
       return ok(this.#status);
     }
 
-    const wanted = parseServiceListenAddress(settings.serviceUrl);
+    // The loopback parse, not the listen-address one: a move to an unreachable
+    // (Fetch-blocked) port is still a move, and the relaunch below refuses it.
+    const wanted = parseLoopbackServiceUrl(settings.serviceUrl);
     const moved = isOk(wanted) && wanted.value.origin !== child.plan.address.origin;
     if (moved) {
       // The child listens where the client no longer looks. Replacing it is a
