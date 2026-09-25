@@ -295,6 +295,8 @@ export type {
   SessionEndEntry,
   SessionInteraction,
   SessionInteractionContext,
+  SessionPreparation,
+  SessionPreparationContext,
   SessionStageRecord,
   SessionTimeouts,
   SessionTracker,

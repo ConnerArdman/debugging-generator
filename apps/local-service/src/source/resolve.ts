@@ -1598,6 +1598,15 @@ function ownerOf(
  * handler or request span that identifies application code, at most
  * `maxParentHops` hops, stopping at a missing parent, a cycle or a parent in
  * another trace.
+ *
+ * An owner that names its module but no symbol is provisional. Next.js's
+ * route-handler span (`AppRouteRouteHandlers.runHandler`) carries the route
+ * but not the request method — only the `http.server` span above it does — so
+ * the handler span alone identifies the route module and not the exported
+ * `GET`/`POST` whose calls lead to the query. A module node reaches no call
+ * site through the graph, so the walk continues to an ancestor in the same
+ * module that names the handler, and falls back to the provisional owner only
+ * when none does.
  */
 async function findQueryOwner(
   env: ResolverEnv,
@@ -1607,6 +1616,7 @@ async function findQueryOwner(
 ): Promise<Result<QueryOwner | undefined, DebuggenError>> {
   const visited = new Set<string>([event.spanId]);
   let current = event;
+  let provisional: QueryOwner | undefined;
 
   for (let hop = 0; hop < env.limits.maxParentHops; hop += 1) {
     const parentSpanId = current.parentSpanId;
@@ -1625,12 +1635,18 @@ async function findQueryOwner(
     if (QUERY_OWNER_KINDS.includes(parent.value.kind)) {
       const owner = ownerOf(env, queries, parent.value);
       if (owner !== undefined) {
-        return ok(owner);
+        if (owner.symbol === undefined) {
+          provisional ??= owner;
+        } else if (provisional === undefined || provisional.file === owner.file) {
+          return ok(owner);
+        } else {
+          break;
+        }
       }
     }
     current = parent.value;
   }
-  return ok(undefined);
+  return ok(provisional);
 }
 
 /**

@@ -39,7 +39,13 @@
  *     repository root and never the demo application (AAP 0.5.4). Its
  *     `.vscode/settings.json` points `debuggen.serviceUrl` at an unbindable
  *     loopback port and turns `debuggen.autoStartService` off, which is what
- *     keeps a run away from a developer's service on the default port 43117;
+ *     keeps a run away from a developer's service on the default port 43117.
+ *     VS Code reads a setting whose manifest `scope` is `machine` or
+ *     `application` from user settings only and silently drops it from a
+ *     workspace's settings — `debuggen.serviceUrl` is `machine`-scoped — so
+ *     every such fixture entry is also written to the throwaway profile's
+ *     `user-data/User/settings.json` (see {@link userOnlyFixtureSettings});
+ *     the fixture file stays the one place those values are authored;
  *   - only the extension under development loads (`--disable-extensions`,
  *     extension dependencies skipped, nothing installed from a marketplace),
  *     and editor telemetry is off.
@@ -104,6 +110,20 @@ const COMPILED_SUFFIX = '.test.js';
  * (`fixtureWorkspaceRoot()`) asserts the opened folder is exactly this one.
  */
 const WORKSPACE_FOLDER = path.join(EXTENSION_DIR, 'test', 'fixtures', 'workspace');
+
+/**
+ * The fixture workspace's settings: the single source of the `debuggen.*`
+ * values every suite runs under. Strict JSON, so it is parsed as such here.
+ */
+const FIXTURE_SETTINGS_FILE = path.join(WORKSPACE_FOLDER, '.vscode', 'settings.json');
+
+/**
+ * Manifest `scope` values VS Code honours only from user settings, never from
+ * a workspace's `.vscode/settings.json` (its workspace and folder settings
+ * models admit `window`, `resource`, `language-overridable` and
+ * `machine-overridable` only).
+ */
+const USER_ONLY_SCOPES = Object.freeze(['application', 'machine']);
 
 /** The suites AAP 0.7.1 Group 3 requires; a run without any of them is refused. */
 const REQUIRED_SUITES = Object.freeze([
@@ -240,6 +260,34 @@ function compareVersions(left, right) {
   return 0;
 }
 
+/**
+ * @param {unknown} value
+ * @returns {value is Record<string, unknown>}
+ */
+function isRecord(value) {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+/**
+ * The extension manifest, `package.json`, parsed. Every manifest fact this
+ * file needs (the engine range, the configuration scopes) is read from it
+ * rather than restated, so each fact has one owner.
+ *
+ * @returns {unknown}
+ * @throws {TestConfigurationError}
+ */
+function readManifest() {
+  const manifestPath = path.join(EXTENSION_DIR, 'package.json');
+  try {
+    return JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  } catch (cause) {
+    throw new TestConfigurationError(
+      `Cannot read the extension manifest ${manifestPath}: ${String(cause)}`,
+      'Restore apps/vscode-extension/package.json.',
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Resolution of the environment knobs
 // ---------------------------------------------------------------------------
@@ -252,17 +300,7 @@ function compareVersions(left, right) {
  * @returns {{ range: string, minimum: [number, number, number], sameMajor: boolean }}
  */
 function engineRange() {
-  const manifestPath = path.join(EXTENSION_DIR, 'package.json');
-  /** @type {unknown} */
-  let manifest;
-  try {
-    manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
-  } catch (cause) {
-    throw new TestConfigurationError(
-      `Cannot read the extension manifest ${manifestPath}: ${String(cause)}`,
-      'Restore apps/vscode-extension/package.json.',
-    );
-  }
+  const manifest = readManifest();
   const range =
     typeof manifest === 'object' &&
     manifest !== null &&
@@ -427,6 +465,78 @@ function assertRunInputs() {
 }
 
 // ---------------------------------------------------------------------------
+// Fixture settings VS Code reads from user settings only
+// ---------------------------------------------------------------------------
+
+/**
+ * The configuration keys the manifest contributes with a user-only scope
+ * ({@link USER_ONLY_SCOPES}). `contributes.configuration` may be one object or
+ * an array of them; VS Code accepts both, so both are read.
+ *
+ * @param {unknown} manifest the parsed `package.json`
+ * @returns {Set<string>}
+ */
+function userOnlyConfigurationKeys(manifest) {
+  const contributes = isRecord(manifest) ? manifest.contributes : undefined;
+  const configuration = isRecord(contributes) ? contributes.configuration : undefined;
+  const sections = Array.isArray(configuration) ? configuration : [configuration];
+  /** @type {Set<string>} */
+  const keys = new Set();
+  for (const section of sections) {
+    const properties = isRecord(section) ? section.properties : undefined;
+    if (!isRecord(properties)) {
+      continue;
+    }
+    for (const [key, property] of Object.entries(properties)) {
+      if (
+        isRecord(property) &&
+        typeof property.scope === 'string' &&
+        USER_ONLY_SCOPES.includes(property.scope)
+      ) {
+        keys.add(key);
+      }
+    }
+  }
+  return keys;
+}
+
+/**
+ * The entries of {@link FIXTURE_SETTINGS_FILE} that VS Code would drop from
+ * the workspace because the manifest contributes their key with a user-only
+ * scope. {@link createThrowawayState} writes them to the throwaway profile's
+ * user settings, where VS Code does apply them. Without this step the
+ * `machine`-scoped `debuggen.serviceUrl` would silently fall back to its
+ * manifest default, the real service's port 43117, and a run could reach a
+ * developer's live service. Values are copied, never restated, so the fixture
+ * file remains their one author.
+ *
+ * @returns {Record<string, unknown>} possibly empty
+ * @throws {TestConfigurationError} when the fixture settings are missing, are
+ *   not strict JSON, or are not a JSON object
+ */
+function userOnlyFixtureSettings() {
+  const relative = path.relative(EXTENSION_DIR, FIXTURE_SETTINGS_FILE);
+  /** @type {unknown} */
+  let settings;
+  try {
+    settings = JSON.parse(fs.readFileSync(FIXTURE_SETTINGS_FILE, 'utf8'));
+  } catch (cause) {
+    throw new TestConfigurationError(
+      `Cannot read the fixture workspace settings ${relative} as strict JSON: ${String(cause)}`,
+      `Restore ${relative} as one JSON object of debuggen.* settings, without comments or trailing commas.`,
+    );
+  }
+  if (!isRecord(settings)) {
+    throw new TestConfigurationError(
+      `The fixture workspace settings ${relative} are not a JSON object.`,
+      `Restore ${relative} as one JSON object of debuggen.* settings.`,
+    );
+  }
+  const userOnlyKeys = userOnlyConfigurationKeys(readManifest());
+  return Object.fromEntries(Object.entries(settings).filter(([key]) => userOnlyKeys.has(key)));
+}
+
+// ---------------------------------------------------------------------------
 // Throwaway state
 // ---------------------------------------------------------------------------
 
@@ -434,7 +544,7 @@ function assertRunInputs() {
  * @typedef {object} ThrowawayState
  * @property {string} root       the directory removed at exit
  * @property {string} home       the run's `DEBUGGEN_HOME` (mode 0700, as the service requires)
- * @property {string} userData   VS Code `--user-data-dir`
+ * @property {string} userData   VS Code `--user-data-dir`, whose `User/settings.json` holds the {@link userOnlyFixtureSettings}
  * @property {string} extensions VS Code `--extensions-dir`
  */
 
@@ -447,10 +557,14 @@ function assertRunInputs() {
  * `mkdtemp` creates the root with mode 0700, so no other account can read the
  * credential the extension may write into `home/`.
  *
+ * `userSettings` becomes the fresh profile's `User/settings.json` (skipped
+ * when empty), which VS Code reads as the user settings of the run.
+ *
  * @param {boolean} keep leave the directory in place and print its path
+ * @param {Record<string, unknown>} userSettings from {@link userOnlyFixtureSettings}
  * @returns {ThrowawayState}
  */
-function createThrowawayState(keep) {
+function createThrowawayState(keep, userSettings) {
   const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), SCRATCH_PREFIX));
   process.once('exit', () => {
     removeThrowawayState(root, keep);
@@ -464,9 +578,22 @@ function createThrowawayState(keep) {
   fs.chmodSync(home, 0o700);
   fs.mkdirSync(userData);
   fs.mkdirSync(extensions);
+  const userSettingKeys = Object.keys(userSettings);
+  if (userSettingKeys.length > 0) {
+    const userSettingsDir = path.join(userData, 'User');
+    fs.mkdirSync(userSettingsDir);
+    fs.writeFileSync(
+      path.join(userSettingsDir, 'settings.json'),
+      `${JSON.stringify(userSettings, null, 2)}\n`,
+    );
+  }
 
+  const seeded =
+    userSettingKeys.length > 0
+      ? `; user settings from the fixture: ${userSettingKeys.join(', ')}`
+      : '';
   console.error(
-    `${LOG_PREFIX} throwaway state ${root} (DEBUGGEN_HOME=${home}); ${keep ? 'kept after the run' : 'removed after the run'}`,
+    `${LOG_PREFIX} throwaway state ${root} (DEBUGGEN_HOME=${home}${seeded}); ${keep ? 'kept after the run' : 'removed after the run'}`,
   );
   return { root, home, userData, extensions };
 }
@@ -549,7 +676,8 @@ const version = resolveVersion();
 const timeout = resolveTimeout();
 const keepState = resolveKeepState();
 assertRunInputs();
-const state = createThrowawayState(keepState);
+const userSettings = userOnlyFixtureSettings();
+const state = createThrowawayState(keepState, userSettings);
 
 export default defineConfig({
   label: 'extension-host',

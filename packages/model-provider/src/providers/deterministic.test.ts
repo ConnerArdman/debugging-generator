@@ -1150,6 +1150,44 @@ describe('property 1: schema-valid — every stage builds an answer its caller c
     }
   });
 
+  it("cites a group's occurrences when its row carries no evidence list of its own", async () => {
+    // The service's analysis rows carry their executions as `occurrences[]`,
+    // each naming its persisted event by `eventId`, and no evidence list.
+    const base = analyzeInput();
+    const aggregates = asObject(base.aggregates);
+    const occurrenceEvents = ['ev-query-occ-01', 'ev-query-occ-02', 'ev-query-occ-03'];
+    const input: JsonObject = {
+      aggregates: {
+        ...aggregates,
+        queries: [
+          {
+            id: 'qry:g:0',
+            statement: 'SELECT id FROM tally_rows WHERE bucket = $1',
+            executionCount: occurrenceEvents.length,
+            occurrences: occurrenceEvents.map((eventId, position) => ({
+              eventId,
+              spanId: `span-occ-${String(position)}`,
+              traceId: TRACE_ID,
+              startTime: position,
+              durationMs: 1,
+            })),
+          },
+        ],
+      },
+    };
+
+    const analysis = await answerFor('analyze', input);
+    const cause = asArray(analysis.likelyCauses).find((entry) =>
+      citedEvidence(entry).some((reference) => occurrenceEvents.includes(reference)),
+    );
+    expect(cause).toBeDefined();
+    const cited = citedEvidence(cause);
+    expect(cited).not.toContain('qry:g:0');
+    for (const reference of cited) {
+      expect(occurrenceEvents).toContain(reference);
+    }
+  });
+
   it('reads metrics from the list carrier exactly as from the map carrier', async () => {
     const fromMap = await answerFor('analyze', analyzeInput());
     const fromList = await answerFor('analyze', analyzeInput({ metricsAsList: true }));
@@ -1880,6 +1918,146 @@ describe('property 4: generated panels genuinely differ between two captures', (
 });
 
 /* -------------------------------------------------------------------------------------------------
+ * service-shaped aggregates
+ *
+ * The fixtures above state a request group's evidence on the group itself. The
+ * service's analysis input (`apps/local-service/src/analysis/summarize.ts`)
+ * states it one level down instead: each group lists its `occurrences`, every
+ * one naming its own event and, once located, its own call site, and the
+ * product's duplicate rule reports `duplicateWindows` of identical requests.
+ * A group of that shape must be read, cited and located exactly as a group
+ * with a direct evidence list is.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The events of the service-shaped group's larger duplicate window, then of its smaller one. */
+const WINDOW_EVENTS: readonly string[] = ['ev-window-01', 'ev-window-02', 'ev-window-03'];
+const LATE_EVENTS: readonly string[] = ['ev-window-04', 'ev-window-05'];
+
+/** How the service-shaped request group may be varied. */
+interface ServiceShapedOptions {
+  /** Gives the last occurrence a different call site than the others. */
+  readonly disagreeingLocations?: boolean;
+}
+
+/**
+ * One request group as the service hands it to the analysis and panel stages:
+ * no evidence list and no window of its own, only its occurrences and the
+ * duplicate windows over them.
+ */
+function serviceShapedRequestGroup(options: ServiceShapedOptions = {}): JsonObject {
+  const shared = sourceLocation(FORM_FILE, 84, 5, 'source-map');
+  const elsewhere = sourceLocation(STORE_FILE, 12, 3, 'source-map');
+  const events = [...WINDOW_EVENTS, ...LATE_EVENTS];
+  return {
+    id: 'req:g:0',
+    method: 'GET',
+    url: '/tally/rows?bucket=?',
+    count: events.length,
+    duplicateCount: events.length - 2,
+    firstStartTime: 1_000,
+    lastStartTime: 2_010,
+    duplicateWindows: [
+      {
+        startTime: 1_000,
+        endTime: 1_022,
+        count: WINDOW_EVENTS.length,
+        eventIds: [...WINDOW_EVENTS],
+      },
+      { startTime: 2_000, endTime: 2_010, count: LATE_EVENTS.length, eventIds: [...LATE_EVENTS] },
+    ],
+    occurrences: events.map((eventId, index) => ({
+      eventId,
+      startTime: index < WINDOW_EVENTS.length ? 1_000 + index * 11 : 2_000 + index,
+      source:
+        options.disagreeingLocations === true && index === events.length - 1 ? elsewhere : shared,
+    })),
+  };
+}
+
+/** The analysis context with its request aggregate replaced by the service-shaped group. */
+function serviceShapedAnalyzeInput(options: ServiceShapedOptions = {}): JsonObject {
+  const base = analyzeInput();
+  return {
+    aggregates: { ...asObject(base.aggregates), requests: [serviceShapedRequestGroup(options)] },
+  };
+}
+
+describe('service-shaped aggregates — evidence carried by occurrences and duplicate windows', () => {
+  it('cites the events of the largest duplicate window for a group with no evidence list', async () => {
+    const analysis = await answerFor('analyze', serviceShapedAnalyzeInput());
+
+    const fact = asArray(analysis.observed).find((entry) =>
+      citedEvidence(entry).some((reference) => WINDOW_EVENTS.includes(reference)),
+    );
+    expect(fact).toBeDefined();
+    // The sentence and its evidence describe the same requests: the window's.
+    expect(asString(asObject(fact).statement)).toContain(String(WINDOW_EVENTS.length));
+    expect([...citedEvidence(fact)].sort()).toEqual([...WINDOW_EVENTS].sort());
+  });
+
+  it('locates the duplicate-request cause at the call site every occurrence shares', async () => {
+    const analysis = await answerFor('analyze', serviceShapedAnalyzeInput());
+
+    const cause = asArray(analysis.likelyCauses).find((entry) =>
+      citedEvidence(entry).some((reference) => WINDOW_EVENTS.includes(reference)),
+    );
+    expect(cause).toBeDefined();
+    const location = asObject(asObject(cause).suggestedLocation);
+    expect(location.file).toBe(FORM_FILE);
+    expect(location.line).toBe(84);
+    expect(location.column).toBe(5);
+  });
+
+  it('suggests no call site when the occurrences disagree on where they came from', async () => {
+    const analysis = await answerFor(
+      'analyze',
+      serviceShapedAnalyzeInput({ disagreeingLocations: true }),
+    );
+
+    const cause = asArray(analysis.likelyCauses).find((entry) =>
+      citedEvidence(entry).some((reference) => WINDOW_EVENTS.includes(reference)),
+    );
+    expect(cause).toBeDefined();
+    // Neither occurrence's site stands in for "a single call site", and the
+    // statement names none of them either.
+    expect(asObject(cause).suggestedLocation).toBeUndefined();
+    const statement = asString(asObject(cause).statement);
+    expect(statement).not.toContain(FORM_FILE);
+    expect(statement).not.toContain(STORE_FILE);
+  });
+
+  it('keeps the request counts on the cards of a duplicate capture whatever the headline reports', async () => {
+    // Every metric the computed tuple lists ahead of the request counts is
+    // reported, so a capped headline row alone would crowd them out.
+    const metrics: JsonObject = {
+      total_duration: 1175,
+      frontend_duration: 120,
+      backend_duration: 415,
+      database_duration: 640,
+      render_count: 6,
+      unchanged_render_count: 1,
+      render_trigger_unknown_count: 0,
+      request_count: 5,
+      duplicate_request_count: 3,
+      query_count: 3,
+    };
+    const base = latencyPanelInput({ metrics });
+    const input: JsonObject = {
+      ...base,
+      aggregates: { ...asObject(base.aggregates), requests: [serviceShapedRequestGroup()] },
+    };
+
+    const ids = metricCardIds(await answerFor('generate-panel', input));
+    expect(ids).toContain('request_count');
+    expect(ids).toContain('duplicate_request_count');
+    // Still drawn from the computed vocabulary, in its order.
+    const positions = ids.map((id) => COMPUTED_METRIC_IDS.findIndex((known) => known === id));
+    expect(positions).not.toContain(-1);
+    expect([...positions].sort((left, right) => left - right)).toEqual(positions);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
  * property 5 — purity and the provider contract
  * ---------------------------------------------------------------------------------------------- */
 
@@ -2354,5 +2532,383 @@ describe('the factory selects this provider by default and never needs a credent
     );
     expect(coerced.maxTokens).toBe(512);
     expect(coerced.maxRetries).toBe(0);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * investigate follow-ups: from the selected element to the route and the data layer
+ *
+ * Shaped the way the investigate stage builds its context
+ * (`apps/local-service/src/pipeline/context-builder.ts`, `buildInvestigateRequest`):
+ * the validated understanding — which carries the selected element's owner
+ * chain as its leading `component` entities rather than the target itself —
+ * the executed query log, the remaining budget, and the candidates projected
+ * from the log's code nodes.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The route the widget's request reaches, as the code graph names an `api-route` node. */
+const TRACED_ROUTE_NAME = '/tally/rows';
+
+/** A code-graph match as a query payload lists it. */
+function graphNode(kind: string, name: string, file: string): JsonObject {
+  return { nodeId: `${kind}:${name}@${file}`, kind, name, file };
+}
+
+const WIDGET_NODE = graphNode('component', WIDGET_SYMBOL, WIDGET_FILE);
+const TRACED_ROUTE_NODE = graphNode('api-route', TRACED_ROUTE_NAME, ROUTE_FILE);
+const TRACED_STORE_NODE = graphNode('db-call', STORE_SYMBOL, STORE_FILE);
+
+/** The component-to-route trace the provider proposes for the found widget. */
+const COMPONENT_TRACE: JsonObject = {
+  tool: 'pathBetween',
+  from: { name: WIDGET_SYMBOL, kind: 'component' },
+  to: { kind: 'api-route' },
+  edgeKinds: ['calls', 'routes-to'],
+};
+
+/** The route-to-data-layer trace it proposes once the component trace reached a route. */
+const ROUTE_TRACE: JsonObject = {
+  tool: 'pathBetween',
+  from: { file: ROUTE_FILE, kind: 'api-route' },
+  to: { kind: 'db-call' },
+};
+
+/** One successful run of the query log, in the shape the investigate stage records it. */
+function executedRun(index: number, request: JsonObject, payload: JsonValue): JsonObject {
+  const found = Array.isArray(payload) ? payload.length > 0 : true;
+  const returned = Array.isArray(payload) ? payload.length : 1;
+  return {
+    index,
+    request,
+    outcome: {
+      ok: true,
+      value: {
+        tool: request.tool ?? null,
+        request,
+        found,
+        total: returned,
+        returned,
+        truncated: false,
+        clamped: [],
+        payload,
+      },
+    },
+  };
+}
+
+/** The seed turn: `findByName` resolving the widget, the only component of the chain the log found. */
+const SEED_RUN = executedRun(0, { tool: 'findByName', name: WIDGET_SYMBOL }, [WIDGET_NODE]);
+
+/** The component trace's run: the widget reaches the traced route. */
+const COMPONENT_TRACE_RUN = executedRun(1, COMPONENT_TRACE, {
+  nodes: [WIDGET_NODE, TRACED_ROUTE_NODE],
+  edges: [],
+  depth: 1,
+});
+
+/** The route trace's run: the traced route reaches its data-layer call. */
+const ROUTE_TRACE_RUN = executedRun(2, ROUTE_TRACE, {
+  nodes: [TRACED_ROUTE_NODE, TRACED_STORE_NODE],
+  edges: [],
+  depth: 1,
+});
+
+/**
+ * Bare matches an unrelated seed turned up: components nobody named, on paths
+ * that sort before every traced file, so a traced route without its bonus would
+ * rank with them and fall off the twelve-entry shortlist.
+ */
+const DECOY_RUN = executedRun(
+  3,
+  { tool: 'findByName', name: 'Panel' },
+  Array.from({ length: 14 }, (_, n) =>
+    graphNode(
+      'component',
+      `DecoyPanel${String(n).padStart(2, '0')}`,
+      `src/aa-decoys/panel-${String(n).padStart(2, '0')}.tsx`,
+    ),
+  ),
+);
+
+/** How an investigate-stage context may be varied. */
+interface TraceContextOptions {
+  /** The runs after the seed turn, in execution order. */
+  readonly runs: readonly JsonObject[];
+  /** Query turns still available. */
+  readonly remainingQueries: number;
+  /** The understanding's component entities; the owner chain, innermost first, by default. */
+  readonly components?: readonly string[];
+}
+
+/** The candidates the context builder projects from a query log: every code node a payload named. */
+function projectedCandidates(runs: readonly JsonObject[]): JsonObject[] {
+  const candidates: JsonObject[] = [];
+  const seen = new Set<string>();
+  const visit = (value: unknown): void => {
+    if (Array.isArray(value)) {
+      value.forEach(visit);
+      return;
+    }
+    if (typeof value !== 'object' || value === null) {
+      return;
+    }
+    const node = value as Record<string, unknown>;
+    if (
+      typeof node.file === 'string' &&
+      typeof node.name === 'string' &&
+      typeof node.kind === 'string'
+    ) {
+      const identity = `${node.file}|${node.name}`;
+      if (!seen.has(identity)) {
+        seen.add(identity);
+        candidates.push({ file: node.file, symbol: node.name, kind: node.kind });
+      }
+    }
+    for (const [key, entry] of Object.entries(node)) {
+      if (key !== 'request') {
+        visit(entry);
+      }
+    }
+  };
+  runs.forEach(visit);
+  return candidates;
+}
+
+/** The structured context of one investigate turn. */
+function traceContext(options: TraceContextOptions): JsonObject {
+  const components = options.components ?? [WIDGET_SYMBOL, FORM_SYMBOL];
+  const runs = [SEED_RUN, ...options.runs];
+  return {
+    understanding: {
+      category: 'slow-interaction',
+      signalsNeeded: ['interaction', 'fetch'],
+      entities: components.map((name) => ({ kind: 'component', name })),
+      searchHints: [],
+    },
+    toolCatalog: 'findByName, pathBetween',
+    queryResults: runs,
+    remainingQueries: options.remainingQueries,
+    candidates: projectedCandidates(runs),
+  };
+}
+
+/** A path-query batch, or the final investigation. */
+const investigateReplyMirror = z.union([
+  z.object({
+    queries: z
+      .array(
+        z.object({
+          tool: z.literal('pathBetween'),
+          from: z.record(z.string(), z.string()),
+          to: z.record(z.string(), z.string()),
+          edgeKinds: z.array(z.string().min(1)).optional(),
+        }),
+      )
+      .min(1),
+  }),
+  investigationMirror,
+]);
+
+/** Answers one investigate turn, unwrapped to a plain object. */
+async function investigateReply(
+  input: JsonObject,
+  variant?: string,
+): Promise<Record<string, unknown>> {
+  const request = requestFor('investigate', input, variant === undefined ? {} : { variant });
+  return asObject(
+    okValue(await provider.generateStructured(investigateReplyMirror, request)).value,
+  );
+}
+
+describe('investigate follow-ups: the selected element is followed to its route and data layer', () => {
+  it('traces each component of the understanding the log found to an API route', async () => {
+    const reply = await investigateReply(traceContext({ runs: [], remainingQueries: 8 }));
+
+    // The form is in the chain but the log never found it, so it is not traced.
+    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+  });
+
+  it('reads the owner chain from a carried target as well', async () => {
+    const reply = await investigateReply({
+      ...understandInput(),
+      queryResults: [SEED_RUN],
+      remainingQueries: 8,
+      candidates: projectedCandidates([SEED_RUN]),
+    });
+
+    expect(reply.queries).toEqual([COMPONENT_TRACE]);
+  });
+
+  it('traces the route a component trace reached on to its data-layer call', async () => {
+    const reply = await investigateReply(
+      traceContext({ runs: [COMPONENT_TRACE_RUN], remainingQueries: 7 }),
+    );
+
+    expect(reply.queries).toEqual([ROUTE_TRACE]);
+  });
+
+  it('answers once the walk is done, keeping the traced route and data layer on the shortlist', async () => {
+    const reply = await investigateReply(
+      traceContext({
+        runs: [COMPONENT_TRACE_RUN, ROUTE_TRACE_RUN, DECOY_RUN],
+        remainingQueries: 5,
+      }),
+    );
+
+    expect(reply.queries).toBeUndefined();
+    const relevant = asArray(reply.relevantFiles).map((entry) => asObject(entry));
+    expect(relevant.length).toBeLessThanOrEqual(12);
+    const files = relevant.map((entry) => asString(entry.file));
+    expect(files).toContain(WIDGET_FILE);
+    expect(files).toContain(ROUTE_FILE);
+    expect(files).toContain(STORE_FILE);
+    const route = relevant.find((entry) => entry.file === ROUTE_FILE);
+    expect(asString(route?.reason)).toContain(WIDGET_SYMBOL);
+
+    const flows = asArray(reply.flows).map((flow) => asString(flow));
+    expect(
+      flows.some((flow) => flow.includes(WIDGET_SYMBOL) && flow.includes(TRACED_ROUTE_NAME)),
+    ).toBe(true);
+    expect(
+      flows.some((flow) => flow.includes(TRACED_ROUTE_NAME) && flow.includes(STORE_SYMBOL)),
+    ).toBe(true);
+  });
+
+  it('proposes nothing when the understanding names no component, or no budget remains', async () => {
+    const unnamed = await investigateReply(
+      traceContext({ runs: [], remainingQueries: 8, components: [] }),
+    );
+    const exhausted = await investigateReply(traceContext({ runs: [], remainingQueries: 0 }));
+
+    for (const reply of [unnamed, exhausted]) {
+      expect(reply.queries).toBeUndefined();
+      expect(asArray(reply.relevantFiles).length).toBeGreaterThan(0);
+    }
+  });
+
+  it('proposes the same follow-ups however the question is worded', async () => {
+    const input = traceContext({ runs: [], remainingQueries: 8 });
+
+    const first = await investigateReply(input, 'first');
+    const second = await investigateReply(input, 'second-asked-with-completely-different-words');
+
+    expect(second).toEqual(first);
+  });
+});
+
+/* -------------------------------------------------------------------------------------------------
+ * planning from a shortlist: patches go where only a patch can measure
+ *
+ * Shaped the way the plan stage builds its context (`buildPlanRequest`): the
+ * validated understanding, whose leading `component` entities are the selected
+ * element's owner chain, and the investigation's relevant files — which carry a
+ * file, a symbol and a score but no graph kind — ranked with the chain's
+ * components first.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** A shortlisted file, as the investigation reports it. */
+function shortlisted(file: string, symbol: string, score: number): JsonObject {
+  return {
+    file,
+    symbol,
+    reason: 'The code graph associates this symbol with the question.',
+    score,
+  };
+}
+
+/** The plan context for a shortlist whose three best-ranked entries are the chain's components. */
+function shortlistPlanInput(): JsonObject {
+  return {
+    understanding: {
+      category: 'slow-interaction',
+      signalsNeeded: ['interactions', 'react', 'fetch', 'http', 'routeHandlers', 'functions', 'pg'],
+      entities: [
+        { kind: 'component', name: FORM_SYMBOL, file: FORM_FILE },
+        { kind: 'component', name: WIDGET_SYMBOL, file: WIDGET_FILE },
+        { kind: 'component', name: TILE_SYMBOL, file: TILE_FILE },
+      ],
+      searchHints: [],
+    },
+    investigation: {
+      relevantFiles: [
+        shortlisted(FORM_FILE, FORM_SYMBOL, 1),
+        shortlisted(WIDGET_FILE, WIDGET_SYMBOL, 1),
+        shortlisted(TILE_FILE, TILE_SYMBOL, 1),
+        shortlisted(ROUTE_FILE, ROUTE_SYMBOL, 0.5),
+        shortlisted(STORE_FILE, STORE_SYMBOL, 0.4),
+      ],
+      flows: [],
+    },
+    adapterCatalog: [
+      {
+        id: 'runtime-adapter',
+        actionTypes: [
+          'interaction-tracking',
+          'react-render-tracking',
+          'fetch-tracking',
+          'db-query-tracking',
+        ],
+        mode: 'runtime',
+        signals: ['interactions', 'react', 'componentTree', 'fetch', 'pg'],
+      },
+      {
+        id: 'patch-adapter',
+        actionTypes: ['server-span', 'function-timing'],
+        mode: 'patch',
+        signals: ['http', 'routeHandlers', 'functions'],
+      },
+    ],
+  };
+}
+
+describe('plan: a shortlist led by components still spends its patches where they measure', () => {
+  it('never asks to time a component the understanding names, and times the functions behind it', async () => {
+    const plan = await answerFor('plan', shortlistPlanInput());
+    const targets = asArray(plan.instrumentationTargets).map(asObject);
+    const patched = targets.filter((target) => target.type === 'function-timing');
+
+    for (const symbol of [FORM_SYMBOL, WIDGET_SYMBOL, TILE_SYMBOL]) {
+      expect(
+        targets.some((target) => target.symbol === symbol && target.type === 'function-timing'),
+        `${symbol} is a component; a timing wrapper cannot be applied to it`,
+      ).toBe(false);
+    }
+    expect(patched.map((target) => target.symbol)).toEqual(
+      expect.arrayContaining([ROUTE_SYMBOL, STORE_SYMBOL]),
+    );
+    // The components' renders are still observed, by the page-wide hook.
+    expect(
+      targets.some(
+        (target) =>
+          target.type === 'react-render-tracking' && target.file === '.' && target.symbol === '*',
+      ),
+    ).toBe(true);
+  });
+
+  it('spends no slot on a runtime action a page-wide hook already covers', async () => {
+    // The same shortlist with the components' graph kind carried, as the
+    // investigate stage's own candidates carry it: each would otherwise take a
+    // slot for a render hook the page-wide one already installs.
+    const input = shortlistPlanInput();
+    const investigation = asObject(input.investigation);
+    const plan = await answerFor('plan', {
+      ...input,
+      investigation: {
+        ...investigation,
+        relevantFiles: asArray(investigation.relevantFiles).map((entry) => {
+          const file = asObject(entry);
+          return file.score === 1 ? { ...file, kind: 'component' } : file;
+        }),
+      },
+    } as JsonObject);
+    const targets = asArray(plan.instrumentationTargets).map(asObject);
+    const types = targets.map((target) => asString(target.type));
+
+    for (const type of ['interaction-tracking', 'react-render-tracking', 'fetch-tracking']) {
+      expect(types.filter((entry) => entry === type)).toHaveLength(1);
+    }
+    expect(
+      targets.filter((target) => target.type === 'function-timing').map((target) => target.symbol),
+    ).toEqual(expect.arrayContaining([ROUTE_SYMBOL, STORE_SYMBOL]));
   });
 });

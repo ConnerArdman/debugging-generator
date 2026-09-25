@@ -398,6 +398,15 @@ const SCORE_TARGET_CHAIN_MATCH = 0.3;
 /** Added when a candidate declares a node kind the product has wording for. */
 const SCORE_KNOWN_KIND = 0.1;
 
+/**
+ * Added when a candidate lies on a path an executed `pathBetween` query found.
+ * A route or data-layer call the selected element's request reaches is named
+ * by no entity and declares no signal, so without this it would rank with the
+ * bare matches and could fall off the shortlist behind the components that
+ * reach it.
+ */
+const SCORE_TRACED_PATH_MATCH = 0.3;
+
 /** Upper bound on a computed score, so the scale stays comparable. */
 const SCORE_MAX = 1;
 
@@ -986,8 +995,23 @@ function pathStems(path: string): readonly string[] {
  * first, and every candidate's references are filtered against it.
  * ---------------------------------------------------------------------------------------------- */
 
-/** Fields that hold a list of evidence references, probed in this order. */
-const EVIDENCE_LIST_FIELDS: readonly string[] = ['evidence', 'eventIds', 'events', 'ids'];
+/**
+ * Fields that hold a list of evidence references, probed in this order.
+ *
+ * `occurrences` is last because it is a list of event *records* rather than of
+ * references: the service's analysis input (`apps/local-service/src/analysis/
+ * summarize.ts`) gives each render, request and query row its captured
+ * executions as `occurrences[]`, every member carrying the `eventId` of the
+ * persisted event it is, and no separate evidence list. Without it a pattern
+ * detected on such a row could cite nothing and was dropped.
+ */
+const EVIDENCE_LIST_FIELDS: readonly string[] = [
+  'evidence',
+  'eventIds',
+  'events',
+  'ids',
+  'occurrences',
+];
 
 /**
  * Fields that hold a single event reference on an aggregate.
@@ -1009,6 +1033,21 @@ const EVIDENCE_SINGLE_FIELDS: readonly string[] = ['eventId'];
  * so an event record spelled with a plain `id` is read as the event it is.
  */
 const EVIDENCE_MEMBER_FIELDS: readonly string[] = ['eventId', 'id'];
+
+/**
+ * Fields that hold an aggregate's **individual occurrences**, each a record
+ * naming its own event.
+ *
+ * The service's analysis input (`apps/local-service/src/analysis/summarize.ts`)
+ * carries a request group's, a render statistic's and a query group's citable
+ * events one level down — `occurrences: [{ eventId, … }]` — rather than as a
+ * list on the aggregate itself. An aggregate that carries no list and no
+ * single reference is therefore cited by its occurrences, which are exactly
+ * the events it was computed from. Only the {@link EVIDENCE_SINGLE_FIELDS}
+ * spelling is read from a member here, never a plain `id`: an occurrence
+ * record's own `id` is not guaranteed to be an event id.
+ */
+const EVIDENCE_OCCURRENCE_FIELDS: readonly string[] = ['occurrences'];
 
 /**
  * The key of the one spelling an emitted evidence reference has: `{ eventId }`.
@@ -1052,7 +1091,9 @@ function readEvidenceRef(value: JsonValue | undefined): string | undefined {
 }
 
 /**
- * The references one aggregate carries, in the order it carries them.
+ * The references one aggregate carries, in the order it carries them: its
+ * own evidence list, else its single event, else the events of its
+ * occurrences ({@link EVIDENCE_OCCURRENCE_FIELDS}).
  *
  * @param source An aggregate: a span, a render statistic, a request or query
  * group, a state transition.
@@ -1079,15 +1120,41 @@ function evidenceOf(source: JsonObject | undefined): readonly string[] {
     }
   }
   if (references.length === 0) {
-    for (const field of EVIDENCE_SINGLE_FIELDS) {
-      const reference = asString(source[field]);
-      if (reference !== undefined) {
-        references.push(reference);
+    const reference = singleEvidenceOf(source);
+    if (reference !== undefined) {
+      references.push(reference);
+    }
+  }
+  if (references.length === 0) {
+    for (const field of EVIDENCE_OCCURRENCE_FIELDS) {
+      for (const occurrence of asObjectArray(source[field]) ?? []) {
+        const reference = singleEvidenceOf(occurrence);
+        if (reference !== undefined) {
+          references.push(reference);
+        }
+      }
+      if (references.length > 0) {
         break;
       }
     }
   }
   return references;
+}
+
+/**
+ * The one event a record names through {@link EVIDENCE_SINGLE_FIELDS}.
+ *
+ * @param record An occurrence or window record.
+ * @returns The reference, or `undefined` when the record names none.
+ */
+function singleEvidenceOf(record: JsonObject): string | undefined {
+  for (const field of EVIDENCE_SINGLE_FIELDS) {
+    const reference = asString(record[field]);
+    if (reference !== undefined) {
+      return reference;
+    }
+  }
+  return undefined;
 }
 
 /**
@@ -1468,6 +1535,23 @@ function isDeclarationSpelling(symbol: string): boolean {
 
 /** The fallback preference for a code-graph node kind with no entry above. */
 const DEFAULT_CODE_KIND_ACTION_TYPES: readonly ActionTypeId[] = ['function-timing'];
+
+/**
+ * The code-node kind an understanding's entity kind establishes, for a
+ * candidate that carries no kind of its own.
+ *
+ * The planning context lists the investigation's relevant files, which name a
+ * file and a symbol but not the graph node's kind, so every such candidate would
+ * otherwise read as a plain function and be offered `function-timing`. A symbol
+ * the understanding itself names as a component is a component — the owner
+ * chain of a selected element is exactly that — and a timing wrapper cannot be
+ * applied to a React component without moving its render and its hook calls
+ * out of the function React analyses (the patch feasibility check refuses it).
+ * Only the kind whose default would be wrong is mapped.
+ */
+const ENTITY_CODE_KINDS: Readonly<Record<string, string>> = Object.freeze({
+  component: 'component',
+});
 
 /**
  * Where each panel data source's material lives in a capture-aggregate bag,
@@ -1851,16 +1935,26 @@ interface RenderView {
   readonly unknownTrigger: number;
 }
 
-/** One group of byte-identical requests. */
+/**
+ * One group of byte-identical requests.
+ *
+ * `count`, `windowMs` and `references` always describe the **same** requests,
+ * because a fact renders them into one sentence ("‹count› requests … within
+ * ‹windowMs› ms") and cites `references` for it.
+ */
 interface RequestGroupView {
   /** The aggregate this view was read from. */
   readonly node: JsonObject;
-  /** Occurrences in the group. */
+  /** Requests the view describes. */
   readonly count: number;
   /** The window they occurred within, in milliseconds. */
   readonly windowMs: number;
   /** The endpoint they addressed, when the capture reported one. */
   readonly endpoint?: string;
+  /** The events of those requests, before filtering against the context. */
+  readonly references: readonly string[];
+  /** The one call site every located request came from, when they agree. */
+  readonly location?: SourceLocation;
 }
 
 /** One group of statements sharing a shape. */
@@ -1954,19 +2048,108 @@ function readRequestGroups(aggregates: JsonObject): readonly RequestGroupView[] 
     readObjectArrayField(aggregates, 'requests', 'requestGroups', 'duplicateRequests') ?? [];
   const groups: RequestGroupView[] = [];
   for (const node of nodes) {
-    const count = asCount(readField(node, 'count', 'occurrenceCount', 'duplicateCount'));
-    if (count === undefined) {
+    const total = asCount(readField(node, 'count', 'occurrenceCount', 'duplicateCount'));
+    if (total === undefined) {
       continue;
     }
     const endpoint = asString(readField(node, 'endpoint', 'url', 'path'));
+    const described = describedRequests(node, total);
+    const location = readSourceLocation(node) ?? sharedOccurrenceLocation(node);
     groups.push({
       node,
-      count,
-      windowMs: asDurationMs(readField(node, 'windowMs', 'window', 'spanMs')) ?? 0,
+      ...described,
       ...(endpoint !== undefined ? { endpoint } : {}),
+      ...(location !== undefined ? { location } : {}),
     });
   }
   return groups;
+}
+
+/** The part of a {@link RequestGroupView} that says which requests it describes. */
+type DescribedRequests = Pick<RequestGroupView, 'count' | 'windowMs' | 'references'>;
+
+/**
+ * Which requests of a group a fact about it describes.
+ *
+ * A group that states its own window (`windowMs`) is described whole, with its
+ * own evidence. One that states none but carries the service's duplicate
+ * windows (`duplicateWindows: [{ startTime, endTime, count, eventIds }]`) is
+ * described by its **largest** window — the burst of identical requests the
+ * product's duplicate rule found — so the count, the duration and the cited
+ * events are that window's. Otherwise the group is described whole, over the
+ * span between its first and last start.
+ *
+ * @param node The request-group aggregate.
+ * @param total The requests in the whole group.
+ * @returns The count, window and references to use.
+ */
+function describedRequests(node: JsonObject, total: number): DescribedRequests {
+  const direct = evidenceOf(node);
+  const explicit = asDurationMs(readField(node, 'windowMs', 'window', 'spanMs'));
+  if (explicit !== undefined) {
+    return { count: total, windowMs: explicit, references: direct };
+  }
+
+  let largest: DescribedRequests | undefined;
+  for (const window of asObjectArray(node['duplicateWindows']) ?? []) {
+    const count = asCount(window['count']);
+    const start = asFiniteNumber(window['startTime']);
+    const end = asFiniteNumber(window['endTime']);
+    const references = evidenceOf(window);
+    if (count === undefined || start === undefined || end === undefined || end < start) {
+      continue;
+    }
+    if (largest === undefined || count > largest.count) {
+      largest = {
+        count,
+        windowMs: asDurationMs(end - start) ?? 0,
+        references: references.length > 0 ? references : direct,
+      };
+    }
+  }
+  if (largest !== undefined) {
+    return largest;
+  }
+
+  const first = asFiniteNumber(readField(node, 'firstStartTime', 'startTime'));
+  const last = asFiniteNumber(readField(node, 'lastStartTime', 'endTime'));
+  const spanned = first !== undefined && last !== undefined && last >= first ? last - first : 0;
+  return { count: total, windowMs: asDurationMs(spanned) ?? 0, references: direct };
+}
+
+/**
+ * The call site every located occurrence of an aggregate came from, when they
+ * all agree on one.
+ *
+ * The service locates each request of a group on its own (the source-map route
+ * over its initiator), and a group spans one call site only when every
+ * occurrence that was located names the same file, line and column. Disagreeing
+ * occurrences yield nothing rather than the first one's site: "from a single
+ * call site" is exactly what the frames that use this location assert.
+ *
+ * @param node The aggregate.
+ * @returns The shared location, or `undefined` when there is none or they differ.
+ */
+function sharedOccurrenceLocation(node: JsonObject): SourceLocation | undefined {
+  let shared: SourceLocation | undefined;
+  for (const field of EVIDENCE_OCCURRENCE_FIELDS) {
+    for (const occurrence of asObjectArray(node[field]) ?? []) {
+      const location = readSourceLocation(occurrence);
+      if (location === undefined) {
+        continue;
+      }
+      if (shared === undefined) {
+        shared = location;
+      } else if (
+        shared.file !== location.file ||
+        shared.line !== location.line ||
+        shared.column !== location.column
+      ) {
+        return undefined;
+      }
+    }
+  }
+  return shared;
 }
 
 /**
@@ -2557,6 +2740,27 @@ interface CandidateView {
 }
 
 /**
+ * The code-node kind the understanding's entities give `symbol`, when one of
+ * them names it with a kind {@link ENTITY_CODE_KINDS} maps.
+ *
+ * @param understanding The understanding the context carries.
+ * @param symbol The candidate's symbol.
+ * @returns The code-node kind, or `undefined`.
+ */
+function entityCodeKind(understanding: UnderstandingView, symbol: string): string | undefined {
+  for (const record of understanding.entityRecords) {
+    const kind =
+      record.name === symbol && Object.hasOwn(ENTITY_CODE_KINDS, record.kind)
+        ? ENTITY_CODE_KINDS[record.kind]
+        : undefined;
+    if (kind !== undefined) {
+      return kind;
+    }
+  }
+  return undefined;
+}
+
+/**
  * The investigation bag of a context, wherever the stage put it.
  *
  * @param root The structured context.
@@ -2617,6 +2821,7 @@ function readCandidates(
   const neededSignals = new Set(understanding.signals);
   const entityNames = new Set(understanding.entities);
   const chain = new Set(understanding.target?.chain ?? []);
+  const traced = tracedPathMembers(root);
 
   const candidates: CandidateView[] = [];
   for (const node of nodes) {
@@ -2627,7 +2832,10 @@ function readCandidates(
 
     const stems = pathStems(file);
     const symbol = asString(readField(node, 'symbol', 'symbolName', 'name')) ?? stems[0] ?? file;
-    const kind = asString(readField(node, 'kind', 'nodeKind', 'type')) ?? '';
+    const kind =
+      asString(readField(node, 'kind', 'nodeKind', 'type')) ??
+      entityCodeKind(understanding, symbol) ??
+      '';
     const declaredSignals = canonicalSignals(
       readStringSet(node, 'signals', 'captureSignals', 'provides'),
     );
@@ -2635,6 +2843,7 @@ function readCandidates(
     const matchedSignals = declaredSignals.filter((signal) => neededSignals.has(signal));
     const matchedEntities = sortStrings([symbol, ...stems].filter((name) => entityNames.has(name)));
     const inChain = chain.has(symbol);
+    const tracedFrom = traced.get(pathMemberKey(file, symbol));
     const knownKind = Object.hasOwn(CODE_KIND_ACTION_TYPES, kind);
 
     const reported = asFiniteNumber(readField(node, 'score', 'relevance', 'weight'));
@@ -2643,6 +2852,7 @@ function readCandidates(
       matchedSignals.length * SCORE_SIGNAL_MATCH +
       (matchedEntities.length > 0 ? SCORE_ENTITY_MATCH : 0) +
       (inChain ? SCORE_TARGET_CHAIN_MATCH : 0) +
+      (tracedFrom !== undefined ? SCORE_TRACED_PATH_MATCH : 0) +
       (knownKind ? SCORE_KNOWN_KIND : 0);
     const score =
       reported === undefined
@@ -2655,7 +2865,7 @@ function readCandidates(
         ? captureSignalLabel(matchedSignals[0])
         : declaredSignals[0] !== undefined
           ? captureSignalLabel(declaredSignals[0])
-          : '');
+          : (tracedFrom ?? ''));
 
     candidates.push({
       file,
@@ -2759,6 +2969,267 @@ function readFlowSteps(value: JsonValue | undefined): readonly string[] {
   return readFlowSteps(readField(object, 'steps', 'nodes', 'path'));
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * stage 2 — follow-up queries: from the selected element to the route and the data layer
+ *
+ * The seed queries resolve the entities of the understanding; what they cannot
+ * say is where a click *goes*. When the question names an element, its owner
+ * chain's components are traced along their calls to the API route a call site
+ * reaches, and each route reached is traced on to its data-layer call — the
+ * "found the component, traced the handler, found the route, found the
+ * database dependency" walk of AAP §0.1.2 Step 8. The queries are derived from
+ * the structured context alone (the owner chain, the candidates the log holds,
+ * the requests already run), never from the question's wording, and a query
+ * already in the log is never proposed again, so the conversation converges on
+ * the final investigation within the stage's budget.
+ * ---------------------------------------------------------------------------------------------- */
+
+/** The context field holding the executed query log, and the field a query batch answers in. */
+const QUERY_RESULTS_FIELD = 'queryResults';
+const QUERY_BATCH_FIELD = 'queries';
+
+/** The graph query every follow-up uses, and the node kinds it walks between. */
+const PATH_BETWEEN_TOOL = 'pathBetween';
+const COMPONENT_NODE_KIND = 'component';
+const API_ROUTE_NODE_KIND = 'api-route';
+const DB_CALL_NODE_KIND = 'db-call';
+
+/**
+ * The edge kinds a component-to-route trace follows: calls, and the join from a
+ * call site to the route it reaches. Rendering, handler and declaration edges
+ * are left out on purpose — a component renders many children and binds many
+ * handlers, and following those spends the path search's node budget before
+ * the call that leaves the page is expanded.
+ */
+const REQUEST_TRACE_EDGE_KINDS: readonly string[] = Object.freeze(['calls', 'routes-to']);
+
+/** Owner-chain components traced to a route, innermost first. */
+const MAX_TRACED_COMPONENTS = 4;
+
+/** Routes reached by a component trace that are traced on to the data layer. */
+const MAX_TRACED_ROUTES = 2;
+
+/**
+ * The components a follow-up traces, in the understanding's order.
+ *
+ * The selected element's owner chain, innermost first, when the context itself
+ * carries the target (the understand stage's does). The investigate stage's
+ * context carries the validated understanding instead of the target, and there
+ * the chain survives as the understanding's `component` entities, which the
+ * understand rules list first and innermost first; those are read in their
+ * carried order.
+ *
+ * @param understanding The understanding the context carries.
+ * @returns The component names, de-duplicated; empty when none is named.
+ */
+function tracedComponentNames(understanding: UnderstandingView): readonly string[] {
+  const chain = understanding.target?.chain ?? [];
+  if (chain.length > 0) {
+    return chain;
+  }
+  const names: string[] = [];
+  for (const record of understanding.entityRecords) {
+    if (record.kind === COMPONENT_NODE_KIND && !names.includes(record.name)) {
+      names.push(record.name);
+    }
+  }
+  return names;
+}
+
+/** The identity of a code node on a traced path, as {@link tracedPathMembers} keys it. */
+function pathMemberKey(file: string, symbol: string): string {
+  return `${file}\u0000${symbol}`;
+}
+
+/**
+ * Every code node on a path an executed `pathBetween` query found, mapped to
+ * the name of that path's first node — what the member was traced from.
+ *
+ * @param root The structured context.
+ * @returns The members; empty when the context ran no path query.
+ */
+function tracedPathMembers(root: JsonObject): ReadonlyMap<string, string> {
+  const members = new Map<string, string>();
+  for (const path of executedPaths(root)) {
+    const nodes = asObjectArray(asObject(path)?.nodes) ?? [];
+    const origin = asString(nodes[0]?.name) ?? asString(nodes[0]?.symbol);
+    for (const node of nodes) {
+      const file = asProjectPath(node.file);
+      const symbol = asString(node.symbol) ?? asString(node.name);
+      if (file !== undefined && symbol !== undefined && origin !== undefined) {
+        const key = pathMemberKey(file, symbol);
+        if (!members.has(key)) {
+          members.set(key, origin);
+        }
+      }
+    }
+  }
+  return members;
+}
+
+/** One executed query of the log: its request, and the payload of a successful run. */
+interface ExecutedRun {
+  readonly request: JsonObject | undefined;
+  readonly payload: JsonValue | undefined;
+}
+
+/**
+ * The executed queries of an investigate-stage context, in log order.
+ *
+ * @param root The structured context.
+ * @returns The runs; empty when the context carries no log.
+ */
+function readExecutedRuns(root: JsonObject): readonly ExecutedRun[] {
+  const runs: ExecutedRun[] = [];
+  for (const run of asObjectArray(root[QUERY_RESULTS_FIELD]) ?? []) {
+    const outcome = asObject(run.outcome);
+    const value = outcome?.ok === true ? asObject(outcome.value) : undefined;
+    runs.push({ request: asObject(run.request), payload: value?.payload });
+  }
+  return runs;
+}
+
+/**
+ * The identity of a path query: its tool, both endpoints' selector fields and
+ * its edge filter. Two requests with the same identity ask the same question.
+ *
+ * @param request A query request.
+ * @returns The identity, or `undefined` for a query that is not a path query.
+ */
+function pathQueryIdentity(request: JsonObject | undefined): string | undefined {
+  if (request === undefined || asString(request.tool) !== PATH_BETWEEN_TOOL) {
+    return undefined;
+  }
+  const endpoint = (value: JsonValue | undefined): string => {
+    const text = asString(value);
+    if (text !== undefined) {
+      return text;
+    }
+    const selector = asObject(value);
+    return ['file', 'symbol', 'name', 'kind']
+      .map((field) => asString(selector?.[field]) ?? '')
+      .join('|');
+  };
+  return [
+    endpoint(request.from),
+    endpoint(request.to),
+    sortStrings([...asStringArray(request.edgeKinds)]).join(','),
+  ].join('>');
+}
+
+/**
+ * The last node of an executed path, when the run found one.
+ *
+ * @param payload The run's payload.
+ * @returns The path's final node, or `undefined`.
+ */
+function pathEndOf(payload: JsonValue | undefined): JsonObject | undefined {
+  const nodes = asArray(asObject(payload)?.nodes);
+  return nodes === undefined ? undefined : asObject(nodes[nodes.length - 1]);
+}
+
+/**
+ * The follow-up queries the log still lacks, or none once the walk is done.
+ *
+ * Two steps, each proposed only after the previous one ran: first a
+ * component-to-route trace for each component of the understanding (the
+ * selected element's owner chain, see {@link tracedComponentNames}) the log
+ * already found, then a route-to-data-layer trace for each route those traces
+ * reached. Nothing is proposed when the understanding names no component
+ * (there is then no element to follow), without remaining budget, or when
+ * every step already ran.
+ *
+ * @param root The structured context.
+ * @param understanding The understanding the context carries.
+ * @returns The queries to run next, possibly empty.
+ */
+function followUpQueries(root: JsonObject, understanding: UnderstandingView): JsonValue[] {
+  const remaining = asFiniteNumber(root.remainingQueries);
+  const components = tracedComponentNames(understanding);
+  if (remaining === undefined || remaining < 1 || components.length === 0) {
+    return [];
+  }
+  const budget = Math.floor(remaining);
+  const runs = readExecutedRuns(root);
+  const executed = new Set<string>();
+  for (const run of runs) {
+    const identity = pathQueryIdentity(run.request);
+    if (identity !== undefined) {
+      executed.add(identity);
+    }
+  }
+  const pending = (queries: readonly JsonObject[]): JsonValue[] =>
+    queries
+      .filter((query) => {
+        const identity = pathQueryIdentity(query);
+        return identity !== undefined && !executed.has(identity);
+      })
+      .slice(0, budget);
+
+  // Step 1 — the owner chain's components the log found, innermost first.
+  const found = new Set<string>();
+  for (const candidate of readCandidates(root, understanding)) {
+    if (candidate.kind === COMPONENT_NODE_KIND) {
+      found.add(candidate.symbol);
+    }
+  }
+  const componentTraces: JsonObject[] = components
+    .filter((component) => found.has(component))
+    .slice(0, MAX_TRACED_COMPONENTS)
+    .map((component) => ({
+      tool: PATH_BETWEEN_TOOL,
+      from: { name: component, kind: COMPONENT_NODE_KIND },
+      to: { kind: API_ROUTE_NODE_KIND },
+      edgeKinds: [...REQUEST_TRACE_EDGE_KINDS],
+    }));
+  const stepOne = pending(componentTraces);
+  if (stepOne.length > 0) {
+    return stepOne;
+  }
+
+  // Step 2 — each route a component trace reached, on to its data-layer call.
+  const traced = new Set(componentTraces.map((query) => pathQueryIdentity(query)));
+  const routeFiles: string[] = [];
+  for (const run of runs) {
+    if (!traced.has(pathQueryIdentity(run.request))) {
+      continue;
+    }
+    const end = pathEndOf(run.payload);
+    const file = asProjectPath(end?.file);
+    if (asString(end?.kind) === API_ROUTE_NODE_KIND && file !== undefined) {
+      if (!routeFiles.includes(file)) {
+        routeFiles.push(file);
+      }
+    }
+  }
+  return pending(
+    routeFiles.slice(0, MAX_TRACED_ROUTES).map((file) => ({
+      tool: PATH_BETWEEN_TOOL,
+      from: { file, kind: API_ROUTE_NODE_KIND },
+      to: { kind: DB_CALL_NODE_KIND },
+    })),
+  );
+}
+
+/**
+ * The flows the executed path queries found, as graph paths `readFlows` renders.
+ *
+ * @param root The structured context.
+ * @returns One path per run that found one, in log order.
+ */
+function executedPaths(root: JsonObject): JsonValue[] {
+  const paths: JsonValue[] = [];
+  for (const run of readExecutedRuns(root)) {
+    if (pathQueryIdentity(run.request) !== undefined && pathEndOf(run.payload) !== undefined) {
+      const payload = asObject(run.payload);
+      if (payload !== undefined) {
+        paths.push(payload);
+      }
+    }
+  }
+  return paths;
+}
+
 /**
  * Builds the code investigation of a request from its structured context.
  *
@@ -2779,11 +3250,16 @@ export function buildInvestigation(input: JsonValue | undefined): JsonValue | un
   }
 
   const understanding = readUnderstanding(root);
+  const followUps = followUpQueries(root, understanding);
+  if (followUps.length > 0) {
+    return { [QUERY_BATCH_FIELD]: followUps };
+  }
   const candidates = sortCandidates(readCandidates(root, understanding)).slice(
     0,
     MAX_RELEVANT_FILES,
   );
-  const flows = readFlows(root);
+  const paths = executedPaths(root);
+  const flows = readFlows(paths.length > 0 ? { ...root, paths } : root);
 
   if (candidates.length === 0 && flows.length === 0) {
     return undefined;
@@ -3071,6 +3547,12 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
     }
     const type = chooseActionType(candidate.actionTypes, catalog);
     if (type === undefined) {
+      continue;
+    }
+    // A runtime hook the plan already reserves observes the whole page or
+    // process, this candidate included: a second action of that type would
+    // collect nothing new, so the slot goes to a candidate that needs its own.
+    if (signalTypes.includes(type)) {
       continue;
     }
     const key = `${candidate.file}|${candidate.symbol}|${type}`;
@@ -3381,14 +3863,14 @@ function factCandidates(
     )
     .slice(0, MAX_DUPLICATE_GROUP_FACTS);
   for (const group of requestGroups) {
-    const references = evidenceOf(group.node);
+    const { references } = group;
     candidates.push({
       factClass: 'duplicateRequests',
       magnitude: group.count,
       statement: duplicateRequestFact(group.count, group.windowMs, group.endpoint),
       references,
     });
-    const callSite = callSiteLabel(group.node);
+    const callSite = group.location === undefined ? '' : formatSourceLocation(group.location);
     if (callSite.length > 0) {
       candidates.push({
         factClass: 'sharedOrigin',
@@ -3522,14 +4004,14 @@ function causeDetections(
         : right.count - left.count,
     )[0];
   if (duplicate !== undefined) {
-    const location = readSourceLocation(duplicate.node);
+    const { location } = duplicate;
     detections.push({
       pattern: 'duplicate-requests',
       count: duplicate.count,
       windowMs: duplicate.windowMs,
-      callSite: callSiteLabel(duplicate.node),
+      callSite: location === undefined ? '' : formatSourceLocation(location),
       steps: duplicate.count - 1,
-      references: evidenceOf(duplicate.node),
+      references: duplicate.references,
       ...(location !== undefined ? { location } : {}),
     });
   }
@@ -3860,30 +4342,59 @@ function readSuggestedLocation(root: JsonObject): SourceLocation | undefined {
 }
 
 /**
+ * The metrics that quantify each evidence pattern, keyed by the pattern.
+ *
+ * A pattern the capture exhibits is shown on the cards by its own
+ * measurements: repeated identical requests by the request and duplicate
+ * counts, renders with unchanged inputs by the render counts that qualify them
+ * (the undetermined-trigger count is the complement that keeps "unchanged"
+ * honest), a repeated statement shape by the query count and database time,
+ * and a dominant operation by the total it dominates. Keyed by the shared
+ * {@link EvidencePattern} vocabulary so a new pattern without an entry is a
+ * compile error.
+ */
+const PATTERN_METRIC_IDS: Readonly<Record<EvidencePattern, readonly ComputedMetricId[]>> =
+  Object.freeze({
+    'duplicate-requests': ['request_count', 'duplicate_request_count'],
+    'unchanged-input-renders': [
+      'render_count',
+      'unchanged_render_count',
+      'render_trigger_unknown_count',
+    ],
+    'repeated-query-shape': ['query_count', 'database_duration'],
+    'dominant-span': ['total_duration'],
+  });
+
+/**
  * The metric ids a card node should name.
  *
- * The reported ids intersected with {@link COMPUTED_METRIC_IDS} — and with the
- * entry's own constraint where it declares one — in the tuple's order, so a
- * card row is laid out identically for identical captures. A metric the capture
- * did not report is never named: an empty card is not evidence.
+ * The first {@link MAX_METRIC_CARDS} reported ids of {@link COMPUTED_METRIC_IDS}
+ * — intersected with the entry's own constraint where it declares one — are
+ * the headline row, in the tuple's order. Every further reported id that
+ * quantifies an evidence pattern the capture exhibits follows, still in the
+ * tuple's order, so a finding is never crowded out of its own cards by the
+ * headline: a capture of duplicated requests shows its request counts, one of
+ * unchanged renders its render counts, whatever the tuple puts first. Identical
+ * captures give identical rows, and a metric the capture did not report is
+ * never named: an empty card is not evidence.
  *
  * @param entry The catalog entry for the card node.
  * @param reading The metric reading.
- * @returns The metric ids, capped.
+ * @param patterns The evidence patterns the capture exhibits.
+ * @returns The metric ids.
  */
-function metricCardIds(entry: CatalogEntryView, reading: MetricReading): readonly string[] {
+function metricCardIds(
+  entry: CatalogEntryView,
+  reading: MetricReading,
+  patterns: readonly EvidencePattern[],
+): readonly string[] {
   const permitted = new Set(entry.metrics);
-  const chosen: string[] = [];
-  for (const id of COMPUTED_METRIC_IDS) {
-    if (!reading.values.has(id)) {
-      continue;
-    }
-    if (permitted.size > 0 && !permitted.has(id)) {
-      continue;
-    }
-    chosen.push(id);
-  }
-  return chosen.slice(0, MAX_METRIC_CARDS);
+  const reported = COMPUTED_METRIC_IDS.filter(
+    (id) => reading.values.has(id) && (permitted.size === 0 || permitted.has(id)),
+  );
+  const chosen = new Set<string>(reported.slice(0, MAX_METRIC_CARDS));
+  const quantifying = new Set<string>(patterns.flatMap((pattern) => PATTERN_METRIC_IDS[pattern]));
+  return reported.filter((id) => chosen.has(id) || quantifying.has(id));
 }
 
 /**
@@ -3946,6 +4457,9 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
   const spans = sortSpans(readSpans(aggregatesBag(root)));
   const totalMs = readTotalDuration(root, reading, spans);
   const traceId = readTraceId(root);
+  // The patterns the capture's numbers form, detected exactly as the analysis
+  // detects them, so the metric cards quantify what the analysis explains.
+  const patterns = causeDetections(root, spans, totalMs).map((detection) => detection.pattern);
 
   const catalog = [...readNodeCatalog(root)].sort((left, right) =>
     left.index === right.index ? compareStrings(left.type, right.type) : left.index - right.index,
@@ -3964,7 +4478,7 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
     const source = entry.sources.find((candidate) => isMaterialSource(candidate, counts));
 
     if (source === METRICS_SOURCE) {
-      const metrics = metricCardIds(entry, reading);
+      const metrics = metricCardIds(entry, reading, patterns);
       if (metrics.length === 0) {
         continue;
       }

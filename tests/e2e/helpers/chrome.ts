@@ -2353,6 +2353,14 @@ export interface SelectTargetOptions {
   readonly route?: TargetSelectionRoute | undefined;
   /** The overall budget for the target to be observable; defaults to {@link TARGET_SELECTION_TIMEOUT_MS}. */
   readonly timeoutMs?: number | undefined;
+  /**
+   * Accept only a descriptor that carries a React owner chain, describing `$0`
+   * again (`devtools-eval`) until it does and waiting for a recorded target
+   * that carries one. On a React page the chain exists only once React owns the
+   * element, so this rides out a page that is still hydrating or is reloading
+   * after an instrumentation patch reached a client module.
+   */
+  readonly requireOwnerChain?: boolean | undefined;
 }
 
 /** The result of {@link selectTarget}. */
@@ -2487,6 +2495,52 @@ async function driveDevtoolsEval(
 }
 
 /**
+ * Drive `devtools-eval` until the product describes the element with a React
+ * owner chain.
+ *
+ * The chain exists only once React owns the element: a page still hydrating
+ * answers with none, and so does one that Next.js Fast Refresh is reloading
+ * because an instrumentation patch reached a module outside a component
+ * boundary. Each attempt is a real selection change the DevTools page answers
+ * and posts; an attempt that fails while the page navigates is retried. The
+ * poll is bounded by `timeoutMs` and reports the last description it saw.
+ */
+async function driveOwnedDescription(
+  caller: string,
+  panel: PanelHandle,
+  state: PanelState,
+  selector: string,
+  timeoutMs: number,
+): Promise<{ descriptor: SelectedTarget } | { unavailable: string }> {
+  let described: SelectedTarget | undefined;
+  let unavailable: string | undefined;
+  await pollUntilReady(
+    async () => {
+      const attempt = await driveDevtoolsEval(panel, state, selector);
+      if ('unavailable' in attempt) {
+        unavailable = attempt.unavailable;
+        return READY;
+      }
+      if (attempt.descriptor.componentChain.length === 0) {
+        return `<${attempt.descriptor.tagName}> ${attempt.descriptor.selector} was described with no owner chain`;
+      }
+      described = attempt.descriptor;
+      return READY;
+    },
+    timeoutMs,
+    (lastSeen) =>
+      `${caller}: the product never described "${selector}" with a React owner chain within ${String(timeoutMs)} ms; last seen: ${lastSeen}.${errorsSuffix(state)}`,
+  );
+  if (unavailable !== undefined) {
+    return { unavailable };
+  }
+  if (described === undefined) {
+    throw new Error(`${caller}: the owner-chain poll settled without a description.`);
+  }
+  return { descriptor: described };
+}
+
+/**
  * Drive `panel-picker`: set `$0` and press the panel's "Use selected element",
  * whose `App.tsx` evaluates its own `$0` expression and sends the
  * `target.selected` port request.
@@ -2538,7 +2592,8 @@ async function observeSelection(
         ({ session }) =>
           (sessionId === undefined || session.id === sessionId) &&
           session.target !== undefined &&
-          sameTarget(session.target, descriptor),
+          sameTarget(session.target, descriptor) &&
+          (options.requireOwnerChain !== true || session.target.componentChain.length > 0),
         { sinceIndex, timeoutMs },
       );
       return validateTarget(message.payload.session.target, "The session record's target");
@@ -2560,6 +2615,46 @@ async function observeSelection(
     );
   }
   return descriptor;
+}
+
+/**
+ * The checks every selection starts with, and the panel state it drives.
+ *
+ * @param caller The exported function, named in every failure.
+ * @returns The panel's state, with the application page as the inspected page.
+ * @throws {Error} When the selector is empty or matches nothing, a handle is
+ * closed, or `appPage` is not the panel's tab.
+ */
+async function prepareSelection(
+  caller: string,
+  panel: PanelHandle,
+  appPage: Page,
+  selector: string,
+  timeoutMs: number,
+): Promise<PanelState> {
+  const state = panelState(panel);
+  if (selector.trim() === '') {
+    throw new Error(`${caller}: the selector is empty.`);
+  }
+  if (panel.isClosed() || appPage.isClosed()) {
+    throw new Error(`${caller}: the panel handle or the application page is closed.`);
+  }
+  try {
+    await expect(appPage.locator(selector).first()).toBeAttached({ timeout: timeoutMs });
+  } catch (error) {
+    throw new Error(
+      `${caller}: "${selector}" matches no element in ${appPage.url()} within ${String(timeoutMs)} ms.`,
+      { cause: error },
+    );
+  }
+  const appTab = await tabIdForPage(panel.extension, appPage);
+  if (appTab !== panel.tabId) {
+    throw new Error(
+      `${caller}: the panel inspects tab ${String(panel.tabId)}, but the application page is tab ${String(appTab)}.`,
+    );
+  }
+  state.inspectedPage = appPage;
+  return state;
 }
 
 /**
@@ -2588,34 +2683,16 @@ async function observeSelection(
  */
 export async function selectTarget(options: SelectTargetOptions): Promise<SelectTargetResult> {
   const { panel, appPage, selector } = options;
-  const state = panelState(panel);
   const timeoutMs = options.timeoutMs ?? TARGET_SELECTION_TIMEOUT_MS;
-  if (selector.trim() === '') {
-    throw new Error('selectTarget: the selector is empty.');
-  }
-  if (panel.isClosed() || appPage.isClosed()) {
-    throw new Error('selectTarget: the panel handle or the application page is closed.');
-  }
-  try {
-    await expect(appPage.locator(selector).first()).toBeAttached({ timeout: timeoutMs });
-  } catch (error) {
-    throw new Error(
-      `selectTarget: "${selector}" matches no element in ${appPage.url()} within ${String(timeoutMs)} ms.`,
-      { cause: error },
-    );
-  }
-  const appTab = await tabIdForPage(panel.extension, appPage);
-  if (appTab !== panel.tabId) {
-    throw new Error(
-      `selectTarget: the panel inspects tab ${String(panel.tabId)}, but the application page is tab ${String(appTab)}.`,
-    );
-  }
-  state.inspectedPage = appPage;
+  const state = await prepareSelection('selectTarget', panel, appPage, selector, timeoutMs);
   const sinceIndex = options.editorClient?.snapshotIndex();
 
   let fallbackReason: string | undefined;
   if (options.route !== 'panel-picker') {
-    const attempt = await driveDevtoolsEval(panel, state, selector);
+    const attempt =
+      options.requireOwnerChain === true
+        ? await driveOwnedDescription('selectTarget', panel, state, selector, timeoutMs)
+        : await driveDevtoolsEval(panel, state, selector);
     if ('descriptor' in attempt) {
       const target = await observeSelection(
         options,
@@ -2636,6 +2713,61 @@ export async function selectTarget(options: SelectTargetOptions): Promise<Select
   const descriptor = await drivePanelPicker(panel, state, selector, timeoutMs);
   const target = await observeSelection(options, state, descriptor, sinceIndex, timeoutMs);
   return { target, route: 'panel-picker', fallbackReason };
+}
+
+/** Options of {@link describeSelection}. */
+export interface DescribeSelectionOptions {
+  /** The DevTools surface of the application's tab. */
+  readonly panel: PanelHandle;
+  /** The application page — the panel's inspected tab. */
+  readonly appPage: Page;
+  /** The element to select, as a CSS selector in `appPage` (its first match is `$0`). */
+  readonly selector: string;
+  /** The budget for the element to attach and be described; defaults to {@link TARGET_SELECTION_TIMEOUT_MS}. */
+  readonly timeoutMs?: number | undefined;
+  /** Describe `$0` again until the descriptor carries a React owner chain (see {@link SelectTargetOptions.requireOwnerChain}). */
+  readonly requireOwnerChain?: boolean | undefined;
+}
+
+/**
+ * Select an element in the Elements panel *before* any question is asked, and
+ * return the `SelectedTarget` the product described it as.
+ *
+ * This is the developer pointing at something first (AAP §0.1.1: "optionally
+ * selects an element, asks a question"). The real DevTools page's
+ * `onSelectionChanged` handler evaluates the product's own `$0` descriptor
+ * expression, answered in the inspected page by the MAIN-world agent's
+ * `describeTarget` — a capability the dormant agent arms before any session
+ * exists for exactly this purpose (`packages/telemetry/src/browser/agent.ts`).
+ * The page then posts `devtools.element`; with no session bound to the tab the
+ * worker forwards nothing, so the descriptor is an input to the *next*
+ * `session.create` — the role the VS Code view's pending target plays
+ * (`apps/vscode-extension/src/state.ts`). Only the `devtools-eval` route can run
+ * here: the panel's "Use selected element" needs a bound session.
+ *
+ * A `SelectedTarget` is never fabricated here: the result is the product's
+ * answer, validated against `selectedTargetSchema`.
+ *
+ * @throws {Error} When the selector matches nothing, `appPage` is not the
+ * panel's tab, the DevTools page cannot evaluate the selection, or the
+ * product's expression reports a failure (for example `agent-unavailable`).
+ */
+export async function describeSelection(
+  options: DescribeSelectionOptions,
+): Promise<SelectedTarget> {
+  const { panel, appPage, selector } = options;
+  const timeoutMs = options.timeoutMs ?? TARGET_SELECTION_TIMEOUT_MS;
+  const state = await prepareSelection('describeSelection', panel, appPage, selector, timeoutMs);
+  const attempt =
+    options.requireOwnerChain === true
+      ? await driveOwnedDescription('describeSelection', panel, state, selector, timeoutMs)
+      : await driveDevtoolsEval(panel, state, selector);
+  if ('descriptor' in attempt) {
+    return attempt.descriptor;
+  }
+  throw new Error(
+    `describeSelection: the DevTools page could not describe the selection: ${attempt.unavailable}.`,
+  );
 }
 
 /**

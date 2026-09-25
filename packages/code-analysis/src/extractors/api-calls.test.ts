@@ -1820,6 +1820,88 @@ describe('apiCallsExtractor: the client-wrapper rule', () => {
   });
 });
 
+/**
+ * A project's own HTTP client function, recognised by forwarding its first
+ * parameter into a `fetch` URL — never by its name. Three consumers: a caller
+ * in the same module, a caller importing it, and callers of look-alikes that
+ * do not forward (which must yield no node).
+ */
+const FORWARDING_MODULES: Readonly<Record<string, string>> = Object.freeze({
+  'src/client.ts': [
+    'declare const origin: string;',
+    '',
+    'export async function send(path: string, init?: { method?: string; body?: string }) {',
+    '  const url = `${origin}${path}`;',
+    '  return fetch(url, init);',
+    '}',
+    '',
+    'export function measure(path: string): number {',
+    '  return path.length;',
+    '}',
+    '',
+    'export function pinned(path: string) {',
+    "  return fetch('/scratch/pinned', { method: path.length > 0 ? 'GET' : 'HEAD' });",
+    '}',
+    '',
+    "export function submit() { return send('/scratch/forwarded', { method: 'POST' }); }",
+    "export function measured() { return measure('/scratch/not-a-request'); }",
+    "export function ignored() { return pinned('/scratch/ignored'); }",
+    "export function relative() { return send('scratch/relative'); }",
+    '',
+  ].join('\n'),
+  'src/caller.ts': [
+    "import { send } from './client';",
+    '',
+    "export function remote() { return send('/scratch/imported'); }",
+    '',
+  ].join('\n'),
+});
+
+/** The forwarding-wrapper project, built on first use. */
+let forwarding: ExtractedProject | undefined;
+
+describe('apiCallsExtractor: the forwarding-wrapper rule', () => {
+  beforeAll(async () => {
+    forwarding = await createScratchProject('debuggen-api-calls-forwarding-', FORWARDING_MODULES);
+  });
+
+  it('records a call through a function that forwards its path into fetch, at the call site', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), 'src/client.ts');
+    const submitted = nodeBySymbol(nodes, 'submit');
+
+    // Named for the callee as written, with the literal path it was given and
+    // the options object's literal method.
+    expect(submitted.name).toBe('send');
+    expect(submitted.data.url).toBe('/scratch/forwarded');
+    expect(submitted.data.dynamic).toBe(false);
+    expect(submitted.data.method).toBe('POST');
+  });
+
+  it('follows the wrapper across an import, and records no method the call does not state', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), 'src/caller.ts');
+    const imported = nodeBySymbol(nodes, 'remote');
+
+    expect(imported.name).toBe('send');
+    expect(imported.data.url).toBe('/scratch/imported');
+    // The wrapper's own default is not something the call site says.
+    expect(imported.data.method).toBeUndefined();
+  });
+
+  it('records nothing for a look-alike that does not forward its parameter, or a relative target', () => {
+    const nodes = apiCallsOf(scratchProject(forwarding, 'forwarding'), 'src/client.ts');
+    const symbols = nodes.map((node) => node.symbol);
+
+    for (const absent of ['measured', 'ignored', 'relative']) {
+      expect(symbols).not.toContain(absent);
+    }
+    // The wrapper's own `fetch` and the look-alike's pinned `fetch` remain
+    // nodes of their own: the forwarding rule adds call sites, it removes none.
+    expect(nodeBySymbol(nodes, 'send').data.dynamic).toBe(true);
+    expect(nodeBySymbol(nodes, 'pinned').data.url).toBe('/scratch/pinned');
+    expect(nodes).toHaveLength(3);
+  });
+});
+
 describe('apiCallsExtractor: computed and static targets', () => {
   it('declares a concatenation and a bare variable dynamic, with their source text', () => {
     const nodes = apiCallsOf(scratchProject(shapes, 'shapes'), 'src/dynamic.ts');

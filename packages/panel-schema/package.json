@@ -9,7 +9,10 @@
   "types": "./dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": [
+        "./dist/index.d.ts",
+        "./src/index.ts"
+      ],
       "import": "./dist/index.js"
     }
   },

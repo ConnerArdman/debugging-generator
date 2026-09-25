@@ -7,11 +7,17 @@
   "sideEffects": false,
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
+      "types": [
+        "./dist/index.d.ts",
+        "./src/index.ts"
+      ],
       "import": "./dist/index.js"
     },
     "./schema": {
-      "types": "./dist/schema/index.d.ts",
+      "types": [
+        "./dist/schema/index.d.ts",
+        "./src/schema/index.ts"
+      ],
       "import": "./dist/schema/index.js"
     }
   },

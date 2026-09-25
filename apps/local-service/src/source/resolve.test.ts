@@ -1589,6 +1589,54 @@ describe('SourceResolver.resolveEvent', () => {
         );
       });
 
+      it('takes the handler from the request span when the route handler span names no method', async () => {
+        // Next.js's route-handler span carries the route but not the method;
+        // the `http.server` span above it carries both. Both spans arriving in
+        // the query's own batch is the common case for a single request.
+        const project = standardProject();
+        const request = makeEvent({
+          kind: KIND.httpServer,
+          attributes: { [ATTR.httpMethod]: 'GET', [ATTR.httpRoute]: PROJECT.routePath },
+        });
+        const handler = makeEvent({
+          kind: KIND.routeHandler,
+          parentSpanId: request.spanId,
+          attributes: { [ATTR.nextRoute]: PROJECT.routePath },
+        });
+        const outcome = await resolved(
+          resolverFor(project, { events: fakeParents([handler, request]).port }).resolveEvent(
+            pgQuery(handler.spanId),
+          ),
+        );
+        expect(outcome.location).toEqual(dbCallMatch(project.readingsCall).location);
+        expect(project.fake.pathBetween).toHaveBeenCalledWith(
+          { file: PROJECT.routeFile, symbol: 'GET' },
+          project.readingsCall.id,
+          expect.objectContaining({ direction: 'out' }),
+        );
+        expect(project.fake.pathBetween).not.toHaveBeenCalledWith(
+          { file: PROJECT.routeFile },
+          expect.anything(),
+          expect.anything(),
+        );
+      });
+
+      it('keeps a method-less route handler as the owner when no ancestor names the handler', async () => {
+        const project = standardProject();
+        const handler = makeEvent({
+          kind: KIND.routeHandler,
+          attributes: { [ATTR.nextRoute]: PROJECT.routePath },
+        });
+        await resolverFor(project, { events: fakeParents([handler]).port }).resolveEvent(
+          pgQuery(handler.spanId),
+        );
+        expect(project.fake.pathBetween).toHaveBeenCalledWith(
+          { file: PROJECT.routeFile },
+          expect.any(String),
+          expect.objectContaining({ direction: 'out' }),
+        );
+      });
+
       it('takes the call site the enclosing function issues directly without a path search', async () => {
         const project = standardProject();
         const parent = makeEvent({

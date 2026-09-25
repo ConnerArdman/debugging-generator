@@ -17,7 +17,7 @@
 
   "// outputs": "`tsc -b` emits declarations only, into each project's .tsbuild/ - anchored per project with `${configDir}` in tsconfig.base.json so siblings cannot overwrite one another. .tsbuild/ is ignored by .gitignore, .prettierignore and eslint.config.js, so `git status` stays clean after the gate runs. The shipping bundles under each dist/ belong to tsup, esbuild, Vite and Next; this build never writes them, and `tsc -b --clean` never removes them.",
 
-  "// no-aliases": "No `baseUrl`/`paths` here or in any referenced project. Cross-package imports resolve through each package's `exports` map into dist/, exactly as the runtime and the bundlers resolve them (AAP 0.2.2); aliasing to source would mask a broken `exports` map and let the package layering be violated without anything failing.",
+  "// no-aliases": "No `baseUrl`/`paths` here or in any referenced project. Cross-package imports resolve through each package's `exports` map: into dist/ on a built tree, exactly as the runtime and the bundlers resolve them (AAP 0.2.2), and - on a tree with no dist/ yet, such as a fresh clone - through the second entry of each `types` fallback array into the package's src/ entry, which `tsc -b` redirects to that referenced project's own .tsbuild declarations, so this gate needs no prior build (AAP 0.8.5; proven by tests/e2e/clean-clone.spec.ts). Aliasing to source would mask a broken `exports` map and let the package layering be violated without anything failing.",
 
   "// prerequisite": "apps/demo-app imports its generated Prisma client from src/generated/prisma, which `prisma generate` writes. The root `typecheck` script chains `pnpm demo:generate` ahead of `tsc -b`, so this gate never depends on `pnpm build` having run first (AAP 0.8.5).",
 

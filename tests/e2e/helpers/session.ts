@@ -104,7 +104,7 @@ import type {
 } from '@debuggen/protocol';
 
 import { expectValidPanelSpec, nodeTypesOf, visualizationNodeTypesOf } from './assertions';
-import { selectTarget, tabIdForPage } from './chrome';
+import { describeSelection, selectTarget, tabIdForPage } from './chrome';
 import type { PanelConnectionStatus, PanelHandle, TargetSelectionRoute } from './chrome';
 import { CaptureConflictError, POLL_INTERVALS_MS, ServiceCallError } from './service';
 import type { EditorClientHandle, ServiceHandle } from './service';
@@ -364,8 +364,19 @@ export interface SessionInteractionContext {
   readonly captureId: string;
 }
 
-/** The spec-owned reproduction step; the only place this module spends wall-clock time. */
+/** The spec-owned reproduction step; with {@link SessionPreparation}, the only place this module spends wall-clock time. */
 export type SessionInteraction = (context: SessionInteractionContext) => Promise<void>;
+
+/** What a {@link RunDebugSessionOptions.beforeCapture} step reaches: the ready session's page and panel. */
+export interface SessionPreparationContext {
+  /** The application page — the panel's inspected tab. */
+  readonly appPage: Page;
+  /** The DevTools surface of that tab. */
+  readonly panel: PanelHandle;
+}
+
+/** A spec-owned step between "Ready to capture" and `capture.start`. */
+export type SessionPreparation = (context: SessionPreparationContext) => Promise<void>;
 
 /** A target given as a CSS selector of the application page, selected through the product. */
 export interface SelectorTarget {
@@ -402,6 +413,20 @@ export interface RunDebugSessionOptions {
   /** Force one selection route instead of preferring `devtools-eval`. */
   readonly selectTargetVia?: TargetSelectionRoute | undefined;
   /**
+   * Point at a `{ selector }` target *before* asking, as a developer who
+   * selects an element and then asks about it does (AAP §0.1.1). The DevTools
+   * page describes `$0` through the product (`./chrome`'s `describeSelection`)
+   * while no session exists, until the descriptor carries the element's React
+   * owner chain; `session.create` carries that descriptor — the editor's
+   * pending target — so problem understanding (Stage 1) reads it. Once the
+   * session is ready the element is selected through the product again, so
+   * `target.selected` runs for the live session and must record the same
+   * element with its owner chain. `false` by default: the selector is then
+   * selected after the tab is bound only, which is after Stage 1 has already
+   * started.
+   */
+  readonly selectBeforeQuestion?: boolean | undefined;
+  /**
    * Accept a deterministic fallback panel (`meta.fallback`). `false` by
    * default: a fallback proves the failure path, not an answer.
    */
@@ -413,6 +438,16 @@ export interface RunDebugSessionOptions {
    * that degradation deliberately opts in.
    */
   readonly allowMissingServerAgent?: boolean | undefined;
+  /**
+   * Runs once the session is ready and before `capture.start`: the pause a
+   * developer takes between "Ready to capture" and pressing Start capture.
+   * Installing a plan that patches a client module can make the dev server's
+   * Fast Refresh reload the page on its own, a moment after the session turns
+   * ready; a reproduction started within milliseconds of readiness would
+   * capture the outgoing, uninstrumented document's traffic alongside the
+   * instrumented one's. Absent by default. A throw fails the `ready` phase.
+   */
+  readonly beforeCapture?: SessionPreparation | undefined;
 }
 
 /** Options of {@link askFollowUp}. */
@@ -1429,7 +1464,12 @@ async function bindTabStep(
   });
 }
 
-/** Step 3 — select `selector` through the product (`$0` → the agent's descriptor → `target.selected`). */
+/**
+ * Step 3 — select `selector` through the product (`$0` → the agent's
+ * descriptor → `target.selected`). With `requireOwnerChain`, only a descriptor
+ * and a recorded target that carry the element's React owner chain are
+ * accepted (`./chrome`'s `SelectTargetOptions.requireOwnerChain`).
+ */
 async function selectTargetStep(
   driver: WorkflowDriver,
   phase: PhaseClock,
@@ -1437,6 +1477,7 @@ async function selectTargetStep(
   appPage: Page,
   selector: string,
   route: TargetSelectionRoute | undefined,
+  requireOwnerChain: boolean,
 ): Promise<SelectedTarget> {
   try {
     const selected = await selectTarget({
@@ -1447,6 +1488,7 @@ async function selectTargetStep(
       sessionId: driver.sessionId,
       route,
       timeoutMs: driver.timeouts.bind,
+      requireOwnerChain,
     });
     return selected.target;
   } catch (error) {
@@ -1457,6 +1499,45 @@ async function selectTargetStep(
       { cause: error },
     );
   }
+}
+
+/**
+ * Step 0 — point at `selector` before any session exists (`./chrome`'s
+ * `describeSelection`). There is no session yet, so the failure text is built
+ * here, as `createSessionStep` builds its own.
+ */
+async function preselectTargetStep(
+  panel: PanelHandle,
+  appPage: Page,
+  selector: string,
+  timeoutMs: number,
+): Promise<SelectedTarget> {
+  const startedAt = Date.now();
+  try {
+    return await describeSelection({
+      panel,
+      appPage,
+      selector,
+      timeoutMs,
+      requireOwnerChain: true,
+    });
+  } catch (error) {
+    throw new SessionWorkflowError({
+      phase: 'target',
+      code: 'target-selection-failed',
+      message: [
+        `[target] describing "${clip(selector, 120)}" before the question failed: ${describeError(error)} (after ${String(Date.now() - startedAt)} ms in this phase)`,
+        '  session status last seen: none — no session exists yet',
+      ].join('\n'),
+      elapsedMs: Date.now() - startedAt,
+      cause: error,
+    });
+  }
+}
+
+/** Whether two descriptors name the same element of the same document. */
+function sameElement(a: SelectedTarget, b: SelectedTarget): boolean {
+  return a.selector === b.selector && a.tagName === b.tagName && a.url === b.url;
 }
 
 /** Whether a progress row is the readiness gate's request for a page reload. */
@@ -1665,7 +1746,29 @@ async function startCaptureStep(driver: WorkflowDriver, phase: PhaseClock): Prom
   return captureId;
 }
 
-/** Step 7 — the spec's interaction, the only place wall-clock time is spent. */
+/**
+ * Step 5b — the spec's {@link RunDebugSessionOptions.beforeCapture} step, run
+ * on the ready session; a throw is reported against the `ready` phase.
+ */
+async function prepareStep(
+  driver: WorkflowDriver,
+  phase: PhaseClock,
+  prepare: SessionPreparation,
+  context: SessionPreparationContext,
+): Promise<void> {
+  try {
+    await prepare(context);
+  } catch (error) {
+    throw driver.fail(
+      phase,
+      'interaction-failed',
+      `the spec's step before capture.start threw: ${describeError(error)}`,
+      { cause: error },
+    );
+  }
+}
+
+/** Step 7 — the spec's interaction, where the reproduction's wall-clock time is spent. */
 async function interactStep(
   driver: WorkflowDriver,
   phase: PhaseClock,
@@ -1907,8 +2010,23 @@ export async function runDebugSession(
     throw invalidOption('create', 'runDebugSession', 'the question is empty.');
   }
   const target = classifyTarget(options.target);
+  const selectBeforeQuestion = options.selectBeforeQuestion === true;
+  if (selectBeforeQuestion && target.selector === undefined) {
+    throw invalidOption(
+      'create',
+      'runDebugSession',
+      'selectBeforeQuestion needs a { selector } target: a pre-built SelectedTarget is already sent with session.create.',
+    );
+  }
   const allowFallbackPanel = options.allowFallbackPanel === true;
   const allowMissingServerAgent = options.allowMissingServerAgent === true;
+
+  // 0. Point at the element first, when asked to: there is no session yet, so
+  // the descriptor is the next question's pending target.
+  const preselected =
+    selectBeforeQuestion && target.selector !== undefined
+      ? await preselectTargetStep(panel, appPage, target.selector, timeouts.bind)
+      : undefined;
 
   // The mark comes first: the service answers `session.create` and starts
   // broadcasting in the same breath.
@@ -1920,7 +2038,7 @@ export async function runDebugSession(
     editorClient,
     projectRoot,
     question,
-    target.prebuilt,
+    target.prebuilt ?? preselected,
     mark,
   );
   options.tracker?.register(created.id);
@@ -1938,8 +2056,12 @@ export async function runDebugSession(
     driver.end(bindPhase);
 
     // 3. Select the target through the product, when one was named by selector.
-    let selected: SelectedTarget | undefined = target.prebuilt;
-    if (target.selector !== undefined) {
+    // A target pointed at before the question is selected again once the
+    // session is ready instead: installing the plan can reload the page (a
+    // patched client module makes Fast Refresh reload it), and selecting then
+    // would describe an element React does not own yet.
+    let selected: SelectedTarget | undefined = target.prebuilt ?? preselected;
+    if (target.selector !== undefined && preselected === undefined) {
       const targetPhase = driver.begin('target');
       selected = await selectTargetStep(
         driver,
@@ -1948,6 +2070,7 @@ export async function runDebugSession(
         appPage,
         target.selector,
         options.selectTargetVia,
+        false,
       );
       driver.end(targetPhase);
     }
@@ -1961,6 +2084,37 @@ export async function runDebugSession(
       allowMissingServerAgent,
     });
     driver.end(readyPhase);
+
+    // 5a. The element pointed at before the question, selected for the live
+    // session, which must record the same element.
+    if (target.selector !== undefined && preselected !== undefined) {
+      const targetPhase = driver.begin('target');
+      selected = await selectTargetStep(
+        driver,
+        targetPhase,
+        panel,
+        appPage,
+        target.selector,
+        options.selectTargetVia,
+        true,
+      );
+      if (!sameElement(preselected, selected)) {
+        throw driver.fail(
+          targetPhase,
+          'target-selection-failed',
+          `the element selected before the question (<${preselected.tagName}> ${clip(preselected.selector, 120)} on ${preselected.url}) is not the one the live session recorded (<${selected.tagName}> ${clip(selected.selector, 120)} on ${selected.url}).`,
+        );
+      }
+      driver.end(targetPhase);
+    }
+
+    // 5b. The developer's pause before pressing Start capture, when the spec
+    // asked for one.
+    if (options.beforeCapture !== undefined) {
+      const pausePhase = driver.begin('ready');
+      await prepareStep(driver, pausePhase, options.beforeCapture, { appPage, panel });
+      driver.end(pausePhase);
+    }
 
     // 6. Start the capture.
     const startPhase = driver.begin('captureStart');

@@ -45,7 +45,7 @@
  * joining), `../summary.ts` (the project's API-call count) and, downstream of
  * the index, the duplicate-request analysis of the local service.
  *
- * ## The three call shapes it recognises, and nothing beyond them
+ * ## The four call shapes it recognises, and nothing beyond them
  *
  * Detection matches **framework-level syntax**, never an application's
  * vocabulary (AAP 0.5.4, enforced by `scripts/check-no-hardcoding.mjs` over
@@ -68,6 +68,16 @@
  *    string or template. The verb-plus-path shape is what a real project's
  *    HTTP client looks like; a list of client names would be exactly the
  *    hardcoded application knowledge this product may not contain.
+ *
+ * 4. **A forwarding wrapper** — a call whose callee resolves (through the
+ *    type checker, across modules) to a function of the analysed project that
+ *    forwards its first parameter into the URL argument of a `fetch` in its
+ *    own body, directly or through a local binding, *and* whose first argument
+ *    is path-like. That is what a project's own HTTP client function is —
+ *    `request('/x', { method: 'POST' })` — recognised by what the function
+ *    does rather than by what it is called. The literal path is recorded at
+ *    the call site, where it is written, so the site joins to its route; the
+ *    `fetch` inside the wrapper stays a node of its own with a dynamic target.
  *
  * The wrapper rule is deliberately generic, and its one known consequence is
  * that a server-side router registration written with the same shape
@@ -752,7 +762,7 @@ interface Position {
  * log. It is deliberately *not* stored on the node — `ApiCallNodeData` is
  * closed, and the shape is legible from the name and method the node carries.
  */
-type CallShape = 'fetch' | 'xhr' | 'wrapper';
+type CallShape = 'fetch' | 'xhr' | 'wrapper' | 'forwarder';
 
 /**
  * What the source says about a request's target.
@@ -1341,6 +1351,230 @@ function fetchMethodOf(init: Node | undefined): FetchMethod {
 }
 
 /* -------------------------------------------------------------------------------------------------
+ * Shape 4 — forwarding wrappers
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * How many local `const` bindings are followed from a `fetch` URL argument
+ * back to the wrapper's parameter: `const url = `${base}${path}``, then
+ * `fetch(url)` is one hop. Two covers a URL assembled in two steps without
+ * turning the check into general data-flow analysis.
+ */
+const MAX_FORWARDING_HOPS = 2;
+
+/**
+ * The verdict for each function-like declaration: whether it forwards its
+ * first parameter into the URL of a `fetch` call. Keyed by the declaration
+ * node, so a wrapper called from many sites is analysed once per project run
+ * and nothing outlives the ts-morph project that owns the node.
+ */
+const forwardingVerdicts = new WeakMap<Node, boolean>();
+
+/**
+ * The function a declaration binds: a function declaration or method, or a
+ * variable initialised with an arrow function or function expression.
+ *
+ * @param declaration One declaration of the callee's symbol.
+ * @returns The function-like node, or `undefined` for anything else.
+ */
+function functionLikeOf(declaration: Node): Node | undefined {
+  if (Node.isFunctionDeclaration(declaration) || Node.isMethodDeclaration(declaration)) {
+    return declaration;
+  }
+  if (Node.isVariableDeclaration(declaration)) {
+    const initializer = declaration.getInitializer();
+    if (
+      initializer !== undefined &&
+      (Node.isArrowFunction(initializer) || Node.isFunctionExpression(initializer))
+    ) {
+      return initializer;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * The name of a function's first parameter, when it is a plain identifier.
+ *
+ * @param fn A function-like node from {@link functionLikeOf}.
+ * @returns The parameter name, or `undefined` for none or a destructuring pattern.
+ */
+function firstParameterName(fn: Node): string | undefined {
+  if (
+    !Node.isFunctionDeclaration(fn) &&
+    !Node.isMethodDeclaration(fn) &&
+    !Node.isArrowFunction(fn) &&
+    !Node.isFunctionExpression(fn)
+  ) {
+    return undefined;
+  }
+  const nameNode = fn.getParameters()[0]?.getNameNode();
+  return nameNode !== undefined && Node.isIdentifier(nameNode) ? nameNode.getText() : undefined;
+}
+
+/**
+ * Whether an identifier is written in a *name* position — a property name after
+ * a dot, a property assignment's key — where it names a member rather than
+ * reading a binding.
+ *
+ * @param identifier The identifier.
+ * @returns `true` when it does not read a binding.
+ */
+function isNamePosition(identifier: Node): boolean {
+  const parent = identifier.getParent();
+  if (parent === undefined) {
+    return false;
+  }
+  if (Node.isPropertyAccessExpression(parent)) {
+    return parent.getNameNode() === identifier;
+  }
+  if (Node.isPropertyAssignment(parent)) {
+    return parent.getNameNode() === identifier;
+  }
+  return false;
+}
+
+/**
+ * The initializer of a local `const`/`let` binding named `name` inside `fn`.
+ *
+ * @param fn The wrapper function.
+ * @param name The binding name.
+ * @returns The initializer, or `undefined` when there is no such binding.
+ */
+function localInitializerOf(fn: Node, name: string): Node | undefined {
+  for (const declaration of fn.getDescendantsOfKind(SyntaxKind.VariableDeclaration)) {
+    const nameNode = declaration.getNameNode();
+    if (Node.isIdentifier(nameNode) && nameNode.getText() === name) {
+      return declaration.getInitializer();
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Whether an expression reads the binding `name`, directly or through at most
+ * `hops` local bindings of the wrapper.
+ *
+ * @param expression The `fetch` URL argument, or an initializer it leads to.
+ * @param name The wrapper's first parameter.
+ * @param fn The wrapper function.
+ * @param hops How many more local bindings may be followed.
+ * @returns `true` when the parameter reaches the expression.
+ */
+function readsBinding(expression: Node, name: string, fn: Node, hops: number): boolean {
+  const identifiers = Node.isIdentifier(expression)
+    ? [expression]
+    : expression.getDescendantsOfKind(SyntaxKind.Identifier);
+  for (const identifier of identifiers) {
+    if (isNamePosition(identifier)) {
+      continue;
+    }
+    const text = identifier.getText();
+    if (text === name) {
+      return true;
+    }
+    if (hops > 0) {
+      const initializer = localInitializerOf(fn, text);
+      if (initializer !== undefined && readsBinding(initializer, name, fn, hops - 1)) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
+
+/**
+ * Whether a function forwards its first parameter into the URL of a `fetch`
+ * call in its own body — the defining property of a project's own HTTP client
+ * function, and a property of the code rather than of any name.
+ *
+ * @param fn A function-like node from {@link functionLikeOf}.
+ * @returns `true` when the function is a forwarding wrapper.
+ */
+function forwardsToFetch(fn: Node): boolean {
+  const known = forwardingVerdicts.get(fn);
+  if (known !== undefined) {
+    return known;
+  }
+  const name = firstParameterName(fn);
+  const verdict =
+    name !== undefined &&
+    fn.getDescendantsOfKind(SyntaxKind.CallExpression).some((call) => {
+      const url = call.getArguments()[0];
+      return (
+        isFetchCallee(call.getExpression()) &&
+        url !== undefined &&
+        readsBinding(url, name, fn, MAX_FORWARDING_HOPS)
+      );
+    });
+  forwardingVerdicts.set(fn, verdict);
+  return verdict;
+}
+
+/**
+ * Whether a callee resolves to a forwarding wrapper declared in the analysed
+ * project (never a declaration file or a dependency).
+ *
+ * Resolution goes through the type checker, including an import alias, so a
+ * wrapper imported from another module is recognised at every call site. A
+ * callee the checker cannot resolve is simply not a wrapper: this is a
+ * classification, and an unresolvable callee is an ordinary call.
+ *
+ * @param callee The called expression.
+ * @returns `true` when the call is made through a forwarding wrapper.
+ */
+function isForwardingWrapperCallee(callee: Node): boolean {
+  try {
+    const symbol = callee.getSymbol();
+    if (symbol === undefined) {
+      return false;
+    }
+    const resolved = symbol.isAlias() ? (symbol.getAliasedSymbol() ?? symbol) : symbol;
+    for (const declaration of resolved.getDeclarations()) {
+      const fn = functionLikeOf(declaration);
+      if (fn === undefined) {
+        continue;
+      }
+      const sourceFile = fn.getSourceFile();
+      if (sourceFile.isDeclarationFile() || sourceFile.isInNodeModules()) {
+        continue;
+      }
+      if (forwardsToFetch(fn)) {
+        return true;
+      }
+    }
+    return false;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The method a forwarding-wrapper call states: an options object's literal
+ * `method`, read as a `fetch` init is. With none stated the node records no
+ * method, because the wrapper's own default is not something the call site
+ * says (and {@link DEFAULT_FETCH_METHOD} is the platform's default, not the
+ * wrapper's).
+ *
+ * @param options The call's second argument.
+ * @returns The method to record, or `undefined` with `unsupported` set.
+ */
+function forwardedMethodOf(options: Node | undefined): FetchMethod {
+  const reading =
+    options === undefined || !Node.isObjectLiteralExpression(options)
+      ? ABSENT_METHOD
+      : literalMethodIn(options);
+  switch (reading.kind) {
+    case 'method':
+      return { method: reading.method, unsupported: false };
+    case 'unsupported':
+      return { method: undefined, unsupported: true };
+    default:
+      return { method: undefined, unsupported: false };
+  }
+}
+
+/* -------------------------------------------------------------------------------------------------
  * Shape 1 and 3 — `fetch` and client wrappers
  * ---------------------------------------------------------------------------------------------- */
 
@@ -1380,7 +1614,7 @@ function isFetchCallee(callee: Node): boolean {
 /**
  * The call site a call expression is, or `undefined` when it is not a request.
  *
- * Two of the three recognised shapes, tested in this order:
+ * Three of the four recognised shapes, tested in this order:
  *
  * 1. **`fetch(url, init?)`** — the target is the first argument and the method
  *    the init object's literal `method`, defaulting to `GET`.
@@ -1388,11 +1622,15 @@ function isFetchCallee(callee: Node): boolean {
  *    HTTP verb *and* the first argument is path-like. Both halves are
  *    required, which is what keeps `list.get(3)` and `map.delete(key)` out of
  *    the graph.
+ * 3. **`wrapper(url, options?)`** — a forwarding wrapper: the first argument
+ *    is path-like and the callee resolves to a project function that forwards
+ *    its first parameter into a `fetch` URL ({@link isForwardingWrapperCallee}).
+ *    The method is the options object's literal `method`, or none.
  *
- * The node's position is the callee's start in both cases: at `fetch` for a
- * bare call, and at the receiver for a property access (`window.fetch(…)`,
- * `api.get(…)`), which is where a developer's eye and an editor's cursor
- * belong.
+ * The node's position is the callee's start in every case: at `fetch` or the
+ * wrapper for a bare call, and at the receiver for a property access
+ * (`window.fetch(…)`, `api.get(…)`), which is where a developer's eye and an
+ * editor's cursor belong.
  *
  * @param call The call expression to classify.
  * @returns The call site, or `undefined`.
@@ -1419,16 +1657,39 @@ function classifyCall(call: CallExpression): CallSite | undefined {
     };
   }
 
-  if (!Node.isPropertyAccessExpression(callee)) {
+  if (first === undefined || !isPathLike(first)) {
     return undefined;
   }
 
   // Shape 3 — `api.get('/x')`, `http.post(`/y/${id}`, body)`. The verb is the
   // method, and the receiver's text is the wrapper the node is named for (the
   // verb would otherwise be recorded twice; see the header).
-  const method = wrapperMethodOf(callee.getName());
+  const method = Node.isPropertyAccessExpression(callee)
+    ? wrapperMethodOf(callee.getName())
+    : undefined;
 
-  if (method === undefined || first === undefined || !isPathLike(first)) {
+  if (method === undefined || !Node.isPropertyAccessExpression(callee)) {
+    // Shape 4 — `request('/x', { method: 'POST' })`, where `request` is a
+    // function of this project that forwards its first parameter into a
+    // `fetch` URL. Named for the callee as written, like a `fetch`.
+    if (
+      (Node.isIdentifier(callee) || Node.isPropertyAccessExpression(callee)) &&
+      isForwardingWrapperCallee(callee)
+    ) {
+      const forwarded = forwardedMethodOf(second);
+
+      return {
+        shape: 'forwarder',
+        name: textOr(callee, callee.getText()),
+        anchor: callee,
+        extent: call,
+        expression: call,
+        target: targetOf(first),
+        method: forwarded.method,
+        unsupportedMethod: forwarded.unsupported,
+      };
+    }
+
     return undefined;
   }
 

@@ -404,6 +404,18 @@ const FRAME_SOURCE_PATTERN =
 /** A V8 (`    at fn (url:1:2)`) or SpiderMonkey/JavaScriptCore (`fn@url:1:2`) frame. */
 const V8_FRAME_PATTERN = /^\s*at\s/;
 
+/**
+ * A frame of the span helper's `span` method — the call every function-timing
+ * patch makes (`__dbg.span(name, meta, () => __orig.apply(…))`, see
+ * `packages/instrumentation/src/patch/wrap-template.ts`).
+ *
+ * The agent is minified, so the method is matched by the property it is called
+ * through rather than by its own name: V8 writes `Object.kT [as span]` for a
+ * renamed method and `Object.span` or `span` for an unrenamed one, and
+ * SpiderMonkey/JavaScriptCore write `span@url:1:2`.
+ */
+const SPAN_HELPER_FRAME_PATTERN = /(?:\[as span\]|(?:^\s*at\s+|\.)span)\s+\(|(?:^|[./<])span@/;
+
 /** Listener options for the XHR terminal listeners: fire once, never capture. */
 const ONCE_OPTIONS: AddEventListenerOptions = { once: true };
 
@@ -1270,13 +1282,13 @@ function isFrameLine(line: string): boolean {
  * format and maps it back to the developer's TypeScript, so any rewriting here
  * would be a second, divergent parser.
  *
- * This module's own frames are dropped first (see
- * {@link AGENT_FRAME_FALLBACK}), then at most {@link MAX_INITIATOR_FRAMES}
- * frames and {@link MAX_INITIATOR_CHARS} characters are kept. `undefined` when
- * the host produced no stack or nothing survived the drop, because an empty
- * `initiator` would be a claim of an unknown call site rather than an absence
- * of one — and `../aggregate/requests.ts` reads a blank value as absent
- * anyway.
+ * The agent's own frames, and the frames a function-timing patch adds, are
+ * dropped first (see {@link applicationFrames}), then at most
+ * {@link MAX_INITIATOR_FRAMES} frames and {@link MAX_INITIATOR_CHARS}
+ * characters are kept. `undefined` when the host produced no stack or nothing
+ * survived the drop, because an empty `initiator` would be a claim of an
+ * unknown call site rather than an absence of one — and
+ * `../aggregate/requests.ts` reads a blank value as absent anyway.
  */
 function captureInitiatorStack(): string | undefined {
   try {
@@ -1285,19 +1297,10 @@ function captureInitiatorStack(): string | undefined {
       return undefined;
     }
 
-    const frames = stack.split('\n').filter(isFrameLine);
-
-    let start = 0;
-    if (agentScriptUrl !== undefined) {
-      while (start < frames.length && (frames[start] ?? '').includes(agentScriptUrl)) {
-        start += 1;
-      }
-    }
-    if (start === 0) {
-      start = Math.min(AGENT_FRAME_FALLBACK, frames.length);
-    }
-
-    const kept = frames.slice(start, start + MAX_INITIATOR_FRAMES);
+    const kept = applicationFrames(stack.split('\n').filter(isFrameLine), agentScriptUrl).slice(
+      0,
+      MAX_INITIATOR_FRAMES,
+    );
     if (kept.length === 0) {
       return undefined;
     }
@@ -1309,6 +1312,66 @@ function captureInitiatorStack(): string | undefined {
     // click-to-source chip and nothing else.
     return undefined;
   }
+}
+
+/**
+ * The frames of a captured stack that the application wrote, innermost first
+ * — the stack as it would read with no instrumentation installed.
+ *
+ * - The leading frames naming `agentSource` (this module's patch and capture
+ *   helpers) are dropped; when `agentSource` is unknown, or names none of the
+ *   leading frames, the first {@link AGENT_FRAME_FALLBACK} frames are dropped
+ *   instead.
+ * - A later run of frames naming `agentSource` is the span helper a
+ *   function-timing patch called. The run is dropped together with its two
+ *   neighbours, which exist only because of the patch: the template's callback
+ *   (`() => __orig.apply(…)`) directly inside it, and the patched function's
+ *   own frame, which did nothing but call the helper, directly outside it. The
+ *   `__orig` frame stays, at the position the patched function held, and still
+ *   carries the original body's line. Without this, two patched functions
+ *   spend six of the {@link MAX_INITIATOR_FRAMES} frames on instrumentation,
+ *   and the frames that tell two call sites apart are cut off.
+ * - Any other later frame naming `agentSource` is dropped on its own, so a
+ *   click-to-source chip never lands in the agent.
+ *
+ * @param frames The stack's frame lines, innermost first, without its header.
+ * @param agentSource The agent's own script source, when it was detected.
+ * @returns The application's frames, unbounded; the caller applies the budget.
+ */
+export function applicationFrames(
+  frames: readonly string[],
+  agentSource: string | undefined,
+): string[] {
+  const isAgentFrame = (index: number): boolean =>
+    agentSource !== undefined && (frames[index] ?? '').includes(agentSource);
+
+  let start = 0;
+  while (start < frames.length && isAgentFrame(start)) {
+    start += 1;
+  }
+  if (start === 0) {
+    start = Math.min(AGENT_FRAME_FALLBACK, frames.length);
+  }
+
+  const kept: string[] = [];
+  let index = start;
+  while (index < frames.length) {
+    if (!isAgentFrame(index)) {
+      kept.push(frames[index] ?? '');
+      index += 1;
+      continue;
+    }
+    let spanHelper = false;
+    while (index < frames.length && isAgentFrame(index)) {
+      spanHelper = spanHelper || SPAN_HELPER_FRAME_PATTERN.test(frames[index] ?? '');
+      index += 1;
+    }
+    if (spanHelper) {
+      kept.pop();
+      index += 1;
+    }
+  }
+  return kept;
 }
 
 /**

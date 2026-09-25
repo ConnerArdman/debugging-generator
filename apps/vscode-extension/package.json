@@ -152,7 +152,7 @@
       "view/item/context": [
         {
           "command": "debuggen.reopenSession",
-          "when": "view == debuggen.sessions",
+          "when": "view == debuggen.sessions && viewItem == debuggen.session",
           "group": "inline"
         }
       ]
