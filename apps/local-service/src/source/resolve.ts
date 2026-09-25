@@ -494,6 +494,18 @@ export interface ModificationCorroborationPort {
 }
 
 /**
+ * An event the resolver can place: a persisted {@link TelemetryEvent}, or one
+ * that ingest has attributed but the store has not ordered yet.
+ *
+ * Ingest resolves an event's location **before** it persists the event, so the
+ * stored document, the live tail and every later panel-data read carry the
+ * same `source`. At that point the store has not assigned `ingestSeq`, and no
+ * route reads the ordering key, so both shapes are accepted.
+ */
+export type ResolvableEvent = Omit<TelemetryEvent, 'ingestSeq'> &
+  Partial<Pick<TelemetryEvent, 'ingestSeq'>>;
+
+/**
  * The narrow view of the telemetry store the `db.query` narrowing walks parent
  * spans through. `createTelemetryRepo` in `src/store/telemetry-repo.ts`
  * satisfies it structurally.
@@ -628,7 +640,7 @@ export interface SourceResolver {
    * failed store port.
    */
   resolveEvent(
-    event: TelemetryEvent,
+    event: ResolvableEvent,
     options?: SourceResolveOptions,
   ): Promise<Result<SourceResolution, DebuggenError>>;
 
@@ -655,7 +667,7 @@ export interface SourceResolver {
    * events are resolved.
    */
   resolveEvents(
-    events: readonly TelemetryEvent[],
+    events: readonly ResolvableEvent[],
     options?: SourceResolveOptions,
   ): Promise<Result<ReadonlyMap<string, SourceLocation>, DebuggenError>>;
 }
@@ -664,9 +676,41 @@ export interface SourceResolver {
  * Internal shapes
  * ---------------------------------------------------------------------------------------------- */
 
+/**
+ * The lowest `ingestSeq` the persisted schema accepts, supplied **for the check
+ * only** when an attributed event has none yet. It never leaves
+ * {@link parseResolvableEvent}.
+ */
+const UNORDERED_INGEST_SEQ = 1;
+
+/**
+ * Validates a {@link ResolvableEvent} against the persisted event schema.
+ *
+ * A persisted event is checked as it is. An attributed event is checked with
+ * {@link UNORDERED_INGEST_SEQ} standing in for the ordering key the store has
+ * not assigned, so every other rule of the persisted schema — the session and
+ * capture ids included — applies unchanged; the stand-in is removed again from
+ * the value returned.
+ *
+ * @param value The event to validate.
+ * @returns The validated event, in the shape it arrived in.
+ */
+function parseResolvableEvent(value: ResolvableEvent): Result<ResolvableEvent, DebuggenError> {
+  if (typeof value !== 'object' || value === null || value.ingestSeq !== undefined) {
+    return parseTelemetryEvent(value);
+  }
+  const parsed = parseTelemetryEvent({ ...value, ingestSeq: UNORDERED_INGEST_SEQ });
+  if (!parsed.ok) {
+    return parsed;
+  }
+  const attributed: ResolvableEvent = { ...parsed.value };
+  delete attributed.ingestSeq;
+  return ok(attributed);
+}
+
 /** What is being resolved: a captured event, or an element the developer selected. */
 type Subject =
-  | { readonly type: 'event'; readonly event: TelemetryEvent }
+  | { readonly type: 'event'; readonly event: ResolvableEvent }
   | { readonly type: 'target'; readonly target: SelectedTarget };
 
 /** One step a route took; a route's steps become its {@link SourceResolutionAttempt}s. */
@@ -734,9 +778,9 @@ interface ResolveScope {
   /** Modification records already read, by session id. */
   readonly modificationsBySession: Map<string, readonly ModificationRecord[]>;
   /** The batch's own events by `(sessionId, spanId)`, consulted before the store. */
-  readonly batchEvents: ReadonlyMap<string, TelemetryEvent>;
+  readonly batchEvents: ReadonlyMap<string, ResolvableEvent>;
   /** Parent spans already read from the store; `null` records a span that never arrived. */
-  readonly parentCache: Map<string, TelemetryEvent | null>;
+  readonly parentCache: Map<string, ResolvableEvent | null>;
   /** Every signal that cancels this call. */
   readonly signals: readonly AbortSignal[];
 }
@@ -752,7 +796,7 @@ type RouteImpl = (
 const REVERTED_STATUS = 'reverted' satisfies ModificationRecord['status'];
 
 /** The tier whose error stacks point into dev-server chunks the source-map route can read. */
-const BROWSER_TIER = 'browser' satisfies TelemetryEvent['tier'];
+const BROWSER_TIER = 'browser' satisfies ResolvableEvent['tier'];
 
 /** The subsystem name this module's diagnostics are bound under. */
 const LOG_SUBSYSTEM = 'source';
@@ -779,7 +823,7 @@ function rejected(reason: SourceResolutionMissReason): RouteStep {
 }
 
 /** A trimmed, non-empty string attribute, or `undefined`. */
-function stringAttribute(event: TelemetryEvent, key: string): string | undefined {
+function stringAttribute(event: ResolvableEvent, key: string): string | undefined {
   const value = event.attributes[key];
   if (typeof value !== 'string') {
     return undefined;
@@ -789,7 +833,7 @@ function stringAttribute(event: TelemetryEvent, key: string): string | undefined
 }
 
 /** The non-empty strings of an array attribute, in order, at most `limit` of them. */
-function stringListAttribute(event: TelemetryEvent, key: string, limit: number): string[] {
+function stringListAttribute(event: ResolvableEvent, key: string, limit: number): string[] {
   const value = event.attributes[key];
   if (!Array.isArray(value)) {
     return [];
@@ -807,7 +851,7 @@ function stringListAttribute(event: TelemetryEvent, key: string, limit: number):
 }
 
 /** The request method a span names, when it is one the route map knows. */
-function requestMethod(event: TelemetryEvent): HttpMethodName | undefined {
+function requestMethod(event: ResolvableEvent): HttpMethodName | undefined {
   const raw = stringAttribute(event, ATTRIBUTE.httpMethod);
   if (raw === undefined) {
     return undefined;
@@ -817,7 +861,7 @@ function requestMethod(event: TelemetryEvent): HttpMethodName | undefined {
 }
 
 /** The database driver a query span names, when it names one the code graph knows. */
-function driverHint(event: TelemetryEvent): DbDriver | undefined {
+function driverHint(event: ResolvableEvent): DbDriver | undefined {
   for (const key of [ATTRIBUTE.dbClient, ATTRIBUTE.dbSystem]) {
     const raw = stringAttribute(event, key)?.toLowerCase();
     const driver = DB_DRIVERS.find((candidate) => candidate === raw);
@@ -883,7 +927,7 @@ function withoutRouteFileSuffix(pattern: string): string {
  * pattern as written, then its variants without route groups and without a
  * file-convention suffix. Bounded and de-duplicated.
  */
-function routePatterns(event: TelemetryEvent, limit: number): string[] {
+function routePatterns(event: ResolvableEvent, limit: number): string[] {
   const written = [
     stringAttribute(event, ATTRIBUTE.nextRoute),
     stringAttribute(event, ATTRIBUTE.httpRoute),
@@ -908,7 +952,7 @@ function routePatterns(event: TelemetryEvent, limit: number): string[] {
  * The concrete request targets a request span names: its `url` attribute and
  * the path of a `METHOD /path` span name. Bounded and de-duplicated.
  */
-function requestTargets(event: TelemetryEvent, limit: number): string[] {
+function requestTargets(event: ResolvableEvent, limit: number): string[] {
   const targets: string[] = [];
   const url = stringAttribute(event, ATTRIBUTE.url);
   if (url !== undefined) {
@@ -1195,7 +1239,7 @@ async function parentEvent(
   scope: ResolveScope,
   sessionId: string,
   spanId: string,
-): Promise<Result<TelemetryEvent | undefined, DebuggenError>> {
+): Promise<Result<ResolvableEvent | undefined, DebuggenError>> {
   const key = spanKey(sessionId, spanId);
   const inBatch = scope.batchEvents.get(key);
   if (inBatch !== undefined) {
@@ -1225,7 +1269,7 @@ async function parentEvent(
  * The patch `meta` an event's attribute bag carries, as a `patch` candidate —
  * for a producer that forwarded the four keys without stamping `source`.
  */
-function patchMetaCandidate(event: TelemetryEvent): LocationCandidate | undefined {
+function patchMetaCandidate(event: ResolvableEvent): LocationCandidate | undefined {
   const attributes = event.attributes;
   const file = attributes[META_FILE];
   if (typeof file !== 'string' || attributes[META_LINE] === undefined) {
@@ -1255,7 +1299,7 @@ function patchMetaCandidate(event: TelemetryEvent): LocationCandidate | undefine
 function corroborates(
   records: readonly ModificationRecord[],
   file: string,
-  event: TelemetryEvent,
+  event: ResolvableEvent,
 ): boolean {
   return records.some((record) => {
     if (!isSafeRelativePath(record.file) || normalizePosix(record.file) !== file) {
@@ -1350,7 +1394,7 @@ function resolveRouteEntry(
  * `url` and the span name's request line come last. The per-method handler
  * location is preferred to the module's when the entry recorded one.
  */
-function findRoute(env: ResolverEnv, event: TelemetryEvent): RouteHit | undefined {
+function findRoute(env: ResolverEnv, event: ResolvableEvent): RouteHit | undefined {
   const method = requestMethod(event);
   const limit = env.limits.maxRouteCandidates;
 
@@ -1473,7 +1517,7 @@ function resolveComponentName(
 function resolveFunctionSymbol(
   env: ResolverEnv,
   queries: CodeQueries,
-  event: TelemetryEvent,
+  event: ResolvableEvent,
 ): RouteStep {
   const symbol =
     stringAttribute(event, ATTRIBUTE.symbol) ??
@@ -1504,7 +1548,7 @@ function resolveFunctionSymbol(
 function ownerOf(
   env: ResolverEnv,
   queries: CodeQueries,
-  parent: TelemetryEvent,
+  parent: ResolvableEvent,
 ): QueryOwner | undefined {
   let file: string | undefined;
   let symbol: string | undefined;
@@ -1559,7 +1603,7 @@ async function findQueryOwner(
   env: ResolverEnv,
   scope: ResolveScope,
   queries: CodeQueries,
-  event: TelemetryEvent,
+  event: ResolvableEvent,
 ): Promise<Result<QueryOwner | undefined, DebuggenError>> {
   const visited = new Set<string>([event.spanId]);
   let current = event;
@@ -1685,7 +1729,7 @@ async function resolveQueryCallSite(
   scope: ResolveScope,
   queries: CodeQueries,
   graph: CodeGraph,
-  event: TelemetryEvent,
+  event: ResolvableEvent,
 ): Promise<Result<RouteStep, DebuggenError>> {
   const owner = await findQueryOwner(env, scope, queries, event);
   if (isErr(owner)) {
@@ -1804,7 +1848,7 @@ const codeGraphRoute: RouteImpl = async (env, scope, subject) => {
  * the route applies at all: a request span's initiator stack, or a browser
  * error's stack.
  */
-function stackOf(event: TelemetryEvent): { readonly applies: boolean; readonly stack?: string } {
+function stackOf(event: ResolvableEvent): { readonly applies: boolean; readonly stack?: string } {
   if (INITIATOR_KINDS.includes(event.kind)) {
     const stack = stringAttribute(event, ATTRIBUTE.initiator);
     return stack === undefined ? { applies: true } : { applies: true, stack };
@@ -2130,7 +2174,7 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
 
   const newScope = (
     options: SourceResolveOptions | undefined,
-    batchEvents: ReadonlyMap<string, TelemetryEvent>,
+    batchEvents: ReadonlyMap<string, ResolvableEvent>,
   ): ResolveScope => ({
     sourceMapCache: deps.sourceMapCache ?? createSourceMapCache(),
     modificationsBySession: new Map(),
@@ -2139,16 +2183,16 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
     signals: signalsFor(deps, options),
   });
 
-  const noBatch: ReadonlyMap<string, TelemetryEvent> = new Map();
+  const noBatch: ReadonlyMap<string, ResolvableEvent> = new Map();
 
   async function resolveEvent(
-    event: TelemetryEvent,
+    event: ResolvableEvent,
     options?: SourceResolveOptions,
   ): Promise<Result<SourceResolution, DebuggenError>> {
     if (!rootIsAbsolute) {
       return err(rootError());
     }
-    const parsed = parseTelemetryEvent(event);
+    const parsed = parseResolvableEvent(event);
     if (isErr(parsed)) {
       return parsed;
     }
@@ -2180,7 +2224,7 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
   }
 
   async function resolveEvents(
-    events: readonly TelemetryEvent[],
+    events: readonly ResolvableEvent[],
     options?: SourceResolveOptions,
   ): Promise<Result<ReadonlyMap<string, SourceLocation>, DebuggenError>> {
     if (!rootIsAbsolute) {
@@ -2188,10 +2232,10 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
     }
 
     const considered = events.slice(0, env.limits.maxBatchEvents);
-    const valid: TelemetryEvent[] = [];
+    const valid: ResolvableEvent[] = [];
     let invalid = 0;
     for (const event of considered) {
-      const parsed = parseTelemetryEvent(event);
+      const parsed = parseResolvableEvent(event);
       if (parsed.ok) {
         valid.push(parsed.value);
       } else {
@@ -2199,7 +2243,7 @@ export function createSourceResolver(deps: SourceResolverDeps): SourceResolver {
       }
     }
 
-    const batchEvents = new Map<string, TelemetryEvent>();
+    const batchEvents = new Map<string, ResolvableEvent>();
     for (const event of valid) {
       const key = spanKey(event.sessionId, event.spanId);
       if (!batchEvents.has(key)) {

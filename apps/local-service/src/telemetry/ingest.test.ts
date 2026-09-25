@@ -83,6 +83,7 @@ import type {
   ProducerId,
   Result,
   SessionId,
+  SourceLocation,
 } from '@debuggen/shared';
 import {
   KIND_ATTRIBUTE_KEYS,
@@ -126,6 +127,7 @@ import type {
   IngestAttributorLike,
   IngestPrivacyPrimitives,
   IngestReport,
+  IngestSourceLocator,
   LiveTailLike,
   TelemetryIngest,
   TelemetryRepoLike,
@@ -345,7 +347,15 @@ function manyEvents(count: number): TelemetryEventIngress[] {
  * of the whole pipeline is then one array comparison.
  */
 type CallTag =
-  'resolve' | 'secret' | 'hash' | 'redact' | 'attribute' | 'insert' | 'correlate' | 'tail';
+  | 'resolve'
+  | 'secret'
+  | 'hash'
+  | 'redact'
+  | 'attribute'
+  | 'locate'
+  | 'insert'
+  | 'correlate'
+  | 'tail';
 
 /** The tags of the per-event and persistence steps AAP §0.7.1 Group 2 orders. */
 const PIPELINE_TAGS: ReadonlySet<CallTag> = new Set<CallTag>([
@@ -724,6 +734,7 @@ interface HarnessOptions {
   readonly correlator?: SubsystemBehaviour;
   readonly tail?: SubsystemBehaviour;
   readonly maxBatch?: number;
+  readonly sources?: IngestSourceLocator;
 }
 
 /** One pipeline and every double it was built from. */
@@ -768,6 +779,7 @@ function harness(options: HarnessOptions = {}): Harness {
     now: fixedClock,
     maxBatch: options.maxBatch,
     privacy: privacy.primitives,
+    sources: options.sources,
   });
 
   return { ingest, log, repo, sessions, privacy, attributor, correlator, tail, logs: entries };
@@ -1126,6 +1138,122 @@ describe('the mandatory order', () => {
 /* =================================================================================================
  * 2. Redaction wiring and the store contract
  * ============================================================================================== */
+
+describe('source locations (step 7½)', () => {
+  const LOCATION: SourceLocation = {
+    file: 'src/components/Widget.tsx',
+    line: 52,
+    column: 7,
+    resolvedBy: 'source-map',
+    confidence: 0.7,
+  };
+  const STAMPED: SourceLocation = {
+    file: 'src/server/ledger.ts',
+    line: 10,
+    column: 3,
+    symbol: 'loadLedger',
+    resolvedBy: 'patch',
+    confidence: 1,
+  };
+
+  /**
+   * A locator that records what it was handed and places every event it is
+   * given, writing into the call-order log `order` returns when it is called.
+   */
+  function locatorSpy(order: () => CallTag[], behaviour: SubsystemBehaviour = 'ok') {
+    const locate = vi.fn(
+      (
+        events: readonly AttributedEvent[],
+      ): Promise<Result<ReadonlyMap<string, SourceLocation>, DebuggenError>> => {
+        order().push('locate');
+        if (behaviour === 'throw') {
+          return Promise.reject(new Error('the source map could not be fetched'));
+        }
+        if (behaviour === 'err') {
+          return Promise.resolve(
+            err(new DebuggenError('CODE_INDEX_FAILED', 'The project could not be indexed.')),
+          );
+        }
+        return Promise.resolve(ok(new Map(events.map((event) => [event.id, LOCATION]))));
+      },
+    );
+    const sources: IngestSourceLocator = { locate };
+    return { sources, locate };
+  }
+
+  it('locates redacted, attributed events before they are stored, and stores and tails the location', async () => {
+    const spy = locatorSpy(() => h.log);
+    const h = harness({ sources: spy.sources });
+
+    const report = expectReport(
+      await h.ingest.ingest(BROWSER_CONTEXT, [makeRequestIngress('/api/one?itemId=A')]),
+    );
+
+    expect(h.log).toEqual([
+      'resolve',
+      'secret',
+      'hash',
+      'redact',
+      'attribute',
+      'locate',
+      'insert',
+      'correlate',
+      'tail',
+    ]);
+    const handed = spy.locate.mock.calls[0]?.[0] ?? [];
+    expect(handed).toHaveLength(1);
+    // Redacted and attributed: the query value is masked and the session stamped.
+    const first = handed[0];
+    expect(first === undefined ? '' : stringAttribute(first, URL_KEY)).not.toContain('itemId=A');
+    expect(first?.sessionId).toBe(report.sessionId);
+    expect(onlyRow(h.repo).source).toEqual(LOCATION);
+    const tailed = h.tail.push.mock.calls[0]?.[1] ?? [];
+    expect(tailed.map((row) => row.source)).toEqual([LOCATION]);
+    expect(report.sourcesLocated).toBe(1);
+    expect(report.failures.location).toBe(0);
+  });
+
+  it('hands over only events without a source and keeps a producer-stamped one', async () => {
+    const spy = locatorSpy(() => []);
+    const h = harness({ sources: spy.sources });
+
+    const report = expectReport(
+      await h.ingest.ingest(BROWSER_CONTEXT, [
+        makeRenderIngress({ source: STAMPED }),
+        makeIngress(),
+      ]),
+    );
+
+    const handed = spy.locate.mock.calls[0]?.[0] ?? [];
+    expect(handed).toHaveLength(1);
+    expect(handed[0]?.source).toBeUndefined();
+    expect(insertedRows(h.repo).map((row) => row.source)).toEqual([STAMPED, LOCATION]);
+    expect(report.sourcesLocated).toBe(1);
+  });
+
+  it('calls no locator when every event already carries a source', async () => {
+    const spy = locatorSpy(() => []);
+    const h = harness({ sources: spy.sources });
+
+    expectReport(await h.ingest.ingest(BROWSER_CONTEXT, [makeRenderIngress({ source: STAMPED })]));
+
+    expect(spy.locate).not.toHaveBeenCalled();
+  });
+
+  for (const behaviour of ['err', 'throw'] as const) {
+    it(`stores the batch without locations when the locator answers ${behaviour}`, async () => {
+      const spy = locatorSpy(() => [], behaviour);
+      const h = harness({ sources: spy.sources });
+
+      const report = expectReport(await h.ingest.ingest(BROWSER_CONTEXT, [makeIngress()]));
+
+      expect(report.persisted).toBe(1);
+      expect(onlyRow(h.repo).source).toBeUndefined();
+      expect(report.failures.location).toBe(1);
+      expect(report.sourcesLocated).toBe(0);
+    });
+  }
+});
 
 describe('redaction wiring and the store contract', () => {
   it('persists exactly the redactor output of every event, attributed and schema-valid', async () => {

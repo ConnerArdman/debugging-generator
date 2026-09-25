@@ -1205,6 +1205,44 @@ describe('a generator declaration', () => {
   });
 });
 
+describe('a React component', () => {
+  /**
+   * The patcher refuses to move a render function's body (see
+   * `reactComponentSite` in `./patch/function-timing.ts`); refusing it here is
+   * what turns that into an unavailable signal instead of a failed install.
+   */
+  it('is refused when it returns JSX, and the refusal points at the runtime route', () => {
+    const refusal = refusalFor({ file: 'src/components/KilnShelfMap.tsx', symbol: 'KilnShelfMap' });
+
+    expect(refusal.code).toBe('unsupported-declaration');
+    expect(refusal.reason).toContain('returns JSX');
+    expect(refusal.hint).toContain('react-render-tracking');
+    expectReadableRefusal(refusal);
+  });
+
+  it('is refused when it calls a hook in its own scope', () => {
+    const refusal = refusalFor({ file: FILES.form, symbol: 'FiringLogForm' });
+
+    expect(refusal.code).toBe('unsupported-declaration');
+    expect(refusal.reason).toMatch(/returns JSX|calls a React hook/u);
+    expectReadableRefusal(refusal);
+  });
+
+  it('leaves a plain helper declared beside a component installable', () => {
+    const report = checkFeasibility(
+      [
+        action({ file: 'src/components/KilnShelfMap.tsx', symbol: 'formatSoakLabel' }),
+        action({ file: FILES.legacyJsx, symbol: 'KilnBadge' }),
+      ],
+      makeContext(),
+      { resolver: claimsEverything() },
+    );
+
+    expect(report.feasible.map((entry) => entry.symbol)).toEqual(['formatSoakLabel']);
+    expect(report.rejected.map((entry) => entry.code)).toEqual(['unsupported-declaration']);
+  });
+});
+
 describe('an unwrappable declaration', () => {
   const unwrappable: readonly { readonly what: string; readonly input: ActionInput }[] = [
     { what: 'a class', input: { file: FILES.controller, symbol: 'KilnController' } },

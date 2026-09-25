@@ -2046,7 +2046,7 @@ function isReactHookName(name: string): boolean {
 }
 
 /** Where, and by what, a declaration was recognised as a React render. */
-interface ReactSiteFinding {
+export interface ReactSiteFinding {
   /** Which of the two recognitions fired. */
   readonly site: PatchReactSite;
 
@@ -2080,11 +2080,16 @@ interface ReactSiteFinding {
  * An arrow's **expression body** is its return, so it is examined directly: a
  * `() => <Row />` component has no `return` statement to find.
  *
+ * Exported so `../feasibility.ts` refuses the same targets before an install
+ * begins, which is what lets the installer report such an action as an
+ * unavailable signal rather than fail the whole install on the patcher's
+ * refusal.
+ *
  * @param target The resolved target.
  * @returns What was recognised and where, or `undefined` for a declaration that
  * is neither a component nor a hook.
  */
-function reactComponentSite(target: ResolvedTarget): ReactSiteFinding | undefined {
+export function reactComponentSite(target: ResolvedTarget): ReactSiteFinding | undefined {
   const body = target.body;
 
   if (!Node.isBlock(body)) {

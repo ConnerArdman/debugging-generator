@@ -77,8 +77,12 @@ import {
 } from '@debuggen/model-provider';
 import type { ModelProvider, PromptStage } from '@debuggen/model-provider';
 import type { Hypothesis } from '@debuggen/panel-schema';
-import { analysisFindingsSchema } from '@debuggen/protocol';
-import type { AnalysisResult, ProgressStage } from '@debuggen/protocol';
+import {
+  analysisFindingsSchema,
+  createEnvelope,
+  parseAnalysisCompletedPayload,
+} from '@debuggen/protocol';
+import type { AnalysisResult, ClientKind, ProgressStage } from '@debuggen/protocol';
 import { DebuggenError, err, fromPromise, noopLogger, ok } from '@debuggen/shared';
 import type { LogFields, Logger, Result } from '@debuggen/shared';
 import type { CaptureSummary } from '@debuggen/telemetry';
@@ -92,6 +96,7 @@ import type {
 import type { AnalysisStageInputBuild, AnalysisSummarizer } from '../../analysis/summarize.js';
 import { LOG_BINDING_KEYS, sessionLogger, subsystemLogger } from '../../logging.js';
 import { MAX_FINDING_ROWS_PER_STAGE } from '../../sessions/progress.js';
+import type { SessionBroadcaster } from '../../sessions/manager.js';
 import type { SessionProgress } from '../../sessions/progress.js';
 import type { SessionFailure } from '../../sessions/state-machine.js';
 import type { PanelsRepo } from '../../store/panels-repo.js';
@@ -220,7 +225,23 @@ export interface AnalyzeStageDeps {
    * verified findings are emitted either way: only this stage has them.
    */
   readonly reportStageBoundaries?: boolean | undefined;
+  /**
+   * Delivers `analysis.completed` once an analysis is stored (AAP §0.4.2:
+   * service → VS Code, DevTools). The client registry in production; absent in
+   * unit contexts, where nothing is sent.
+   */
+  readonly broadcaster?: Pick<SessionBroadcaster, 'broadcastToKinds'> | undefined;
 }
+
+/**
+ * The user-interface kinds `analysis.completed` is delivered to: the editor
+ * view, whose analysis summary renders it, and the DevTools panel (AAP §0.4.2).
+ * The same audience as `panel.generated`, which follows it.
+ */
+export const ANALYSIS_BROADCAST_KINDS: readonly ClientKind[] = Object.freeze([
+  'devtools',
+  'vscode',
+]);
 
 /** What one analysis run is asked to analyse (AAP §0.4.2, Analysis and Follow-up rows). */
 export interface AnalyzeStageInput {
@@ -635,6 +656,47 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
   };
 
   /**
+   * Hands `analysis.completed` to the broadcaster: exactly `{ sessionId,
+   * analysis }`, validated with protocol's payload parser and enveloped with
+   * `createEnvelope`. Delivery is best effort — the analysis is already stored,
+   * and a client that missed the frame recovers it through the reopen replay —
+   * so a failure is logged by code and never fails the stage.
+   *
+   * @returns Whether the frame was handed to the broadcaster.
+   */
+  const announce = (analysis: AnalysisResult, log: Logger): boolean => {
+    const broadcaster = deps.broadcaster;
+    if (broadcaster === undefined) {
+      return false;
+    }
+    const payload = parseAnalysisCompletedPayload({ sessionId: analysis.sessionId, analysis });
+    if (!payload.ok) {
+      log.error(
+        'A stored analysis failed the analysis.completed payload schema; it was not broadcast.',
+        {
+          analysisVersion: analysis.analysisVersion,
+          code: payload.error.code,
+        },
+      );
+      return false;
+    }
+    try {
+      broadcaster.broadcastToKinds(
+        analysis.sessionId,
+        ANALYSIS_BROADCAST_KINDS,
+        createEnvelope('analysis.completed', payload.value),
+      );
+    } catch (thrown) {
+      log.warn('Broadcasting analysis.completed failed; clients recover the analysis on reopen.', {
+        analysisVersion: analysis.analysisVersion,
+        code: DebuggenError.from(thrown, 'TRANSPORT_DISCONNECTED').code,
+      });
+      return false;
+    }
+    return true;
+  };
+
+  /**
    * The single failure path: log the code and enumerated reason, report the
    * stage's `failed` row when this stage owns its boundary rows, and return
    * the error unchanged. Nothing about the failed payload is logged.
@@ -854,6 +916,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
       return fail(context, log, accepted.error, startedAt);
     }
     const analysis = accepted.value;
+    const broadcast = announce(analysis, log);
 
     // 10. Progress: count rows from the stored result, then the closing row.
     for (const row of analysisFindingRows(analysis, report.value)) {
@@ -870,6 +933,7 @@ export function createAnalyzeStage(deps: AnalyzeStageDeps): AnalyzeStage {
     const truncated = uniqueNames(build.input.truncated.sections, requested.value.truncated);
     log.info('The analyze stage stored an analysis.', {
       analysisVersion: analysis.analysisVersion,
+      broadcast,
       superseding: analysis.supersedes !== undefined,
       regenerated: input.regenerate === true,
       observed: analysis.observed.length,

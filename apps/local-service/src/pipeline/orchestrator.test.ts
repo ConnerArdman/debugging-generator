@@ -2674,6 +2674,87 @@ const UNDERSTOOD: UnderstandResult = Object.freeze({
   repairs: 0,
 });
 
+describe('regate', () => {
+  it('admits an instrumenting session whose re-evaluated verdict is satisfied', async () => {
+    const evaluateReadiness = vi.fn<EvaluateReadinessFn>(() => Promise.resolve(ok(verdict(true))));
+    const h = harness({ script: { install: { satisfied: false } }, evaluateReadiness });
+    await toReady(h);
+    expect(h.manager.current().status).toBe('instrumenting');
+
+    const outcome = expectOk(await h.orchestrator.regate({ sessionId: SESSION_ID }));
+
+    expect(outcome).toEqual({
+      sessionId: SESSION_ID,
+      outcome: 'regated',
+      status: 'ready',
+      ready: true,
+    });
+    expect(evaluateReadiness).toHaveBeenCalledTimes(1);
+    const asked = h.manager.wire.calls.filter(
+      (call) => call.member === 'transitionTo' && call.args[1] === 'ready',
+    );
+    expect(asked.map((call) => call.args[2])).toEqual([{ readinessSatisfied: true }]);
+    expect(h.stages.arm).not.toHaveBeenCalled();
+    expect(h.orchestrator.activeRun(SESSION_ID)).toBeUndefined();
+  });
+
+  it('leaves the session instrumenting, and asks for nothing, when the verdict is still unsatisfied', async () => {
+    const evaluateReadiness = vi.fn<EvaluateReadinessFn>(() => Promise.resolve(ok(verdict(false))));
+    const h = harness({ script: { install: { satisfied: false } }, evaluateReadiness });
+    await toReady(h);
+
+    const outcome = expectOk(await h.orchestrator.regate({ sessionId: SESSION_ID }));
+
+    expect(outcome.outcome).toBe('regated');
+    expect(outcome.ready).toBe(false);
+    expect(h.manager.current().status).toBe('instrumenting');
+    expect(transitionRequests(h, 'ready')).toBe(0);
+    expect(transitionRequests(h, 'failed')).toBe(0);
+  });
+
+  it('skips a session that is not instrumenting, without evaluating anything', async () => {
+    const evaluateReadiness = vi.fn<EvaluateReadinessFn>(() => Promise.resolve(ok(verdict(true))));
+    const h = harness({ session: { status: 'ready' }, evaluateReadiness });
+
+    const outcome = expectOk(await h.orchestrator.regate({ sessionId: SESSION_ID }));
+
+    expect(outcome).toMatchObject({ outcome: 'skipped', status: 'ready', ready: true });
+    expect(evaluateReadiness).not.toHaveBeenCalled();
+  });
+
+  it('defers a re-gate asked for mid-run, then admits the session once the run leaves it instrumenting', async () => {
+    const evaluateReadiness = vi.fn<EvaluateReadinessFn>(() => Promise.resolve(ok(verdict(true))));
+    const h = harness({ script: { install: { satisfied: false } }, evaluateReadiness });
+    const entered = deferred<PipelineStageContext>();
+    const release = deferred();
+    h.stages.investigate.mockImplementationOnce(async (context) => {
+      entered.resolve(context);
+      await release.promise;
+      return ok({
+        investigation: INVESTIGATION,
+        promptVersion: REPORTED.investigate,
+        repairs: 0,
+        toolRuns: [],
+      });
+    });
+
+    const first = h.orchestrator.run({ sessionId: SESSION_ID });
+    await entered.promise;
+    const deferredOutcome = expectOk(await h.orchestrator.regate({ sessionId: SESSION_ID }));
+    expect(deferredOutcome.outcome).toBe('deferred');
+    expect(evaluateReadiness).not.toHaveBeenCalled();
+
+    release.resolve();
+    expectOk(await first);
+
+    await vi.waitFor(() => {
+      expect(h.manager.current().status).toBe('ready');
+    });
+    expect(evaluateReadiness).toHaveBeenCalledTimes(1);
+    expect(transitionRequests(h, 'failed')).toBe(0);
+  });
+});
+
 describe('concurrency, cancellation and lifecycle', () => {
   it('allows one operation per session: each second call is refused, naming the operation and the active stage', async () => {
     const h = harness();

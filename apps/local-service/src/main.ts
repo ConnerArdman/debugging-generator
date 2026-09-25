@@ -5,323 +5,295 @@
  *
  * `tsup.config.ts` declares exactly one entry, `main: 'src/main.ts'`, so this
  * module is the whole program: everything the service runs is reached through
- * the static imports below and collapses into a single `dist/main.js`. Four
- * paths depend on that, and each of them is written down somewhere else:
+ * the static imports below and collapses into a single `dist/main.js`.
  *
- * - `package.json` names `dist/main.js` as `main`, as the `import`/`default`
- *   conditions of its only `exports` entry and as the target of
- *   `"start": "node dist/main.js"`, and `dist/main.d.ts` as `types`.
- * - the root `playwright.config.ts` `webServer` entry runs
- *   `node apps/local-service/dist/main.js` from the repository root, polls
- *   `GET ${serviceUrl}/health` until it answers, and shuts the process down
- *   with **SIGTERM** and a 10 s grace period — so the health route and the
- *   signal handling below are both load-bearing for every browser and
- *   end-to-end suite (AAP 0.8.3).
- * - `apps/vscode-extension/esbuild.mjs` bundles these same sources into the
- *   VSIX, which is why every import here is static and top-level: a computed
- *   `import()` of a local module would not survive that second bundle.
- * - `src/store/schema.sql` is loaded through `new URL('./store/schema.sql',
- *   import.meta.url)`. That one relative URL is correct in both layouts —
- *   under `tsx watch src/main.ts` this module is `src/main.ts` and the DDL sits
- *   at `src/store/schema.sql`, and in the bundle it is `dist/main.js` beside the
- *   `dist/store/schema.sql` that the tsup `onSuccess` hook copies.
+ * - `package.json` names `dist/main.js` as `main`, as its only `exports` entry
+ *   and as the target of `"start": "node dist/main.js"`.
+ * - The root `playwright.config.ts` `webServer` entry runs
+ *   `node apps/local-service/dist/main.js`, polls `GET ${serviceUrl}/health`
+ *   until it answers and stops the process with **SIGTERM** and a 10 s grace
+ *   period, so the health route and the signal handling are load-bearing for
+ *   every browser and end-to-end suite (AAP 0.8.3).
+ * - `apps/vscode-extension/esbuild.mjs` re-bundles these same sources into the
+ *   VSIX, which is why every import is static and top-level (a computed
+ *   `import()` of a local module would not survive that second bundle), why
+ *   the prompt directory is always taken from `config.promptsDir` and never
+ *   assumed to sit beside the bundle, and why {@link StartServiceOptions}
+ *   accepts the store DDL inline.
  *
  * ## Start-up order, and why it is this order
  *
- * {@link startService} performs five steps and reports each failure as a typed
- * `Err` rather than a throw, because the caller — {@link main}, or an
- * integration suite — is the only place that knows whether a failure should
- * print and exit or fail an assertion:
+ * {@link startService} runs one fixed sequence and reports every failure as a
+ * typed `Err`, never a throw. A failure after a resource has been acquired
+ * releases everything acquired so far, so a refused start leaves no open
+ * database, no bound socket and no timer behind.
  *
- * 1. **Configuration.** `loadServiceConfig` from `./config.js`, over an
- *    **injected** environment. Nothing in {@link startService} reads
- *    `process.env`; {@link main} passes it in after `dotenv`, so a suite's
- *    injected environment is authoritative and two starts in one process cannot
- *    disagree.
- * 2. **Logging.** One root logger from `createServiceLogger`, with a child per
- *    area from `subsystemLogger`. The resolved configuration is logged once,
- *    through `describeServiceConfig`, which is the credential-free view of it —
- *    no other line in this file logs configuration.
- * 3. **The state tree.** `$DEBUGGEN_HOME` and its two subdirectories, created
- *    and verified `0700` and symlink-free by `ensureSecureDir`. The state root
- *    is created first and then declared as the boundary (`upTo`) of the two
- *    below it, which is what makes the whole chain verified rather than just its
- *    tail (AAP 0.5.6).
- * 4. **The session store.** `node:sqlite` opened at `config.databasePath`, its
- *    per-connection pragmas set here (the DDL's header and `./store/migrations.js`
- *    both state that the caller owns them), and the schema ladder applied by
- *    `applyMigrations`. The database and its write-ahead-log sidecars are then
- *    restricted to `0600`, because `DatabaseSync` creates them under the process
- *    umask and AAP 0.4.2 requires every file in the state tree to be
- *    owner-only. A failure after this point closes the handle again, so a
- *    refused start leaves no open database behind.
- * 5. **The HTTP surface.** One `Hono` app served by `@hono/node-server`'s
- *    `serve` on `config.host`/`config.port`. The returned promise settles only
- *    once the socket is listening — or once binding has failed — and the bound
- *    port is read back from the listener's `AddressInfo`, so a configured port of
- *    `0` (how a suite avoids colliding with another process) still yields a
- *    usable {@link ServiceHandle.url}.
+ * 1. **Configuration** — `loadServiceConfig` over an **injected** environment.
+ *    Nothing in {@link startService} reads `process.env`; {@link main} passes it
+ *    after `dotenv`, so a suite's injected environment is authoritative.
+ * 2. **Logging** — one root logger, a `subsystem` child per area; the resolved
+ *    configuration is logged once through its credential-free view.
+ * 3. **The state tree** — `$DEBUGGEN_HOME`, `backups/` and `index/`, created and
+ *    verified `0700` and symlink-free by `ensureSecureDir` (mkdir's own mode is
+ *    umask-masked, which is why it is not used).
+ * 4. **The session store** — `openStore` from `./store/db.js`: the owner-only
+ *    database file, WAL mode, the pragmas and the schema ladder.
+ * 5. **The editor credential** — `AuthService.ensureEditorCredential` from
+ *    `./server/auth.js`, the single owner of credential policy (AAP 0.5.6): the
+ *    plaintext token lives only in `auth.json` (`0600`, written with
+ *    `createFileExclusive`/`writeSecureFileAtomic` there) and the store keeps
+ *    its SHA-256 digest. It runs after the store because the digest is written
+ *    to the `credentials` table. The token is never logged here.
+ * 6. **Modification reconciliation — before serving** (AAP 0.5.1). Every
+ *    non-reverted journal record, whatever its session's status, is closed,
+ *    restored from its backup or marked `conflict` by
+ *    `reconcileModificationsOnStartup`. A developer who killed the service
+ *    mid-session gets their files back here, before any client can open a new
+ *    session.
+ * 7. **Retention — before serving** (AAP 0.4.2): `runRetention` purges aged
+ *    sessions, stale index caches and orphan backups, conflict backups exempt.
+ * 8. **The model provider** — `createModelProvider` over the validated
+ *    selection. An unusable selection is a configuration error and fails the
+ *    start; a transport failure is a runtime condition reported per session by
+ *    the stage that meets it (AAP 0.5.5), so nothing is contacted here.
+ * 9. **The prompt tree** — `createPromptLoader` over `config.promptsDir`, then
+ *    the manifest and every stage's current prompt are loaded eagerly, so a
+ *    broken prompt tree fails the start rather than a session.
+ * 10. **Subsystem wiring**, in dependency order, each handed only the
+ *     collaborators it declares.
+ * 11. **One HTTP server, two protocols** — a single `node:http` server whose
+ *     request listener is the hono application of `./server/http.js` and whose
+ *     `upgrade` event is routed to the WebSocket server of `./server/ws.js` at
+ *     protocol's `WS_PATH`. The bound port is read back, so `port: 0` yields a
+ *     usable {@link ServiceHandle.url}.
+ * 12. **Health** — `GET /health`, auth-exempt, answers from the first accepted
+ *     connection.
  *
- * ## What the HTTP surface carries
+ * ## What this file adds beside the subsystems
  *
- * Three things, and deliberately nothing else:
+ * A composition root composes. The only code of its own is the process
+ * lifecycle and the adapters that bind one subsystem's declared port to
+ * another's concrete surface where the two are not already structurally the
+ * same object:
  *
- * - an **origin guard** on every route (AAP 0.5.6): a request whose `Origin`
- *   header is not one of the accepted non-web origins is answered `403` with
- *   `{ code: 'FORBIDDEN_ORIGIN', message }`. No `Access-Control-Allow-Origin`
- *   header is ever set, so a web page cannot read a response even if one were
- *   answered.
- * - **`GET /health`**, unauthenticated — one of the two auth-exempt operations
- *   of AAP 0.5.6 — answering from the moment the server listens with "version
- *   and pairing availability only": `{ version, protocolVersion,
- *   pairingAvailable }`, the `HealthResponse` of `@debuggen/protocol`. Its one
- *   definition is that package's strict `healthResponseSchema`, which this
- *   handler validates the body against before sending it and which
- *   `HttpClient.health()` applies to what it receives, so the service and every
- *   client — VS Code service discovery, the DevTools "Service not running" and
- *   pairing states — read one shape. The Playwright `webServer` probe reads the
- *   status code only, never the body.
- * - **`app.onError`**, which logs the failure and answers `500` with
- *   `{ code: 'INTERNAL', message }`. A caught value never reaches a response
- *   body.
+ * - an **agent-readiness ledger** — the relayed `agent.ready` reports per tab,
+ *   written by the WebSocket router and read by the readiness gate;
+ * - the **server-agent presence** view of the client registry;
+ * - the **source-open delivery** port over the client registry;
+ * - the **credential issuer** the dev-server launcher mints its scoped
+ *   `server-agent` credentials through;
+ * - the **capture-time readiness re-evaluation** the capture stage uses to move
+ *   a session whose page was not ready at install time to `ready`;
+ * - an **effective configuration** whose `port` is the bound port once the
+ *   socket listens, which is what a launched dev server's ingest URL and the
+ *   dev-server probe's self-exclusion need under `port: 0`.
  *
- * ## A composition root composes; it does not implement a subsystem
+ * ## Shutdown
  *
- * This module's own code is the five steps above plus process lifecycle. Every
- * other capability of the coordination service is a module of its own in AAP
- * 0.7.1 Group 2, reached from here by calling it — and each of the four below is
- * a policy the AAP places in exactly one file, which is precisely why this file
- * does not carry a copy of it:
- *
- * - **The access boundary** — role-bound credentials, the `auth.json` editor
- *   credential, the SHA-256 hashes in the `credentials` table, pairing and
- *   rotation — is `./server/auth.js` (AAP 0.5.6). A second writer of
- *   `$DEBUGGEN_HOME/auth.json` would be a second policy, and the rotation
- *   guarantee that section states (every credential and every socket
- *   invalidated at once) holds only while there is one owner. Minting a
- *   credential from here would also put a secret on disk that no route in this
- *   file authenticates against.
- * - **The WebSocket surface** is `./server/ws.js` with `./server/clients.js`,
- *   attached to the same `node:http` server this file creates (AAP 0.4.2).
- *   Its handshake is a protocol contract, not local code: the first frame is
- *   `client.hello` and a connection that does not present a valid token inside
- *   three seconds is closed with code 4401, both defined once in
- *   `@debuggen/protocol` (`messages/agent.ts`, and the envelope that validates
- *   every frame). Accepting a socket here without those definitions would mean
- *   restating a cross-process shape in an app, which AAP 0.4.2 names a defect,
- *   and accepting one without the handshake would be a hole in the boundary
- *   above. `ws` is therefore not imported by this file at all.
- * - **Start-up modification reconciliation** is `./cleanup/cleanup.js` over the
- *   journal repository, driven by `@debuggen/instrumentation` (AAP 0.5.1). It
- *   is the one code path that writes into a developer's working tree, it is
- *   governed by the hash ladder of that section, and its correctness is
- *   established by that package's own suite — not by a copy inlined into a
- *   process entry point.
- * - **The retention purge** is `./store/retention.js` over the same
- *   repositories (AAP 0.4.2): sessions, telemetry, panels and analyses past
- *   `DEBUGGEN_RETENTION_DAYS`, stale index caches, orphan backups, with
- *   conflict backups exempt.
- *
- * The model provider and the prompt loader are likewise constructed for the
- * pipeline that consumes them; this file performs no model interaction, and
- * validating a prompt manifest while binding a socket would make the
- * availability of the unauthenticated health route depend on an artefact that
- * route does not serve.
- *
- * What this file guarantees instead is that composition itself is sound: each
- * step reports a typed failure rather than throwing, a failure after a resource
- * has been acquired closes that resource before returning, and
- * {@link ServiceHandle.close} releases the HTTP server and the store exactly
- * once however often it is called.
+ * {@link ServiceHandle.close} is idempotent and bounded. It stops accepting
+ * requests, cancels in-flight pipeline work, stops the dev servers this service
+ * launched (which expires their scoped credentials), closes every WebSocket
+ * with the normal going-away code (never 4401, which means unauthorized),
+ * releases the in-memory subsystems and finally checkpoints and closes the
+ * database. It deliberately does **not** restore instrumented files: the
+ * journal is durable and step 6 of the next start restores them, so a stuck
+ * restore can never hold up a stop, and a stop that is killed part-way loses
+ * nothing (AAP 0.5.1 lists service start as a cleanup trigger for exactly this
+ * reason).
  */
 
-import { serve, type ServerType } from '@hono/node-server';
 import { config as loadDotenvFile } from 'dotenv';
-import { Hono } from 'hono';
 
+import { createAdapterRegistry, type AdapterRegistry } from '@debuggen/instrumentation';
+import {
+  PROMPT_STAGES,
+  createModelProvider,
+  createPromptLoader,
+  type ModelProvider,
+  type PromptLoader,
+} from '@debuggen/model-provider';
 import {
   HTTP_ROUTES,
   PROTOCOL_VERSION,
-  parseHttpResponse,
-  type HealthResponse,
-  type HttpOperationId,
+  WS_PATH,
+  type AgentReadyPayload,
+  type ClientKind,
+  type ProtocolMessage,
+  type SelectedTarget,
 } from '@debuggen/protocol';
 import {
   DebuggenError,
   err,
   isErr,
+  nowEpochMs,
   ok,
   type LogFields,
   type Logger,
   type Result,
+  type SessionId,
 } from '@debuggen/shared';
-import {
-  SECURE_FILE_MODE,
-  createFileExclusive,
-  ensureSecureDir,
-  readFileNoFollow,
-} from '@debuggen/shared/node';
+import { ensureSecureDir } from '@debuggen/shared/node';
 
-import type { EventEmitter } from 'node:events';
-import { closeSync, constants, fchmodSync, fstatSync, openSync } from 'node:fs';
+import { realpathSync } from 'node:fs';
+import { createServer, type RequestListener, type Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
-import { DatabaseSync } from 'node:sqlite';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
+import { reconcileModificationsOnStartup, createSessionCleanup } from './cleanup/cleanup.js';
+import type { SessionCleanup, StartupReconciliationReport } from './cleanup/cleanup.js';
 import {
   describeServiceConfig,
   loadServiceConfig,
+  toModelProviderOverrides,
   type ServiceConfig,
   type ServiceConfigOverrides,
 } from './config.js';
+import { createDevServerLauncher } from './dev-server/launcher.js';
+import type { DevServerLauncher, ServerAgentCredentialIssuer } from './dev-server/launcher.js';
+import {
+  MAX_RELOAD_WAIT_MS,
+  collectObservedReadiness,
+  collectReadinessEvidence,
+  evaluateReadiness,
+} from './instrumentation/readiness.js';
+import type {
+  BrowserAgentRegistry,
+  CollectObservedReadinessDeps,
+  ReadinessVerdict,
+  ServerAgentReadinessSource,
+  WaitForAgentReadyOptions,
+} from './instrumentation/readiness.js';
+import { createInstrumentationService } from './instrumentation/service.js';
+import type { CodeAnalysisHandles, InstrumentationService } from './instrumentation/service.js';
+import { createInstrumentationWatcher } from './instrumentation/watcher.js';
+import type { InstrumentationWatcher } from './instrumentation/watcher.js';
 import { createServiceLogger, subsystemLogger, type ServiceLoggerOptions } from './logging.js';
-import { applyMigrations } from './store/migrations.js';
+import { createAnalysisFacts } from './analysis/facts.js';
+import { createAnalysisSummarizer } from './analysis/summarize.js';
+import { createPanelDataResolver } from './panels/data.js';
+import { createFallbackPanelBuilder } from './panels/fallback.js';
+import { createPanelGenerator } from './panels/generate.js';
+import { createPanelValidator } from './panels/validate.js';
+import { createContextBuilder } from './pipeline/context-builder.js';
+import type { PipelineCodeHandles } from './pipeline/context-builder.js';
+import { createCodeIndexLoader, createPipelineOrchestrator } from './pipeline/orchestrator.js';
+import type { CodeIndexPort, PipelineOrchestrator } from './pipeline/orchestrator.js';
+import type { CaptureReadinessRequest, CaptureReadinessSource } from './pipeline/stages/capture.js';
+import { createAuthService } from './server/auth.js';
+import type { AuthService } from './server/auth.js';
+import { WS_CLOSE_GOING_AWAY, createClientRegistry } from './server/clients.js';
+import type { ClientRegistry } from './server/clients.js';
+import { createHttpApp } from './server/http.js';
+import type { HttpApp } from './server/http.js';
+import { createBindingRoutes } from './server/routes/binding.js';
+import type { BindingRoutes } from './server/routes/binding.js';
+import { devServerLookupFromLaunches } from './server/routes/sessions.js';
+import { createWsServer } from './server/ws.js';
+import type {
+  AgentReadinessPort,
+  TargetSelectionPort,
+  WsConnectionFacts,
+  WsServer,
+} from './server/ws.js';
+import { createSessionManager } from './sessions/manager.js';
+import type { SessionManager } from './sessions/manager.js';
+import { createSessionProgress } from './sessions/progress.js';
+import type { SessionProgress } from './sessions/progress.js';
+import { createSessionReopener } from './sessions/reopen.js';
+import { createSourceOpenHandler } from './source/open.js';
+import type { SourceOpenClientPort } from './source/open.js';
+import { createSourceResolver } from './source/resolve.js';
+import type { ModificationCorroborationPort, ParentEventPort } from './source/resolve.js';
+import { openStore } from './store/db.js';
+import type { Store } from './store/db.js';
+import { createModificationsRepo } from './store/modifications-repo.js';
+import type { ModificationsRepo } from './store/modifications-repo.js';
+import { createPanelsRepo } from './store/panels-repo.js';
+import type { PanelsRepo } from './store/panels-repo.js';
+import { runRetention } from './store/retention.js';
+import type { RetentionReport } from './store/retention.js';
+import { createSessionsRepo } from './store/sessions-repo.js';
+import type { SessionsRepo } from './store/sessions-repo.js';
+import { createTelemetryRepo } from './store/telemetry-repo.js';
+import type { TelemetryRepo } from './store/telemetry-repo.js';
+import { createIngestAttributor } from './telemetry/attribute.js';
+import { createTraceCorrelator } from './telemetry/correlate.js';
+import type { TraceCorrelator } from './telemetry/correlate.js';
+import { createTelemetryIngest } from './telemetry/ingest.js';
+import type { IngestSourceLocator } from './telemetry/ingest.js';
+import { createLiveTail } from './telemetry/live-tail.js';
+import type { LiveTail } from './telemetry/live-tail.js';
 
 /* -------------------------------------------------------------------------------------------------
  * Constants
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * The `subsystem` bindings this file's loggers carry, one per area it composes.
- *
- * They follow the convention `./logging.js` documents for
- * `LOG_BINDING_KEYS.subsystem` — the module's source folder name — so a record
- * from the store, from the HTTP surface and from the lifecycle itself are
- * separable with one filter rather than by matching message text.
+ * The `subsystem` bindings of the records this file emits itself, following
+ * the convention of `./logging.js`: the source folder a record is about.
  */
 const SUBSYSTEM_SERVICE = 'service';
 
-/** The `subsystem` binding of every record about the session store. */
-const SUBSYSTEM_STORE = 'store';
-
-/** The `subsystem` binding of every record about the HTTP surface. */
+/** The `subsystem` binding of the records about the HTTP and WebSocket surface. */
 const SUBSYSTEM_SERVER = 'server';
 
+/** The `subsystem` binding of the agent-readiness ledger's records. */
+const SUBSYSTEM_READINESS = 'instrumentation.agents';
+
 /**
- * The path of the unauthenticated health route.
- *
- * Read from the protocol's route table rather than restated, because it is a
- * contract with readers outside this workspace — the `webServer.url` of the
- * root `playwright.config.ts`, the service-discovery probe of the VS Code
- * extension and `HttpClient.health()`, which builds its request from the same
- * `HTTP_ROUTES.health` row — so the path this service registers and the path
- * every client requests have one definition.
+ * The path of the unauthenticated health route, read from protocol's route
+ * table (it is a contract with the Playwright `webServer` probe, VS Code service
+ * discovery and `HttpClient.health()`), and reported in the "listening" line.
  */
 const HEALTH_ROUTE = HTTP_ROUTES.health.pattern;
 
 /**
- * This service build's version: the `version` field of the `GET /health` body.
+ * This service build's version: the `version` of the `GET /health` body.
  *
- * The same string as the `version` of `apps/local-service/package.json`, kept
- * in step by hand and held to it by `main.test.ts`, which reads that manifest
- * and fails when the two differ. It is a literal because no way of reading the
- * manifest holds in every layout this module runs in:
- *
- * - `import`ing `../package.json` puts a file outside this project's `include`
- *   (`src/**` and `test/**`) into the program and makes the manifest a bundle
- *   input;
- * - a build-time substitution needs a `define` in `tsup.config.ts`, which
- *   forbids injecting anything into the bundle, and would be absent under
- *   `tsx watch src/main.ts`;
- * - reading `new URL('../package.json', import.meta.url)` at run time finds this
- *   package's manifest from `src/main.ts` and `dist/main.js` only: the VS Code
- *   extension re-bundles these sources to `dist/service/main.js`, where the same
- *   URL names the extension's manifest.
- *
- * Clients display and log it and never parse it — the protocol validates it as
- * a non-empty opaque token — and compatibility is decided by `protocolVersion`,
- * never by this value.
+ * The `version` of `apps/local-service/package.json`, kept in step by hand and
+ * held to it by `main.test.ts`. A literal because no way of reading the manifest
+ * holds in every layout this module runs in: importing `../package.json` puts a
+ * file outside this project's `include` into the program, a build-time `define`
+ * would be absent under `tsx watch src/main.ts`, and a run-time read of
+ * `new URL('../package.json', import.meta.url)` names the VS Code extension's
+ * manifest once these sources are re-bundled into the VSIX. Clients display it
+ * and never parse it; compatibility is decided by `protocolVersion`.
  */
-const SERVICE_VERSION = '0.1.0';
+export const SERVICE_VERSION = '0.1.0';
 
 /**
- * The two operations of the pairing flow of AAP 0.5.6, in the order a pairing
- * runs: the editor mints a one-time code, the DevTools extension redeems it.
- *
- * Named by their `HTTP_ROUTES` ids rather than by method and path, so the
- * methods and patterns {@link servesPairingFlow} looks for are the protocol's
- * own and cannot drift from the table clients build their requests from.
+ * How long the HTTP server waits for open connections to drain before closing
+ * them itself, in milliseconds. Idle keep-alive sockets are released at once;
+ * this bounds the in-flight ones so the rest of the shutdown sequence runs well
+ * inside Playwright's 10 s SIGTERM window.
  */
-const PAIRING_OPERATIONS = [
-  'pair.start',
-  'pair.complete',
-] as const satisfies readonly HttpOperationId[];
+const HTTP_DRAIN_GRACE_MS = 3_000;
 
 /**
- * How long a statement waits for the write lock before SQLite gives up, in
- * milliseconds.
- *
- * The store is opened in WAL mode, where a reader never blocks a writer, so the
- * only contention left is writer-versus-writer: this process against a second
- * service instance a developer started by accident, or against a `sqlite3`
- * session they left open. Five seconds is long enough that such an overlap
- * resolves itself instead of failing a request, and short enough that a
- * genuinely stuck lock surfaces as an error rather than as a hung start-up.
+ * The bound on each awaited shutdown step, in milliseconds. A step that has not
+ * settled by then is logged as abandoned and the sequence moves on, so a stuck
+ * collaborator — a dev server that ignores SIGTERM, a pipeline stage blocked on
+ * the network — cannot keep the process alive. The launcher's own escalation to
+ * SIGKILL happens inside this window (its default grace is 5 s).
  */
-const STORE_BUSY_TIMEOUT_MS = 5_000;
+const SHUTDOWN_STEP_TIMEOUT_MS = 6_000;
 
 /**
- * The permission bits of a `stat` mode, masked out of the file-type bits.
- *
- * `mode` carries both, so a comparison against a permission constant has to
- * mask first; `0o777` is the mask rather than `0o7777` deliberately — the
- * set-user-id, set-group-id and sticky bits are not what this file asserts, and
- * masking them in would make an unrelated bit fail an owner-only check.
+ * How often the client registry sweeps: it unregisters connections that stayed
+ * offline past their grace period and closes any whose credential has expired.
+ * The timer is `unref`'d by the registry and stopped by `closeAll`.
  */
-const PERMISSION_BITS = 0o777;
+const CLIENT_SWEEP_INTERVAL_MS = 30_000;
 
 /**
- * How long {@link ServiceHandle.close} waits for open connections to drain
- * before closing them itself, in milliseconds.
- *
- * `close()` must be bounded: Playwright sends SIGTERM and waits 10 s before
- * escalating, and `server.close()` on its own resolves only once the last
- * keep-alive connection has gone away — which a client holding an idle socket
- * can postpone indefinitely. Idle sockets are released immediately and anything
- * still open after this grace period is closed outright, so the process always
- * reaches the store checkpoint below well inside Playwright's window.
+ * The most tabs the agent-readiness ledger remembers a report for. One entry per
+ * inspected tab; the oldest report is forgotten first, which is harmless because
+ * the page agent reports again on its next document load.
  */
-const SHUTDOWN_GRACE_MS = 5_000;
+const MAX_TRACKED_AGENT_TABS = 256;
 
-/**
- * The URL schemes an `Origin` header may carry.
- *
- * AAP 0.5.6 states the accepted set positively — "accepted origins are absent
- * (Node clients), `chrome-extension://<id>` and `vscode-webview://*`" — and this
- * guard is written that way round on purpose. Refusing everything that is not on
- * this list also refuses the cases an `http:`/`https:` deny-list would let
- * through while still being a browser: the literal `Origin: null` a sandboxed
- * iframe or a `data:`/`file:` document sends, an `Origin` from another browser's
- * extension scheme, and a malformed header value. None of those is a client this
- * service has, so none of them has a reason to be accepted.
- *
- * Typed `readonly string[]` rather than as a literal tuple so a parsed
- * `URL.protocol` — a plain `string` — can be tested against it without a cast.
- */
-const ACCEPTED_ORIGIN_PROTOCOLS: readonly string[] = Object.freeze([
-  'chrome-extension:',
-  'vscode-webview:',
-]);
-
-/**
- * The body message of a refused cross-origin request.
- *
- * It names the policy and not the request: the value that was refused is
- * already in the caller's own console, and repeating it in the response body
- * would reflect an attacker-chosen string back to them.
- */
-const FORBIDDEN_ORIGIN_MESSAGE =
-  'Debug Generator refuses requests from web origins. Only the Debug Generator DevTools extension, the VS Code webview and local Node clients may call this service.';
-
-/**
- * The body message of an unhandled server-side failure.
- *
- * Fixed text, because the response must carry nothing derived from the caught
- * value: the reason is logged with the request's method and path, which is where
- * a developer looks for it.
- */
-const INTERNAL_ERROR_MESSAGE =
-  'The Debug Generator local service failed to handle this request. Its log holds the reason.';
+/** The client kind that can display a pairing code (AAP 0.5.6). */
+const PAIRING_DISPLAY_KIND: ClientKind = 'vscode';
 
 /** The signals that mean "stop": the two a developer and a test runner send. */
 const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
@@ -334,49 +306,76 @@ const SHUTDOWN_SIGNALS = ['SIGINT', 'SIGTERM'] as const;
  * How a host steers {@link startService}.
  *
  * Every member is optional and accepts an explicit `undefined`, so a caller may
- * spread a partially filled record without stripping its empty members first —
- * the repository compiles with `exactOptionalPropertyTypes`.
+ * spread a partially filled record — the repository compiles with
+ * `exactOptionalPropertyTypes`.
  */
 export interface StartServiceOptions {
   /**
-   * The environment to resolve configuration from. Defaults to an **empty
-   * object**, not to `process.env`.
-   *
-   * That default is the whole point of the parameter: `startService` is pure
-   * with respect to the process it runs in, so an integration suite gets exactly
-   * the settings it passed and cannot be perturbed by the developer's shell.
-   * {@link main} passes `process.env` after `dotenv` has populated it.
+   * The environment configuration is resolved from. Defaults to an **empty
+   * object**, never to `process.env`: `startService` is pure with respect to the
+   * process it runs in, so a suite gets exactly the settings it passed.
+   * {@link main} passes `process.env` after `dotenv` has populated it. The same
+   * record is the parent environment of every dev server the launcher starts.
    */
   readonly env?: Readonly<Record<string, string | undefined>> | undefined;
 
   /**
-   * Settings the host has already decided, which win over the environment per
-   * setting. This is how a suite pins a temporary `$DEBUGGEN_HOME` and an
-   * ephemeral port (`port: 0`) without touching the process environment.
+   * Settings the host has already decided, winning over the environment per
+   * setting — how a suite pins a temporary `$DEBUGGEN_HOME` and an ephemeral
+   * port (`port: 0`).
    */
   readonly overrides?: ServiceConfigOverrides | undefined;
 
-  /**
-   * Seams for the logger `createServiceLogger` builds — a capturing
-   * `destination`, a pre-built pino instance, a level override. Left absent, the
-   * service logs structured JSON to stdout at the configured level.
-   */
+  /** Seams for the logger `createServiceLogger` builds (destination, level, bindings). */
   readonly loggerOptions?: ServiceLoggerOptions | undefined;
+
+  /** A pre-built root logger, used instead of `createServiceLogger` when given. */
+  readonly logger?: Logger | undefined;
+
+  /**
+   * A pre-built model provider, used instead of `createModelProvider` when given
+   * — how a suite substitutes a scripted provider without an environment.
+   */
+  readonly provider?: ModelProvider | undefined;
+
+  /**
+   * The clock, in epoch milliseconds, handed to every subsystem that accepts
+   * one. Defaults to each subsystem's own (`nowEpochMs`).
+   */
+  readonly now?: (() => number) | undefined;
+
+  /**
+   * The session store's DDL, inlined by an embedding host's bundler. Forwarded
+   * to `openStore`, where it replaces the filesystem probe for `schema.sql`.
+   */
+  readonly inlineSchemaSql?: string | undefined;
 }
 
 /**
- * A started service: where it is listening, and how to stop it.
- *
- * Returned inside an `Ok` by {@link startService} once the socket is listening
- * and the store is migrated, so holding one of these is a statement that the
- * service is serving rather than that it was asked to.
+ * What the start-up maintenance of steps 5–7 found, kept on the handle so a
+ * suite (or a developer reading the log) can see that crash recovery ran.
+ */
+export interface StartupReport {
+  /** Whether step 5 minted a new editor credential and wrote `auth.json`. */
+  readonly editorCredentialCreated: boolean;
+
+  /** The modification reconciliation's report: restored, closed, conflicts. */
+  readonly reconciliation: StartupReconciliationReport;
+
+  /**
+   * The retention sweep's report, or `undefined` when the sweep could not run
+   * at all (logged at `error`; retention never blocks a start).
+   */
+  readonly retention: RetentionReport | undefined;
+}
+
+/**
+ * A started service: where it is listening, what it composed, and how to stop
+ * it. Returned inside an `Ok` only once the socket is listening, so holding one
+ * is a statement that the service is serving.
  */
 export interface ServiceHandle {
-  /**
-   * The base URL clients use, built from the configured host and the **bound**
-   * port. With `port: 0` that is the port the operating system chose, which is
-   * the only way a caller can learn it.
-   */
+  /** The base URL clients use, from the configured host and the **bound** port. */
   readonly url: string;
 
   /** The interface the server is bound to, as configured. */
@@ -385,52 +384,82 @@ export interface ServiceHandle {
   /** The port the server is actually bound to; never `0`. */
   readonly port: number;
 
+  /** The protocol path the WebSocket server answers upgrades on. */
+  readonly wsPath: string;
+
   /**
-   * The service's root logger.
-   *
-   * Exposed because the process-level concerns {@link main} owns — the single
-   * "listening" line, the shutdown record, an uncaught exception — must be
-   * reported through the *same* logger the service uses, with its level,
-   * bindings and redaction policy, rather than through a second one built from
-   * the same configuration.
+   * The effective configuration every subsystem was handed; its `port` is the
+   * bound port.
+   */
+  readonly config: ServiceConfig;
+
+  /**
+   * The service's root logger, so the process-level records {@link main} owns go
+   * through the same logger, level and redaction policy as the service's own.
    */
   readonly logger: Logger;
 
+  /** The open session store, for suites that assert on persisted state. */
+  readonly store: Store;
+
+  /** The session manager, for suites that drive a session without HTTP. */
+  readonly manager: SessionManager;
+
+  /** What the start-up maintenance found. */
+  readonly startup: StartupReport;
+
   /**
-   * Stops accepting connections, closes the open ones, checkpoints the
-   * write-ahead log and closes the database.
-   *
-   * Idempotent and bounded: the first call performs the sequence and every
-   * later or concurrent call awaits that same promise, which is what makes it
-   * safe to wire to both SIGINT and SIGTERM and to call again from a crash
-   * handler. It never rejects — a failure inside the sequence is logged, because
-   * a caller cannot act on it and must still be allowed to exit.
+   * Stops the service: see this module's "Shutdown" section. Idempotent — every
+   * call returns the same promise — bounded, and never rejects.
    */
   close(): Promise<void>;
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Internal shapes
+ * ---------------------------------------------------------------------------------------------- */
+
 /**
- * The root logger and the per-area children derived from it, passed together.
- *
- * Internal, because it is a parameter shape rather than part of the contract a
- * caller holds: {@link ServiceHandle} exposes the root alone. The root is
- * carried alongside the children because two of this workspace's modules —
- * `./config.js`'s `describeServiceConfig` and `./store/migrations.js` — put
- * their own `subsystem` field on the records they produce, and handing those a
- * logger already bound to the same key would emit it twice in one JSON record.
+ * The root logger and the children this file emits through. The root is kept
+ * apart because several modules (`describeServiceConfig`, the store, retention)
+ * put their own `subsystem` field on their records, and a child already bound
+ * to that key would emit it twice in one JSON record.
  */
 interface ServiceLoggers {
-  /** The root, which carries no `subsystem` binding. */
   readonly root: Logger;
-
-  /** Lifecycle records: start-up, shutdown, the state tree. */
   readonly service: Logger;
-
-  /** Session-store records this file emits itself. */
-  readonly store: Logger;
-
-  /** HTTP-surface records: binding, refusals, unhandled request failures. */
   readonly server: Logger;
+}
+
+/**
+ * Everything a start acquires that must be released again, filled in as the
+ * start proceeds. One shutdown sequence ({@link releaseParts}) reads it, both
+ * for {@link ServiceHandle.close} and for a start that fails part-way, so the
+ * two paths cannot release in different orders.
+ */
+interface ServiceParts {
+  store?: Store;
+  auth?: AuthService;
+  clients?: ClientRegistry;
+  ledger?: AgentReadyLedger;
+  watcher?: InstrumentationWatcher;
+  instrumentation?: InstrumentationService;
+  cleanup?: SessionCleanup;
+  correlator?: TraceCorrelator;
+  liveTail?: LiveTail;
+  launcher?: DevServerLauncher;
+  orchestrator?: PipelineOrchestrator;
+  http?: HttpApp;
+  ws?: WsServer;
+  server?: Server;
+}
+
+/** The repositories over the one store, built once and shared. */
+interface Repositories {
+  readonly sessions: SessionsRepo;
+  readonly panels: PanelsRepo;
+  readonly telemetry: TelemetryRepo;
+  readonly modifications: ModificationsRepo;
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -438,26 +467,22 @@ interface ServiceLoggers {
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Wraps a caught value as the typed error a caller reports, keeping the
- * original reachable as `cause`.
- *
- * The same shape `./store/migrations.js` uses, for the same reasons: `catch`
- * binds `unknown`, `DebuggenError.from` normalises it, and a specific code
- * raised deeper survives while anything else takes `fallbackCode`. The
- * underlying message goes into `details.reason` rather than into the message
- * line, so what a user interface renders stays short and stable.
+ * Wraps a caught value as the typed error a caller reports, keeping the original
+ * reachable as `cause`. A specific code raised deeper survives; anything else
+ * takes `fallbackCode`. The underlying message goes into `details.reason`, so
+ * what a user interface renders stays short and stable.
  *
  * @param cause The caught value.
  * @param fallbackCode The code to apply when `cause` carries none.
  * @param message A complete sentence naming what failed.
  * @param hint The developer's next step.
- * @param details Diagnostic context: paths, ports and reasons only. This object
- * is logged, so nothing secret belongs in it.
+ * @param details Diagnostic context — paths, ports, reasons; logged, so nothing
+ * secret belongs in it.
  * @returns The error to return inside an `Err`.
  */
 function wrapStartupFailure(
   cause: unknown,
-  fallbackCode: 'FS_UNSAFE_PATH' | 'INTERNAL' | 'STORE_ERROR',
+  fallbackCode: 'FS_UNSAFE_PATH' | 'INTERNAL' | 'CONFIG_INVALID',
   message: string,
   hint: string,
   details: LogFields,
@@ -471,36 +496,9 @@ function wrapStartupFailure(
 }
 
 /**
- * The loggable view of a failure: its code and hint beside the message, never
- * the message twice.
- *
- * Used for every `Err` this file logs, so a failed start reads the same however
- * deep it came from. `details` is forwarded as a nested object because the
- * scrubbing pass in `./logging.js` walks nested values.
+ * The loggable view of a failure: its code, hint and details beside the
+ * message, never the message twice.
  */
-/**
- * The platform's `errno` string for a caught filesystem failure, when it has
- * one.
- *
- * The distinctions this file makes between failures are the errno's, not the
- * message's: `EEXIST` means the store file was already there, `ELOOP` means a
- * symbolic link was refused at a final component, `ENOENT` means a write-ahead
- * sidecar has not been created. Reading the code off the caught value keeps
- * those branches independent of wording, in this or any Node version.
- *
- * @param cause Anything caught from a filesystem call.
- * @returns The `code` property when the value carries a string one, otherwise
- * `undefined` — which is the answer for a `DebuggenError` and for a thrown
- * non-error alike.
- */
-function errnoCodeOf(cause: unknown): string | undefined {
-  if (typeof cause !== 'object' || cause === null) {
-    return undefined;
-  }
-  const code = (cause as { code?: unknown }).code;
-  return typeof code === 'string' ? code : undefined;
-}
-
 function errorFields(error: DebuggenError): LogFields {
   return {
     code: error.code,
@@ -509,31 +507,28 @@ function errorFields(error: DebuggenError): LogFields {
   };
 }
 
+/** The message of a caught value, for a `reason` field; never the value itself. */
+function reasonOf(cause: unknown): string {
+  return DebuggenError.from(cause, 'INTERNAL').message;
+}
+
 /* -------------------------------------------------------------------------------------------------
  * Step 3 — the state tree
  * ---------------------------------------------------------------------------------------------- */
 
 /**
  * Creates `$DEBUGGEN_HOME`, the backup root and the index cache, and verifies
- * that every one of them is a private (`0700`) directory this account owns.
+ * that each is a private (`0700`) directory this account owns.
  *
- * The order is what makes the guarantee whole. `ensureSecureDir` without a
- * boundary vouches only for the components it created, so the state root is
- * established first; the two subdirectories then pass `upTo:
- * config.debuggenHome`, which is the declaration that turns the check from "the
- * tail this call created is private" into "every directory from the state root
- * down is private, and none of them is a symbolic link" (see that function's
- * own documentation, and AAP 0.5.6 for why it matters: this tree holds the
- * session database, the editor credential and the backups of a developer's
- * patched files).
- *
- * `config.authFilePath` and `config.databasePath` are files rather than
- * directories and are not created here: the store opens its own file in step 4,
- * and the credential is written by the module that owns credential policy.
+ * The state root is established first and then declared as the boundary
+ * (`upTo`) of the two below it, which turns the check from "the tail this call
+ * created is private" into "every directory from the state root down is private
+ * and none is a symbolic link" (AAP 0.5.6: this tree holds the session database,
+ * the editor credential and the backups of a developer's patched files).
  *
  * @param config The resolved configuration, whose paths are already absolute.
- * @returns `Ok` when the tree is present and private, `Err` naming the path
- * that could not be established.
+ * @returns `Ok` when the tree is present and private, `Err` naming the path that
+ * could not be established.
  */
 function prepareStateTree(config: ServiceConfig): Result<void, DebuggenError> {
   try {
@@ -560,671 +555,779 @@ function prepareStateTree(config: ServiceConfig): Result<void, DebuggenError> {
 }
 
 /* -------------------------------------------------------------------------------------------------
- * Step 4 — the session store
+ * The effective configuration
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Reads the store's data definition from beside this module.
+ * The configuration every subsystem is handed: the resolved one, except that
+ * `port` reads the **bound** port once the socket is listening.
  *
- * One candidate, `new URL('./store/schema.sql', import.meta.url)`, because that
- * single relative URL is correct in both layouts this program runs in — see this
- * file's header for the two of them. `readFileNoFollow` rather than a plain read
- * so a symbolic link planted at the final component is refused (`ELOOP`) instead
- * of followed: the DDL is executed verbatim by SQLite, which makes it code as
- * much as data.
+ * Several subsystems need the port the service actually answers on, not the one
+ * it was asked for: the dev-server launcher builds a launched child's ingest URL
+ * from it, and dev-server detection excludes the service's own port when it
+ * reads a child's "listening on" line. With a configured port those are the
+ * same number; with `port: 0` (how a suite avoids collisions) only the bound
+ * value is right. Each of those subsystems reads `config.port` when it acts,
+ * never at construction, and none of them acts before the socket is bound — a
+ * launch is itself an HTTP request — so a getter over the bound value gives
+ * every one of them the right answer without constructing them after `listen`.
  *
- * @returns `Ok` with the DDL text, or `Err` with a packaging-level `STORE_ERROR`.
+ * @param config The resolved configuration.
+ * @param boundPort The bound port, or `undefined` before `listen` completes.
+ * @returns A frozen configuration whose `port` is live.
  */
-function loadStoreDdl(): Result<string, DebuggenError> {
-  const schemaUrl = new URL('./store/schema.sql', import.meta.url);
-  try {
-    return ok(readFileNoFollow(fileURLToPath(schemaUrl)).toString('utf8'));
-  } catch (cause) {
-    return err(
-      wrapStartupFailure(
-        cause,
-        'STORE_ERROR',
-        'Could not read the session store schema that ships beside the service entry point.',
-        'This is a packaging fault rather than a setting: rebuild the service with `pnpm --filter @debuggen/local-service build`, which copies src/store/schema.sql to dist/store/schema.sql, or reinstall Debug Generator.',
-        { subsystem: SUBSYSTEM_STORE, schemaUrl: schemaUrl.href },
-      ),
-    );
-  }
-}
-
-/**
- * Restricts the session store's files to {@link SECURE_FILE_MODE}, and proves it.
- *
- * AAP 0.4.2 states the rule this function exists for: the `$DEBUGGEN_HOME` tree
- * is created `0700` and **every file in it is `0600`**. `ensureSecureDir`
- * discharges the directory half, but the database is not created by this
- * product's own file writers — `node:sqlite`'s `DatabaseSync` opens the path
- * itself and accepts no mode argument, so the file, and the `-wal`/`-shm`
- * sidecars WAL mode creates beside it, land with whatever the process umask
- * allows (`0644` under the common `022`). A private directory hides them from a
- * *listing*, but the modes are what decide who may read a session's captured
- * telemetry, questions and file paths if the tree is ever copied, archived, or
- * reached through a path another account may traverse.
- *
- * The sidecars are tightened opportunistically rather than required: they exist
- * only once the database has been written, and a missing one is the normal state
- * of a database that has just been opened read-only, so `ENOENT` is skipped
- * while every other failure is reported.
- *
- * A failure to establish the mode fails the start-up rather than degrading it,
- * which is the same choice `@debuggen/shared/node` makes for the directories and
- * for every file it creates: a state root whose privacy could not be established
- * is not a state root this service is willing to write a session into. The mode
- * is re-read after the change, so a successful return is a statement about the
- * filesystem rather than about the call that was attempted.
- *
- * @param config The validated configuration, for `databasePath`.
- * @returns `ok(undefined)` once the database and every present sidecar are
- * `0600`, or one `STORE_ERROR` naming the path that could not be restricted.
- */
-function tightenStoreFiles(config: ServiceConfig): Result<void, DebuggenError> {
-  const paths = [
-    config.databasePath,
-    `${config.databasePath}-wal`,
-    `${config.databasePath}-shm`,
-  ] as const;
-
-  for (const [index, path] of paths.entries()) {
-    const required = index === 0;
-    try {
-      tightenFileNoFollow(path);
-    } catch (cause) {
-      // A sidecar that does not exist is not a failure: WAL mode creates the two
-      // of them on the first write and a truncating checkpoint removes them
-      // again, so the set present at any moment is a property of the store's
-      // history rather than of its correctness.
-      if (!required && errnoCodeOf(cause) === 'ENOENT') {
-        continue;
-      }
-      const unsafe = errnoCodeOf(cause) === 'ELOOP';
-      return err(
-        wrapStartupFailure(
-          cause,
-          unsafe ? 'FS_UNSAFE_PATH' : 'STORE_ERROR',
-          unsafe
-            ? 'The session store path is a symbolic link, which Debug Generator will not write through.'
-            : 'Could not restrict the session store to owner-only access.',
-          unsafe
-            ? `Remove or replace ${path}: the session store must be a regular file inside the state directory, and following a link there would write a session's captured telemetry somewhere this service did not choose.`
-            : `Check that ${path} is owned by this account and that its filesystem records POSIX permissions; the session store holds captured telemetry and must not be readable by other accounts.`,
-          { subsystem: SUBSYSTEM_STORE, path, mode: SECURE_FILE_MODE.toString(8) },
-        ),
-      );
-    }
-  }
-
-  return ok(undefined);
-}
-
-/**
- * Restricts one file to {@link SECURE_FILE_MODE} through a descriptor that
- * refuses to follow a symbolic link, and proves the result on that same
- * descriptor.
- *
- * Every step is deliberate, and the reason is the same one that makes
- * `@debuggen/shared/node` open its state files with `O_NOFOLLOW` and `fchmod`
- * them on the descriptor rather than `chmod` them by path:
- *
- * - `O_NOFOLLOW` makes a symbolic link at the final component fail with
- *   `ELOOP`, so a link planted at the database path is refused instead of
- *   having another file's permissions rewritten through it.
- * - `fstat` on the open descriptor establishes that the thing being restricted
- *   is a regular file — a directory or a device at that path is a broken state
- *   tree, not something to chmod.
- * - `fchmod` and the confirming `fstat` both act on the descriptor already
- *   held, so there is no second path lookup that a concurrent rename could
- *   redirect, and a successful return is a statement about the file itself.
- *
- * The descriptor is opened read-only: changing a mode requires ownership of the
- * file, never write access to its contents, and read-only is the least the call
- * needs. It is closed in a `finally`, so a failure leaks no descriptor.
- *
- * @param path The file to restrict.
- * @throws The platform's own filesystem error with its `code` intact — `ELOOP`
- * for a planted link, `ENOENT` when nothing is there, `EACCES`, `EPERM` — or a
- * `DebuggenError` with code `STORE_ERROR` when the entry is not a regular file
- * or the mode did not take. Callers map these onto their own reporting.
- */
-function tightenFileNoFollow(path: string): void {
-  // `O_NOFOLLOW` is POSIX and present on Linux and macOS, the two platforms this
-  // product supports. The fallback keeps the flag arithmetic valid rather than
-  // silently producing `NaN` where a platform omits the constant; the no-follow
-  // guarantee is inherently the platform's to provide.
-  const noFollow = constants.O_NOFOLLOW ?? 0;
-  const fd = openSync(path, constants.O_RDONLY | noFollow);
-
-  try {
-    if (!fstatSync(fd).isFile()) {
-      throw new DebuggenError(
-        'STORE_ERROR',
-        'expected a regular file at the session store path, found another kind of entry',
-      );
-    }
-
-    fchmodSync(fd, SECURE_FILE_MODE);
-
-    const mode = fstatSync(fd).mode & PERMISSION_BITS;
-    if (mode !== SECURE_FILE_MODE) {
-      throw new DebuggenError(
-        'STORE_ERROR',
-        `expected mode ${SECURE_FILE_MODE.toString(8)} after restricting it, found ${mode.toString(8)}`,
-      );
-    }
-  } finally {
-    closeSync(fd);
-  }
-}
-
-/**
- * Creates the session store's file — or adopts the one already there — as a
- * regular, owner-only file, **before** SQLite is allowed to open the path.
- *
- * `node:sqlite`'s `DatabaseSync` takes a path and no mode, and it opens that
- * path the ordinary way: a missing database is created under the process umask
- * (`0644` under the common `022`, which AAP 0.4.2 forbids for anything in the
- * state tree) and a symbolic link at the path is followed, so a link planted
- * there would have a session's captured telemetry written through it. Neither
- * property can be fixed after the fact — by the time the handle exists the file
- * has been created and written to — so the file is established first:
- *
- * - `createFileExclusive` from `@debuggen/shared/node` creates it with
- *   `O_CREAT | O_EXCL | O_NOFOLLOW` at {@link SECURE_FILE_MODE}, after
- *   verifying that every directory from the state root down is a real
- *   directory this account owns at `0700`. A zero-byte file is a valid empty
- *   SQLite database, so the schema ladder then populates it exactly as it would
- *   a file SQLite had created itself.
- * - An existing entry surfaces as `EEXIST` — `O_EXCL` takes precedence over
- *   `O_NOFOLLOW`, so a planted link reports `EEXIST` too — and is then put
- *   through {@link tightenFileNoFollow}, which refuses the link with `ELOOP`,
- *   refuses a non-regular entry, and restricts a genuine database that an
- *   earlier build (or a permissive umask) left readable.
- *
- * Establishing the mode here rather than only after the migration also closes a
- * failure path: a database created by this call is `0600` from the moment it
- * exists, so a migration that fails part-way leaves no permissive file behind.
- *
- * @param config The validated configuration, for `databasePath` and the state
- * root that bounds the parent verification.
- * @returns `ok(undefined)` when the path holds a regular, owner-only file, or
- * one typed failure — `FS_UNSAFE_PATH` for a link or a non-directory parent,
- * `STORE_ERROR` for anything else.
- */
-function prepareDatabaseFile(config: ServiceConfig): Result<void, DebuggenError> {
-  try {
-    createFileExclusive(config.databasePath, '', { upTo: config.debuggenHome });
-  } catch (cause) {
-    if (errnoCodeOf(cause) !== 'EEXIST') {
-      const unsafe =
-        errnoCodeOf(cause) === 'ELOOP' || DebuggenError.from(cause).code === 'FS_UNSAFE_PATH';
-      return err(
-        wrapStartupFailure(
-          cause,
-          unsafe ? 'FS_UNSAFE_PATH' : 'STORE_ERROR',
-          'Could not create the Debug Generator session store file.',
-          `Check that ${config.debuggenHome} is a directory you own at mode 0700, that no component of it is a symbolic link, and that ${config.databasePath} can be created inside it; or set DEBUGGEN_HOME to another location.`,
-          {
-            subsystem: SUBSYSTEM_STORE,
-            databasePath: config.databasePath,
-            debuggenHome: config.debuggenHome,
-          },
-        ),
-      );
-    }
-  }
-
-  return tightenStoreFiles(config);
-}
-
-/**
- * Opens `$DEBUGGEN_HOME/sessions.sqlite`, sets its pragmas and migrates it.
- *
- * The three pragmas are per-connection settings the DDL's header and
- * `./store/migrations.js` both assign to the caller, and none of them is
- * optional here:
- *
- * - `journal_mode = WAL` is the mode AAP 0.4.2 specifies for this store; it is
- *   persistent in the file, is set on every open because a copied or restored
- *   file may not carry it, and cannot be set from inside a transaction — which
- *   is exactly why the migration ladder refuses to own it.
- * - `foreign_keys = ON` is off by default in SQLite and is per connection, so
- *   the cascade rules the schema declares hold only while this statement has
- *   run. Without it a deleted session would leave its telemetry behind.
- * - `busy_timeout` replaces an immediate `SQLITE_BUSY` with a bounded wait; see
- *   {@link STORE_BUSY_TIMEOUT_MS}.
- *
- * The handle is closed again before returning an `Err`, so a refused start
- * leaves no open database and no stray `-wal` file behind.
- *
- * @param config The resolved configuration; `databasePath` is inside the state
- * tree step 3 has already created.
- * @param loggers The service's loggers. This function's own records go through
- * the `store` child, while the migration ladder is handed the **root**: that
- * module puts `subsystem: 'store'` on every record it emits, so a child already
- * bound to the same key would duplicate it in one JSON record.
- * @returns `Ok` with an open, migrated handle, or `Err` describing why the store
- * cannot be used.
- */
-function openSessionStore(
+function createEffectiveConfig(
   config: ServiceConfig,
-  loggers: ServiceLoggers,
-): Result<DatabaseSync, DebuggenError> {
-  const logger = loggers.store;
-  const ddl = loadStoreDdl();
-  if (isErr(ddl)) {
-    return ddl;
-  }
-
-  // Before the handle exists, because `DatabaseSync` creates a missing database
-  // under the umask and follows a link at the path, and neither can be undone
-  // once it has written to the file.
-  const prepared = prepareDatabaseFile(config);
-  if (isErr(prepared)) {
-    return prepared;
-  }
-
-  // `db` is declared outside the block so that a pragma that throws *after* the
-  // handle was assigned still closes it: a returned failure must not leave an
-  // open connection behind, or the caller's retry meets its own predecessor.
-  let db: DatabaseSync | undefined;
-  try {
-    db = new DatabaseSync(config.databasePath);
-    db.exec('PRAGMA journal_mode = WAL;');
-    db.exec('PRAGMA foreign_keys = ON;');
-    db.exec(`PRAGMA busy_timeout = ${STORE_BUSY_TIMEOUT_MS};`);
-  } catch (cause) {
-    if (db !== undefined) {
-      closeSessionStore(db, logger);
-    }
-    return err(
-      wrapStartupFailure(
-        cause,
-        'STORE_ERROR',
-        'Could not open the Debug Generator session store.',
-        `Check that ${config.databasePath} is writable by this account and that no other Debug Generator service is already running against it; stop that service, or set DEBUGGEN_HOME to a different state directory.`,
-        { subsystem: SUBSYSTEM_STORE, databasePath: config.databasePath },
-      ),
-    );
-  }
-
-  const outcome = applyMigrations(db, { ddl: ddl.value, logger: loggers.root });
-
-  // Run on both paths, and before either return: the migration transaction is
-  // the first write, so it is what creates the `-wal` and `-shm` sidecars — a
-  // failed ladder leaves them behind exactly as a successful one does, and they
-  // hold the same session data as the database itself.
-  const tightened = tightenStoreFiles(config);
-
-  if (isErr(outcome)) {
-    if (isErr(tightened)) {
-      logger.error(tightened.error.message, errorFields(tightened.error));
-    }
-    closeSessionStore(db, logger);
-    return outcome;
-  }
-
-  if (isErr(tightened)) {
-    closeSessionStore(db, logger);
-    return tightened;
-  }
-
-  logger.info('session store ready', {
-    databasePath: config.databasePath,
-    fromVersion: outcome.value.fromVersion,
-    toVersion: outcome.value.toVersion,
-    applied: [...outcome.value.applied],
-    adopted: outcome.value.adopted,
+  boundPort: () => number | undefined,
+): ServiceConfig {
+  const view: ServiceConfig = { ...config };
+  Object.defineProperty(view, 'port', {
+    enumerable: true,
+    configurable: false,
+    get: (): number => boundPort() ?? config.port,
   });
-
-  return ok(db);
+  return Object.freeze(view);
 }
 
 /**
- * Checkpoints the write-ahead log and closes the database, reporting rather
- * than raising.
- *
- * `PRAGMA wal_checkpoint(TRUNCATE)` folds `sessions.sqlite-wal` back into the
- * database file and truncates it, so a stopped service leaves one file that any
- * SQLite client can read — which is what makes a session inspectable after the
- * fact, and what keeps a crash-free stop from leaving a multi-megabyte log
- * behind. It is attempted before the close and never allowed to prevent it: a
- * failed checkpoint costs disk space, while a skipped close leaks a file
- * descriptor and the store's write lock.
- *
- * Called on the failure path of {@link openSessionStore}, on the failure path of
- * {@link startService} and from {@link ServiceHandle.close}, so it tolerates a
- * handle that is already closed.
- *
- * @param db The handle to close.
- * @param logger The `store` child logger.
- */
-function closeSessionStore(db: DatabaseSync, logger: Logger): void {
-  if (!db.isOpen) {
-    return;
-  }
-
-  try {
-    db.exec('PRAGMA wal_checkpoint(TRUNCATE);');
-  } catch (cause) {
-    logger.warn('could not checkpoint the session store write-ahead log before closing it', {
-      reason: DebuggenError.from(cause, 'STORE_ERROR').message,
-    });
-  }
-
-  try {
-    db.close();
-  } catch (cause) {
-    logger.error('could not close the session store cleanly', {
-      reason: DebuggenError.from(cause, 'STORE_ERROR').message,
-    });
-  }
-}
-
-/* -------------------------------------------------------------------------------------------------
- * Step 5 — the HTTP surface
- * ---------------------------------------------------------------------------------------------- */
-
-/** A listening HTTP surface: the server, and where it ended up bound. */
-interface HttpSurface {
-  /** The Node server `serve` created, for {@link ServiceHandle.close}. */
-  readonly server: ServerType;
-
-  /** The interface it is bound to, as configured. */
-  readonly host: string;
-
-  /** The port it is actually bound to, read back from the bound socket. */
-  readonly port: number;
-
-  /** The base URL of {@link host} and {@link port}. */
-  readonly url: string;
-}
-
-/**
- * Whether an `Origin` header value is one this service accepts.
- *
- * Parsed with `URL` rather than matched as a string, so a prefix that merely
- * looks like an accepted scheme (`chrome-extension://x@evil.example`, or a
- * header with leading whitespace) is judged on its parsed protocol.
- *
- * @param origin The raw header value; the caller has already established that
- * the header is present, because an absent `Origin` is a non-browser client and
- * is accepted without reaching here.
- * @returns `true` for the schemes of {@link ACCEPTED_ORIGIN_PROTOCOLS}, `false`
- * for every web origin, for `null` and for anything unparseable.
- */
-function isAcceptedOrigin(origin: string): boolean {
-  let parsed: URL;
-  try {
-    parsed = new URL(origin);
-  } catch {
-    return false;
-  }
-  return ACCEPTED_ORIGIN_PROTOCOLS.includes(parsed.protocol);
-}
-
-/**
- * Builds the base URL of a bound socket.
- *
- * A bare IPv6 literal is bracketed, because `http://::1:43117` is not a URL and
- * `DEBUGGEN_HOST=::1` is a supported configuration: the host is validated as a
- * non-empty string without whitespace, not as an IPv4 address.
- *
- * @param host The configured interface.
- * @param port The bound port.
- * @returns An absolute `http:` URL with no trailing slash.
+ * The base URL of a bound socket. A bare IPv6 literal is bracketed, because
+ * `DEBUGGEN_HOST=::1` is a supported configuration and `http://::1:43117` is not
+ * a URL.
  */
 function formatServiceUrl(host: string, port: number): string {
   const authority = host.includes(':') && !host.startsWith('[') ? `[${host}]` : host;
   return `http://${authority}:${port}`;
 }
 
+/* -------------------------------------------------------------------------------------------------
+ * Bounded waiting
+ * ---------------------------------------------------------------------------------------------- */
+
 /**
- * Whether `app` serves the pairing flow of AAP 0.5.6 — a handler at both
- * `POST /pair/start` and `POST /pair/complete` — which is what the
- * `pairingAvailable` field of the `GET /health` body reports.
+ * Awaits `work` for at most `timeoutMs`, never rejecting.
  *
- * Derived from the application's own route registry rather than stated as a
- * literal, so the flag cannot claim a flow the service does not answer: the
- * DevTools panel reads `pairingAvailable` to decide whether to offer its pairing
- * dialog, and a `true` from a service that answers both routes `404` would offer
- * a dialog that cannot succeed. A flow served by half is not available, hence
- * `every`.
+ * Used for every awaited shutdown step. A rejection is logged; a timeout is
+ * logged as the step being abandoned (what AAP-level "force-killed" means for a
+ * step this file does not own — the launcher escalates its own children to
+ * SIGKILL inside the window). The timer is cleared on settlement and `unref`'d,
+ * so the bound itself never keeps the event loop alive.
  *
- * Each operation is matched on the method and pattern of its `HTTP_ROUTES` row
- * against `app.routes`, which Hono records with the method upper-cased and the
- * path merged with the app's base path — the same form the table states. An
- * entry registered through `use` carries the method `ALL` and is middleware
- * that passes the request on rather than a handler that answers it, so it never
- * satisfies a match.
+ * @param work The step, started by the caller.
+ * @param timeoutMs The bound.
+ * @param step A short name for the log record.
+ * @param logger Where the outcome is reported.
+ * @returns Whether the step settled within the bound.
+ */
+async function settleWithin(
+  work: Promise<unknown>,
+  timeoutMs: number,
+  step: string,
+  logger: Logger,
+): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<'timeout'>((resolve) => {
+    timer = setTimeout(() => {
+      resolve('timeout');
+    }, timeoutMs);
+    timer.unref();
+  });
+
+  const settled = work.then(
+    () => 'settled' as const,
+    (cause: unknown) => {
+      logger.error('a shutdown step failed; continuing with the next one', {
+        step,
+        reason: reasonOf(cause),
+      });
+      return 'settled' as const;
+    },
+  );
+
+  try {
+    const outcome = await Promise.race([settled, timeout]);
+    if (outcome === 'timeout') {
+      logger.warn('a shutdown step did not finish in time and was abandoned', {
+        step,
+        timeoutMs,
+      });
+      return false;
+    }
+    return true;
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Runs one synchronous release step, logging rather than raising a failure, so
+ * one broken collaborator cannot stop the rest of the sequence.
+ */
+function releaseQuietly(step: string, logger: Logger, release: () => unknown): void {
+  try {
+    release();
+  } catch (cause) {
+    logger.error('a shutdown step failed; continuing with the next one', {
+      step,
+      reason: reasonOf(cause),
+    });
+  }
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Composition adapters
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * The relayed page-agent reports, per tab: the one object that is both the
+ * WebSocket router's {@link AgentReadinessPort} (where a relayed `agent.ready`
+ * is written) and the readiness gate's {@link BrowserAgentRegistry} (where it
+ * is read), so the report the gate judges is exactly the report the router
+ * accepted.
+ */
+export interface AgentReadyLedger extends AgentReadinessPort, BrowserAgentRegistry {
+  /**
+   * Records a relayed report as the tab's newest one and wakes the waits it
+   * answers. Synchronous; refused with `TRANSPORT_DISCONNECTED` after
+   * {@link AgentReadyLedger.close}.
+   */
+  agentReady(
+    payload: AgentReadyPayload,
+    client: WsConnectionFacts,
+  ): Result<AgentReadyReceipt, DebuggenError>;
+
+  /** When the report {@link BrowserAgentRegistry.latestAgentReady} returns was received. */
+  latestAgentReadyAt(tabId: number): number | undefined;
+
+  /** Resolves every pending wait with `undefined` and forgets every report. Idempotent. */
+  close(): void;
+}
+
+/** What {@link AgentReadyLedger.agentReady} acknowledges: the tab and document recorded. */
+export interface AgentReadyReceipt {
+  readonly tabId: number;
+  readonly documentId: string;
+}
+
+/** Collaborators of {@link createAgentReadyLedger}. */
+export interface AgentReadyLedgerDeps {
+  /** Where accepted reports are noted at `debug`. Never receives a page URL. */
+  readonly logger: Logger;
+  /** The clock a report is stamped with, in epoch milliseconds. */
+  readonly now?: (() => number) | undefined;
+  /** The most tabs remembered; the oldest report is forgotten first. */
+  readonly maxTabs?: number | undefined;
+}
+
+/** One stored report and when it arrived. */
+interface AgentReport {
+  readonly payload: AgentReadyPayload;
+  readonly receivedAt: number;
+}
+
+/** One pending {@link BrowserAgentRegistry.waitForAgentReady}. */
+interface AgentWaiter {
+  readonly afterDocumentId: string | undefined;
+  readonly settle: (payload: AgentReadyPayload | undefined) => void;
+}
+
+/**
+ * Creates the agent-readiness ledger.
  *
- * This is the service-side precondition of `pairingAvailable`, not the whole of
- * it: the protocol defines the field as "a pairing code can be requested right
- * now", and `false` also covers the case of no editor client being connected to
- * display a code, which is a fact of the WebSocket client registry rather than
- * of the route table. {@link createServiceApp} registers neither pairing
- * operation and this composition attaches no WebSocket surface through which an
- * editor could connect, so both conditions are unmet and the application it
- * builds reports `false`.
+ * The ledger replaces a tab's report on every accepted `agent.ready`, so the
+ * newest document's facts are the only ones returned; the WebSocket router
+ * calls it only after the relaying DevTools connection has been authorized for
+ * the tab the report names. A wait resolves with the first report whose
+ * document differs from the one the caller already knows (or with any report
+ * when it knows none), with `undefined` on its timeout, on abort and on
+ * {@link AgentReadyLedger.close}; it never rejects and never outlives its bound.
  *
- * Exported so the derivation can be exercised against applications that do
- * register the pairing routes, which the service this module starts does not.
- *
- * @param app The composed application.
- * @returns `true` only when both pairing operations have a handler registered at
- * their protocol method and pattern.
+ * @param deps The logger, and optionally a clock and a size bound.
+ * @returns The ledger.
  *
  * @example
  * ```ts
- * const app = new Hono();
- * servesPairingFlow(app); // false
- * app.post('/pair/start', mint).post('/pair/complete', redeem);
- * servesPairingFlow(app); // true
+ * const ledger = createAgentReadyLedger({ logger });
+ * ledger.agentReady(payload, connection); // from the WebSocket router
+ * ledger.latestAgentReady(payload.tabId); // → payload
  * ```
  */
-export function servesPairingFlow(app: Hono): boolean {
-  return PAIRING_OPERATIONS.every((operation) => {
-    const { method, pattern } = HTTP_ROUTES[operation];
-    return app.routes.some((route) => route.method === method && route.path === pattern);
-  });
-}
+export function createAgentReadyLedger(deps: AgentReadyLedgerDeps): AgentReadyLedger {
+  const log = subsystemLogger(deps.logger, SUBSYSTEM_READINESS);
+  const now = deps.now ?? nowEpochMs;
+  const requestedMax = deps.maxTabs ?? MAX_TRACKED_AGENT_TABS;
+  const maxTabs =
+    Number.isSafeInteger(requestedMax) && requestedMax > 0 ? requestedMax : MAX_TRACKED_AGENT_TABS;
+  const reports = new Map<number, AgentReport>();
+  const waiters = new Map<number, Set<AgentWaiter>>();
+  let closed = false;
 
-/**
- * Builds and validates the `GET /health` body for `app`.
- *
- * The body is held to its one definition twice. `satisfies HealthResponse`
- * fixes its field set to the protocol's type at compile time, so a field added
- * or dropped here does not build; `parseHttpResponse('health', …)` then applies
- * `healthResponseSchema` — the strict schema `HttpClient.health()` parses the
- * reply with — to its values, so a version string the protocol would refuse
- * (empty, or longer than its bound) is caught here rather than by every client.
- *
- * @param app The composed application, read for {@link servesPairingFlow}.
- * @returns `ok(body)`, or `err` with `PROTOCOL_INVALID_MESSAGE` naming the field
- * that fails the schema.
- */
-function buildHealthResponse(app: Hono): Result<HealthResponse, DebuggenError> {
-  return parseHttpResponse('health', {
-    version: SERVICE_VERSION,
-    protocolVersion: PROTOCOL_VERSION,
-    pairingAvailable: servesPairingFlow(app),
-  } satisfies HealthResponse);
-}
-
-/**
- * Builds the service's Hono application: the origin guard, `GET /health` and
- * the error handler.
- *
- * Pure and synchronous — it registers handlers and nothing else — so the app can
- * be built before the socket is bound and the health route answers from the
- * first accepted connection.
- *
- * @param logger The `server` child logger, captured by the two handlers that
- * report.
- * @returns The application whose `fetch` is handed to `serve`.
- */
-function createServiceApp(logger: Logger): Hono {
-  const app = new Hono();
-
-  // AAP 0.5.6, applied to every route including the ones that do not exist: a
-  // refusal must not depend on whether a path happens to be registered. No
-  // `Access-Control-Allow-Origin` header is set here or anywhere else in this
-  // file, so a browser cannot read a response even when one is produced.
-  app.use('*', async (c, next) => {
-    const origin = c.req.header('Origin');
-    if (origin !== undefined && !isAcceptedOrigin(origin)) {
-      logger.warn('refused a request from a forbidden origin', {
-        method: c.req.method,
-        path: c.req.path,
-        origin,
-      });
-      return c.json({ code: 'FORBIDDEN_ORIGIN', message: FORBIDDEN_ORIGIN_MESSAGE }, 403);
+  /** Stores a report as the tab's most recent one, evicting beyond the bound. */
+  function remember(tabId: number, report: AgentReport): void {
+    reports.delete(tabId);
+    reports.set(tabId, report);
+    while (reports.size > maxTabs) {
+      const oldest = reports.keys().next();
+      if (oldest.done === true) {
+        break;
+      }
+      reports.delete(oldest.value);
     }
-    await next();
-    return undefined;
-  });
+  }
 
-  // Unauthenticated by design — one of the two auth-exempt operations of AAP
-  // 0.5.6 — and therefore limited to "version and pairing availability only":
-  // the service build's version, the protocol version it speaks and whether
-  // pairing can be requested. Nothing about the developer's machine, the session
-  // store or the configuration belongs in this body.
-  //
-  // The body is `@debuggen/protocol`'s `HealthResponse`, validated against
-  // `healthResponseSchema` on every request by `buildHealthResponse`. Evaluated
-  // per request rather than once, so `pairingAvailable` describes the routes the
-  // app serves when it answers. A body that fails the schema is thrown to
-  // `app.onError` below — logged with the failing field, answered `500` — and is
-  // never sent, because a client would refuse it anyway.
-  app.get(HEALTH_ROUTE, (c) => {
-    const body = buildHealthResponse(app);
-    if (isErr(body)) {
-      throw body.error;
+  /** Whether a report answers a wait: a different document, or any when none is known. */
+  function answers(afterDocumentId: string | undefined, payload: AgentReadyPayload): boolean {
+    return afterDocumentId === undefined || payload.documentId !== afterDocumentId;
+  }
+
+  function agentReady(
+    payload: AgentReadyPayload,
+    client: WsConnectionFacts,
+  ): Result<AgentReadyReceipt, DebuggenError> {
+    if (closed) {
+      return err(
+        new DebuggenError(
+          'TRANSPORT_DISCONNECTED',
+          'The Debug Generator service is shutting down and records no further page-agent reports.',
+          { details: { reason: 'service-closing' } },
+        ),
+      );
     }
-    return c.json(body.value);
-  });
-
-  // The last boundary: a handler that threw, or a middleware that rejected.
-  // The caught value is logged with the request that produced it and never
-  // reflected into the response, where it could carry a path, a query or a
-  // fragment of a developer's data.
-  app.onError((cause, c) => {
-    const error = DebuggenError.from(cause, 'INTERNAL');
-    logger.error('unhandled failure while serving a request', {
-      method: c.req.method,
-      path: c.req.path,
-      ...errorFields(error),
-      reason: error.message,
+    remember(payload.tabId, { payload, receivedAt: now() });
+    log.debug('recorded a page-agent readiness report', {
+      tabId: payload.tabId,
+      documentId: payload.documentId,
+      reactDetected: payload.reactDetected,
+      installedBeforeReact: payload.installedBeforeReact,
+      clientId: client.id,
     });
-    return c.json({ code: 'INTERNAL', message: INTERNAL_ERROR_MESSAGE }, 500);
+    const pending = waiters.get(payload.tabId);
+    if (pending !== undefined) {
+      for (const waiter of [...pending]) {
+        if (answers(waiter.afterDocumentId, payload)) {
+          waiter.settle(payload);
+        }
+      }
+    }
+    return ok({ tabId: payload.tabId, documentId: payload.documentId });
+  }
+
+  function waitForAgentReady(
+    tabId: number,
+    options: WaitForAgentReadyOptions,
+  ): Promise<AgentReadyPayload | undefined> {
+    const current = reports.get(tabId)?.payload;
+    if (current !== undefined && answers(options.afterDocumentId, current)) {
+      return Promise.resolve(current);
+    }
+    if (closed || options.signal?.aborted === true) {
+      return Promise.resolve(undefined);
+    }
+
+    const requested = options.timeoutMs ?? MAX_RELOAD_WAIT_MS;
+    const timeoutMs = Math.min(Math.max(0, requested), MAX_RELOAD_WAIT_MS);
+
+    return new Promise((resolve) => {
+      const signal = options.signal;
+      const owner = waiters.get(tabId) ?? new Set<AgentWaiter>();
+      waiters.set(tabId, owner);
+
+      // Both callbacks run on a later tick, by which time `waiter` exists.
+      const onAbort = (): void => {
+        waiter.settle(undefined);
+      };
+      const timer = setTimeout(() => {
+        waiter.settle(undefined);
+      }, timeoutMs);
+      timer.unref();
+
+      const waiter: AgentWaiter = {
+        afterDocumentId: options.afterDocumentId,
+        settle: (payload) => {
+          if (!owner.delete(waiter)) {
+            return;
+          }
+          if (owner.size === 0 && waiters.get(tabId) === owner) {
+            waiters.delete(tabId);
+          }
+          clearTimeout(timer);
+          signal?.removeEventListener('abort', onAbort);
+          resolve(payload);
+        },
+      };
+
+      owner.add(waiter);
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+
+  function close(): void {
+    if (closed) {
+      return;
+    }
+    closed = true;
+    for (const set of [...waiters.values()]) {
+      for (const waiter of [...set]) {
+        waiter.settle(undefined);
+      }
+    }
+    waiters.clear();
+    reports.clear();
+  }
+
+  return Object.freeze({
+    agentReady,
+    latestAgentReady: (tabId: number): AgentReadyPayload | undefined => reports.get(tabId)?.payload,
+    latestAgentReadyAt: (tabId: number): number | undefined => reports.get(tabId)?.receivedAt,
+    waitForAgentReady,
+    close,
   });
-
-  return app;
 }
 
 /**
- * Registers an `error` listener on a server of `serve`'s union return type.
- *
- * `ServerType` is `Server | Http2Server | Http2SecureServer`, and each of those
- * declares its own overload set for `on`; calling an overloaded method through
- * a union is what TypeScript refuses. Widening to the `EventEmitter` all three
- * extend is an ordinary assignment rather than a cast, and `error` is an
- * `EventEmitter` event on every one of them.
- *
- * The listener is attached immediately after `serve` returns, which is
- * race-free: `serve` calls `listen` synchronously and Node emits a bind failure
- * on a later tick.
- *
- * @param server The server `serve` returned.
- * @param listener Handler for the emitted error.
+ * The readiness gate's view of the connected dev-server preloads, over the
+ * client registry: a project has a server agent while at least one of its
+ * `server-agent` connections is online, and the registry's snapshot of the
+ * most recent one carries the heartbeat (`lastSeenAt`) the preload-bound
+ * adapters measure staleness against.
  */
-function onServerError(server: ServerType, listener: (cause: unknown) => void): void {
-  const emitter: EventEmitter = server;
-  emitter.on('error', listener);
+function serverAgentPresenceOf(clients: ClientRegistry): ServerAgentReadinessSource {
+  return Object.freeze({
+    hasServerAgentForProject: (projectRoot: string): boolean =>
+      clients.serverAgentsForProject(projectRoot).some((client) => client.online),
+    serverAgentForProject: (projectRoot: string) => clients.serverAgentForProject(projectRoot),
+  });
 }
 
 /**
- * Releases connections that are open but idle, where the runtime offers it.
- *
- * `closeIdleConnections` is declared by `node:http`'s server and not by every
- * member of `ServerType`, so it is feature-detected rather than assumed. It is
- * what lets `server.close()` complete promptly in the common case, where the
- * only thing keeping the server open is a client's idle keep-alive socket.
- *
- * @param server The server being shut down.
+ * The dev-server launcher's credential port, over the access boundary: a
+ * launched child receives a `server-agent` credential scoped to its one project
+ * root (AAP 0.5.6), and the credentials of that project are revoked when the
+ * child exits or is stopped.
  */
-function closeIdleConnections(server: ServerType): void {
-  if ('closeIdleConnections' in server && typeof server.closeIdleConnections === 'function') {
-    server.closeIdleConnections();
-  }
+function credentialIssuerOf(auth: AuthService): ServerAgentCredentialIssuer {
+  return Object.freeze({
+    issue: (input: { readonly projectRoot: string; readonly expiresAt?: number | undefined }) =>
+      auth.issueServerAgentCredential({
+        projectRoot: input.projectRoot,
+        expiresAt: input.expiresAt,
+      }),
+    revoke: (input: { readonly projectRoot: string }) =>
+      auth.revokeServerAgentCredentials(input.projectRoot),
+  });
 }
 
 /**
- * Closes every remaining connection, including in-flight ones.
+ * The delivery port `source.open` forwards through: the session's clients of
+ * one kind, over the client registry.
  *
- * The escalation behind {@link SHUTDOWN_GRACE_MS}: a request that has not
- * finished by then is abandoned so the process can exit inside the window its
- * supervisor allows. Feature-detected for the same reason as
- * {@link closeIdleConnections}.
- *
- * @param server The server being shut down.
+ * The registry routes a session's fan-out to an editor by the session's project
+ * root, which it learns from the first session record it carries. A location
+ * clicked in a panel reopened from storage can arrive before any record has
+ * been sent in this process, so the project is taught from the store first.
  */
-function forceCloseConnections(server: ServerType): void {
-  if ('closeAllConnections' in server && typeof server.closeAllConnections === 'function') {
-    server.closeAllConnections();
-  }
-}
-
-/**
- * Binds the socket and resolves once it is listening.
- *
- * The promise settles exactly once, on whichever of three things happens first:
- * the listening callback (`Ok`, with the bound port read back from the
- * `AddressInfo` the adapter hands over), an `error` event (`Err`), or a
- * synchronous throw from `serve` (`Err`). A bind failure therefore never
- * escapes as an unhandled `error` event, and `EADDRINUSE` — by far the most
- * common of them, and what a second service instance or a stale process
- * produces — arrives as a typed error naming the host and port a developer has
- * to free or change.
- *
- * The `error` listener stays attached after the promise has settled, because a
- * server that emits `error` with no listener throws inside Node's event
- * machinery; afterwards such an event is logged instead.
- *
- * @param app The application whose `fetch` handles requests.
- * @param config The resolved configuration: `host` and `port` are the bind
- * request, and `port: 0` asks the operating system to choose.
- * @param logger The `server` child logger.
- * @returns `Ok` with the listening surface, or `Err` explaining the refusal.
- */
-function startHttpServer(
-  app: Hono,
-  config: ServiceConfig,
+function sourceOpenDeliveryOf(
+  clients: ClientRegistry,
+  sessions: Pick<SessionsRepo, 'get'>,
   logger: Logger,
-): Promise<Result<HttpSurface, DebuggenError>> {
+): SourceOpenClientPort {
+  return Object.freeze({
+    sendToSessionClients(
+      sessionId: SessionId,
+      clientKind: ClientKind,
+      message: ProtocolMessage,
+    ): number {
+      if (clients.projectForSession(sessionId) === undefined) {
+        const record = sessions.get(sessionId);
+        if (isErr(record)) {
+          logger.warn('could not read the session a source location belongs to', {
+            sessionId,
+            code: record.error.code,
+          });
+        } else if (record.value !== undefined) {
+          const tracked = clients.trackSession(sessionId, record.value.projectRoot);
+          if (isErr(tracked)) {
+            logger.warn('could not route a source location to the session’s editors', {
+              sessionId,
+              code: tracked.error.code,
+            });
+          }
+        }
+      }
+      return clients.broadcastToKinds(sessionId, [clientKind], message);
+    },
+  });
+}
+
+/**
+ * Where a `target.selected` goes: the session record's current target, which
+ * the first pipeline stage reads. The WebSocket router has already proved the
+ * sender holds the session's tab binding.
+ */
+function targetSelectionOf(manager: SessionManager): TargetSelectionPort {
+  return Object.freeze({
+    selected: (sessionId: SessionId, target: SelectedTarget) =>
+      manager.patch(sessionId, { target }),
+  });
+}
+
+/** The code-analysis handles the instrumentation context is built from, in its field names. */
+function toInstrumentationHandles(handles: PipelineCodeHandles): CodeAnalysisHandles {
+  return {
+    graph: handles.graph,
+    queries: handles.queries,
+    routeMap: handles.routeMap,
+    summary: handles.projectSummary,
+    project: handles.loaded,
+  };
+}
+
+/** Collaborators of {@link createIngestSourceLocator}. */
+export interface IngestSourceLocatorDeps {
+  /** Where a batch's session — its project root and dev-server URL — is read. */
+  readonly sessions: Pick<SessionsRepo, 'get'>;
+  /** The code index shared with the pipeline, so a project is indexed once. */
+  readonly codeIndex: Pick<CodeIndexPort, 'load'>;
+  /** The modification journal the patch route corroborates a stamp against. */
+  readonly modifications: ModificationCorroborationPort;
+  /** The stored spans a database query's enclosing function is found through. */
+  readonly events: ParentEventPort;
+  /** The service's root logger. */
+  readonly logger: Logger;
+}
+
+/**
+ * The source-location port of telemetry ingest (its step 7½): each batch is
+ * resolved by `./source/resolve.ts` over the batch's own session — its project
+ * root, its code index, the modification journal, the stored parent spans and
+ * its dev-server URL, which pins where the source-map route may fetch a chunk's
+ * map from (AAP §0.4.2, "Source resolution path").
+ *
+ * The resolver is built per batch, so one batch shares one source-map cache
+ * and a chunk the dev server rebuilt between batches is never mapped through
+ * a stale document. The code index is the pipeline's, normally loaded already
+ * by the session's own stages; a load that is still running is shared rather
+ * than started again for every batch of a burst. An index that cannot be
+ * loaded leaves the routes that need none — patch metadata and the source map
+ * — to answer on their own.
+ *
+ * @param deps The session store, code index, journal, telemetry store and logger.
+ * @returns The port handed to `createTelemetryIngest`.
+ */
+export function createIngestSourceLocator(deps: IngestSourceLocatorDeps): IngestSourceLocator {
+  const loading = new Map<string, Promise<Result<PipelineCodeHandles, DebuggenError>>>();
+
+  const codeFor = (projectRoot: string): Promise<Result<PipelineCodeHandles, DebuggenError>> => {
+    const inFlight = loading.get(projectRoot);
+    if (inFlight !== undefined) {
+      return inFlight;
+    }
+    const started = deps.codeIndex.load(projectRoot).finally(() => {
+      loading.delete(projectRoot);
+    });
+    loading.set(projectRoot, started);
+    return started;
+  };
+
+  return Object.freeze({
+    locate: async (events, attribution) => {
+      const session = deps.sessions.get(attribution.sessionId);
+      if (!session.ok) {
+        return session;
+      }
+      const record = session.value;
+      if (record === undefined) {
+        return ok(new Map());
+      }
+      const code = await codeFor(record.projectRoot);
+      const handles = code.ok ? code.value : undefined;
+      const resolver = createSourceResolver({
+        projectRoot: record.projectRoot,
+        queries: handles?.queries,
+        routeMap: handles?.routeMap,
+        graph: handles?.graph,
+        modifications: deps.modifications,
+        events: deps.events,
+        devServerOrigin: record.devServerUrl,
+        logger: deps.logger,
+      });
+      return resolver.resolveEvents(events);
+    },
+  } satisfies IngestSourceLocator);
+}
+
+/** Collaborators of {@link createCaptureReadinessSource}. */
+interface CaptureReadinessDeps {
+  readonly sessions: Pick<SessionsRepo, 'get'>;
+  readonly instrumentation: Pick<InstrumentationService, 'buildContext'>;
+  readonly codeIndex: CodeIndexPort;
+  readonly adapters: AdapterRegistry;
+  readonly progress: SessionProgress;
+  readonly observe: Omit<CollectObservedReadinessDeps, 'logger' | 'now'>;
+  readonly logger: Logger;
+  readonly now?: (() => number) | undefined;
+}
+
+/**
+ * The capture stage's readiness re-evaluation (`CaptureReadinessSource`).
+ *
+ * The install evaluates readiness once; a page reloaded, a tab bound or a
+ * preload connected after that is only seen if the verdict is taken again when
+ * a capture starts, which is what moves an `instrumenting` session to `ready`.
+ * This composes the same three steps the install uses — the observed evidence
+ * (`collectReadinessEvidence`), the adapter context
+ * (`InstrumentationService.buildContext` over the project's code handles, from
+ * the same code-index loader the pipeline uses) and the verdict
+ * (`evaluateReadiness`) — with a reload-prompt ledger of its own, so a document
+ * is asked to reload at most once by this path.
+ */
+function createCaptureReadinessSource(deps: CaptureReadinessDeps): CaptureReadinessSource {
+  const reloadPrompts = new Set<string>();
+
+  async function evaluate(
+    request: CaptureReadinessRequest,
+  ): Promise<Result<ReadinessVerdict, DebuggenError>> {
+    const session = deps.sessions.get(request.sessionId);
+    if (isErr(session)) {
+      return session;
+    }
+    const devServerUrl = session.value?.devServerUrl;
+
+    const evidence = await collectReadinessEvidence(
+      { ...deps.observe, logger: deps.logger, now: deps.now },
+      {
+        sessionId: request.sessionId,
+        projectRoot: request.projectRoot,
+        boundTab: request.boundTab,
+        plan: request.plan,
+        devServerUrl:
+          devServerUrl === undefined || devServerUrl.length === 0 ? undefined : devServerUrl,
+        signal: request.signal,
+      },
+    );
+    if (isErr(evidence)) {
+      return evidence;
+    }
+
+    const code = await deps.codeIndex.load(request.projectRoot, { signal: request.signal });
+    if (isErr(code)) {
+      return code;
+    }
+
+    const context = deps.instrumentation.buildContext({
+      sessionId: request.sessionId,
+      projectRoot: request.projectRoot,
+      plan: request.plan,
+      code: toInstrumentationHandles(code.value),
+      readiness: evidence.value.observed,
+      signal: request.signal,
+    });
+    if (isErr(context)) {
+      return context;
+    }
+
+    return evaluateReadiness(
+      {
+        adapters: deps.adapters,
+        agents: deps.observe.agents,
+        progress: deps.progress,
+        logger: deps.logger,
+        now: deps.now,
+        reloadPrompts,
+      },
+      {
+        context: context.value,
+        plan: request.plan,
+        boundTab: request.boundTab,
+        devServer: evidence.value.devServer,
+        allowReloadPrompt: request.allowReloadPrompt,
+        requireServerAgent: request.requireServerAgent,
+        signal: request.signal,
+      },
+    );
+  }
+
+  return Object.freeze({ evaluateReadiness: evaluate });
+}
+
+/**
+ * The readiness port the WebSocket router relays `agent.ready` to: the ledger
+ * records the report, then the session bound to the reporting tab is re-gated.
+ *
+ * A session's install often runs before its tab is bound (the panel binds after
+ * the editor created the session) or before the page it will capture has
+ * reloaded, so the install's verdict cannot be the last word. The service
+ * worker re-relays the tab's latest report on every new binding and every
+ * document sends one when it loads, so re-gating on each report is what moves
+ * the session to "Ready to capture" — or asks for the one reload a late hook
+ * needs — as soon as the page can actually be observed. The report's own answer
+ * is returned unchanged; the re-gate never delays or fails it.
+ *
+ * @param ledger The ledger that records the report.
+ * @param bindings Where the reporting tab's binding is looked up.
+ * @param pipeline The orchestrator that re-gates the bound session.
+ * @param logger The service's root logger.
+ * @returns The port handed to the WebSocket router.
+ */
+export function regatingReadinessPort(
+  ledger: AgentReadinessPort,
+  bindings: Pick<ClientRegistry, 'bindingForTab'>,
+  pipeline: Pick<PipelineOrchestrator, 'regate'>,
+  logger: Logger,
+): AgentReadinessPort {
+  const log = subsystemLogger(logger, SUBSYSTEM_READINESS);
+  return Object.freeze({
+    agentReady: async (payload: AgentReadyPayload, client: WsConnectionFacts) => {
+      const recorded = await ledger.agentReady(payload, client);
+      const binding = recorded.ok ? bindings.bindingForTab(payload.tabId) : undefined;
+      if (binding !== undefined) {
+        void pipeline.regate({ sessionId: binding.sessionId }).then((outcome) => {
+          if (!outcome.ok) {
+            log.debug('the bound session was not re-gated after a page-agent report', {
+              sessionId: binding.sessionId,
+              tabId: payload.tabId,
+              code: outcome.error.code,
+            });
+          }
+        });
+      }
+      return recorded;
+    },
+  } satisfies AgentReadinessPort);
+}
+
+/**
+ * The binding routes the WebSocket router dispatches to, with one addition:
+ * the session a tab was just bound to is re-gated.
+ *
+ * A session's install usually runs before the panel binds its tab, so the
+ * install's verdict can only ask for a binding. A page that carries an agent
+ * reports it and is re-gated by {@link regatingReadinessPort}, but a page that
+ * was open before the extension was enabled carries none and never reports, so
+ * the report alone would leave the session in `instrumenting` without ever
+ * asking for the one reload that recovers it. Re-gating on the bind is what
+ * surfaces that request (or admits a tab whose report is already on file). The
+ * bind's own answer is returned unchanged; the re-gate never delays or fails it.
+ * The other two routes are delegated explicitly, so a route added to
+ * {@link BindingRoutes} is a compile error here rather than a missing member.
+ *
+ * @param binding The binding routes that do the work.
+ * @param pipeline The orchestrator that re-gates the bound session.
+ * @param logger The service's root logger.
+ * @returns The routes handed to the WebSocket router.
+ */
+export function regatingBindingRoutes(
+  binding: BindingRoutes,
+  pipeline: Pick<PipelineOrchestrator, 'regate'>,
+  logger: Logger,
+): BindingRoutes {
+  const log = subsystemLogger(logger, SUBSYSTEM_READINESS);
+  return Object.freeze({
+    handleSessionBind: async (payload, connection) => {
+      const bound = await binding.handleSessionBind(payload, connection);
+      if (bound.ok) {
+        const { sessionId, tabId } = bound.value;
+        void pipeline.regate({ sessionId }).then((outcome) => {
+          if (!outcome.ok) {
+            log.debug('the bound session was not re-gated after its tab was bound', {
+              sessionId,
+              tabId,
+              code: outcome.error.code,
+            });
+          }
+        });
+      }
+      return bound;
+    },
+    handleTabNavigated: (payload, connection) => binding.handleTabNavigated(payload, connection),
+    handleSessionUnbind: (payload, connection) => binding.handleSessionUnbind(payload, connection),
+  } satisfies BindingRoutes);
+}
+
+/**
+ * The instrumentation service as the pipeline sees it: every method delegated,
+ * plus the capture-time readiness re-evaluation. Delegated explicitly rather
+ * than spread, so a method the service adds is a compile error here instead of
+ * a silently missing member.
+ */
+function withCaptureReadiness(
+  service: InstrumentationService,
+  readiness: CaptureReadinessSource,
+): InstrumentationService & CaptureReadinessSource {
+  return Object.freeze({
+    buildContext: (input) => service.buildContext(input),
+    install: (request) => service.install(request),
+    armCapture: (request) => service.armCapture(request),
+    disarmCapture: (request) => service.disarmCapture(request),
+    restoreArming: (input) => service.restoreArming(input),
+    arming: (sessionId) => service.arming(sessionId),
+    isInstalling: (sessionId) => service.isInstalling(sessionId),
+    stopSession: (sessionId) => service.stopSession(sessionId),
+    dispose: () => service.dispose(),
+    evaluateReadiness: (request) => readiness.evaluateReadiness(request),
+  } satisfies InstrumentationService & CaptureReadinessSource);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Step 9 — the prompt tree
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Validates the prompt tree eagerly: the manifest parses and names a current
+ * version for every stage, and every one of those files loads. A broken tree —
+ * a VSIX whose copy is incomplete, a manifest edited by hand — then fails the
+ * start with the loader's own hint instead of failing a developer's session at
+ * its first model call.
+ *
+ * @param loader The loader over `config.promptsDir`.
+ * @returns `ok` with the stage → version map the sessions will record, or the
+ * loader's first failure.
+ */
+function validatePromptTree(
+  loader: PromptLoader,
+): Result<Readonly<Record<string, string>>, DebuggenError> {
+  const versions = loader.versions();
+  if (isErr(versions)) {
+    return versions;
+  }
+  for (const stage of PROMPT_STAGES) {
+    const loaded = loader.load(stage);
+    if (isErr(loaded)) {
+      return loaded;
+    }
+  }
+  return ok(versions.value);
+}
+
+/* -------------------------------------------------------------------------------------------------
+ * Step 11 — the one HTTP server
+ * ---------------------------------------------------------------------------------------------- */
+
+/**
+ * Binds the server and resolves once it is listening, with the bound port.
+ *
+ * Settles exactly once, on the first of: `listening` (`Ok`, the port read back
+ * from the socket's `AddressInfo`), `error` (`Err`), or a synchronous throw from
+ * `listen` (`Err`). `EADDRINUSE` — what a second service instance or a stale
+ * process produces — arrives as a typed error naming the host and port to free
+ * or change.
+ *
+ * @param server The server, with its request listener and upgrade routing set.
+ * @param config The resolved configuration; `port: 0` asks the OS to choose.
+ * @returns The bound port, or the refusal.
+ */
+function listen(server: Server, config: ServiceConfig): Promise<Result<number, DebuggenError>> {
   return new Promise((resolve) => {
     let settled = false;
-    const settle = (result: Result<HttpSurface, DebuggenError>): void => {
+
+    const refuse = (cause: unknown): void => {
       if (settled) {
         return;
       }
       settled = true;
-      resolve(result);
-    };
-
-    let server: ServerType;
-
-    const handleFailure = (cause: unknown): void => {
-      if (settled) {
-        logger.error('the HTTP server reported an error after start-up', {
-          reason: DebuggenError.from(cause, 'INTERNAL').message,
-        });
-        return;
-      }
-      settle(
+      server.off('listening', onListening);
+      resolve(
         err(
           wrapStartupFailure(
             cause,
@@ -1237,135 +1340,186 @@ function startHttpServer(
       );
     };
 
-    const handleListening = (info: AddressInfo): void => {
-      settle(
-        ok({
-          server,
-          host: config.host,
-          port: info.port,
-          url: formatServiceUrl(config.host, info.port),
-        }),
-      );
+    const onListening = (): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      server.off('error', refuse);
+      const address: AddressInfo | string | null = server.address();
+      if (address === null || typeof address === 'string') {
+        resolve(
+          err(
+            new DebuggenError('INTERNAL', 'The service socket reported no TCP address.', {
+              hint: 'Set DEBUGGEN_HOST to a loopback IP address such as 127.0.0.1.',
+              details: { subsystem: SUBSYSTEM_SERVER, host: config.host },
+            }),
+          ),
+        );
+        return;
+      }
+      resolve(ok(address.port));
     };
 
+    server.once('error', refuse);
+    server.once('listening', onListening);
     try {
-      server = serve(
-        { fetch: app.fetch, hostname: config.host, port: config.port },
-        handleListening,
-      );
-      onServerError(server, handleFailure);
+      server.listen(config.port, config.host);
     } catch (cause) {
-      handleFailure(cause);
+      refuse(cause);
     }
   });
 }
 
 /**
  * Stops the server accepting connections and waits, bounded, for the open ones
- * to end.
- *
- * Never rejects: a shutdown that cannot complete still has to let the process
- * exit, so the outcome is logged and the promise resolves either way.
- *
- * @param server The listening server.
- * @param logger The `server` child logger.
- * @returns A promise that resolves once the server is closed, or once
- * {@link SHUTDOWN_GRACE_MS} has elapsed and the remaining connections have been
- * closed outright.
+ * to end. Idle keep-alive sockets are released immediately; anything still open
+ * after {@link HTTP_DRAIN_GRACE_MS} is closed outright. Never rejects.
  */
-function closeHttpServer(server: ServerType, logger: Logger): Promise<void> {
+function closeHttpServer(server: Server, logger: Logger): Promise<void> {
+  if (!server.listening) {
+    return Promise.resolve();
+  }
   return new Promise((resolve) => {
     let finished = false;
-
-    // Declared before the timer it clears, which it can only ever run after:
-    // `finish` is reached from the timer's own callback or from the server's
-    // close callback, both of which are later ticks.
     const finish = (): void => {
       if (finished) {
         return;
       }
       finished = true;
-      clearTimeout(graceTimer);
+      clearTimeout(grace);
       resolve();
     };
 
-    const graceTimer = setTimeout(() => {
-      logger.warn('connections were still open after the shutdown grace period; closing them', {
-        graceMs: SHUTDOWN_GRACE_MS,
+    const grace = setTimeout(() => {
+      logger.warn('HTTP connections were still open after the drain period; closing them', {
+        graceMs: HTTP_DRAIN_GRACE_MS,
       });
-      forceCloseConnections(server);
+      server.closeAllConnections();
       finish();
-    }, SHUTDOWN_GRACE_MS);
-
-    // Unreferenced so the grace period cannot itself keep the event loop alive
-    // once the server has closed on time, which is the ordinary case.
-    graceTimer.unref();
+    }, HTTP_DRAIN_GRACE_MS);
+    grace.unref();
 
     server.close(() => {
       finish();
     });
-
-    // After `close()`, so a socket that goes idle between the two calls is
-    // still released rather than waited on.
-    closeIdleConnections(server);
+    server.closeIdleConnections();
   });
 }
 
 /* -------------------------------------------------------------------------------------------------
- * The handle
+ * Releasing what a start acquired
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Assembles the {@link ServiceHandle} a successful start returns.
+ * Releases everything in `parts`, in the one order both a failed start and
+ * {@link ServiceHandle.close} use. Every step is guarded, awaited steps are
+ * bounded by {@link SHUTDOWN_STEP_TIMEOUT_MS}, and nothing here throws:
  *
- * The shutdown sequence is memoised in one promise, which is what makes
- * {@link ServiceHandle.close} idempotent under the two signals, a suite's
- * explicit call and a crash handler all at once: the first caller runs the
- * sequence, every other caller awaits it, and nobody closes a database twice.
- * The sequence is ordered — the socket stops accepting *before* the store is
- * checkpointed — so no request can be part-way through a write when the handle
- * goes away.
- *
- * @param surface The listening HTTP surface.
- * @param db The open, migrated store.
- * @param loggers The root logger and its children.
- * @returns A frozen handle; frozen because it is shared with signal handlers
- * and must not be re-pointed by whoever holds it.
+ * 1. stop accepting — new requests on a kept-alive connection are answered
+ *    `503`, the listener stops accepting, pending agent-readiness waits resolve;
+ * 2. stop the cleanup runner (the journal stays durable; the next start
+ *    restores anything a cut-short cleanup left) and cancel in-flight pipeline
+ *    operations, which may otherwise still be writing the store;
+ * 3. stop the dev servers this service launched, which also revokes their
+ *    scoped `server-agent` credentials;
+ * 4. flush the live tail, then close every WebSocket with the going-away code
+ *    and wait for the HTTP server to finish;
+ * 5. release the in-memory subsystems and the client registry;
+ * 6. checkpoint the write-ahead log and close the database — last, so nothing
+ *    above can write to a closed store.
  */
-function createServiceHandle(
-  surface: HttpSurface,
-  db: DatabaseSync,
-  loggers: ServiceLoggers,
-): ServiceHandle {
-  let closing: Promise<void> | undefined;
+async function releaseParts(parts: ServiceParts, loggers: ServiceLoggers): Promise<void> {
+  const log = loggers.service;
+  const {
+    store,
+    auth,
+    clients,
+    ledger,
+    watcher,
+    instrumentation,
+    cleanup,
+    correlator,
+    liveTail,
+    launcher,
+    orchestrator,
+    http,
+    ws,
+    server,
+  } = parts;
 
-  const shutdown = async (): Promise<void> => {
-    loggers.service.info('stopping the Debug Generator service', { url: surface.url });
-    try {
-      await closeHttpServer(surface.server, loggers.server);
-      closeSessionStore(db, loggers.store);
-      loggers.service.info('the Debug Generator service has stopped', { url: surface.url });
-    } catch (cause) {
-      // Neither helper is expected to throw — both report internally — so this
-      // is the guard that keeps the memoised promise resolvable even if one of
-      // them ever does. A rejected `closing` would make every later `close()`
-      // reject too, including the one a signal handler awaits before exit.
-      loggers.service.error('the shutdown sequence failed', {
-        reason: DebuggenError.from(cause, 'INTERNAL').message,
-      });
-    }
-  };
+  // 1 — stop accepting.
+  if (http !== undefined) {
+    releaseQuietly('http-app', log, () => {
+      http.close();
+    });
+  }
+  const serverClosed =
+    server === undefined ? Promise.resolve() : closeHttpServer(server, loggers.server);
+  if (ledger !== undefined) {
+    releaseQuietly('agent-ledger', log, () => {
+      ledger.close();
+    });
+  }
 
-  return Object.freeze({
-    url: surface.url,
-    host: surface.host,
-    port: surface.port,
-    logger: loggers.root,
-    close: (): Promise<void> => {
-      closing ??= shutdown();
-      return closing;
-    },
-  });
+  // 2 — cleanup and pipeline work in flight.
+  if (cleanup !== undefined) {
+    releaseQuietly('session-cleanup', log, () => {
+      cleanup.dispose();
+    });
+  }
+  if (orchestrator !== undefined) {
+    await settleWithin(orchestrator.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'pipeline', log);
+  }
+
+  // 3 — launched dev servers and their credentials.
+  if (launcher !== undefined) {
+    await settleWithin(launcher.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'dev-servers', log);
+  }
+
+  // 4 — the live tail, the sockets, the listener.
+  if (liveTail !== undefined) {
+    await settleWithin(liveTail.flush(), SHUTDOWN_STEP_TIMEOUT_MS, 'live-tail', log);
+  }
+  if (ws !== undefined) {
+    await settleWithin(ws.close(), SHUTDOWN_STEP_TIMEOUT_MS, 'websockets', log);
+  }
+  await settleWithin(serverClosed, SHUTDOWN_STEP_TIMEOUT_MS, 'http-server', log);
+
+  // 5 — in-memory subsystems.
+  if (instrumentation !== undefined) {
+    await settleWithin(instrumentation.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'instrumentation', log);
+  }
+  if (watcher !== undefined) {
+    await settleWithin(watcher.dispose(), SHUTDOWN_STEP_TIMEOUT_MS, 'watcher', log);
+  }
+  if (liveTail !== undefined) {
+    releaseQuietly('live-tail', log, () => {
+      liveTail.close();
+    });
+  }
+  if (correlator !== undefined) {
+    releaseQuietly('correlator', log, () => {
+      correlator.close();
+    });
+  }
+  if (clients !== undefined) {
+    releaseQuietly('clients', log, () => {
+      clients.closeAll(WS_CLOSE_GOING_AWAY);
+    });
+  }
+  if (auth !== undefined) {
+    releaseQuietly('auth', log, () => {
+      auth.close();
+    });
+  }
+
+  // 6 — the store, last.
+  if (store !== undefined) {
+    releaseQuietly('store', log, () => {
+      store.close();
+    });
+  }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1373,29 +1527,28 @@ function createServiceHandle(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
- * Starts the local service: configuration, logging, state tree, store, HTTP.
+ * Starts the local service. See this module's header for the twelve steps and
+ * why they run in this order.
  *
- * The five steps and their order are documented in this module's header. Every
- * failure is a typed `Err` rather than a throw, and every step that has already
- * taken a resource releases it before the `Err` is returned, so a refused start
- * leaves the machine as it found it: no open database, no bound socket.
+ * Reads no `process` state — not the environment, not the working directory,
+ * not the signals — which is what lets an integration suite start several
+ * services in one process, each with its own temporary state root, an ephemeral
+ * port and the deterministic provider.
  *
- * Reads no `process` state whatsoever — not the environment, not the working
- * directory, not the signals — which is what lets an integration suite start
- * several services in one process, each with its own temporary state root and
- * an ephemeral port.
- *
- * @param options The environment, the overrides and the logger seams. Defaults
- * to an empty record, which resolves the service's own defaults.
+ * @param options The environment, overrides and seams. Defaults to an empty
+ * record, which resolves the service's own defaults.
  * @returns `Ok` with a listening {@link ServiceHandle}, or `Err` with the first
- * failure that prevented the start — `CONFIG_INVALID` from the configuration
- * loader, `FS_UNSAFE_PATH` from the state tree, `STORE_ERROR` from the store, or
- * `INTERNAL` from the bind.
+ * failure that prevented the start — `CONFIG_INVALID` from the configuration,
+ * the provider selection or the prompt tree, `FS_UNSAFE_PATH` from the state
+ * tree or the store files, `STORE_ERROR` from the store or the modification
+ * journal, `INTERNAL` from wiring or the bind. Everything acquired before the
+ * failure has been released by the time it is returned.
  *
  * @example Starting a throwaway instance in a suite
  * ```ts
  * const started = await startService({
- *   overrides: { debuggenHome: tempDir, port: 0 },
+ *   env: { DEBUGGEN_PROVIDER: 'deterministic' },
+ *   overrides: { debuggenHome: tempDir, port: 0, logLevel: 'silent' },
  * });
  * if (isErr(started)) {
  *   throw started.error;
@@ -1407,24 +1560,30 @@ function createServiceHandle(
 export async function startService(
   options: StartServiceOptions = {},
 ): Promise<Result<ServiceHandle, DebuggenError>> {
+  const env = options.env ?? {};
+  const now = options.now;
+  const clock: { readonly now?: () => number } = now === undefined ? {} : { now };
+
   // 1 — configuration, from the injected environment only.
-  const loaded = loadServiceConfig(options.env ?? {}, options.overrides);
+  const loaded = loadServiceConfig(env, options.overrides);
   if (isErr(loaded)) {
     return loaded;
   }
-  const config = loaded.value;
+  const resolved = loaded.value;
 
-  // 2 — logging. `describeServiceConfig` is logged through the ROOT logger
-  // because those fields already carry their own `subsystem`, and it is the one
-  // credential-free view of the configuration: nothing else here logs it.
-  const root = createServiceLogger(config, options.loggerOptions);
+  // 2 — logging. The configuration is logged once, through its credential-free
+  // view, on the root (its fields carry their own `subsystem`).
+  const root = options.logger ?? createServiceLogger(resolved, options.loggerOptions);
   const loggers: ServiceLoggers = {
     root,
     service: subsystemLogger(root, SUBSYSTEM_SERVICE),
-    store: subsystemLogger(root, SUBSYSTEM_STORE),
     server: subsystemLogger(root, SUBSYSTEM_SERVER),
   };
-  root.info('service configuration resolved', describeServiceConfig(config));
+  root.info('service configuration resolved', describeServiceConfig(resolved));
+
+  // Written once, when `listen` resolves; read by the effective configuration.
+  const bound: { port?: number } = {};
+  const config = createEffectiveConfig(resolved, () => bound.port);
 
   // 3 — the state tree, before anything writes into it.
   const tree = prepareStateTree(config);
@@ -1433,24 +1592,489 @@ export async function startService(
     return tree;
   }
 
-  // 4 — the session store, before the surface that serves from it.
-  const store = openSessionStore(config, loggers);
-  if (isErr(store)) {
-    loggers.store.error(store.error.message, errorFields(store.error));
-    return store;
-  }
-  const db = store.value;
+  const parts: ServiceParts = {};
+  const refuse = async (error: DebuggenError): Promise<Result<never, DebuggenError>> => {
+    loggers.service.error(error.message, errorFields(error));
+    await releaseParts(parts, loggers);
+    return err(error);
+  };
 
-  // 5 — the HTTP surface. On failure the store is closed again, so the `Err`
-  // this returns describes a process that holds nothing.
-  const surface = await startHttpServer(createServiceApp(loggers.server), config, loggers.server);
-  if (isErr(surface)) {
-    loggers.server.error(surface.error.message, errorFields(surface.error));
-    closeSessionStore(db, loggers.store);
-    return surface;
+  // 4 — the session store and its repositories.
+  const opened = openStore({ config, logger: root, inlineDdl: options.inlineSchemaSql });
+  if (isErr(opened)) {
+    return refuse(opened.error);
+  }
+  const store = opened.value;
+  parts.store = store;
+  const repos: Repositories = {
+    sessions: createSessionsRepo({ store, logger: root, ...clock }),
+    panels: createPanelsRepo({ store, logger: root, ...clock }),
+    telemetry: createTelemetryRepo({ store, logger: root }),
+    modifications: createModificationsRepo({ store, logger: root, ...clock }),
+  };
+
+  // The client registry exists before the access boundary because it is the
+  // boundary's revoker: rotation closes every socket through it.
+  const clients = createClientRegistry({
+    logger: root,
+    sweepIntervalMs: CLIENT_SWEEP_INTERVAL_MS,
+    ...clock,
+  });
+  parts.clients = clients;
+
+  // 5 — the editor credential. The token is written to auth.json by the auth
+  // service and is never seen, held or logged here.
+  const authCreated = createAuthService({
+    store,
+    config,
+    logger: root,
+    revoker: clients,
+    ...clock,
+  });
+  if (isErr(authCreated)) {
+    return refuse(authCreated.error);
+  }
+  const auth = authCreated.value;
+  parts.auth = auth;
+  const editor = auth.ensureEditorCredential();
+  if (isErr(editor)) {
+    return refuse(editor.error);
+  }
+  loggers.service.info('editor credential ready', {
+    authFilePath: config.authFilePath,
+    created: editor.value.created,
+  });
+
+  // 6 — crash recovery, before anything can serve: every open journal record,
+  // whatever its session's status. A journal that cannot be read at all fails
+  // the start, because serving on top of unreconciled patches would let a new
+  // session instrument files an old one never restored.
+  const reconciled = await reconcileModificationsOnStartup({
+    modifications: repos.modifications,
+    sessions: repos.sessions,
+    config,
+    logger: root,
+    ...clock,
+  });
+  if (isErr(reconciled)) {
+    return refuse(reconciled.error);
+  }
+  if (reconciled.value.conflicts > 0 || reconciled.value.unresolved > 0) {
+    loggers.service.warn('start-up reconciliation left files for the developer to resolve', {
+      status: reconciled.value.status,
+      conflicts: reconciled.value.conflicts,
+      unresolved: reconciled.value.unresolved,
+      restored: reconciled.value.restored,
+    });
   }
 
-  return ok(createServiceHandle(surface.value, db, loggers));
+  // 7 — retention. Housekeeping, not correctness: a sweep that cannot run is
+  // logged and the start continues, and the next start sweeps again.
+  const swept = await runRetention({
+    store,
+    sessions: repos.sessions,
+    telemetry: repos.telemetry,
+    modifications: repos.modifications,
+    panels: repos.panels,
+    config,
+    logger: root,
+    ...clock,
+  });
+  let retention: RetentionReport | undefined;
+  if (isErr(swept)) {
+    loggers.service.error('the retention sweep could not run; it runs again on the next start', {
+      ...errorFields(swept.error),
+      reason: swept.error.message,
+    });
+  } else {
+    retention = swept.value;
+    if (swept.value.errors.length > 0) {
+      loggers.service.warn('the retention sweep left some items in place', {
+        issues: swept.value.errors.length,
+      });
+    }
+  }
+
+  // 8 — the model provider. Construction contacts nothing, so only a selection
+  // that cannot work at all (a configuration error) can fail here; a transport
+  // failure surfaces per session, in the stage that meets it.
+  let provider: ModelProvider;
+  if (options.provider === undefined) {
+    const created = createModelProvider({
+      env,
+      overrides: toModelProviderOverrides(config),
+      logger: root,
+    });
+    if (isErr(created)) {
+      return refuse(created.error);
+    }
+    provider = created.value;
+  } else {
+    provider = options.provider;
+  }
+
+  // 9 — the prompt tree, validated eagerly.
+  const promptLoader = createPromptLoader({ promptsDir: config.promptsDir, env, logger: root });
+  const prompts = validatePromptTree(promptLoader);
+  if (isErr(prompts)) {
+    return refuse(prompts.error);
+  }
+  loggers.service.info('model provider and prompts ready', {
+    provider: provider.id,
+    promptsDir: promptLoader.promptsDir,
+    promptVersions: { ...prompts.value },
+  });
+
+  // 10 — subsystem wiring, in dependency order.
+  const ledger = createAgentReadyLedger({ logger: root, ...clock });
+  parts.ledger = ledger;
+  const serverAgents = serverAgentPresenceOf(clients);
+  const adapters = createAdapterRegistry({ logger: root });
+  const progress = createSessionProgress({
+    sessions: repos.sessions,
+    broadcaster: clients,
+    logger: root,
+    ...clock,
+  });
+
+  // Telemetry: correlation, the live tail and ingest.
+  const correlator = createTraceCorrelator({ telemetry: repos.telemetry, logger: root });
+  parts.correlator = correlator;
+  const liveTail = createLiveTail({ broadcaster: clients, logger: root, ...clock });
+  parts.liveTail = liveTail;
+
+  // Instrumentation: the conflict watcher, the dev-server launcher whose children
+  // the readiness gate observes, and the installer driver. The driver asks the
+  // session manager who owns a project's capture; the manager does not exist
+  // yet (it needs the cleanup runner, which needs the driver), so the lookup is
+  // late-bound and answers "nobody" until it does — before `listen`, nothing can
+  // ask.
+  const watcher = createInstrumentationWatcher({
+    modifications: repos.modifications,
+    progress,
+    config,
+    logger: root,
+    ...clock,
+  });
+  parts.watcher = watcher;
+  const launcher = createDevServerLauncher({
+    config,
+    logger: root,
+    credentials: credentialIssuerOf(auth),
+    parentEnv: env,
+    detectDeps: { serverAgents },
+    ...clock,
+  });
+  parts.launcher = launcher;
+  const managerRef: { current?: SessionManager } = {};
+  const instrumentation = createInstrumentationService({
+    config,
+    logger: root,
+    modifications: repos.modifications,
+    progress,
+    broadcaster: clients,
+    serverAgentChannel: clients,
+    watcher,
+    agents: ledger,
+    serverAgents,
+    devServers: launcher,
+    captures: {
+      captureOwnerForProject: (projectRoot: string) =>
+        managerRef.current?.captureOwnerForProject(projectRoot),
+    },
+    adapters,
+    ...clock,
+  });
+  parts.instrumentation = instrumentation;
+
+  // Cleanup, then the sessions it serves.
+  const cleanup = createSessionCleanup({
+    modifications: repos.modifications,
+    sessions: repos.sessions,
+    config,
+    instrumentation,
+    watcher,
+    progress,
+    logger: root,
+    ...clock,
+  });
+  parts.cleanup = cleanup;
+  const sessionManager = createSessionManager({
+    sessions: repos.sessions,
+    broadcaster: clients,
+    progress,
+    cleanup,
+    config,
+    logger: root,
+    ...clock,
+  });
+  managerRef.current = sessionManager;
+  const hydrated = await sessionManager.hydrate();
+  if (isErr(hydrated)) {
+    return refuse(hydrated.error);
+  }
+  const reopener = createSessionReopener({
+    sessions: repos.sessions,
+    panels: repos.panels,
+    broadcaster: clients,
+    logger: root,
+    ...clock,
+  });
+
+  const attributor = createIngestAttributor({
+    sessions: repos.sessions,
+    sessionManager,
+    logger: root,
+    ...clock,
+  });
+  // One code-index loader for the whole service: ingest places events in the
+  // same index the pipeline stages query.
+  const codeIndex = createCodeIndexLoader({ config, logger: root });
+  const ingest = createTelemetryIngest({
+    telemetry: repos.telemetry,
+    sessions: repos.sessions,
+    attributor,
+    correlator,
+    liveTail,
+    sources: createIngestSourceLocator({
+      sessions: repos.sessions,
+      codeIndex,
+      modifications: repos.modifications,
+      events: repos.telemetry,
+      logger: root,
+    }),
+    logger: root,
+    ...clock,
+  });
+
+  // Analysis and panels.
+  const summarizer = createAnalysisSummarizer({
+    telemetry: repos.telemetry,
+    sessions: repos.sessions,
+    panels: repos.panels,
+    correlator,
+    logger: root,
+    ...clock,
+  });
+  const facts = createAnalysisFacts({
+    evidence: repos.telemetry,
+    store: repos.panels,
+    logger: root,
+    ...clock,
+  });
+  const validator = createPanelValidator({ evidence: facts, captures: summarizer, logger: root });
+  const fallback = createFallbackPanelBuilder({ validator, captures: summarizer, logger: root });
+  const panelGenerator = createPanelGenerator({
+    provider,
+    prompts: promptLoader,
+    validator,
+    fallback,
+    panels: repos.panels,
+    captures: summarizer,
+    broadcaster: clients,
+    logger: root,
+  });
+  const panelData = createPanelDataResolver({
+    telemetry: repos.telemetry,
+    correlator,
+    sessions: repos.sessions,
+    captures: summarizer,
+    logger: root,
+    ...clock,
+  });
+
+  // Source navigation.
+  const sourceOpen = createSourceOpenHandler({
+    sessions: repos.sessions,
+    clients: sourceOpenDeliveryOf(clients, repos.sessions, loggers.server),
+    logger: root,
+    ...clock,
+  });
+
+  // The pipeline. The code-index loader created with ingest serves the
+  // orchestrator and the capture-time readiness re-evaluation too, so a
+  // project is indexed once.
+  const contextBuilder = createContextBuilder({ promptLoader, config, logger: root, ...clock });
+  const observe: Omit<CollectObservedReadinessDeps, 'logger' | 'now'> = {
+    serverAgents,
+    agents: ledger,
+    devServers: launcher,
+    config,
+  };
+  const captureReadiness = createCaptureReadinessSource({
+    sessions: repos.sessions,
+    instrumentation,
+    codeIndex,
+    adapters,
+    progress,
+    observe,
+    logger: root,
+    now,
+  });
+  const orchestrator = createPipelineOrchestrator({
+    config,
+    logger: root,
+    provider,
+    promptLoader,
+    contextBuilder,
+    sessions: sessionManager,
+    progress,
+    sessionsRepo: repos.sessions,
+    panelsRepo: repos.panels,
+    telemetryRepo: repos.telemetry,
+    instrumentation: withCaptureReadiness(instrumentation, captureReadiness),
+    modifications: repos.modifications,
+    summarizer,
+    facts,
+    panelGenerator,
+    broadcaster: clients,
+    adapters,
+    observeReadiness: (request) =>
+      collectObservedReadiness({ ...observe, logger: root, now }, request),
+    codeIndex,
+    ...clock,
+  });
+  parts.orchestrator = orchestrator;
+
+  // 11 — one HTTP server, two protocols.
+  const http = createHttpApp({
+    auth,
+    config,
+    logger: root,
+    manager: sessionManager,
+    reopener,
+    orchestrator,
+    sessions: repos.sessions,
+    panels: repos.panels,
+    modifications: repos.modifications,
+    bindings: clients,
+    devServers: devServerLookupFromLaunches(launcher),
+    resolver: panelData,
+    ingest,
+    launcher,
+    serviceVersion: SERVICE_VERSION,
+    isPairingAvailable: () => clients.list({ kind: PAIRING_DISPLAY_KIND, online: true }).length > 0,
+  });
+  if (isErr(http)) {
+    return refuse(http.error);
+  }
+  parts.http = http.value;
+
+  const binding = createBindingRoutes({
+    clients,
+    sessions: repos.sessions,
+    manager: sessionManager,
+    reopener,
+    arming: instrumentation,
+    logger: root,
+    ...clock,
+  });
+  const ws = createWsServer({
+    auth,
+    clients,
+    binding: regatingBindingRoutes(binding, orchestrator, root),
+    telemetry: http.value.telemetry,
+    readiness: regatingReadinessPort(ledger, clients, orchestrator, root),
+    targets: targetSelectionOf(sessionManager),
+    sourceOpen,
+    logger: root,
+  });
+  if (isErr(ws)) {
+    return refuse(ws.error);
+  }
+  parts.ws = ws.value;
+
+  const server = createServer(http.value.requestListener satisfies RequestListener);
+  parts.server = server;
+  const attached = ws.value.attach(server);
+  if (isErr(attached)) {
+    return refuse(attached.error);
+  }
+  const listened = await listen(server, resolved);
+  if (isErr(listened)) {
+    return refuse(listened.error);
+  }
+  bound.port = listened.value;
+  server.on('error', (cause: unknown) => {
+    loggers.server.error('the HTTP server reported an error after start-up', {
+      reason: reasonOf(cause),
+    });
+  });
+
+  // 12 — serving. `GET /health` answers from here on.
+  return ok(
+    createServiceHandle({
+      url: formatServiceUrl(config.host, listened.value),
+      host: config.host,
+      port: listened.value,
+      config,
+      loggers,
+      store,
+      manager: sessionManager,
+      startup: {
+        editorCredentialCreated: editor.value.created,
+        reconciliation: reconciled.value,
+        retention,
+      },
+      parts,
+    }),
+  );
+}
+
+/** What {@link createServiceHandle} assembles a handle from. */
+interface ServiceHandleInput {
+  readonly url: string;
+  readonly host: string;
+  readonly port: number;
+  readonly config: ServiceConfig;
+  readonly loggers: ServiceLoggers;
+  readonly store: Store;
+  readonly manager: SessionManager;
+  readonly startup: StartupReport;
+  readonly parts: ServiceParts;
+}
+
+/**
+ * Assembles the handle a successful start returns.
+ *
+ * The shutdown is memoised in one promise, which makes
+ * {@link ServiceHandle.close} idempotent under both signals, a suite's explicit
+ * call and a crash handler at once: the first caller runs the sequence and every
+ * other caller awaits it. The handle is frozen because it is shared with signal
+ * handlers and must not be re-pointed by whoever holds it.
+ */
+function createServiceHandle(input: ServiceHandleInput): ServiceHandle {
+  const { loggers, parts, url } = input;
+  let closing: Promise<void> | undefined;
+
+  const shutdown = async (): Promise<void> => {
+    loggers.service.info('stopping the Debug Generator service', { url });
+    try {
+      await releaseParts(parts, loggers);
+      loggers.service.info('the Debug Generator service has stopped', { url });
+    } catch (cause) {
+      // `releaseParts` guards every step; this keeps the memoised promise
+      // resolvable even if a guard is ever bypassed, because a rejected
+      // `closing` would make every later `close()` reject too.
+      loggers.service.error('the shutdown sequence failed', { reason: reasonOf(cause) });
+    }
+  };
+
+  return Object.freeze({
+    url,
+    host: input.host,
+    port: input.port,
+    wsPath: WS_PATH,
+    config: input.config,
+    logger: loggers.root,
+    store: input.store,
+    manager: input.manager,
+    startup: Object.freeze(input.startup),
+    close: (): Promise<void> => {
+      closing ??= shutdown();
+      return closing;
+    },
+  });
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -1458,18 +2082,20 @@ export async function startService(
  * ---------------------------------------------------------------------------------------------- */
 
 /**
+ * How long after a completed shutdown the process is ended explicitly if
+ * something outside the service's control still holds the event loop open (a
+ * third-party handle, a child that ignored every signal). `unref`'d, so a clean
+ * stop exits on its own well before it fires.
+ */
+const EXIT_BACKSTOP_MS = 2_000;
+
+/**
  * Writes a start-up failure to stderr in the form a developer reads in a
- * terminal or in Playwright's captured output.
- *
- * stderr rather than the logger: a failure before or during
- * {@link startService} may predate a usable logger — a rejected
- * `DEBUGGEN_LOG_LEVEL` is itself a configuration failure — and the message has
- * to arrive regardless. Written in one call so the lines cannot interleave with
- * another writer's.
- *
- * @param error The failure to report. Its `details` are deliberately omitted:
- * they are diagnostic context for the log, while this is the message a
- * developer acts on.
+ * terminal or in Playwright's captured output: the code, the message and the
+ * hint, in one write so the lines cannot interleave with another writer's.
+ * stderr rather than the logger, because a failure may predate a usable
+ * logger (a rejected `DEBUGGEN_LOG_LEVEL` is itself a configuration failure).
+ * `details` are deliberately omitted: they are diagnostic context for the log.
  */
 function reportStartupFailure(error: DebuggenError): void {
   const lines = [`debuggen: ${error.code}: ${error.message}`];
@@ -1482,23 +2108,17 @@ function reportStartupFailure(error: DebuggenError): void {
 /**
  * Wires the process's signals and crash handlers to one shutdown.
  *
- * - **SIGINT and SIGTERM** close the handle once and then let the process end
- *   naturally. The re-entry guard matters: Playwright sends SIGTERM and waits
- *   10 s, a developer may press Ctrl-C twice, and a second sequence must not
- *   start while the first is running. `close()` is itself idempotent, so the
- *   guard is about not logging the decision twice.
- * - **`uncaughtException` and `unhandledRejection`** are the two ways this
- *   process could otherwise die silently or, worse, keep listening in a state
- *   nobody can reason about. Both are logged at `fatal` through the service's
- *   own logger, set a non-zero exit code and then run the same shutdown, which
- *   is what turns a crash into an orderly stop with a checkpointed store rather
- *   than a lingering socket and a `-wal` file.
+ * - **SIGINT / SIGTERM** close the handle once. A repeated signal while the
+ *   shutdown is running — Ctrl-C pressed twice — ends the process at once; the
+ *   journal is durable, so the next start still restores every patched file.
+ * - **`uncaughtException` / `unhandledRejection`** are logged at `fatal`
+ *   through the service's own logger, set exit code 1 and run the same
+ *   shutdown, so a crash is never silent and never leaves a listening socket
+ *   in a state nobody can reason about.
  *
- * `process.exitCode` is set instead of calling `process.exit`, which would
- * discard whatever stdout still holds — including the very record that explains
- * the exit.
- *
- * @param handle The started service to stop.
+ * `process.exitCode` is set rather than exiting at once, so stdout still flushes
+ * the record that explains the exit; an `unref`'d backstop ends the process if
+ * something outside the service keeps it alive after the shutdown completed.
  */
 function installProcessHandlers(handle: ServiceHandle): void {
   const lifecycle = subsystemLogger(handle.logger, SUBSYSTEM_SERVICE);
@@ -1506,70 +2126,63 @@ function installProcessHandlers(handle: ServiceHandle): void {
 
   const stop = (reason: string, fields: LogFields): void => {
     if (stopping) {
-      lifecycle.debug('ignoring a repeated shutdown request', { reason, ...fields });
       return;
     }
     stopping = true;
     lifecycle.info(reason, fields);
-    handle.close().catch((cause: unknown) => {
-      // `close()` is documented never to reject; this keeps even a broken
-      // promise from becoming an unhandled rejection inside a signal handler.
-      lifecycle.error('the shutdown request failed', {
-        reason: DebuggenError.from(cause, 'INTERNAL').message,
-      });
+    void handle.close().then(() => {
+      setTimeout(() => {
+        lifecycle.warn('the process was still alive after shutdown; exiting', {
+          backstopMs: EXIT_BACKSTOP_MS,
+        });
+        process.exit();
+      }, EXIT_BACKSTOP_MS).unref();
     });
   };
 
   for (const signal of SHUTDOWN_SIGNALS) {
     process.on(signal, () => {
+      if (stopping) {
+        lifecycle.warn('received a second shutdown signal; exiting without waiting', { signal });
+        process.exit(process.exitCode ?? 1);
+      }
       stop('received a shutdown signal', { signal });
     });
   }
 
-  process.on('uncaughtException', (cause: unknown) => {
+  const crash = (kind: string, cause: unknown): void => {
     const error = DebuggenError.from(cause, 'INTERNAL');
-    lifecycle.fatal('an uncaught exception reached the process boundary', {
+    lifecycle.fatal(`${kind} reached the process boundary`, {
       ...errorFields(error),
       reason: error.message,
     });
     process.exitCode = 1;
-    stop('stopping after an uncaught exception', {});
-  });
+    stop(`stopping after ${kind}`, {});
+  };
 
+  process.on('uncaughtException', (cause: unknown) => {
+    crash('an uncaught exception', cause);
+  });
   process.on('unhandledRejection', (cause: unknown) => {
-    const error = DebuggenError.from(cause, 'INTERNAL');
-    lifecycle.fatal('a promise rejection reached the process boundary unhandled', {
-      ...errorFields(error),
-      reason: error.message,
-    });
-    process.exitCode = 1;
-    stop('stopping after an unhandled rejection', {});
+    crash('an unhandled promise rejection', cause);
   });
 }
 
 /**
  * The process entry: loads `.env`, starts the service and wires the signals.
  *
- * The process-facing half of this module: {@link startService} reads no
- * `process` state at all, and everything that does — the environment, the exit
- * code, the signals and the crash handlers — is reached from here or from the
- * helpers this function calls.
+ * The only function in this workspace that reads `process.env`, sets the exit
+ * code or installs signal handlers. `dotenv` runs here and nowhere else —
+ * quietly, and without inspecting its result, because an absent `.env` is the
+ * normal case — so an injected environment in a suite stays authoritative.
  *
- * `dotenv` runs here and nowhere else, quietly (it otherwise prints a banner
- * that would be the first thing in an otherwise structured log stream), and its
- * result is not inspected on purpose: an absent `.env` is the normal case —
- * every setting has a default or is supplied by the environment the service was
- * started with — so treating it as a failure would break `node dist/main.js` on
- * a clean checkout.
+ * On failure it prints the code, message and hint to stderr and sets exit code
+ * 1. On success it logs the listening URL once, which is the line a developer
+ * looks for and the one Playwright's captured output shows.
  *
- * On failure it prints the code, message and hint to stderr and sets
- * `process.exitCode = 1` rather than calling `process.exit`, so the streams
- * flush. On success it logs the listening URL once, which is the line a
- * developer looks for and the line Playwright's captured output makes visible.
- *
- * @returns A promise that resolves once the service is listening, or once the
- * failure has been reported. It does not wait for the service to stop: the
- * bound socket keeps the process alive, and the signal handlers end it.
+ * @returns A promise that resolves once the service is listening or the failure
+ * has been reported. It does not wait for the service to stop: the bound socket
+ * keeps the process alive, and the signal handlers end it.
  */
 export async function main(): Promise<void> {
   loadDotenvFile({ quiet: true });
@@ -1588,6 +2201,7 @@ export async function main(): Promise<void> {
     url: handle.url,
     host: handle.host,
     port: handle.port,
+    wsPath: handle.wsPath,
     protocolVersion: PROTOCOL_VERSION,
     healthRoute: HEALTH_ROUTE,
   });
@@ -1596,33 +2210,37 @@ export async function main(): Promise<void> {
 /**
  * Whether this module is the program the runtime was asked to run.
  *
- * `import.meta.url` is compared with `process.argv[1]` resolved through
- * `pathToFileURL`, which is what makes the comparison hold for both supported
- * invocations — `node dist/main.js`, where Node resolves the argument to an
- * absolute path, and `tsx watch src/main.ts`, where the loader keeps the
- * TypeScript path — without matching a filename by hand.
+ * Compares the real path of `process.argv[1]` with the real path of this module,
+ * which holds for both supported invocations — `node dist/main.js` and
+ * `tsx watch src/main.ts` — and through a symbolic link in either path. It is
+ * what lets a suite `import` this module for {@link startService} without a
+ * listener appearing as a side effect of the import.
  *
- * The check is what lets an integration suite `import` this module for
- * {@link startService} without a listener appearing as a side effect of the
- * import.
- *
- * @param argv The process arguments, injectable so the decision can be
- * exercised directly.
+ * @param argv The process arguments, injectable so the decision can be tested.
+ * @param moduleUrl This module's URL, injectable for the same reason.
  * @returns `true` only when the entry script is this module.
  */
-function isProcessEntry(argv: readonly string[] = process.argv): boolean {
+export function isProcessEntry(
+  argv: readonly string[] = process.argv,
+  moduleUrl: string = import.meta.url,
+): boolean {
   const entry = argv[1];
   if (entry === undefined || entry.length === 0) {
     return false;
   }
-  return pathToFileURL(entry).href === import.meta.url;
+  try {
+    // Inside the `try`: a module URL that is not a `file:` URL (a bundler that
+    // rewrote `import.meta`) must answer `false`, never throw at import time.
+    return realpathSync(entry) === realpathSync(fileURLToPath(moduleUrl));
+  } catch {
+    return pathToFileURL(entry).href === moduleUrl;
+  }
 }
 
 if (isProcessEntry()) {
   main().catch((cause: unknown) => {
     // `main` handles every failure it can name; this covers the ones it cannot,
-    // so the process still reports a reason and a non-zero status instead of
-    // exiting 0 on a rejected promise.
+    // so the process still reports a reason and a non-zero status.
     reportStartupFailure(DebuggenError.from(cause, 'INTERNAL'));
     process.exitCode = 1;
   });

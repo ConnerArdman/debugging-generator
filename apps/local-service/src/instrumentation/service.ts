@@ -184,6 +184,9 @@ const UI_CLIENT_KINDS: readonly ClientKind[] = Object.freeze(['vscode', 'devtool
  */
 const AGENT_CLIENT_KINDS: readonly ClientKind[] = Object.freeze(['agent'] as const);
 
+/** The mode of an action installed as a runtime hook rather than a file patch. */
+const RUNTIME_ACTION_MODE = 'runtime' as const satisfies InstrumentationAction['mode'];
+
 /** The protocol bound on a progress row's message (`session.progress`). */
 const MAX_PROGRESS_MESSAGE_LENGTH = 2000;
 
@@ -2067,10 +2070,20 @@ export function createInstrumentationService(
       );
     }
 
+    // A page-agent hook an adapter could not arm at install time — the bound
+    // tab's agent had not reported yet, the usual order when the editor
+    // creates the session before the panel binds its tab — is armed now from
+    // the plan's runtime actions. Arming one edits no file, and a capture is
+    // admitted only after its readiness gate has re-evaluated the bound tab.
+    const agentHooks = unionAgentHooks(
+      config.agentHooks,
+      deriveAgentHookConfig(state.actions.filter((action) => action.mode === RUNTIME_ACTION_MODE)),
+    );
+
     const agentPayload = parseAgentConfigPayload({
       sessionId,
       captureId,
-      hooks: config.agentHooks,
+      hooks: agentHooks,
     });
 
     if (isErr(agentPayload)) {
@@ -2137,7 +2150,7 @@ export function createInstrumentationService(
       sessionId,
       captureId,
       planVersion: state.activePlanVersion,
-      agentHooks: config.agentHooks,
+      agentHooks,
       serverSignals: config.serverSignals,
       serverAgent,
     });

@@ -1975,10 +1975,14 @@ async function openPanel(harness: ExtensionHarness, launch: PanelLaunch): Promis
     },
     async waitForPanelSpec(options) {
       const timeoutMs = options?.timeoutMs ?? DEFAULT_WAIT_TIMEOUT_MS;
+      // `PanelHost` names no landmark after the panel (its `PanelShell` gets no
+      // label); the title is the summary head's heading inside the panel block.
       const target =
         options?.title === undefined
           ? panelView.first()
-          : main.getByRole('region', { name: options.title, exact: true });
+          : panelView
+              .filter({ has: page.getByRole('heading', { name: options.title, exact: true }) })
+              .first();
       try {
         await target.waitFor({ state: 'visible', timeout: timeoutMs });
       } catch {

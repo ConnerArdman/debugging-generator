@@ -120,8 +120,10 @@ import {
 import type {
   PatchNonAddressablePosition,
   PatchableFunctionNode,
+  ResolvedTarget,
   SymbolSpelling,
 } from './patch/target-resolver.js';
+import { reactComponentSite } from './patch/function-timing.js';
 import {
   TARGETLESS_FILE,
   TARGETLESS_SYMBOL,
@@ -952,7 +954,50 @@ function checkDeclarationShape(
     return resolutionRejection(resolved.error, action, file, spelling);
   }
 
-  return generatorRejection(resolved.value.fn, action, file);
+  return (
+    generatorRejection(resolved.value.fn, action, file) ??
+    reactComponentRejection(resolved.value, action, file)
+  );
+}
+
+/**
+ * The rejection for a React component or hook, or `undefined` when the target
+ * is neither.
+ *
+ * The recognition is the patcher's own (`reactComponentSite` in
+ * `./patch/function-timing.ts`), so this gate refuses exactly the targets the
+ * patcher would refuse — before an install begins, where a refusal becomes an
+ * unavailable signal, instead of mid-install, where it would roll back every
+ * other modification of the same install. Coded `'unsupported-declaration'`:
+ * the declaration exists and is a function, but not one whose body a timing
+ * wrapper may move.
+ *
+ * @param target The resolved target.
+ * @param action The action under test.
+ * @param file The normalised project-relative path.
+ * @returns The rejection, or `undefined`.
+ */
+function reactComponentRejection(
+  target: ResolvedTarget,
+  action: InstrumentationAction,
+  file: string,
+): Rejection | undefined {
+  const site = reactComponentSite(target);
+
+  if (site === undefined) {
+    return undefined;
+  }
+
+  const subject = `'${reportable(action.symbol)}' in '${reportable(file)}'`;
+
+  return {
+    code: 'unsupported-declaration',
+    reason:
+      site.site === 'jsx-return'
+        ? `${subject} returns JSX, so it is a React render function, and a timing wrapper would move its render and any hook it calls out of the component React analyses`
+        : `${subject} calls a React hook in its own scope, so it is a component or a hook, and a timing wrapper would move that hook call into a function that is neither`,
+    hint: `Plan a react-render-tracking action for this component instead: it observes renders and commits at run time. ${RUNTIME_ALTERNATIVE}`,
+  };
 }
 
 /**

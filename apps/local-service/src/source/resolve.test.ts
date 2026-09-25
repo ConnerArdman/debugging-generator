@@ -78,6 +78,8 @@ import {
   DebuggenError,
   SOURCE_RESOLVED_BY,
   err,
+  isErr,
+  isOk,
   isSourceLocation,
   newCaptureId,
   newEventId,
@@ -120,6 +122,7 @@ import {
 import type {
   ModificationCorroborationPort,
   ParentEventPort,
+  ResolvableEvent,
   SourceResolution,
   SourceResolutionMissReason,
   SourceResolver,
@@ -1654,6 +1657,42 @@ describe('SourceResolver.resolveEvent', () => {
         expect(options?.maxMaps).toBe(SOURCE_RESOLVE_LIMITS.maxSourceMaps);
         expect(fetchImpl).not.toHaveBeenCalled();
       }
+    });
+
+    it('resolves an attributed event the store has not ordered yet exactly as its persisted form', async () => {
+      const first = mapped(PROJECT.component.file);
+      const persisted = makeEvent({
+        kind: KIND.fetch,
+        attributes: { [ATTR.initiator]: CHUNK_STACK },
+      });
+      const attributed: ResolvableEvent = { ...persisted };
+      delete attributed.ingestSeq;
+      const resolver = resolverFor(standardProject(), {
+        resolveStackImpl: stackResolver([first]),
+        devServerOrigin: DEV_ORIGIN,
+      });
+
+      const before = await resolved(resolver.resolveEvent(attributed));
+      const after = await resolved(resolver.resolveEvent(persisted));
+      const batch = await resolver.resolveEvents([attributed]);
+
+      expect(before).toEqual(after);
+      expect(before.route).toBe(ROUTE.sourceMap);
+      expect(isOk(batch) && batch.value.get(persisted.id)).toEqual(before.location);
+    });
+
+    it('still refuses a malformed attributed event', async () => {
+      const attributed: ResolvableEvent = {
+        ...makeEvent({ kind: KIND.fetch, attributes: { [ATTR.initiator]: CHUNK_STACK } }),
+        spanId: 'not-a-span-id',
+      };
+      delete attributed.ingestSeq;
+      const outcome = await resolverFor(standardProject(), {
+        resolveStackImpl: stackResolver([mapped(PROJECT.component.file)]),
+        devServerOrigin: DEV_ORIGIN,
+      }).resolveEvent(attributed);
+
+      expect(isErr(outcome)).toBe(true);
     });
 
     it('keeps the first frame that maps into the project, after refusing one that does not', async () => {

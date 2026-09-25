@@ -604,7 +604,17 @@ export type CaptureSignal =
   | 'db.query'
   | 'http.client'
   | 'server.error'
-  | 'log';
+  | 'log'
+  | 'interactions'
+  | 'react'
+  | 'perf'
+  | 'errors'
+  | 'componentTree'
+  | 'http'
+  | 'routeHandlers'
+  | 'prisma'
+  | 'pg'
+  | 'functions';
 
 /** Display wording per {@link CaptureSignal}, phrased as the plural a capture list reads with. */
 export const CAPTURE_SIGNAL_LABELS: Readonly<Record<CaptureSignal, string>> = Object.freeze({
@@ -625,6 +635,16 @@ export const CAPTURE_SIGNAL_LABELS: Readonly<Record<CaptureSignal, string>> = Ob
   'http.client': 'outgoing server requests',
   'server.error': 'server errors',
   log: 'log records',
+  interactions: 'interaction timing',
+  react: 'renders',
+  perf: 'performance entries',
+  errors: 'page errors',
+  componentTree: 'component tree snapshots',
+  http: 'incoming server requests',
+  routeHandlers: 'route handler timing',
+  prisma: 'database queries',
+  pg: 'database queries',
+  functions: 'function timing',
 });
 
 /** Wording for a capture signal this module has no entry for. */

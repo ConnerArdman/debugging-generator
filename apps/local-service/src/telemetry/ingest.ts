@@ -44,6 +44,14 @@
  * 7. **Attribute** — `attributor.attributeEvent` stamps `sessionId` and
  *    `captureId` and applies the tier gate; a dropped event is counted under
  *    its reason and never stored.
+ * 7½. **Locate** — the optional `sources` port places every attributed event
+ *    that arrived without a `source` in the project's code (AAP §0.4.2, "Source
+ *    resolution path": patch metadata, route map, code graph, or the fetch
+ *    initiator mapped through the dev server's source map). It runs on
+ *    redacted, attributed events and **before** persistence, so the stored
+ *    document, the correlator and the live tail all carry the same location. A
+ *    failure is counted and logged, never fatal: the event is stored without
+ *    a location rather than not at all.
  * 8. **Persist** — one `telemetry.insertMany` call for the whole batch. The
  *    store assigns `ingestSeq` and returns the rows as it holds them; a store
  *    failure is a typed `Err` and nothing is retried or broadcast.
@@ -135,6 +143,7 @@ import type {
   Logger,
   Result,
   SessionId,
+  SourceLocation,
   TraceId,
 } from '@debuggen/shared';
 import {
@@ -420,6 +429,22 @@ export const DEFAULT_INGEST_PRIVACY: IngestPrivacyPrimitives = Object.freeze({
   redactEvent,
 });
 
+/**
+ * The source-location port of step 7½: `../source/resolve.ts` behind a
+ * per-session adapter that `../main.ts` wires (the session's project root,
+ * code index, modification journal and dev-server origin).
+ *
+ * Handed only redacted, attributed events that carry no `source`, all of one
+ * batch at once so the resolver shares one source-map cache across them; it
+ * answers the locations it found keyed by event id and leaves the rest out.
+ */
+export interface IngestSourceLocator {
+  locate(
+    events: readonly AttributedEvent[],
+    attribution: IngestAttribution,
+  ): Promise<Result<ReadonlyMap<string, SourceLocation>, DebuggenError>>;
+}
+
 /** Everything {@link createTelemetryIngest} is given; all of it injected. */
 export interface TelemetryIngestDeps {
   /** The telemetry store; only `insertMany` is called. */
@@ -435,6 +460,12 @@ export interface TelemetryIngestDeps {
   readonly correlator?: TraceCorrelatorLike | undefined;
   /** The DevTools live tail. Optional for the same reason as {@link correlator}. */
   readonly liveTail?: LiveTailLike | undefined;
+  /**
+   * Places attributed events in the project's source before they are stored
+   * (step 7½). Optional for the same reason as {@link correlator}: without it
+   * events are stored with whatever `source` their producer stamped.
+   */
+  readonly sources?: IngestSourceLocator | undefined;
   /** The service logger; defaults to `noopLogger`. Bound to `subsystem: "telemetry.ingest"`. */
   readonly logger?: Logger | undefined;
   /** The clock this module's own elapsed time is read from; defaults to `nowEpochMs`. */
@@ -465,6 +496,8 @@ export interface IngestFailureCounts {
   readonly redaction: number;
   /** Events the attributor could not decide on, and which were therefore not stored. */
   readonly attribution: number;
+  /** `1` when locating the batch's events failed; they were stored without a location. */
+  readonly location: number;
   /** `1` when correlating the persisted rows failed; the rows stay persisted. */
   readonly correlation: number;
   /** `1` when the live tail refused or failed the persisted rows; the rows stay persisted. */
@@ -495,6 +528,8 @@ export interface IngestReport {
   readonly skipped: number;
   /** Request events that received a `request_key`. */
   readonly requestKeysComputed: number;
+  /** Events stored with a `source` step 7½ placed (a producer-stamped `source` is not counted). */
+  readonly sourcesLocated: number;
   /** Producer-supplied service-assigned attribute keys removed (a producer may never set them). */
   readonly serviceKeysStripped: number;
   /** Failures that were counted rather than failing the batch. */
@@ -584,6 +619,7 @@ interface MutableFailureCounts {
   requestKey: number;
   redaction: number;
   attribution: number;
+  location: number;
   correlation: number;
   tail: number;
 }
@@ -598,6 +634,7 @@ interface RunState {
   inserted: number;
   skipped: number;
   requestKeysComputed: number;
+  sourcesLocated: number;
   serviceKeysStripped: number;
   readonly failures: MutableFailureCounts;
   tracesTouched: readonly TraceId[];
@@ -655,7 +692,15 @@ function newRunState(received: number): RunState {
     skipped: 0,
     requestKeysComputed: 0,
     serviceKeysStripped: 0,
-    failures: { requestKey: 0, redaction: 0, attribution: 0, correlation: 0, tail: 0 },
+    failures: {
+      requestKey: 0,
+      redaction: 0,
+      attribution: 0,
+      location: 0,
+      correlation: 0,
+      tail: 0,
+    },
+    sourcesLocated: 0,
     tracesTouched: [],
   };
 }
@@ -682,6 +727,7 @@ function toReport(state: RunState): IngestReport {
     inserted: state.inserted,
     skipped: state.skipped,
     requestKeysComputed: state.requestKeysComputed,
+    sourcesLocated: state.sourcesLocated,
     serviceKeysStripped: state.serviceKeysStripped,
     failures: Object.freeze({ ...state.failures }),
     tracesTouched: Object.freeze([...state.tracesTouched]),
@@ -1142,6 +1188,50 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
     }
   }
 
+  /** Step 7½: source locations for the events that carry none; failure is counted, never fatal. */
+  async function locate(
+    events: readonly AttributedEvent[],
+    attribution: IngestAttribution,
+    state: RunState,
+    scoped: Logger,
+  ): Promise<readonly AttributedEvent[]> {
+    const sources = deps.sources;
+    const pending = events.filter((event) => event.source === undefined);
+
+    if (sources === undefined || pending.length === 0) {
+      return events;
+    }
+
+    let code: DebuggenErrorCode;
+
+    try {
+      const located = await sources.locate(pending, attribution);
+
+      if (located.ok) {
+        const found = located.value;
+        return events.map((event) => {
+          const source = event.source === undefined ? found.get(event.id) : undefined;
+          if (source === undefined) {
+            return event;
+          }
+          state.sourcesLocated += 1;
+          return { ...event, source };
+        });
+      }
+
+      code = asDebuggenError(located.error, 'locate', 'INTERNAL').code;
+    } catch {
+      code = 'INTERNAL';
+    }
+
+    state.failures.location = 1;
+    emit(scoped, 'warn', 'telemetry events could not be located; they are stored without one', {
+      code,
+      pending: pending.length,
+    });
+    return events;
+  }
+
   /** Step 9: correlation of the returned rows; failure is counted, never fatal. */
   async function correlate(
     rows: readonly TelemetryEvent[],
@@ -1375,15 +1465,18 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       });
     }
 
+    // 7½. Locate — before persistence, so the stored row, the correlator and the tail agree.
+    const placed = await locate(collected, attribution, state, scoped);
+
     // 8. Persist — one write; the store assigns `ingestSeq`.
-    if (collected.length > 0) {
-      const stored = await persist(collected);
+    if (placed.length > 0) {
+      const stored = await persist(placed);
 
       if (isErr(stored)) {
         emit(scoped, 'warn', 'telemetry batch could not be persisted', {
           ...originFields,
           code: stored.error.code,
-          attributed: collected.length,
+          attributed: placed.length,
         });
         return stored;
       }
@@ -1412,6 +1505,7 @@ export function createTelemetryIngest(deps: TelemetryIngestDeps): TelemetryInges
       inserted: state.inserted,
       skipped: state.skipped,
       requestKeysComputed: state.requestKeysComputed,
+      sourcesLocated: state.sourcesLocated,
       tracesTouched: state.tracesTouched.length,
       ...(startedAt === undefined || finishedAt === undefined
         ? {}

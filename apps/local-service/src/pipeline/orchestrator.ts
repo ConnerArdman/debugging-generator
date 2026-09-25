@@ -52,8 +52,10 @@
  * - The install's readiness gate emits "Ready to capture" when satisfied, and
  *   the degradation sentences built by `buildDegradationNotice`; they are not
  *   emitted again.
- * - `panel.generated` is broadcast by `../panels/generate.ts`; `analysis.completed`
- *   is a reopen replay of `../sessions/reopen.ts`. Neither is sent from here.
+ * - `panel.generated` is broadcast by `../panels/generate.ts` and
+ *   `analysis.completed` by `./stages/analyze.ts` (given `deps.broadcaster`);
+ *   both are also replayed by `../sessions/reopen.ts`. Neither is sent from
+ *   here.
  *
  * ## Privacy
  *
@@ -112,7 +114,7 @@ import type {
 } from '../instrumentation/service.js';
 import { sessionLogger, subsystemLogger } from '../logging.js';
 import type { PanelGenerator } from '../panels/generate.js';
-import type { SessionManager, SessionPatch } from '../sessions/manager.js';
+import type { SessionBroadcaster, SessionManager, SessionPatch } from '../sessions/manager.js';
 import { PROGRESS_STAGE_TITLES } from '../sessions/progress.js';
 import type { SessionProgress } from '../sessions/progress.js';
 import { isTerminalSessionStatus, statusForStage, transition } from '../sessions/state-machine.js';
@@ -239,6 +241,7 @@ export const PIPELINE_OPERATIONS = Object.freeze([
   'beginCapture',
   'completeCapture',
   'followUp',
+  'regate',
 ] as const);
 
 /** One public operation of the orchestrator. */
@@ -396,6 +399,12 @@ export interface PipelineOrchestratorDeps {
   readonly facts: AnalysisFacts;
   /** Panel generation, validation, fallback, persistence and broadcast. */
   readonly panelGenerator: PanelGenerator;
+  /**
+   * Delivers `analysis.completed` from the analyze stage once an analysis is
+   * stored — the client registry in production. Absent, no analysis frame is
+   * broadcast live and clients see the analysis on their next reopen replay.
+   */
+  readonly broadcaster?: Pick<SessionBroadcaster, 'broadcastToKinds'> | undefined;
   /** The live adapter registry — the same one the instrumentation service installs with. */
   readonly adapters: AdapterRegistry;
   /**
@@ -445,6 +454,30 @@ export interface PipelineRunOutcome {
 }
 
 /** What {@link PipelineOrchestrator.beginCapture} is asked. */
+/** Input of {@link PipelineOrchestrator.regate}. */
+export interface RegateRequest {
+  readonly sessionId: string;
+  /** Cancels the readiness re-evaluation. */
+  readonly signal?: AbortSignal | undefined;
+}
+
+/**
+ * What {@link PipelineOrchestrator.regate} did.
+ *
+ * - `'regated'` — the readiness gate ran; `ready` says whether it admitted the
+ *   session;
+ * - `'deferred'` — another operation holds the session, so the gate runs once
+ *   that operation has ended;
+ * - `'skipped'` — the session is not `instrumenting`, so there was nothing to
+ *   re-gate.
+ */
+export interface RegateOutcome {
+  readonly sessionId: string;
+  readonly outcome: 'regated' | 'deferred' | 'skipped';
+  readonly status: SessionStatus;
+  readonly ready: boolean;
+}
+
 export interface CaptureBeginRequest {
   readonly sessionId: string;
   /** Cancels the readiness re-evaluation and the arm. */
@@ -554,6 +587,17 @@ export interface PipelineOrchestrator {
 
   /** Answers a follow-up question along one of AAP §0.4.2's two paths. */
   followUp(request: FollowUpRequest): Promise<Result<FollowUpOutcome, DebuggenError>>;
+
+  /**
+   * Re-evaluates the readiness gate of an `instrumenting` session and takes the
+   * guarded `instrumenting → ready` edge when it is satisfied. Called when the
+   * bound tab's page agent reports, so a session whose install ran before its
+   * tab was bound — or before the page reloaded — reaches "Ready to capture"
+   * without waiting for a capture to re-gate it. A session held by another
+   * operation is re-gated as soon as that operation ends; a session in any other
+   * status is left alone.
+   */
+  regate(request: RegateRequest): Promise<Result<RegateOutcome, DebuggenError>>;
 
   /**
    * Aborts the session's in-flight operation, if any. The operation settles
@@ -960,6 +1004,9 @@ const REEVALUATE_READINESS_LOG =
 /** Info record of a finished operation. Fields: operation, status, timing. */
 const OPERATION_COMPLETED_LOG = 'Pipeline operation completed.';
 
+/** Debug record of a deferred re-gate that did not run. Fields: session id, error code. */
+const REGATE_FAILED_LOG = 'A deferred readiness re-gate did not run.';
+
 /* -------------------------------------------------------------------------------------------------
  * The orchestrator
  * ---------------------------------------------------------------------------------------------- */
@@ -1044,6 +1091,8 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
 
   /** The one operation in flight per session. */
   const active = new Map<string, ActiveOperation>();
+  /** Sessions whose re-gate was asked for while another operation held them. */
+  const pendingRegates = new Set<string>();
   /** Every operation's settlement, for {@link dispose}. */
   const settling = new Set<Promise<unknown>>();
   /** The failure a stage tried to report through {@link stageProgress}, per session. */
@@ -1156,6 +1205,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
         progress: stageProgress,
         logger: deps.logger,
         reportStageBoundaries: false,
+        broadcaster: deps.broadcaster,
       })),
     generatePanel: (): GeneratePanelStage =>
       overrides.generatePanel ??
@@ -1183,6 +1233,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           progress: stageProgress,
           logger: deps.logger,
           reportStageBoundaries: true,
+          broadcaster: deps.broadcaster,
         }),
         panelRegeneration: deps.panelGenerator,
         instrumentation: quietInstaller,
@@ -1640,6 +1691,16 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
           active.delete(sessionId);
         }
         recordedFailures.delete(sessionId);
+        if (pendingRegates.delete(sessionId) && !disposed) {
+          // After this operation has fully released the session.
+          queueMicrotask(() => {
+            void regate({ sessionId }).then((outcome) => {
+              if (!outcome.ok) {
+                log.debug(REGATE_FAILED_LOG, { sessionId, code: outcome.error.code });
+              }
+            });
+          });
+        }
         if (controller.signal.aborted && op.projectRoot !== undefined) {
           releaseCode(op.projectRoot);
         }
@@ -1796,6 +1857,50 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     }
     const ready = await moveTo(op, READY_STATUS, { readinessSatisfied: true });
     return ready.ok ? ready : failStage(op, INSTRUMENT_STAGE, ready.error);
+  }
+
+  /* ----------------------------------------------------------------------------------------------
+   * regate — the readiness gate, re-run when the bound tab's page agent reports
+   * -------------------------------------------------------------------------------------------- */
+
+  function regate(request: RegateRequest): Promise<Result<RegateOutcome, DebuggenError>> {
+    const { sessionId } = request;
+    const outcomeOf = (outcome: RegateOutcome['outcome'], status: SessionStatus): RegateOutcome =>
+      Object.freeze({ sessionId, outcome, status, ready: status === READY_STATUS });
+
+    if (!disposed && active.has(sessionId)) {
+      pendingRegates.add(sessionId);
+      const current = readSession(sessionId);
+      return Promise.resolve(
+        current.ok ? ok(outcomeOf('deferred', current.value.status)) : current,
+      );
+    }
+
+    return execute<RegateOutcome>(
+      'regate',
+      sessionId,
+      INSTRUMENT_STAGE,
+      request.signal,
+      async (op) => {
+        const initial = readSession(sessionId);
+        if (!initial.ok) {
+          return initial;
+        }
+        if (initial.value.status !== INSTRUMENTING_STATUS) {
+          return ok(outcomeOf('skipped', initial.value.status));
+        }
+        const verdict = await currentVerdict(op, initial.value);
+        if (op.signal.aborted) {
+          return err(cancelledError(sessionId, INSTRUMENT_STAGE));
+        }
+        if (verdict?.satisfied !== true) {
+          return ok(outcomeOf('regated', INSTRUMENTING_STATUS));
+        }
+        // A refused edge leaves the session `instrumenting`; a capture re-gates it.
+        const ready = await moveTo(op, READY_STATUS, { readinessSatisfied: true });
+        return ready.ok ? ok(outcomeOf('regated', ready.value.status)) : ready;
+      },
+    );
   }
 
   /* ----------------------------------------------------------------------------------------------
@@ -2198,6 +2303,7 @@ export function createPipelineOrchestrator(deps: PipelineOrchestratorDeps): Pipe
     beginCapture,
     completeCapture,
     followUp,
+    regate,
     cancel,
     activeRun,
     dispose,

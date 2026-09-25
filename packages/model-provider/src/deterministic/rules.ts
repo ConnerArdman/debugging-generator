@@ -377,8 +377,8 @@ const MATERIAL_MIN_ITEMS_BY_SOURCE: Readonly<Record<string, number>> = Object.fr
 /** Decimal places kept on a relevance score. */
 const SCORE_DECIMALS = 3;
 
-/** Decimal places kept on a hypothesis confidence. */
-const CONFIDENCE_DECIMALS = 2;
+/** Decimal places kept on a resolver confidence of a suggested source location. */
+const LOCATION_CONFIDENCE_DECIMALS = 2;
 
 /** Decimal places kept on a metric value passed through to an analysis. */
 const METRIC_DECIMALS = 3;
@@ -401,27 +401,38 @@ const SCORE_KNOWN_KIND = 0.1;
 /** Upper bound on a computed score, so the scale stays comparable. */
 const SCORE_MAX = 1;
 
-/** Confidence a detected pattern starts from before its evidence is weighed. */
-const CONFIDENCE_BASE = 0.4;
-
-/** Confidence added per step of evidence strength. */
-const CONFIDENCE_STEP = 0.1;
-
 /** Steps of evidence strength that still raise confidence. */
 const CONFIDENCE_MAX_STEPS = 5;
 
-/** Lowest confidence a reported hypothesis carries. */
-const CONFIDENCE_MIN = 0.3;
+/**
+ * The analytical confidence vocabulary of a hypothesis, lowest first.
+ *
+ * Restated from `@debuggen/panel-schema`'s `CONFIDENCE_LEVELS`, which this
+ * package sits below and cannot import. A hypothesis carries a **word**, not a
+ * number: the analyze stage validates the answer against protocol's strict
+ * `analysisFindingsSchema`, the summary header renders one badge per level, and
+ * there is no calibration behind a decimal that a rules engine could honestly
+ * claim.
+ */
+export const CONFIDENCE_LEVELS = ['low', 'medium', 'high'] as const;
+
+/** One member of {@link CONFIDENCE_LEVELS}. */
+type ConfidenceLevel = (typeof CONFIDENCE_LEVELS)[number];
 
 /**
- * Highest confidence a reported hypothesis carries.
+ * The fewest whole steps of evidence strength each level needs, strongest
+ * first; the first threshold a detection reaches names its level.
  *
- * Below one on purpose: these are patterns matched against counts, and the
- * product presents them under a heading that separates them from the observed
- * facts precisely because they are inferences. A confidence of one would claim
- * otherwise.
+ * `high` is reachable, deliberately: these are patterns matched against counts
+ * and presented under the "Likely cause" heading, so even the strongest one is
+ * still labelled an inference rather than a fact, which is what the separate
+ * heading exists to say.
  */
-const CONFIDENCE_MAX = 0.9;
+const CONFIDENCE_LEVEL_THRESHOLDS: readonly (readonly [ConfidenceLevel, number])[] = [
+  ['high', 4],
+  ['medium', 2],
+  ['low', 0],
+];
 
 /**
  * Multiplier turning a dominance share into whole steps of evidence strength.
@@ -803,24 +814,42 @@ function asDurationMs(value: JsonValue | undefined): number | undefined {
 }
 
 /**
- * The confidence for a detected pattern, from the strength of its evidence.
+ * The whole steps of evidence strength a detection is ranked by.
  *
- * One rule for all four patterns, and it is monotonic by construction:
- * confidence rises with `steps` and with nothing else, in fixed increments,
- * bounded at both ends. `steps` is a whole number each detector derives from
- * its own counts — one duplicate beyond the first, one unchanged-input render,
- * a tenth of the interaction's total beyond the dominance threshold — so a
- * stronger pattern can never be reported less confidently than a weaker one of
- * the same class.
+ * Negative values count as none and anything past {@link CONFIDENCE_MAX_STEPS}
+ * as the maximum, so one very strong pattern cannot outrank another merely by
+ * overflowing the scale.
+ *
+ * @param steps Whole steps of evidence strength, as a detector derived them.
+ * @returns The bounded step count.
+ */
+function boundedSteps(steps: number): number {
+  return clampRange(Math.floor(clampNonNegative(steps)), 0, CONFIDENCE_MAX_STEPS);
+}
+
+/**
+ * The confidence level for a detected pattern, from the strength of its
+ * evidence.
+ *
+ * One rule for all four patterns, and it is monotonic by construction: the
+ * level rises with `steps` and with nothing else. `steps` is a whole number
+ * each detector derives from its own counts — one duplicate beyond the first,
+ * one unchanged-input render, a tenth of the interaction's total beyond the
+ * dominance threshold — so a stronger pattern can never be reported less
+ * confidently than a weaker one of the same class.
  *
  * @param steps Whole steps of evidence strength; negative values are treated as
  * none.
- * @returns A confidence in `[CONFIDENCE_MIN, CONFIDENCE_MAX]`, rounded.
+ * @returns A member of {@link CONFIDENCE_LEVELS}.
  */
-function confidenceForSteps(steps: number): number {
-  const bounded = clampRange(Math.floor(clampNonNegative(steps)), 0, CONFIDENCE_MAX_STEPS);
-  const raw = CONFIDENCE_BASE + bounded * CONFIDENCE_STEP;
-  return roundValue(clampRange(raw, CONFIDENCE_MIN, CONFIDENCE_MAX), CONFIDENCE_DECIMALS);
+function confidenceForSteps(steps: number): ConfidenceLevel {
+  const bounded = boundedSteps(steps);
+  for (const [level, threshold] of CONFIDENCE_LEVEL_THRESHOLDS) {
+    if (bounded >= threshold) {
+      return level;
+    }
+  }
+  return 'low';
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -963,35 +992,39 @@ const EVIDENCE_LIST_FIELDS: readonly string[] = ['evidence', 'eventIds', 'events
 /**
  * Fields that hold a single event reference on an aggregate.
  *
- * Deliberately **without** any span-identifier field: a span id lives in a
- * different identifier space from an event id, and citing one where the other
- * is expected produces a reference that resolves to nothing.
+ * Deliberately **without** any span-identifier field, and without the
+ * aggregate's own `id`: a span id lives in a different identifier space from
+ * an event id, and so does the id of a request or query group, a component
+ * tree node, a graph participant or a fact candidate. Citing one where an
+ * event id is expected produces a reference that resolves to nothing, and the
+ * analyze stage rejects the whole analysis for it.
  */
-const EVIDENCE_SINGLE_FIELDS: readonly string[] = ['eventId', 'id'];
+const EVIDENCE_SINGLE_FIELDS: readonly string[] = ['eventId'];
 
 /**
- * How the structured context spells an evidence reference.
+ * Fields that name the event a **member of an evidence list** is.
  *
- * The reference type belongs to the panel package, and the aggregates in the
- * context were built by the same layer that has to agree with it, so the
- * context's own spelling is the best available evidence of what the validator
- * expects. A context whose references are plain strings gets plain strings
- * back; anything else is normalised to the product's object form.
+ * Wider than {@link EVIDENCE_SINGLE_FIELDS} on purpose: the list's own field —
+ * `evidence`, `eventIds`, `events` — already says every member is an event,
+ * so an event record spelled with a plain `id` is read as the event it is.
  */
-type EvidenceShape = 'string' | 'object';
+const EVIDENCE_MEMBER_FIELDS: readonly string[] = ['eventId', 'id'];
 
-/** The object form's key, used whenever {@link EvidenceShape} is `'object'`. */
+/**
+ * The key of the one spelling an emitted evidence reference has: `{ eventId }`.
+ *
+ * The context may spell its own references either way — a request group lists
+ * bare `eventIds`, a fact candidate carries `{ eventId }` records — and both are
+ * read. What is emitted is always the object form, because that is the only
+ * form `@debuggen/panel-schema`'s `EventRef` accepts, and protocol's strict
+ * findings schema validates every fact and cause with it.
+ */
 const EVIDENCE_OBJECT_KEY = 'eventId';
 
-/**
- * The reference set of one structured context: which references exist, and how
- * the context spells them.
- */
+/** The reference set of one structured context. */
 interface EvidenceIndex {
   /** Every reference the context carries, within {@link MAX_EVIDENCE_IDS}. */
   readonly available: ReadonlySet<string>;
-  /** The spelling to emit, taken from the context. */
-  readonly shape: EvidenceShape;
 }
 
 /**
@@ -1009,7 +1042,7 @@ function readEvidenceRef(value: JsonValue | undefined): string | undefined {
   if (object === undefined) {
     return undefined;
   }
-  for (const field of EVIDENCE_SINGLE_FIELDS) {
+  for (const field of EVIDENCE_MEMBER_FIELDS) {
     const reference = asString(object[field]);
     if (reference !== undefined) {
       return reference;
@@ -1058,21 +1091,18 @@ function evidenceOf(source: JsonObject | undefined): readonly string[] {
 }
 
 /**
- * Harvests every evidence reference in a bag of aggregates, and decides the
- * spelling to emit.
+ * Harvests every evidence reference in a bag of aggregates.
  *
- * The spelling is decided by the *first* list-style reference encountered in
- * the walk, which is deterministic because the walk is: bags are visited in the
- * order the caller lists them and nested nodes in the bounded depth-first order
- * of {@link flattenNodes}. A context that carries no list-style reference at
- * all leaves the spelling at the product's object form.
+ * Deterministic because the walk is: bags are visited in the order the caller
+ * lists them and nested nodes in the bounded depth-first order of
+ * {@link flattenNodes}, so the {@link MAX_EVIDENCE_IDS} cap always keeps the
+ * same references.
  *
  * @param bags Objects whose nested structures may carry references.
- * @returns The available references and the spelling to emit.
+ * @returns The available references.
  */
 function indexEvidence(bags: readonly (JsonObject | undefined)[]): EvidenceIndex {
   const available = new Set<string>();
-  let shape: EvidenceShape | undefined;
 
   for (const bag of bags) {
     if (bag === undefined) {
@@ -1080,9 +1110,6 @@ function indexEvidence(bags: readonly (JsonObject | undefined)[]): EvidenceIndex
     }
     for (const key of sortedKeys(bag)) {
       for (const node of flattenNodes(bag[key])) {
-        if (shape === undefined) {
-          shape = evidenceShapeOf(node);
-        }
         for (const reference of evidenceOf(node)) {
           if (available.size >= MAX_EVIDENCE_IDS) {
             break;
@@ -1093,37 +1120,11 @@ function indexEvidence(bags: readonly (JsonObject | undefined)[]): EvidenceIndex
     }
   }
 
-  return { available, shape: shape ?? 'object' };
+  return { available };
 }
 
 /**
- * The spelling one node's evidence list uses, when it has one.
- *
- * @param node An aggregate node.
- * @returns `'string'`, `'object'`, or `undefined` when the node carries no
- * list-style evidence.
- */
-function evidenceShapeOf(node: JsonObject): EvidenceShape | undefined {
-  for (const field of EVIDENCE_LIST_FIELDS) {
-    const list = asArray(node[field]);
-    if (list === undefined || list.length === 0) {
-      continue;
-    }
-    for (const member of list) {
-      if (asString(member) !== undefined) {
-        return 'string';
-      }
-      if (asObject(member) !== undefined) {
-        return 'object';
-      }
-    }
-  }
-  return undefined;
-}
-
-/**
- * The citable subset of a candidate's references, in the context's own
- * spelling.
+ * The citable subset of a candidate's references, as `{ eventId }` records.
  *
  * Filtered against the harvested set, de-duplicated, ordered, and capped. An
  * empty result is the caller's signal to **drop the candidate entirely**: a
@@ -1131,7 +1132,7 @@ function evidenceShapeOf(node: JsonObject): EvidenceShape | undefined {
  * this module has no business asserting.
  *
  * @param references The candidate's raw references.
- * @param index The context's reference set and spelling.
+ * @param index The context's reference set.
  * @returns The citable references as JSON values, possibly empty.
  */
 function citeEvidence(references: readonly string[], index: EvidenceIndex): JsonValue[] {
@@ -1142,9 +1143,6 @@ function citeEvidence(references: readonly string[], index: EvidenceIndex): Json
     }
   }
   const ordered = sortStrings([...citable]).slice(0, MAX_EVIDENCE_PER_FACT);
-  if (index.shape === 'string') {
-    return [...ordered];
-  }
   return ordered.map((reference) => ({ [EVIDENCE_OBJECT_KEY]: reference }));
 }
 
@@ -1209,7 +1207,7 @@ function readSourceLocation(value: JsonValue | undefined): SourceLocation | unde
     ...(symbol !== undefined ? { symbol } : {}),
     ...(endLine !== undefined ? { endLine } : {}),
     resolvedBy,
-    confidence: roundValue(clampRange(confidence, 0, 1), CONFIDENCE_DECIMALS),
+    confidence: roundValue(clampRange(confidence, 0, 1), LOCATION_CONFIDENCE_DECIMALS),
   };
 
   const parsed = parseSourceLocation(candidate);
@@ -1306,29 +1304,130 @@ const RUNTIME_ACTION_TYPES: readonly ActionTypeId[] = [
 ];
 
 /**
+ * The capture-signal vocabulary every signal list in these rules is expressed in.
+ *
+ * Mirrors `CAPTURE_SIGNALS` of `@debuggen/instrumentation` (`schema/readiness.ts`):
+ * the closed vocabulary `ProblemUnderstanding.signalsNeeded` is validated
+ * against, the adapters' readiness catalog is keyed by, and the readiness gate
+ * reports one row per member of. The package layering of AAP §0.2.2 keeps this
+ * package below instrumentation, so the names are restated rather than
+ * imported; an understanding built in any other vocabulary is one the product's
+ * own schema rejects, which is a defect of this module, not of the caller.
+ */
+const CAPTURE_SIGNAL_NAMES: readonly string[] = Object.freeze([
+  'interactions',
+  'react',
+  'state',
+  'fetch',
+  'perf',
+  'errors',
+  'componentTree',
+  'http',
+  'routeHandlers',
+  'prisma',
+  'pg',
+  'functions',
+]);
+
+/** Membership view of {@link CAPTURE_SIGNAL_NAMES}. */
+const CAPTURE_SIGNAL_SET: ReadonlySet<string> = new Set(CAPTURE_SIGNAL_NAMES);
+
+/**
+ * Telemetry-kind spellings of a capture signal, translated on read.
+ *
+ * A context may name what it recorded by event kind (`render`, `db.query`) —
+ * a capture summary's natural vocabulary — rather than by capture signal. Each
+ * kind is read as the signal(s) whose hook produces it, so a kind and its
+ * signal can never both be counted, and a gap is never reported for a signal
+ * the capture already holds under its kind name. `db.query` stands for both
+ * drivers because one query span looks the same whichever of them issued it.
+ */
+const SIGNAL_ALIASES: Readonly<Record<string, readonly string[]>> = Object.freeze({
+  interaction: ['interactions'],
+  render: ['react'],
+  commit: ['react'],
+  xhr: ['fetch'],
+  'http.client': ['fetch'],
+  navigation: ['perf'],
+  'perf.longtask': ['perf'],
+  'perf.entry': ['perf'],
+  error: ['errors'],
+  'server.error': ['errors'],
+  'http.server': ['http'],
+  'route.handler': ['routeHandlers'],
+  function: ['functions'],
+  'db.query': ['prisma', 'pg'],
+});
+
+/**
+ * Reads a list of signal names into the capture-signal vocabulary.
+ *
+ * Capture signals pass through, telemetry-kind spellings are translated by
+ * {@link SIGNAL_ALIASES}, and any other name is dropped: a name that belongs to
+ * neither vocabulary selects no hook and no action type, and carrying it
+ * forward would make the understanding this module answers with invalid
+ * against the closed vocabulary its caller validates.
+ *
+ * @param names The names as read from a context.
+ * @returns The distinct capture signals, ascending.
+ */
+function canonicalSignals(names: Iterable<string>): string[] {
+  const signals = new Set<string>();
+  for (const name of names) {
+    if (CAPTURE_SIGNAL_SET.has(name)) {
+      signals.add(name);
+      continue;
+    }
+    for (const signal of SIGNAL_ALIASES[name] ?? []) {
+      signals.add(signal);
+    }
+  }
+  return sortStrings([...signals]);
+}
+
+/**
+ * The `file` and `symbol` of a targetless action.
+ *
+ * Mirror `TARGETLESS_FILE` and `TARGETLESS_SYMBOL` of `@debuggen/instrumentation`
+ * (`schema/plan.ts`): the explicit marker a runtime action that observes the
+ * whole page or process names instead of an invented declaration.
+ */
+const TARGETLESS_ACTION_FILE = '.';
+const TARGETLESS_ACTION_SYMBOL = '*';
+
+/**
+ * The action types that wrap one named declaration and so are never targetless.
+ *
+ * Mirrors `TARGET_REQUIRED_ACTION_TYPES` of `@debuggen/instrumentation`.
+ */
+const TARGET_REQUIRED_TYPES: ReadonlySet<string> = new Set(['function-timing', 'server-span']);
+
+/**
  * The action types that can supply each capture signal, in preference order.
  *
- * Read in two places: choosing what a plan must install for the signals an
- * understanding asked for, and deciding which additive actions a follow-up
- * needs for a signal the existing capture is missing. A signal with no entry
- * here needs no action at all — an error and a log record are collected by a
- * hook that is either on or off for the whole capture, never per symbol.
+ * Keyed by {@link CAPTURE_SIGNAL_NAMES} and mirroring the hooks each action type
+ * arms in `@debuggen/instrumentation`'s readiness derivation. Read in two
+ * places: choosing what a plan must install for the signals an understanding
+ * asked for, and deciding which additive actions a follow-up needs for a signal
+ * the existing capture is missing. A signal with no entry here needs no action
+ * at all — errors are collected by a hook that is either on or off for the
+ * whole capture, never per symbol.
  */
 const SIGNAL_ACTION_TYPES: Readonly<Record<string, readonly ActionTypeId[]>> = Object.freeze({
-  interaction: ['interaction-tracking'],
-  render: ['react-render-tracking'],
-  commit: ['react-render-tracking'],
+  interactions: ['interaction-tracking'],
+  react: ['react-render-tracking'],
+  componentTree: ['react-render-tracking'],
   state: ['state-tracking'],
   fetch: ['fetch-tracking'],
-  xhr: ['fetch-tracking'],
-  'http.client': ['fetch-tracking'],
-  navigation: ['perf-tracking'],
-  'perf.longtask': ['perf-tracking'],
-  'perf.entry': ['perf-tracking'],
-  'http.server': ['server-span'],
-  'route.handler': ['server-span'],
-  function: ['function-timing'],
-  'db.query': ['db-query-tracking'],
+  perf: ['perf-tracking'],
+  // One runtime hook set observes both: perf-tracking arms the performance
+  // observers and the page-error listeners together.
+  errors: ['perf-tracking'],
+  http: ['server-span'],
+  routeHandlers: ['server-span'],
+  functions: ['function-timing'],
+  prisma: ['db-query-tracking'],
+  pg: ['db-query-tracking'],
 });
 
 /**
@@ -1343,13 +1442,29 @@ const SIGNAL_ACTION_TYPES: Readonly<Record<string, readonly ActionTypeId[]>> = O
 const CODE_KIND_ACTION_TYPES: Readonly<Record<string, readonly ActionTypeId[]>> = Object.freeze({
   component: ['react-render-tracking', 'function-timing'],
   'event-handler': ['interaction-tracking', 'function-timing'],
+  handler: ['interaction-tracking', 'function-timing'],
   'api-call': ['fetch-tracking', 'function-timing'],
   'api-route': ['server-span', 'function-timing'],
   'server-function': ['function-timing'],
   'db-call': ['db-query-tracking', 'function-timing'],
-  file: ['function-timing'],
+  file: [],
   symbol: ['function-timing'],
 });
+
+/**
+ * Whether a candidate's symbol spells a declaration a patch could wrap.
+ *
+ * A patch-mode action wraps one named declaration, so a candidate named by a
+ * route path, a module path or any other non-identifier is offered only the
+ * runtime action types its kind supports. `Owner.member` spellings are
+ * declarations too.
+ *
+ * @param symbol The candidate's symbol.
+ * @returns `true` for an identifier or a dotted chain of identifiers.
+ */
+function isDeclarationSpelling(symbol: string): boolean {
+  return /^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/u.test(symbol);
+}
 
 /** The fallback preference for a code-graph node kind with no entry above. */
 const DEFAULT_CODE_KIND_ACTION_TYPES: readonly ActionTypeId[] = ['function-timing'];
@@ -1414,8 +1529,91 @@ interface UnderstandingView {
   readonly signals: readonly string[];
   /** The named entities the understanding reported. */
   readonly entities: readonly string[];
+  /** The entities a context carried in the `{ kind, name, file? }` shape, in carried order. */
+  readonly entityRecords: readonly EntityRecord[];
   /** The selected target, when there was one. */
   readonly target?: TargetView;
+}
+
+/** One named entity in the shape `ProblemUnderstanding.entities` carries. */
+interface EntityRecord {
+  /** A member of {@link ENTITY_KINDS}. */
+  readonly kind: string;
+  /** The entity's name: single-line, at most {@link MAX_ENTITY_NAME_CHARS} characters. */
+  readonly name: string;
+  /** The project-relative file declaring it, when one was carried. */
+  readonly file?: string;
+}
+
+/**
+ * The entity-kind vocabulary an understanding is answered in.
+ *
+ * Mirrors `PROBLEM_ENTITY_KINDS` of `@debuggen/instrumentation`
+ * (`schema/target.ts`); restated for the layering reason given at
+ * {@link CAPTURE_SIGNAL_NAMES}. A carried kind outside it is read as `'other'`.
+ */
+const ENTITY_KINDS: ReadonlySet<string> = new Set([
+  'component',
+  'function',
+  'hook',
+  'route',
+  'file',
+  'symbol',
+  'selector',
+  'url',
+  'query',
+  'other',
+]);
+
+/** The longest entity name `ProblemUnderstanding` accepts. */
+const MAX_ENTITY_NAME_CHARS = 200;
+
+/** The longest search hint `ProblemUnderstanding` accepts. */
+const MAX_SEARCH_HINT_CHARS = 120;
+
+/**
+ * Whether a string can be an entity name or search hint of at most `max` characters.
+ *
+ * @param text The candidate.
+ * @param max The longest accepted length.
+ * @returns `true` for a non-blank, single-line string within the bound.
+ */
+function isSingleLineWithin(text: string, max: number): boolean {
+  return text.trim().length > 0 && text.length <= max && !/[\r\n]/u.test(text);
+}
+
+/**
+ * Reads the `{ kind, name, file? }` entities a bag carries.
+ *
+ * @param source The bag to read.
+ * @param names The candidate field names, first match per field unioned.
+ * @returns The records, in carried order; members that name nothing are dropped.
+ */
+function readEntityRecords(
+  source: JsonObject | undefined,
+  ...names: readonly string[]
+): EntityRecord[] {
+  if (source === undefined) {
+    return [];
+  }
+  const records: EntityRecord[] = [];
+  for (const field of names) {
+    for (const member of asArray(source[field]) ?? []) {
+      const object = asObject(member);
+      const name = object === undefined ? undefined : asString(object['name']);
+      if (object === undefined || name === undefined) {
+        continue;
+      }
+      const kind = asString(object['kind']);
+      const file = asProjectPath(object['file']);
+      records.push({
+        kind: kind !== undefined && ENTITY_KINDS.has(kind) ? kind : 'other',
+        name,
+        ...(file !== undefined ? { file } : {}),
+      });
+    }
+  }
+  return records;
 }
 
 /**
@@ -1534,22 +1732,26 @@ function readUnderstanding(root: JsonObject): UnderstandingView {
   const target = readTarget(root);
   const category = readCategory(root);
 
-  const signals = new Set<string>();
-  for (const signal of readStringSet(root, 'signalsNeeded', 'signals', 'requestedSignals')) {
-    signals.add(signal);
-  }
-  for (const signal of readStringSet(bag, 'signalsNeeded', 'signals', 'requestedSignals')) {
-    signals.add(signal);
-  }
+  const signals = new Set<string>(
+    canonicalSignals([
+      ...readStringSet(root, 'signalsNeeded', 'signals', 'requestedSignals'),
+      ...readStringSet(bag, 'signalsNeeded', 'signals', 'requestedSignals'),
+    ]),
+  );
 
   // The project summary is read for entities as well as the understanding
   // itself: the names a summary reports are exactly the named entities an
   // understanding is expected to carry, and the understand stage's own context
   // has them there rather than beside its category hint.
   const entities = new Set<string>();
+  const entityRecords: EntityRecord[] = [];
   for (const source of [root, bag, readObjectField(root, 'projectSummary', 'project')]) {
     for (const entity of readStringSet(source, 'entities', 'components', 'namedEntities')) {
       entities.add(entity);
+    }
+    for (const record of readEntityRecords(source, 'entities', 'namedEntities')) {
+      entities.add(record.name);
+      entityRecords.push(record);
     }
   }
   if (target !== undefined) {
@@ -1562,6 +1764,7 @@ function readUnderstanding(root: JsonObject): UnderstandingView {
     ...(category !== undefined ? { category } : {}),
     signals: sortStrings([...signals]).slice(0, MAX_CAPTURE_SIGNALS),
     entities: sortStrings([...entities]).slice(0, MAX_ENTITIES),
+    entityRecords,
     ...(target !== undefined ? { target } : {}),
   };
 }
@@ -1794,29 +1997,26 @@ function readQueryGroups(aggregates: JsonObject): readonly QueryGroupView[] {
 }
 
 /**
- * The metric values a capture reported, and the shape the context carried them
- * in.
+ * The metric values a capture reported.
  *
- * Two carriers are accepted because both are natural: a map from id to value,
- * and a list of id-and-value records. The shape is remembered rather than
- * normalised away, so an analysis hands the values back in the form its own
- * layer uses — the same reasoning that decides how evidence references are
- * spelled. Only ids in {@link COMPUTED_METRIC_IDS} are kept; a value the
- * context reports under any other name is not a metric this product computes.
+ * Two carriers are read because both are natural: a map from id to value, and
+ * a list of id-and-value records. Only ids in {@link COMPUTED_METRIC_IDS} are
+ * kept; a value the context reports under any other name is not a metric this
+ * product computes. The values ground the facts and causes an analysis states;
+ * they are never echoed onto the analysis itself, whose metrics protocol's
+ * `createAnalysisResult` computes deterministically rather than accepting them
+ * from a provider.
  */
 interface MetricReading {
   /** The reported values, keyed by metric id. */
   readonly values: ReadonlyMap<ComputedMetricId, number>;
-  /** The carrier the context used, echoed by {@link metricsOutput}. */
-  readonly carrier: 'object' | 'array';
 }
 
 /**
  * Reads the metric values of a context.
  *
  * @param root The structured context.
- * @returns The reported values and their carrier; an empty map when none were
- * reported.
+ * @returns The reported values; an empty map when none were reported.
  */
 function readMetrics(root: JsonObject): MetricReading {
   const values = new Map<ComputedMetricId, number>();
@@ -1835,7 +2035,7 @@ function readMetrics(root: JsonObject): MetricReading {
         }
       }
       if (values.size > 0) {
-        return { values, carrier: 'object' };
+        return { values };
       }
     }
 
@@ -1854,41 +2054,12 @@ function readMetrics(root: JsonObject): MetricReading {
         }
       }
       if (values.size > 0) {
-        return { values, carrier: 'array' };
+        return { values };
       }
     }
   }
 
-  return { values, carrier: 'object' };
-}
-
-/**
- * The reported metric values, in the carrier the context used and in
- * {@link COMPUTED_METRIC_IDS} order.
- *
- * @param reading The metric reading.
- * @returns A JSON value ready to be placed on an analysis.
- */
-function metricsOutput(reading: MetricReading): JsonValue {
-  if (reading.carrier === 'array') {
-    const entries: JsonValue[] = [];
-    for (const id of COMPUTED_METRIC_IDS) {
-      const value = reading.values.get(id);
-      if (value !== undefined) {
-        entries.push({ id, value });
-      }
-    }
-    return entries;
-  }
-
-  const map: Record<string, JsonValue> = {};
-  for (const id of COMPUTED_METRIC_IDS) {
-    const value = reading.values.get(id);
-    if (value !== undefined) {
-      map[id] = value;
-    }
-  }
-  return map;
+  return { values };
 }
 
 /**
@@ -2100,12 +2271,23 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
 
   const understanding = readUnderstanding(root);
   const projectSummary = readObjectField(root, 'projectSummary', 'project');
-  const bags: readonly (JsonObject | undefined)[] = [root, understandingBag(root), projectSummary];
+  // A code-analysis project summary reports its tallies under `counts`, so the
+  // presence fields are read there as well as at the top level.
+  const counts = readObjectField(projectSummary, 'counts');
+  const bags: readonly (JsonObject | undefined)[] = [
+    root,
+    understandingBag(root),
+    projectSummary,
+    counts,
+  ];
+  // Tallies only: a summary's `components` list of names is an entity source,
+  // not a count, so the render and interaction rules read the counts alone.
+  const summaryCounts: readonly (JsonObject | undefined)[] = [counts];
 
   const signals = new Set<string>(understanding.signals);
   if (understanding.target !== undefined) {
-    signals.add('interaction');
-    signals.add('render');
+    signals.add('interactions');
+    signals.add('react');
   }
   if (
     reportsPresence(
@@ -2118,10 +2300,12 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
       'routeCount',
     )
   ) {
-    signals.add('http.server');
-    signals.add('route.handler');
+    signals.add('http');
+    signals.add('routeHandlers');
   }
+  const drivers = reportedDatabaseDrivers(projectSummary);
   if (
+    drivers !== undefined ||
     reportsPresence(
       bags,
       'hasDatabase',
@@ -2132,18 +2316,42 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
       'dbCallCount',
     )
   ) {
-    signals.add('db.query');
+    for (const driver of drivers ?? DATABASE_DRIVER_SIGNALS) {
+      signals.add(driver);
+    }
   }
   if (reportsPresence(bags, 'hasClientRequests', 'apiCalls', 'apiCallCount', 'requestCallSites')) {
     signals.add('fetch');
   }
+  // Reported components make renders worth capturing, and reported event
+  // handlers make interactions worth capturing, as a selected target does.
+  if (reportsPresence(summaryCounts, 'components', 'componentCount')) {
+    signals.add('react');
+  }
+  if (reportsPresence(summaryCounts, 'handlers', 'eventHandlers', 'handlerCount')) {
+    signals.add('interactions');
+  }
+  // A question observed in the page is also observed through its performance
+  // entries: long tasks, resource timing and the navigation that framed the
+  // document are the only source of the browser-tier measurements
+  // (`blocking_time`, `long_task_count`, `transferred_bytes`), and a reload
+  // during a capture is visible only as its navigation entry. The hook edits
+  // no file, so it is collected whenever the page itself is.
+  if (signals.has('interactions') || signals.has('react')) {
+    signals.add('perf');
+  }
 
-  const entities = sortStrings([...new Set(understanding.entities)]).slice(0, MAX_ENTITIES);
+  const entities = understandingEntities(root, understanding, projectSummary);
   const hints = new Set<string>();
   for (const entity of entities) {
-    hints.add(entity);
-    for (const stem of pathStems(entity)) {
-      hints.add(stem);
+    // A URL or a DOM locator names no declaration, so neither makes a name lookup.
+    if (entity.kind === 'url' || entity.kind === 'selector') {
+      continue;
+    }
+    for (const hint of [entity.name, ...pathStems(entity.name)]) {
+      if (isSingleLineWithin(hint, MAX_SEARCH_HINT_CHARS)) {
+        hints.add(hint);
+      }
     }
   }
 
@@ -2159,11 +2367,173 @@ export function buildUnderstanding(input: JsonValue | undefined): JsonValue | un
   }
 
   return {
-    ...(understanding.category !== undefined ? { category: understanding.category } : {}),
+    category: understandingCategory(understanding.category),
     signalsNeeded: orderedSignals,
-    entities,
+    entities: entities.map((entity) => ({ ...entity })),
     searchHints,
   };
+}
+
+/**
+ * The named entities an understanding reports, most specific first.
+ *
+ * Every entity comes from a structured field of the context, never from the
+ * question's prose: the selected target's component chain, entities carried in
+ * record shape, bare names carried by an earlier stage or the project summary
+ * (a path-shaped name is a `'file'`, any other a `'symbol'`), the identifier
+ * candidates the stage's generic tokenizer extracted, the page the question was
+ * asked on, and finally the routes the project summary reports — the seeds a
+ * code investigation can start from when nothing more specific was given. Each
+ * name appears once, under the first kind it was read with.
+ *
+ * @param root The structured context.
+ * @param understanding The context's understanding view.
+ * @param projectSummary The context's project summary, if any.
+ * @returns At most {@link MAX_ENTITIES} records.
+ */
+function understandingEntities(
+  root: JsonObject,
+  understanding: UnderstandingView,
+  projectSummary: JsonObject | undefined,
+): EntityRecord[] {
+  const records: EntityRecord[] = [];
+  const seen = new Set<string>();
+  const add = (kind: string, name: string, file?: string): void => {
+    if (seen.has(name) || !isSingleLineWithin(name, MAX_ENTITY_NAME_CHARS)) {
+      return;
+    }
+    seen.add(name);
+    records.push({ kind, name, ...(file !== undefined ? { file } : {}) });
+  };
+
+  for (const component of understanding.target?.chain ?? []) {
+    add('component', component);
+  }
+  for (const record of understanding.entityRecords) {
+    add(record.kind, record.name, record.file);
+  }
+  for (const name of understanding.entities) {
+    add(isPathShaped(name) ? 'file' : 'symbol', name);
+  }
+  for (const identifier of asStringArray(root['identifierCandidates'])) {
+    add('symbol', identifier);
+  }
+  const currentUrl = asString(root['currentUrl']);
+  if (currentUrl !== undefined) {
+    add('url', currentUrl);
+  }
+  for (const route of asArray(projectSummary?.['routes']) ?? []) {
+    const object = asObject(route);
+    const path =
+      object === undefined ? asString(route) : asString(readField(object, 'routePath', 'path'));
+    if (path !== undefined) {
+      add('route', path);
+    }
+  }
+
+  return records.slice(0, MAX_ENTITIES);
+}
+
+/**
+ * Whether a bare entity name reads as a module path rather than a declaration.
+ *
+ * @param name The name.
+ * @returns `true` when it contains a separator or ends in a file extension.
+ */
+function isPathShaped(name: string): boolean {
+  return name.includes('/') || extnamePosix(basenamePosix(name)).length > 0;
+}
+
+/**
+ * The problem-category vocabulary an understanding is answered in.
+ *
+ * Mirrors `PROBLEM_CATEGORIES` of `@debuggen/instrumentation`
+ * (`schema/target.ts`), which `ProblemUnderstanding.category` is validated
+ * against; restated rather than imported for the layering reason given at
+ * {@link CAPTURE_SIGNAL_NAMES}.
+ */
+const UNDERSTANDING_CATEGORIES: ReadonlySet<string> = new Set([
+  'performance',
+  'rendering',
+  'network',
+  'data',
+  'state',
+  'error',
+  'correctness',
+  'other',
+]);
+
+/**
+ * The understanding category each of `../deterministic/templates.js`'s
+ * symptom-level categories belongs to.
+ *
+ * A carried symptom is folded into the class of behaviour it is an instance
+ * of, so a context phrased in either vocabulary yields the same valid value.
+ */
+const CATEGORY_CLASSES: Readonly<Record<string, string>> = Object.freeze({
+  'slow-interaction': 'performance',
+  'slow-request': 'performance',
+  'slow-query': 'performance',
+  'blocked-main-thread': 'performance',
+  'excessive-renders': 'rendering',
+  'duplicate-requests': 'network',
+  'unexpected-state': 'state',
+  'runtime-error': 'error',
+});
+
+/** The category of an understanding whose context classified nothing. */
+const UNCLASSIFIED_CATEGORY = 'other';
+
+/**
+ * The category an understanding reports.
+ *
+ * Echoed, never decided: a carried category in the understanding vocabulary is
+ * kept, a carried symptom-level category is read as its class, and anything
+ * else — including no category at all — is reported as `'other'`, the member
+ * the vocabulary keeps so that classification never has to lie.
+ *
+ * @param carried The category the context carried, if any.
+ * @returns A member of {@link UNDERSTANDING_CATEGORIES}.
+ */
+function understandingCategory(carried: string | undefined): string {
+  if (carried === undefined) {
+    return UNCLASSIFIED_CATEGORY;
+  }
+  if (UNDERSTANDING_CATEGORIES.has(carried)) {
+    return carried;
+  }
+  return CATEGORY_CLASSES[carried] ?? UNCLASSIFIED_CATEGORY;
+}
+
+/** The database signals, one per driver, for a project whose driver is not reported. */
+const DATABASE_DRIVER_SIGNALS: readonly string[] = Object.freeze(['pg', 'prisma']);
+
+/**
+ * The database drivers a project summary reports, as capture signals.
+ *
+ * Read from the summary's `databaseAccess.style` — `'prisma'`, `'pg'`, `'both'`
+ * or `'none'` — so an understanding asks for exactly the drivers the project
+ * uses rather than for both whenever it touches a database.
+ *
+ * @param projectSummary The context's project summary, if any.
+ * @returns The driver signals, an empty list for `'none'`, or `undefined` when
+ * the summary reports no access style.
+ */
+function reportedDatabaseDrivers(
+  projectSummary: JsonObject | undefined,
+): readonly string[] | undefined {
+  const style = asString(readObjectField(projectSummary, 'databaseAccess')?.['style']);
+  switch (style) {
+    case 'prisma':
+    case 'pg':
+      return [style];
+    case 'both':
+      return DATABASE_DRIVER_SIGNALS;
+    case 'none':
+      return [];
+    default:
+      return undefined;
+  }
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -2258,7 +2628,9 @@ function readCandidates(
     const stems = pathStems(file);
     const symbol = asString(readField(node, 'symbol', 'symbolName', 'name')) ?? stems[0] ?? file;
     const kind = asString(readField(node, 'kind', 'nodeKind', 'type')) ?? '';
-    const declaredSignals = readStringSet(node, 'signals', 'captureSignals', 'provides');
+    const declaredSignals = canonicalSignals(
+      readStringSet(node, 'signals', 'captureSignals', 'provides'),
+    );
 
     const matchedSignals = declaredSignals.filter((signal) => neededSignals.has(signal));
     const matchedEntities = sortStrings([symbol, ...stems].filter((name) => entityNames.has(name)));
@@ -2291,7 +2663,9 @@ function readCandidates(
       kind,
       score,
       relatedLabel,
-      actionTypes: CODE_KIND_ACTION_TYPES[kind] ?? DEFAULT_CODE_KIND_ACTION_TYPES,
+      actionTypes: (CODE_KIND_ACTION_TYPES[kind] ?? DEFAULT_CODE_KIND_ACTION_TYPES).filter(
+        (type) => !TARGET_REQUIRED_TYPES.has(type) || isDeclarationSpelling(symbol),
+      ),
     });
   }
 
@@ -2496,12 +2870,8 @@ function readAdapterCatalog(root: JsonObject): AdapterCatalogView {
         }
       }
     }
-    for (const signal of readStringSet(
-      entry,
-      'signals',
-      'availableSignals',
-      'captureSignals',
-      'provides',
+    for (const signal of canonicalSignals(
+      readStringSet(entry, 'signals', 'availableSignals', 'captureSignals', 'provides'),
     )) {
       declaredSignals.add(signal);
     }
@@ -2674,11 +3044,29 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
   const catalog = readAdapterCatalog(root);
   const candidates = sortCandidates(readCandidates(root, understanding));
 
+  // The page- and process-wide runtime action each needed signal would be
+  // collected by. Their slots are reserved before candidates are considered, so
+  // a long candidate list can never crowd out the hooks a capture depends on.
+  const signalTypes: ActionTypeId[] = [];
+  for (const signal of sortStrings([...understanding.signals])) {
+    const type = (SIGNAL_ACTION_TYPES[signal] ?? []).find(
+      (candidate) =>
+        catalog.claimed.has(candidate) &&
+        isRuntimeActionType(candidate, catalog) &&
+        !TARGET_REQUIRED_TYPES.has(candidate),
+    );
+    if (type !== undefined && !signalTypes.includes(type)) {
+      signalTypes.push(type);
+    }
+  }
+  const candidateBudget = Math.max(0, MAX_INSTRUMENTATION_TARGETS - signalTypes.length);
+
   const targets: JsonObject[] = [];
   const emitted = new Set<string>();
+  const emittedTypes = new Set<ActionTypeId>();
   const contributed = new Set<string>();
   for (const candidate of candidates) {
-    if (targets.length >= MAX_INSTRUMENTATION_TARGETS) {
+    if (targets.length >= candidateBudget) {
       break;
     }
     const type = chooseActionType(candidate.actionTypes, catalog);
@@ -2690,9 +3078,23 @@ export function buildPlanInput(input: JsonValue | undefined): JsonValue | undefi
       continue;
     }
     emitted.add(key);
+    emittedTypes.add(type);
     targets.push(instrumentationTarget(candidate.file, candidate.symbol, type));
     for (const signal of signalsForActionType(type)) {
       contributed.add(signal);
+    }
+  }
+
+  // A needed signal no candidate's action collects is collected by a
+  // targetless runtime action: the hook that observes it everywhere.
+  for (const type of signalTypes) {
+    if (emittedTypes.has(type)) {
+      continue;
+    }
+    emittedTypes.add(type);
+    targets.push(instrumentationTarget(TARGETLESS_ACTION_FILE, TARGETLESS_ACTION_SYMBOL, type));
+    for (const covered of signalsForActionType(type)) {
+      contributed.add(covered);
     }
   }
 
@@ -3205,8 +3607,8 @@ function causeDetections(
  * claim nobody can check is exactly what the product's separation of observed
  * facts from inferred causes exists to prevent.
  *
- * A capture that recorded nothing yields a valid analysis with no facts, no
- * causes and whatever metrics were reported. That is the honest answer for the
+ * A capture that recorded nothing yields a valid analysis with no facts and no
+ * causes. That is the honest answer for the
  * "capture yielded nothing" path, and it is why this builder does not fall back
  * to `undefined` for an empty bag: the session has a result, and the result is
  * that there is nothing to report yet.
@@ -3260,15 +3662,16 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
   const causes = causeDetections(root, spans, totalMs)
     .map((detection) => ({
       statement: causeStatement(detection),
+      strength: boundedSteps(detection.steps),
       confidence: confidenceForSteps(detection.steps),
       evidence: citeEvidence(detection.references, index),
       location: detection.location,
     }))
     .filter((cause) => cause.evidence.length > 0)
     .sort((left, right) =>
-      left.confidence === right.confidence
+      left.strength === right.strength
         ? compareStrings(left.statement, right.statement)
-        : right.confidence - left.confidence,
+        : right.strength - left.strength,
     )
     .slice(0, MAX_LIKELY_CAUSES);
 
@@ -3283,7 +3686,7 @@ export function buildAnalysis(input: JsonValue | undefined): JsonValue | undefin
     });
   }
 
-  return { observed, likelyCauses, metrics: metricsOutput(reading) };
+  return { observed, likelyCauses };
 }
 
 /* -------------------------------------------------------------------------------------------------
@@ -3636,13 +4039,16 @@ export function buildPanelSpecInput(input: JsonValue | undefined): JsonValue | u
  * the capture may not have would suppress a genuine gap and leave a follow-up
  * answering from evidence it does not hold, while claiming too little only
  * costs an additive action that turns out to have been unnecessary. A source
- * that could hold any of several signals therefore establishes none.
+ * that could hold any of several signals therefore establishes none. The
+ * `queries` source is not such a source: both drivers' spans land in it, and
+ * the one action type that collects them arms both driver instrumentations
+ * together, so a populated query aggregate establishes both driver signals.
  */
 const SOURCE_CAPTURE_SIGNALS: Readonly<Record<string, readonly string[]>> = Object.freeze({
-  trace: ['interaction'],
-  renders: ['render', 'commit'],
+  trace: ['interactions'],
+  renders: ['react'],
   requests: ['fetch'],
-  queries: ['db.query'],
+  queries: ['pg', 'prisma'],
   stateTransitions: ['state'],
 });
 
@@ -3683,10 +4089,12 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
   const counts = readSourceCounts(root, reading);
   const captureBag = readObjectField(root, 'captureSummary', 'capture', 'latestCapture');
 
-  const captured = new Set<string>([
-    ...readStringSet(captureBag, 'capturedSignals', 'signals', 'kinds'),
-    ...readStringSet(root, 'capturedSignals'),
-  ]);
+  const captured = new Set<string>(
+    canonicalSignals([
+      ...readStringSet(captureBag, 'capturedSignals', 'signals', 'kinds'),
+      ...readStringSet(root, 'capturedSignals'),
+    ]),
+  );
   for (const source of sortStrings(Object.keys(SOURCE_CAPTURE_SIGNALS))) {
     if (!isMaterialSource(source, counts)) {
       continue;
@@ -3698,12 +4106,14 @@ export function buildFollowUpDecision(input: JsonValue | undefined): JsonValue |
 
   const wanted = new Set<string>(understanding.signals);
   for (const bag of [root, understandingBag(root), analysisBag(root), captureBag]) {
-    for (const signal of readStringSet(
-      bag,
-      'missingSignals',
-      'coverageGaps',
-      'unavailableSignals',
-      'additionalSignals',
+    for (const signal of canonicalSignals(
+      readStringSet(
+        bag,
+        'missingSignals',
+        'coverageGaps',
+        'unavailableSignals',
+        'additionalSignals',
+      ),
     )) {
       wanted.add(signal);
     }

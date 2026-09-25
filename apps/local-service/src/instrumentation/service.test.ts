@@ -1233,6 +1233,37 @@ describe('message mapping', () => {
     expect(framesOf(allMessages(h), 'instrumentation.ready')).toHaveLength(1);
   });
 
+  it('arms the page hooks of runtime actions an adapter left unarmed at install time', async () => {
+    // The browser adapters report nothing enabled while no page agent has
+    // reported, so the installer's page-agent configuration is dormant.
+    const h = createHarness({
+      script: (call) =>
+        Promise.resolve(
+          ok({
+            ...cleanResult(call.context.debuggenHome, call.plan),
+            agentHooks: { ...DORMANT_AGENT_HOOK_CONFIG },
+          }),
+        ),
+    });
+    await h.service.install(installRequest(h, buildPlan()));
+
+    const armed = h.service.armCapture({ sessionId: SESSION_ID, captureId: CAPTURE_ID });
+
+    expect(isOk(armed)).toBe(true);
+    const payload = first(framesOf(allMessages(h), 'agent.config')).payload;
+    // BASE_TARGETS' three targetless runtime actions: interactions, renders, requests.
+    expect(payload.hooks).toMatchObject({
+      interactions: true,
+      react: true,
+      componentTree: true,
+      fetch: true,
+    });
+    expect(agentConfigPayloadSchema.safeParse(payload).success).toBe(true);
+    if (isOk(armed)) {
+      expect(armed.value.agentHooks).toStrictEqual(payload.hooks);
+    }
+  });
+
   it('arms agent.config and server-agent.config with the installer configuration', async () => {
     const h = createHarness();
     const plan = buildPlan();

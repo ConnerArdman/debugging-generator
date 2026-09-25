@@ -66,7 +66,11 @@ import { z } from 'zod';
 import { DEBUGGEN_ERROR_CODES, DebuggenError } from '@debuggen/shared';
 import type { Result } from '@debuggen/shared';
 
-import { COMPUTED_METRIC_IDS, INSTRUMENTATION_ACTION_TYPES } from '../deterministic/rules.js';
+import {
+  COMPUTED_METRIC_IDS,
+  CONFIDENCE_LEVELS,
+  INSTRUMENTATION_ACTION_TYPES,
+} from '../deterministic/rules.js';
 import { EMPTY_CAPTURE_NOTICE } from '../deterministic/templates.js';
 import { isModelProvider, modelUnavailableMessage } from '../provider.js';
 import type { ModelProvider } from '../provider.js';
@@ -840,8 +844,12 @@ function toolCallInput(options: ToolCallOptions = {}): JsonObject {
  * restated, so a change to either tuple reaches these schemas automatically.
  * ---------------------------------------------------------------------------------------------- */
 
-/** An evidence reference, in either shape the rules emit (bare id or `{ eventId }`). */
-const evidenceRefMirror = z.union([z.string().min(1), z.object({ eventId: z.string().min(1) })]);
+/**
+ * An evidence reference: `@debuggen/panel-schema`'s `EventRef`, whose only
+ * spelling is the `{ eventId }` record — a bare id is rejected there, so it is
+ * rejected here, whatever spelling the capture context used.
+ */
+const evidenceRefMirror = z.strictObject({ eventId: z.string().min(1) });
 
 /** `SourceLocation` as a panel or a hypothesis carries it. */
 const sourceLocationMirror = z.object({
@@ -854,17 +862,21 @@ const sourceLocationMirror = z.object({
   confidence: z.number().min(0).max(1),
 });
 
-/** An observed fact: a statement with at least one evidence reference. */
-const factMirror = z.object({
+/** An observed fact: a statement with at least one evidence reference, and nothing else. */
+const factMirror = z.strictObject({
   statement: z.string().min(1),
   evidence: z.array(evidenceRefMirror).min(1),
 });
 
-/** A likely cause: a fact with a confidence and, where one is known, a location. */
-const hypothesisMirror = z.object({
+/**
+ * A likely cause: a fact with a confidence **level** and, where one is known, a
+ * location — `@debuggen/panel-schema`'s `Hypothesis`, whose confidence is the
+ * closed word vocabulary rather than a number.
+ */
+const hypothesisMirror = z.strictObject({
   statement: z.string().min(1),
   evidence: z.array(evidenceRefMirror).min(1),
-  confidence: z.number().min(0).max(1),
+  confidence: z.enum(CONFIDENCE_LEVELS),
   suggestedLocation: sourceLocationMirror.optional(),
 });
 
@@ -872,7 +884,13 @@ const hypothesisMirror = z.object({
 const understandingMirror = z.object({
   category: z.string().min(1).optional(),
   signalsNeeded: z.array(z.string().min(1)),
-  entities: z.array(z.string().min(1)),
+  entities: z.array(
+    z.strictObject({
+      kind: z.string().min(1),
+      name: z.string().min(1),
+      file: z.string().min(1).optional(),
+    }),
+  ),
   searchHints: z.array(z.string().min(1)),
 });
 
@@ -906,22 +924,17 @@ const planInputMirror = z.object({
 });
 
 /**
- * The computed metrics, in either carrier.
+ * `AnalysisFindings` — protocol's `analysisFindingsSchema`, the exact artifact
+ * the analyze stage validates: observed facts and likely causes kept
+ * structurally apart, and nothing else.
  *
- * Keys are checked against `COMPUTED_METRIC_IDS` in the assertions rather than
- * in the schema: a record keyed by an enum is exhaustive in Zod 4, and a
- * capture legitimately reports a subset.
+ * Strict, like the original: the metrics of an `AnalysisResult` are computed by
+ * protocol's `createAnalysisResult`, never proposed by a provider, so an answer
+ * that carries a `metrics` key fails the stage's gate and must fail here too.
  */
-const metricsMirror = z.union([
-  z.record(z.string().min(1), z.number()),
-  z.array(z.object({ id: z.enum(COMPUTED_METRIC_IDS), value: z.number() })),
-]);
-
-/** `AnalysisResult` — observed facts and likely causes kept structurally apart. */
-const analysisMirror = z.object({
+const analysisMirror = z.strictObject({
   observed: z.array(factMirror),
   likelyCauses: z.array(hypothesisMirror),
-  metrics: metricsMirror,
 });
 
 /** One authored panel node: a visualization with its query fields, or a leaf with a location. */
@@ -1084,31 +1097,79 @@ describe('property 1: schema-valid — every stage builds an answer its caller c
     });
   }
 
-  it('reports the metrics of an analysis under ids drawn from the computed vocabulary', async () => {
+  it('answers an analysis in exactly the findings shape, proposing no metrics of its own', async () => {
     const result = await provider.generateStructured(
       analysisMirror,
       requestFor('analyze', analyzeInput()),
     );
-    const parsed = okValue(result).value;
-    expect(parsed).toBeDefined();
-    const metrics = asObject(asObject(parsed).metrics);
-    expect(Object.keys(metrics).length).toBeGreaterThan(0);
-    for (const id of Object.keys(metrics)) {
-      expect(COMPUTED_METRIC_IDS).toContain(id);
+    const parsed = asObject(okValue(result).value);
+    expect(Object.keys(parsed).sort()).toEqual(['likelyCauses', 'observed']);
+    expect(parsed.metrics).toBeUndefined();
+    for (const cause of asArray(parsed.likelyCauses)) {
+      expect(CONFIDENCE_LEVELS).toContain(asObject(cause).confidence);
     }
   });
 
-  it('reports the metrics in the list carrier when the capture reported them as a list', async () => {
-    const result = await provider.generateStructured(
-      analysisMirror,
-      requestFor('analyze', analyzeInput({ metricsAsList: true })),
+  it('cites every reference as an { eventId } record even when the capture spelled it bare', async () => {
+    // The fixture's aggregates carry bare-string evidence lists throughout.
+    const analysis = await answerFor('analyze', analyzeInput());
+    const cited = [...asArray(analysis.observed), ...asArray(analysis.likelyCauses)].flatMap(
+      (item) => asArray(asObject(item).evidence),
     );
-    const parsed = asObject(okValue(result).value);
-    const metrics = asArray(parsed.metrics);
-    expect(metrics.length).toBeGreaterThan(0);
-    for (const entry of metrics) {
-      expect(COMPUTED_METRIC_IDS).toContain(asString(asObject(entry).id));
+    expect(cited.length).toBeGreaterThan(0);
+    for (const reference of cited) {
+      expect(typeof reference).toBe('object');
+      expect(Object.keys(asObject(reference))).toEqual(['eventId']);
     }
+  });
+
+  it("never cites an aggregate's own id as an event", async () => {
+    // The service's analysis input identifies groups, tree nodes and graph
+    // participants by ids of their own; only `eventId` and evidence lists name
+    // persisted events.
+    const base = analyzeInput();
+    const aggregates = asObject(base.aggregates);
+    const input: JsonObject = {
+      aggregates: {
+        ...aggregates,
+        componentTree: [{ id: 'tree-node-1', name: WIDGET_SYMBOL, renderCount: 40 }],
+        requests: [
+          ...asArray(aggregates.requests).map((group) => ({ ...asObject(group), id: 'req:g:0' })),
+          { id: 'req:g:1', endpoint: '/tally/other', count: 3, windowMs: 10 },
+        ],
+      },
+    };
+
+    const analysis = await answerFor('analyze', input);
+    const cited = [...asArray(analysis.observed), ...asArray(analysis.likelyCauses)].flatMap(
+      (item) => citedEvidence(item),
+    );
+    expect(cited.length).toBeGreaterThan(0);
+    for (const own of ['tree-node-1', 'req:g:0', 'req:g:1']) {
+      expect(cited).not.toContain(own);
+    }
+  });
+
+  it('reads metrics from the list carrier exactly as from the map carrier', async () => {
+    const fromMap = await answerFor('analyze', analyzeInput());
+    const fromList = await answerFor('analyze', analyzeInput({ metricsAsList: true }));
+    expect(fromList).toEqual(fromMap);
+  });
+
+  it('never states a stronger pattern less confidently than a weaker one of its class', async () => {
+    const levelOfDuplicates = async (duplicateCount: number): Promise<number> => {
+      const analysis = await answerFor('analyze', analyzeInput({ duplicateCount }));
+      const cause = asArray(analysis.likelyCauses).find((entry) =>
+        citedEvidence(entry).some((reference) => REQUEST_EVENTS.includes(reference)),
+      );
+      expect(cause).toBeDefined();
+      const levels: readonly string[] = CONFIDENCE_LEVELS;
+      return levels.indexOf(asString(asObject(cause).confidence));
+    };
+    const weak = await levelOfDuplicates(2);
+    const strong = await levelOfDuplicates(6);
+    expect(weak).toBeGreaterThanOrEqual(0);
+    expect(strong).toBeGreaterThan(weak);
   });
 
   it('plans only action types the instrumentation vocabulary declares', async () => {
@@ -1211,6 +1272,21 @@ async function answerFor(stage: PromptStage, input: JsonObject): Promise<Record<
   return asObject(okValue(await stageCase.call(requestFor(stage, input))).value);
 }
 
+/** The `name` of every entity an understanding reported, in order. */
+function entityNames(understanding: Record<string, unknown>): readonly string[] {
+  return asArray(understanding.entities).map((entity) => asString(asObject(entity).name));
+}
+
+/** Answers an understand request against `schema`, unwrapped to a plain object. */
+async function closedAnswer(
+  schema: z.ZodType,
+  input: JsonObject,
+): Promise<Record<string, unknown>> {
+  return asObject(
+    okValue(await provider.generateStructured(schema, requestFor('understand', input))).value,
+  );
+}
+
 /** The `file` of every relevant file an investigation reported, in order. */
 function reportedFiles(answer: Record<string, unknown>): readonly string[] {
   return asArray(answer.relevantFiles).map((entry) => asString(asObject(entry).file));
@@ -1252,11 +1328,11 @@ describe('property 2: input-derived — one context field moves, the answer fiel
     const base = await answerFor('understand', understandInput());
     const moved = await answerFor('understand', understandInput({ componentChain: [TILE_SYMBOL] }));
 
-    expect(asArray(base.entities)).toContain(FORM_SYMBOL);
-    expect(asArray(base.entities)).not.toContain(TILE_SYMBOL);
+    expect(entityNames(base)).toContain(FORM_SYMBOL);
+    expect(entityNames(base)).not.toContain(TILE_SYMBOL);
 
-    expect(asArray(moved.entities)).toContain(TILE_SYMBOL);
-    expect(asArray(moved.entities)).not.toContain(FORM_SYMBOL);
+    expect(entityNames(moved)).toContain(TILE_SYMBOL);
+    expect(entityNames(moved)).not.toContain(FORM_SYMBOL);
     expect(asArray(moved.searchHints)).toContain(TILE_SYMBOL);
   });
 
@@ -1343,17 +1419,192 @@ describe('property 2: input-derived — one context field moves, the answer fiel
     expect(asArray(moved.additionalActions)).toEqual([]);
   });
 
+  describe('understanding vocabulary', () => {
+    /**
+     * The closed vocabularies `ProblemUnderstanding` is validated against in
+     * `@debuggen/instrumentation` (`CAPTURE_SIGNALS`, `PROBLEM_CATEGORIES`),
+     * restated because this package sits below that one. The loose
+     * {@link understandingMirror} accepts any string; this one is what the
+     * service's understand stage actually hands the provider.
+     */
+    const closedSignals = [
+      'interactions',
+      'react',
+      'state',
+      'fetch',
+      'perf',
+      'errors',
+      'componentTree',
+      'http',
+      'routeHandlers',
+      'prisma',
+      'pg',
+      'functions',
+    ] as const;
+    const closedCategories = [
+      'performance',
+      'rendering',
+      'network',
+      'data',
+      'state',
+      'error',
+      'correctness',
+      'other',
+    ] as const;
+    const closedEntityKinds = [
+      'component',
+      'function',
+      'hook',
+      'route',
+      'file',
+      'symbol',
+      'selector',
+      'url',
+      'query',
+      'other',
+    ] as const;
+    const closedUnderstanding = z.strictObject({
+      category: z.enum(closedCategories),
+      signalsNeeded: z.array(z.enum(closedSignals)).min(1),
+      entities: z.array(
+        z.strictObject({
+          kind: z.enum(closedEntityKinds),
+          name: z.string().min(1).max(200),
+          file: z.string().min(1).optional(),
+        }),
+      ),
+      searchHints: z.array(z.string().min(1)),
+    });
+
+    /** The understand stage's own context: lexical hints and a code-analysis project summary. */
+    function serviceUnderstandInput(style: string): JsonObject {
+      return {
+        tokens: ['button', 'slow'],
+        identifierCandidates: [],
+        signalTerms: ['slow'],
+        projectSummary: {
+          projectName: 'sample',
+          databaseAccess: { style, callSiteCount: 2 },
+          routes: [{ routePath: '/api/items', file: 'app/api/items/route.ts' }],
+          counts: { apiCalls: 1, apiRoutes: 1, dbCalls: 2, components: 3 },
+        },
+      };
+    }
+
+    it('answers the service context in the closed vocabularies, classifying nothing it was not given', async () => {
+      const answer = await closedAnswer(closedUnderstanding, serviceUnderstandInput('prisma'));
+
+      expect(answer.category).toBe('other');
+      expect(answer.signalsNeeded).toEqual([
+        'fetch',
+        'http',
+        'perf',
+        'prisma',
+        'react',
+        'routeHandlers',
+      ]);
+      // The summary's routes are what a code investigation can be seeded from.
+      expect(answer.entities).toEqual([{ kind: 'route', name: '/api/items' }]);
+      expect(answer.searchHints).toEqual(['/api/items', 'items']);
+    });
+
+    it('observes a page through its performance entries whenever it observes the page at all', async () => {
+      const page = await closedAnswer(closedUnderstanding, serviceUnderstandInput('prisma'));
+      const serverOnly = await closedAnswer(closedUnderstanding, {
+        ...serviceUnderstandInput('prisma'),
+        projectSummary: {
+          projectName: 'sample',
+          databaseAccess: { style: 'prisma', callSiteCount: 2 },
+          routes: [{ routePath: '/api/items', file: 'app/api/items/route.ts' }],
+          counts: { apiRoutes: 1, dbCalls: 2 },
+        },
+      });
+
+      // Reported components make the page worth observing, and with it its
+      // long tasks, resource timing and navigation.
+      expect(page.signalsNeeded).toEqual(expect.arrayContaining(['react', 'perf']));
+      // A project with nothing observable in the page asks for no page hook.
+      expect(serverOnly.signalsNeeded).not.toContain('react');
+      expect(serverOnly.signalsNeeded).not.toContain('interactions');
+      expect(serverOnly.signalsNeeded).not.toContain('perf');
+    });
+
+    it('plans one runtime action for a needed page-error signal', async () => {
+      const plan = await answerFor('plan', {
+        ...planInput({
+          candidates: [],
+          withoutFlows: true,
+          claimedActionTypes: ['perf-tracking'],
+          availableSignals: ['perf', 'errors'],
+        }),
+        signalsNeeded: ['errors'],
+      });
+      const targets = asArray(plan.instrumentationTargets).map(asObject);
+
+      expect(targets.map((target) => target.type)).toEqual(['perf-tracking']);
+    });
+
+    it('asks for exactly the database drivers the summary reports', async () => {
+      const pg = await closedAnswer(closedUnderstanding, serviceUnderstandInput('pg'));
+      const both = await closedAnswer(closedUnderstanding, serviceUnderstandInput('both'));
+
+      expect(pg.signalsNeeded).toContain('pg');
+      expect(pg.signalsNeeded).not.toContain('prisma');
+      expect(both.signalsNeeded).toEqual(expect.arrayContaining(['pg', 'prisma']));
+    });
+
+    it('collects a needed signal no candidate covers with a targetless runtime action', async () => {
+      const plan = await answerFor('plan', {
+        ...planInput({
+          candidates: [],
+          withoutFlows: true,
+          claimedActionTypes: ['interaction-tracking', 'react-render-tracking', 'fetch-tracking'],
+          availableSignals: ['interactions', 'react', 'componentTree', 'fetch'],
+        }),
+        signalsNeeded: ['interactions', 'react', 'fetch'],
+      });
+      const targets = asArray(plan.instrumentationTargets).map(asObject);
+
+      expect(targets.map((target) => target.type).sort()).toEqual([
+        'fetch-tracking',
+        'interaction-tracking',
+        'react-render-tracking',
+      ]);
+      for (const target of targets) {
+        expect(target.file).toBe('.');
+        expect(target.symbol).toBe('*');
+      }
+      expect(asArray(plan.capture)).toEqual(
+        expect.arrayContaining(['interactions', 'react', 'componentTree']),
+      );
+    });
+
+    it('reads a carried symptom category and kind-named signals into the closed vocabularies', async () => {
+      const answer = await closedAnswer(
+        closedUnderstanding,
+        understandInput({ category: 'excessive-renders' }),
+      );
+
+      expect(answer.category).toBe('rendering');
+      expect(answer.signalsNeeded).toEqual(expect.arrayContaining(['interactions', 'react']));
+      // The selected target's chain leads, as components; a path-shaped name is a file.
+      expect(entityNames(answer).slice(0, 2)).toEqual([WIDGET_SYMBOL, FORM_SYMBOL]);
+      expect(asArray(answer.entities)).toContainEqual({ kind: 'file', name: FORM_FILE });
+    });
+  });
+
   describe('graceful degradation', () => {
     it('answers a smaller understanding when the optional selected target is absent', async () => {
       const base = await answerFor('understand', understandInput());
       const degraded = await answerFor('understand', understandInput({ withoutTarget: true }));
 
-      expect(asArray(base.signalsNeeded)).toContain('render');
+      expect(asArray(base.signalsNeeded)).toContain('react');
       // The target is what establishes that renders are worth capturing; the
-      // signal the context asked for directly survives without it.
-      expect(asArray(degraded.signalsNeeded)).not.toContain('render');
-      expect(asArray(degraded.signalsNeeded)).toContain('interaction');
-      expect(asArray(degraded.entities)).not.toContain(FORM_SYMBOL);
+      // signal the context asked for directly survives without it, read into
+      // the capture-signal vocabulary.
+      expect(asArray(degraded.signalsNeeded)).not.toContain('react');
+      expect(asArray(degraded.signalsNeeded)).toContain('interactions');
+      expect(entityNames(degraded)).not.toContain(FORM_SYMBOL);
       expect(undefinedPaths(degraded)).toEqual([]);
     });
 
@@ -1381,7 +1632,7 @@ describe('property 2: input-derived — one context field moves, the answer fiel
 
       expect(asArray(degraded.observed)).toEqual([]);
       expect(asArray(degraded.likelyCauses)).toEqual([]);
-      expect(asObject(degraded.metrics)).toEqual({});
+      expect(degraded.metrics).toBeUndefined();
       expect(undefinedPaths(degraded)).toEqual([]);
     });
 
@@ -1594,7 +1845,7 @@ describe('property 4: generated panels genuinely differ between two captures', (
     for (const cause of causes) {
       const entry = asObject(cause);
       expect(citedEvidence(cause).length).toBeGreaterThan(0);
-      expect(typeof entry.confidence).toBe('number');
+      expect(CONFIDENCE_LEVELS).toContain(entry.confidence);
     }
 
     // Every cited identifier exists in the capture that was handed in.
