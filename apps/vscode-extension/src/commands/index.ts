@@ -261,7 +261,10 @@ export interface CommandDiscovery {
 /**
  * The session-scoped source opener. The default delegates to
  * `openSourceLocation`, which re-validates the location against the given
- * project root and reports its own refusals.
+ * project root and returns every refusal as a typed `Err`. Reporting that
+ * `Err` is the caller's job: `debuggen.openSource` renders it once through
+ * {@link CommandUi.notifyFailure}, so the default keeps the opener's own
+ * warning notification silent rather than doubling every refusal.
  */
 export interface OpenSourcePort {
   open(
@@ -515,10 +518,24 @@ const DEFAULT_DISCOVERY: CommandDiscovery = Object.freeze({
   normalizeDevServerUrl,
 });
 
-/** The production {@link OpenSourcePort}: the session-scoped `openSourceLocation`. */
+/**
+ * Discards `openSourceLocation`'s own warning notification. The command that
+ * uses this port reports the returned `Err` through {@link CommandUi}, which
+ * reaches the Debug Generator view as well as a notification; letting the
+ * opener show its toast too would give the developer two messages for one
+ * refusal.
+ */
+function silenceOpenerWarning(): void {
+  // Intentionally empty: see above. The refusal is still returned as an `Err`.
+}
+
+/**
+ * The production {@link OpenSourcePort}: the session-scoped
+ * `openSourceLocation`, with its warning left to the caller.
+ */
 const DEFAULT_OPEN_SOURCE: OpenSourcePort = Object.freeze({
   open: (location: SourceLocation, context: OpenSourceContext) =>
-    openSourceLocation(location, context),
+    openSourceLocation(location, context, { showWarning: silenceOpenerWarning }),
 });
 
 /**
