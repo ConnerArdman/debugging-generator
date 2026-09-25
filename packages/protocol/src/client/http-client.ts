@@ -215,6 +215,21 @@ const UNAUTHORIZED_FAMILY_CODES: readonly DebuggenErrorCode[] = [
   'UNAUTHORIZED',
 ];
 
+/**
+ * The error codes of a `403` that refuses an **accepted** credential for acting
+ * outside its scope (AAP §0.5.6, "authorization by role and scope"): a DevTools
+ * credential on a session its tab is not bound to (`TAB_NOT_BOUND`), or a path
+ * outside the session's project (`PATH_OUTSIDE_PROJECT`).
+ *
+ * They are kept as the service sent them rather than flattened to
+ * `UNAUTHORIZED`: the credential is valid, so a client that treats
+ * `UNAUTHORIZED` as "this credential was refused" — the Chrome extension's
+ * worker clears its paired credential on it — must not see one here. A panel
+ * still showing an ended session's data, for instance, is answered
+ * `403 TAB_NOT_BOUND`; flattened, that refusal would unpair the extension.
+ */
+const SCOPE_REFUSAL_CODES: readonly DebuggenErrorCode[] = ['TAB_NOT_BOUND', 'PATH_OUTSIDE_PROJECT'];
+
 /** The recovery step for a credential the service would not accept, or for none. */
 const CREDENTIAL_REFUSED_HINT =
   'The local service refused this credential. Pair this client again, or supply the rotated credential with setToken().';
@@ -2149,7 +2164,9 @@ function refusalError(
  * The exception is an authentication failure: a `401` or `403` must always reach
  * the caller as an unauthorized-family code, so the DevTools panel can render
  * "Not paired" and open its pairing dialog and the editor can offer a rotation,
- * and a status in that family with an unrelated code is normalised.
+ * and a status in that family with an unrelated code is normalised. A scope
+ * refusal of an accepted credential ({@link SCOPE_REFUSAL_CODES}) is not an
+ * authentication failure and keeps its code.
  *
  * @param status The numeric HTTP status.
  * @param reported The code the payload carried, when it parsed.
@@ -2163,7 +2180,11 @@ function resolveRefusalCode(
     return statusFamilyCode(status);
   }
 
-  if (UNAUTHORIZED_STATUSES.includes(status) && !UNAUTHORIZED_FAMILY_CODES.includes(reported)) {
+  if (
+    UNAUTHORIZED_STATUSES.includes(status) &&
+    !UNAUTHORIZED_FAMILY_CODES.includes(reported) &&
+    !SCOPE_REFUSAL_CODES.includes(reported)
+  ) {
     return 'UNAUTHORIZED';
   }
 

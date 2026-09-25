@@ -71,8 +71,11 @@ scripts/no-hardcoding.policy.json
 # Prisma client output (`prisma generate`, run by `pnpm demo:generate`).
 apps/demo-app/src/generated/
 
-# Written by Next.js on every `next dev` / `next build`.
+# Written by Next.js on every `next dev` / `next build`. The fixture app gets one
+# too: tests/e2e/helpers/sample-app.ts serves it in place through the launcher,
+# and its own .gitignore keeps the file out of git, but not out of `prettier .`.
 apps/demo-app/next-env.d.ts
+tests/fixtures/sample-next-app/next-env.d.ts
 
 # Migration SQL authored by Prisma Migrate, plus its migration_lock.toml.
 # Prettier has no SQL or TOML parser today; the entry keeps that intentional.

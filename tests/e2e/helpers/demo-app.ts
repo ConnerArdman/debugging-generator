@@ -81,8 +81,11 @@
  * `./repo` supplies the repository root, command runner and `git ls-files`;
  * `./service` supplies the typed service client. `sample-app.ts` reuses this
  * module's snapshot, restoration, residual-check and source-lookup functions
- * with its own `relDir` / `relativeTo`, so the fixture application gets the
- * same contract without a second implementation. The dependency is one-way:
+ * with its own `relDir` / `relativeTo`, and its serving probe (`probeDemo`
+ * with a `baseUrl`), port test (`isPortListening`), loopback comparison
+ * (`sameLoopbackPort`) and editor announcement (`withEditorAnnouncement`),
+ * so the fixture application gets the same contract without a second
+ * implementation. The dependency is one-way:
  * this module never imports `fixtures.ts`, and it owns its own budgets.
  */
 
@@ -221,13 +224,16 @@ export class DemoAppError extends Error {
 // Small utilities
 // ---------------------------------------------------------------------------
 
-/** A thrown value's message, without its stack. */
-function messageOf(error: unknown): string {
+/** A thrown value's message, without its stack. Shared with `sample-app.ts`. */
+export function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** `text` without trailing full stops or whitespace, ready to be followed by one full stop. */
-function sentence(text: string): string {
+/**
+ * `text` without trailing full stops or whitespace, ready to be followed by
+ * one full stop. Shared with `sample-app.ts`.
+ */
+export function sentence(text: string): string {
   return text.replace(/[.\s]+$/, '');
 }
 
@@ -685,8 +691,11 @@ function probeUrl(options: ServingProbeOptions): URL {
   return url;
 }
 
-/** A fetch failure in words: the timeout, or the underlying socket error code. */
-function describeFetchError(error: unknown, timeoutMs: number): string {
+/**
+ * A fetch failure in words: the timeout, or the underlying socket error code.
+ * Shared with `sample-app.ts`.
+ */
+export function describeFetchError(error: unknown, timeoutMs: number): string {
   if (error instanceof Error && (error.name === 'TimeoutError' || error.name === 'AbortError')) {
     return `no response within ${String(timeoutMs)} ms`;
   }
@@ -734,8 +743,8 @@ export async function probeDemo(options: ServingProbeOptions = {}): Promise<Serv
   }
 }
 
-/** A probe result in words, for failure messages. */
-function describeProbe(result: ServingProbeResult | undefined): string {
+/** A probe result in words, for failure messages. Shared with `sample-app.ts`. */
+export function describeProbe(result: ServingProbeResult | undefined): string {
   if (result === undefined) {
     return 'no probe completed';
   }
@@ -775,9 +784,10 @@ export async function expectServing(
 /**
  * Whether anything accepts a TCP connection on `origin`'s host and port.
  * Used before a launch because a GET would wait out a cold compile; a
- * connect answers at once.
+ * connect answers at once. Shared with `sample-app.ts`, whose port ladder
+ * uses the same test.
  */
-function isPortListening(origin: string, timeoutMs: number): Promise<boolean> {
+export function isPortListening(origin: string, timeoutMs: number): Promise<boolean> {
   const url = new URL(origin);
   const port = url.port === '' ? 80 : Number(url.port);
   return new Promise((resolve) => {
@@ -895,8 +905,11 @@ function isLoopbackHost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '[::1]';
 }
 
-/** Whether two origins name the same loopback listening port (host spellings may differ). */
-function sameLoopbackPort(left: string, right: string): boolean {
+/**
+ * Whether two origins name the same loopback listening port (host spellings
+ * may differ). Shared with `sample-app.ts`.
+ */
+export function sameLoopbackPort(left: string, right: string): boolean {
   const a = new URL(left);
   const b = new URL(right);
   return (
@@ -966,9 +979,10 @@ export function expectPreloadAttached(launch: DemoAppLaunch): DemoAppLaunch {
  * (which contains `apps/demo-app`), so the worker-scoped demo fixture can
  * launch before any test-scoped editor client exists. Closing it releases the
  * announcement only — a launched child is tied to neither the connection nor
- * a session and runs until `POST /dev-server/stop`.
+ * a session and runs until `POST /dev-server/stop`. Shared with
+ * `sample-app.ts`: the repository root contains the fixture app too.
  */
-async function withEditorAnnouncement<T>(
+export async function withEditorAnnouncement<T>(
   service: ServiceHandle,
   action: () => Promise<T>,
 ): Promise<T> {

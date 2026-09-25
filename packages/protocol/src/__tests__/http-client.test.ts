@@ -33,7 +33,9 @@
  *   route's schema refuses fails before anything is sent.
  * - **What comes back.** A valid reply parses; invalid JSON, a schema-violating
  *   reply and an empty body are protocol failures; a non-2xx keeps the service's
- *   code, except that `401`/`403` stay in the unauthorized family; `429`, `5xx`
+ *   code, except that `401`/`403` stay in the unauthorized family (a `403`
+ *   scope refusal of an accepted credential — `TAB_NOT_BOUND`,
+ *   `PATH_OUTSIDE_PROJECT` — keeps its code); `429`, `5xx`
  *   and unconformant bodies map by status; a `409` on `capture.start` names the
  *   owning session; a transport that throws, rejects or fails mid-body is
  *   `TRANSPORT_DISCONNECTED`.
@@ -1200,6 +1202,31 @@ describe('HttpClient — replies', () => {
       expect(error.details).toEqual(expect.objectContaining({ operation: 'session.list', status }));
       expectFamilyHint(error.hint, code);
       expect(reachableText(error)).not.toContain(MARKER);
+      expect(reachableText(error)).not.toContain(EDITOR_TOKEN);
+    },
+  );
+
+  it.each([
+    [
+      403,
+      { code: 'TAB_NOT_BOUND', message: 'The tab is not bound to this session' },
+      'TAB_NOT_BOUND',
+    ],
+    [403, { code: 'PATH_OUTSIDE_PROJECT', message: 'Outside the project' }, 'PATH_OUTSIDE_PROJECT'],
+  ] as const)(
+    'keeps the scope refusal of an accepted credential as sent (a %i with %j → %s), never as a refused credential',
+    async (status, body, code) => {
+      const client = new HttpClient({
+        baseUrl: ORIGIN,
+        token: EDITOR_TOKEN,
+        fetch: fetchReplying(reply(status, body)),
+      });
+
+      const error = failureOf(await client.request('session.list'));
+
+      expect(error.code).toBe(code);
+      expect(error.details).toEqual(expect.objectContaining({ operation: 'session.list', status }));
+      expect(error.hint ?? '').not.toContain(FAMILY_HINT_FRAGMENTS.UNAUTHORIZED);
       expect(reachableText(error)).not.toContain(EDITOR_TOKEN);
     },
   );
