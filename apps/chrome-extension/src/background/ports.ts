@@ -260,8 +260,10 @@ export type ChromeRuntimeSatisfiesPortHubRuntime = AssertTrue<
  * What a panel request handler is told besides the payload.
  *
  * - `connectionId` — the panel connection that asked. A panel port does not
- *   know its inspected tab at connect time (its `sender` names no tab and no
- *   panel request payload carries one), so a handler that learns the tab —
+ *   know its inspected tab at connect time (its `sender` never names the
+ *   inspected tab — a DevTools panel has no tab at all, and a panel page
+ *   opened directly in a tab names only its own — and no panel request
+ *   payload carries one), so a handler that learns the tab —
  *   for example the `session.snapshot` handler, from the tab bound to the
  *   named session — calls {@link PortHub.bindPanelTab} with this id.
  * - `tabId` — the tab this panel is bound to, when it is.
@@ -1101,7 +1103,23 @@ export function createPortHub(deps: PortHubDeps): PortHub {
   // a local app tab, exactly the scope the manifest's host permissions grant.
   // -------------------------------------------------------------------------
 
-  /** Why an extension-page port (panel or devtools page) is refused, if it is. */
+  /**
+   * Why an extension-page port (panel or devtools page) is refused, if it is.
+   *
+   * What makes a sender one of this extension's own pages is its URL: only a
+   * document served from `chrome-extension://<this id>/` carries one, and
+   * Chrome — not the sender — fills `sender.url`. A content script, by
+   * contrast, always reports the URL of the web page it runs in. So:
+   *
+   * - a sender with a URL is accepted exactly when that URL is one of this
+   *   extension's pages, whether or not it is hosted in a tab. A DevTools
+   *   page or panel has no tab; the same panel document opened directly as an
+   *   extension page in a tab — how `tests/browser/**` exercises the built
+   *   panel (AAP §0.8.3) — has one, and is still this extension's own code;
+   * - a sender with no URL is accepted only when it is not hosted in a tab,
+   *   because a tab-hosted sender whose document cannot be named could be a
+   *   content script, which must use `PORT_CONTENT_BRIDGE` instead.
+   */
   function extensionPageRefusal(
     sender: chrome.runtime.MessageSender | undefined,
   ): SenderRefusal | undefined {
@@ -1111,19 +1129,18 @@ export function createPortHub(deps: PortHubDeps): PortHub {
     if (sender.id !== runtime.id) {
       return 'foreign-extension';
     }
-    if (sender.tab !== undefined) {
-      // A content script or a page in a tab — not a DevTools extension page.
-      return 'extension-page-in-tab';
+    if (sender.url === undefined) {
+      // A tab-hosted sender that names no document cannot be told apart from
+      // a content script — not an extension page.
+      return sender.tab === undefined ? undefined : 'extension-page-in-tab';
     }
-    if (sender.url !== undefined) {
-      const url = parseUrl(sender.url);
-      if (
-        url === undefined ||
-        url.protocol !== EXTENSION_PAGE_PROTOCOL ||
-        url.hostname !== runtime.id
-      ) {
-        return 'not-extension-page';
-      }
+    const url = parseUrl(sender.url);
+    if (
+      url === undefined ||
+      url.protocol !== EXTENSION_PAGE_PROTOCOL ||
+      url.hostname !== runtime.id
+    ) {
+      return 'not-extension-page';
     }
     return undefined;
   }
